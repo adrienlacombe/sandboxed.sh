@@ -142,24 +142,21 @@ function EntryEditor({
               ))}
             </select>
             <span className="text-white/20">/</span>
-            <select
+            <input
+              list={`routing-models-${i}`}
               value={entry.model_id}
               onChange={(e) => updateEntry(i, 'model_id', e.target.value)}
               disabled={!entry.provider_id}
-              className="flex-1 min-w-0 rounded border border-white/[0.06] bg-white/[0.02] px-2 py-1 text-xs text-white focus:outline-none focus:border-indigo-500/50 appearance-none cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
-              style={{
-                backgroundImage: "url(\"data:image/svg+xml,%3csvg xmlns='http://www.w3.org/2000/svg' fill='none' viewBox='0 0 20 20'%3e%3cpath stroke='%236b7280' stroke-linecap='round' stroke-linejoin='round' stroke-width='1.5' d='M6 8l4 4 4-4'/%3e%3c/svg%3e\")",
-                backgroundPosition: 'right 0.25rem center',
-                backgroundRepeat: 'no-repeat',
-                backgroundSize: '1.2em 1.2em',
-                paddingRight: '1.5rem',
-              }}
-            >
-              <option value="" className="bg-[#1a1a1a]">{entry.provider_id ? 'Select model' : 'Select provider first'}</option>
+              placeholder={entry.provider_id ? 'Select or type model id' : 'Select provider first'}
+              className="flex-1 min-w-0 rounded border border-white/[0.06] bg-white/[0.02] px-2 py-1 text-xs text-white focus:outline-none focus:border-indigo-500/50 disabled:opacity-40 disabled:cursor-not-allowed"
+            />
+            <datalist id={`routing-models-${i}`}>
               {models.map((m) => (
-                <option key={m.id} value={m.id} className="bg-[#1a1a1a]">{m.name || m.id}</option>
+                <option key={m.id} value={m.id}>
+                  {m.name || m.id}
+                </option>
               ))}
-            </select>
+            </datalist>
             <div className="flex items-center gap-0.5 flex-shrink-0">
               <button
                 onClick={() => moveEntry(i, 'up')}

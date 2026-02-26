@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
 use super::routes::AppState;
-use crate::ai_providers::{AIProviderStore, ProviderType};
+use crate::ai_providers::{AIProvider, AIProviderStore, ProviderType};
 use crate::util::{auth_entry_has_credentials, home_dir, AI_PROVIDERS_PATH};
 
 /// Cached model lists fetched from provider APIs at startup.
@@ -151,6 +151,64 @@ fn sanitize_custom_provider_id(name: &str) -> String {
         .collect::<String>()
         .to_lowercase()
         .replace('-', "_")
+}
+
+fn store_custom_models(provider: &AIProvider) -> Vec<ProviderModel> {
+    provider
+        .custom_models
+        .clone()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|model| ProviderModel {
+            id: model.id,
+            name: model.name.unwrap_or_else(|| "Custom model".to_string()),
+            description: None,
+        })
+        .collect()
+}
+
+fn merge_store_provider_models(
+    providers: &mut Vec<Provider>,
+    store_providers: &[AIProvider],
+    include_all: bool,
+) {
+    for provider in store_providers {
+        if !provider.enabled {
+            continue;
+        }
+        if !include_all && !provider.has_credentials() {
+            continue;
+        }
+
+        let store_models = store_custom_models(provider);
+        if store_models.is_empty() {
+            continue;
+        }
+
+        let id = if provider.provider_type == ProviderType::Custom {
+            sanitize_custom_provider_id(&provider.name)
+        } else {
+            provider.provider_type.id().to_string()
+        };
+
+        if let Some(existing) = providers.iter_mut().find(|p| p.id == id) {
+            let mut seen: HashSet<String> = existing.models.iter().map(|m| m.id.clone()).collect();
+            for model in store_models {
+                if seen.insert(model.id.clone()) {
+                    existing.models.push(model);
+                }
+            }
+            continue;
+        }
+
+        providers.push(Provider {
+            id,
+            name: provider.name.clone(),
+            billing: "custom".to_string(),
+            description: "Custom provider".to_string(),
+            models: store_models,
+        });
+    }
 }
 
 fn codex_model_probe_cache() -> &'static RwLock<HashMap<String, CodexProbeCacheEntry>> {
@@ -1009,6 +1067,9 @@ pub async fn list_providers(
     }
     drop(cached);
 
+    let store_providers = state.ai_providers.list().await;
+    merge_store_provider_models(&mut config.providers, &store_providers, query.include_all);
+
     // Get the set of configured provider IDs
     let configured = get_configured_provider_ids(state.config.working_dir.as_path());
 
@@ -1056,42 +1117,8 @@ pub async fn list_backend_model_options(
             .collect()
     };
 
-    // Add non-default providers from AIProviderStore (Custom, Cerebras, Zai, etc.)
-    let default_provider_ids = DEFAULT_CATALOG_PROVIDER_IDS;
-    let custom_providers = state.ai_providers.list().await;
-    for provider in custom_providers {
-        // Skip disabled providers and those already in the default catalog
-        if !provider.enabled || default_provider_ids.contains(&provider.provider_type.id()) {
-            continue;
-        }
-        if !query.include_all && !provider.has_credentials() {
-            continue;
-        }
-        // Use the canonical provider type ID for known types, sanitized name for Custom
-        let id = if provider.provider_type == ProviderType::Custom {
-            sanitize_custom_provider_id(&provider.name)
-        } else {
-            provider.provider_type.id().to_string()
-        };
-        let models = provider
-            .custom_models
-            .clone()
-            .unwrap_or_default()
-            .into_iter()
-            .map(|model| ProviderModel {
-                id: model.id,
-                name: model.name.unwrap_or_else(|| "Custom model".to_string()),
-                description: None,
-            })
-            .collect();
-        providers.push(Provider {
-            id,
-            name: provider.name.clone(),
-            billing: "custom".to_string(),
-            description: "Custom provider".to_string(),
-            models,
-        });
-    }
+    let store_providers = state.ai_providers.list().await;
+    merge_store_provider_models(&mut providers, &store_providers, query.include_all);
 
     let mut backends: std::collections::HashMap<String, Vec<BackendModelOption>> =
         std::collections::HashMap::new();
@@ -1217,37 +1244,8 @@ pub async fn validate_model_override(
 
     // Load all providers (including configured and non-default)
     let mut providers = config.providers;
-    let default_provider_ids = DEFAULT_CATALOG_PROVIDER_IDS;
-    let custom_providers = state.ai_providers.list().await;
-    for provider in custom_providers {
-        // Skip disabled providers and those already in the default catalog
-        if !provider.enabled || default_provider_ids.contains(&provider.provider_type.id()) {
-            continue;
-        }
-        let id = if provider.provider_type == ProviderType::Custom {
-            sanitize_custom_provider_id(&provider.name)
-        } else {
-            provider.provider_type.id().to_string()
-        };
-        let models = provider
-            .custom_models
-            .clone()
-            .unwrap_or_default()
-            .into_iter()
-            .map(|model| ProviderModel {
-                id: model.id,
-                name: model.name.unwrap_or_else(|| "Custom model".to_string()),
-                description: None,
-            })
-            .collect();
-        providers.push(Provider {
-            id,
-            name: provider.name.clone(),
-            billing: "custom".to_string(),
-            description: "Custom provider".to_string(),
-            models,
-        });
-    }
+    let store_providers = state.ai_providers.list().await;
+    merge_store_provider_models(&mut providers, &store_providers, true);
 
     match backend {
         "opencode" => {
