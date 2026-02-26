@@ -831,17 +831,21 @@ impl ModelChainStore {
                     continue;
                 }
                 let routed_api_key = account.api_key.clone().or_else(|| {
-                    account
-                        .oauth
-                        .as_ref()
-                        .and_then(|oauth| {
-                            let token = oauth.access_token.trim();
-                            if token.is_empty() {
-                                None
-                            } else {
-                                Some(token.to_string())
-                            }
-                        })
+                    if !matches!(
+                        provider_type,
+                        crate::ai_providers::ProviderType::OpenAI
+                            | crate::ai_providers::ProviderType::Anthropic
+                    ) {
+                        return None;
+                    }
+                    account.oauth.as_ref().and_then(|oauth| {
+                        let token = oauth.access_token.trim();
+                        if token.is_empty() {
+                            None
+                        } else {
+                            Some(token.to_string())
+                        }
+                    })
                 });
                 seen_account_ids.insert(account.id);
                 resolved.push(ResolvedEntry {
