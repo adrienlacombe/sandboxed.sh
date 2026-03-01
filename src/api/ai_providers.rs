@@ -366,7 +366,10 @@ pub fn read_standard_accounts(working_dir: &Path) -> Vec<crate::provider_health:
         // forwarded as a Bearer token for proxy routing.
         if api_key.is_none()
             && has_oauth
-            && matches!(provider_type, ProviderType::OpenAI | ProviderType::Anthropic)
+            && matches!(
+                provider_type,
+                ProviderType::OpenAI | ProviderType::Anthropic
+            )
         {
             api_key = value
                 .get("access")
@@ -378,8 +381,8 @@ pub fn read_standard_accounts(working_dir: &Path) -> Vec<crate::provider_health:
         }
 
         // Only include accounts that have credentials we can route with.
-        let has_routable_credentials = api_key.is_some()
-            || (provider_type == ProviderType::Google && has_oauth);
+        let has_routable_credentials =
+            api_key.is_some() || (provider_type == ProviderType::Google && has_oauth);
         if !has_routable_credentials {
             continue;
         }

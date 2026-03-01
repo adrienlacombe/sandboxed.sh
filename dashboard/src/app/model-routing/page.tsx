@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useMemo } from 'react';
+import { useState, useMemo, useId } from 'react';
 import useSWR from 'swr';
 import { toast } from '@/components/toast';
 import {
@@ -71,6 +71,7 @@ function EntryEditor({
   const addEntry = () => {
     onChange([...entries, { provider_id: '', model_id: '' }]);
   };
+  const editorId = useId().replace(/:/g, '');
 
   const removeEntry = (index: number) => {
     onChange(entries.filter((_, i) => i !== index));
@@ -116,6 +117,7 @@ function EntryEditor({
       </div>
       {entries.map((entry, i) => {
         const models = getModelsForProvider(entry.provider_id);
+        const datalistId = `routing-models-${editorId}-${i}`;
         return (
           <div
             key={i}
@@ -143,14 +145,14 @@ function EntryEditor({
             </select>
             <span className="text-white/20">/</span>
             <input
-              list={`routing-models-${i}`}
+              list={datalistId}
               value={entry.model_id}
               onChange={(e) => updateEntry(i, 'model_id', e.target.value)}
               disabled={!entry.provider_id}
               placeholder={entry.provider_id ? 'Select or type model id' : 'Select provider first'}
               className="flex-1 min-w-0 rounded border border-white/[0.06] bg-white/[0.02] px-2 py-1 text-xs text-white focus:outline-none focus:border-indigo-500/50 disabled:opacity-40 disabled:cursor-not-allowed"
             />
-            <datalist id={`routing-models-${i}`}>
+            <datalist id={datalistId}>
               {models.map((m) => (
                 <option key={m.id} value={m.id}>
                   {m.name || m.id}
