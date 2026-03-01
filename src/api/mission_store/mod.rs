@@ -175,6 +175,9 @@ pub enum StopPolicy {
 pub enum FreshSession {
     /// Always start a fresh session (clear context/history).
     Always,
+    /// Route completion-triggered automation to another session.
+    /// Requires custom variable `nextSessionId` set to a mission UUID.
+    Switch,
     /// Keep session alive (default behavior).
     #[default]
     Keep,

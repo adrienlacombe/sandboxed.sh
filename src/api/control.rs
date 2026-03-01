@@ -5054,12 +5054,50 @@ async fn resolve_automation_command(
     Some(substitute_variables(&command_content, &context))
 }
 
+#[derive(Debug, Clone)]
+struct RoutedAutomationMessage {
+    content: String,
+    target_mission_id: Uuid,
+}
+
+fn next_session_id_from_automation_variables(
+    automation: &super::mission_store::Automation,
+) -> Option<Uuid> {
+    let raw = automation.variables.get("nextSessionId")?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    Uuid::parse_str(raw).ok()
+}
+
+fn resolve_agent_finished_target_mission(
+    source_mission_id: Uuid,
+    source_mission_status: MissionStatus,
+    automation: &super::mission_store::Automation,
+) -> Uuid {
+    if source_mission_status == MissionStatus::Completed
+        && automation.fresh_session == mission_store::FreshSession::Switch
+    {
+        if let Some(next_id) = next_session_id_from_automation_variables(automation) {
+            return next_id;
+        }
+
+        tracing::warn!(
+            "Automation {} is in switch mode but has no valid nextSessionId variable; falling back to mission {}",
+            automation.id,
+            source_mission_id
+        );
+    }
+
+    source_mission_id
+}
+
 async fn agent_finished_automation_messages(
     mission_store: &Arc<dyn MissionStore>,
     mission_id: Uuid,
     library: &SharedLibrary,
     workspaces: &workspace::SharedWorkspaceStore,
-) -> Vec<String> {
+) -> Vec<RoutedAutomationMessage> {
     use super::automation_variables::{substitute_variables, SubstitutionContext};
     use super::mission_store::{AutomationExecution, CommandSource, ExecutionStatus, TriggerType};
 
@@ -5243,14 +5281,21 @@ async fn agent_finished_automation_messages(
             );
         }
 
+        let target_mission_id =
+            resolve_agent_finished_target_mission(mission.id, mission.status, &automation);
+
         tracing::info!(
-            "Triggering agent_finished automation {} (execution {}) for mission {}",
+            "Triggering agent_finished automation {} (execution {}) from mission {} to mission {}",
             automation.id,
             execution_id,
-            mission.id
+            mission.id,
+            target_mission_id
         );
 
-        out.push(substituted_content);
+        out.push(RoutedAutomationMessage {
+            content: substituted_content,
+            target_mission_id,
+        });
     }
 
     out
@@ -7148,9 +7193,14 @@ async fn control_actor_loop(
                                 &workspaces,
                             )
                             .await;
-                            for content in messages.into_iter().rev() {
+                            for message in messages.into_iter().rev() {
                                 // Push to front so it runs before unrelated queued items, but preserve order.
-                                queue.push_front((Uuid::new_v4(), content, None, Some(mission_id)));
+                                queue.push_front((
+                                    Uuid::new_v4(),
+                                    message.content,
+                                    None,
+                                    Some(message.target_mission_id),
+                                ));
                             }
                         }
                     }
@@ -7387,8 +7437,20 @@ async fn control_actor_loop(
                                     &workspaces,
                                 )
                                 .await;
-                                for content in messages {
-                                    runner.queue_message(Uuid::new_v4(), content, None);
+                                for message in messages {
+                                    if message.target_mission_id == *mission_id {
+                                        runner.queue_message(Uuid::new_v4(), message.content, None);
+                                        continue;
+                                    }
+
+                                    // Queue for targeted mission on the main runner if it is not
+                                    // the current parallel mission.
+                                    queue.push_back((
+                                        Uuid::new_v4(),
+                                        message.content,
+                                        None,
+                                        Some(message.target_mission_id),
+                                    ));
                                 }
                             }
 
@@ -8272,6 +8334,24 @@ pub async fn create_automation(
         };
 
     // Build the complete Automation struct
+    let fresh_session = req
+        .fresh_session
+        .unwrap_or(mission_store::FreshSession::Keep);
+    if fresh_session == mission_store::FreshSession::Switch {
+        let has_next_session_id = req
+            .variables
+            .get("nextSessionId")
+            .map(|value| Uuid::parse_str(value.trim()).is_ok())
+            .unwrap_or(false);
+        if !has_next_session_id {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "session mode 'switch' requires variables.nextSessionId to be a valid mission UUID"
+                    .to_string(),
+            ));
+        }
+    }
+
     let automation = mission_store::Automation {
         id: Uuid::new_v4(),
         mission_id,
@@ -8282,9 +8362,7 @@ pub async fn create_automation(
         stop_policy: req
             .stop_policy
             .unwrap_or(mission_store::StopPolicy::WhenFailingConsecutively { count: 2 }),
-        fresh_session: req
-            .fresh_session
-            .unwrap_or(mission_store::FreshSession::Keep),
+        fresh_session,
         created_at: mission_store::now_string(),
         last_triggered_at,
         retry_config: req.retry_config.unwrap_or_default(),
@@ -8437,6 +8515,21 @@ pub async fn update_automation(
 
     if let Some(active) = req.active {
         automation.active = active;
+    }
+
+    if automation.fresh_session == mission_store::FreshSession::Switch {
+        let has_next_session_id = automation
+            .variables
+            .get("nextSessionId")
+            .map(|value| Uuid::parse_str(value.trim()).is_ok())
+            .unwrap_or(false);
+        if !has_next_session_id {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "session mode 'switch' requires variables.nextSessionId to be a valid mission UUID"
+                    .to_string(),
+            ));
+        }
     }
 
     // Update automation in the store
@@ -8862,6 +8955,60 @@ pub async fn webhook_receiver(
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    fn test_automation_with_mode(
+        fresh_session: mission_store::FreshSession,
+        variables: HashMap<String, String>,
+    ) -> mission_store::Automation {
+        mission_store::Automation {
+            id: Uuid::new_v4(),
+            mission_id: Uuid::new_v4(),
+            command_source: mission_store::CommandSource::Inline {
+                content: "ping".to_string(),
+            },
+            trigger: mission_store::TriggerType::AgentFinished,
+            variables,
+            active: true,
+            created_at: mission_store::now_string(),
+            last_triggered_at: None,
+            retry_config: mission_store::RetryConfig::default(),
+            stop_policy: mission_store::StopPolicy::Never,
+            fresh_session,
+            consecutive_failures: 0,
+        }
+    }
+
+    #[test]
+    fn test_resolve_agent_finished_target_mission_switches_on_completed() {
+        let source_mission_id = Uuid::new_v4();
+        let next_mission_id = Uuid::new_v4();
+        let mut vars = HashMap::new();
+        vars.insert("nextSessionId".to_string(), next_mission_id.to_string());
+        let automation = test_automation_with_mode(mission_store::FreshSession::Switch, vars);
+
+        let target = resolve_agent_finished_target_mission(
+            source_mission_id,
+            MissionStatus::Completed,
+            &automation,
+        );
+        assert_eq!(target, next_mission_id);
+    }
+
+    #[test]
+    fn test_resolve_agent_finished_target_mission_does_not_switch_when_not_completed() {
+        let source_mission_id = Uuid::new_v4();
+        let next_mission_id = Uuid::new_v4();
+        let mut vars = HashMap::new();
+        vars.insert("nextSessionId".to_string(), next_mission_id.to_string());
+        let automation = test_automation_with_mode(mission_store::FreshSession::Switch, vars);
+
+        let target = resolve_agent_finished_target_mission(
+            source_mission_id,
+            MissionStatus::Active,
+            &automation,
+        );
+        assert_eq!(target, source_mission_id);
+    }
 
     #[test]
     fn test_parse_image_tag() {

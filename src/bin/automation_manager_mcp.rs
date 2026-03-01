@@ -12,7 +12,8 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use sandboxed_sh::api::mission_store::{
-    Automation, AutomationExecution, CommandSource, RetryConfig, StopPolicy, TriggerType,
+    Automation, AutomationExecution, CommandSource, FreshSession, RetryConfig, StopPolicy,
+    TriggerType,
 };
 
 // =============================================================================
@@ -110,6 +111,8 @@ struct CreateAutomationParams {
     retry_config: Option<RetryConfig>,
     #[serde(default)]
     stop_policy: Option<StopPolicy>,
+    #[serde(default)]
+    fresh_session: Option<FreshSession>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -125,6 +128,8 @@ struct UpdateAutomationParams {
     retry_config: Option<RetryConfig>,
     #[serde(default)]
     stop_policy: Option<StopPolicy>,
+    #[serde(default)]
+    fresh_session: Option<FreshSession>,
     #[serde(default)]
     active: Option<bool>,
 }
@@ -268,6 +273,11 @@ impl AutomationManagerMcp {
                                 "backoff_multiplier": {"type": "number", "description": "Exponential backoff multiplier"}
                             }
                         },
+                        "fresh_session": {
+                            "type": "string",
+                            "enum": ["keep", "always", "switch"],
+                            "description": "Session mode; 'switch' requires variables.nextSessionId"
+                        },
                         "stop_policy": {
                             "type": "string",
                             "description": "Auto-stop behavior for this automation",
@@ -381,6 +391,7 @@ impl AutomationManagerMcp {
             "variables": params.variables,
             "retry_config": params.retry_config,
             "stop_policy": params.stop_policy,
+            "fresh_session": params.fresh_session,
         }));
 
         if let Some(ref token) = self.api_token {
@@ -418,6 +429,7 @@ impl AutomationManagerMcp {
             "variables": params.variables,
             "retry_config": params.retry_config,
             "stop_policy": params.stop_policy,
+            "fresh_session": params.fresh_session,
             "active": params.active,
         }));
 

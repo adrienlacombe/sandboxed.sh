@@ -304,6 +304,7 @@ impl SqliteMissionStore {
         // Parse fresh_session
         let fresh_session = match fresh_session_str.as_str() {
             "always" => FreshSession::Always,
+            "switch" => FreshSession::Switch,
             _ => FreshSession::Keep,
         };
 
@@ -2102,6 +2103,7 @@ impl MissionStore for SqliteMissionStore {
             };
             let fresh_session_str = match a.fresh_session {
                 FreshSession::Always => "always",
+                FreshSession::Switch => "switch",
                 FreshSession::Keep => "keep",
             };
             conn.execute(
@@ -2310,6 +2312,7 @@ impl MissionStore for SqliteMissionStore {
             };
             let fresh_session_str = match automation.fresh_session {
                 FreshSession::Always => "always",
+                FreshSession::Switch => "switch",
                 FreshSession::Keep => "keep",
             };
             conn.execute(
