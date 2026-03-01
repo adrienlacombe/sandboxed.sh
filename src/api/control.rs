@@ -5243,14 +5243,17 @@ async fn agent_finished_automation_messages(
 
         let substituted_content = substitute_variables(&command_content, &context);
 
+        let target_mission_id =
+            resolve_agent_finished_target_mission(mission.id, mission.status, &automation);
+
         // Create an execution record in Running status – it will be
         // completed by complete_running_executions_for_mission when the
-        // agent finishes processing.
+        // target agent finishes processing.
         let execution_id = Uuid::new_v4();
         let execution = AutomationExecution {
             id: execution_id,
             automation_id: automation.id,
-            mission_id: mission.id,
+            mission_id: target_mission_id,
             triggered_at: mission_store::now_string(),
             trigger_source: "agent_finished".to_string(),
             status: ExecutionStatus::Running,
@@ -5280,9 +5283,6 @@ async fn agent_finished_automation_messages(
                 automation.id
             );
         }
-
-        let target_mission_id =
-            resolve_agent_finished_target_mission(mission.id, mission.status, &automation);
 
         tracing::info!(
             "Triggering agent_finished automation {} (execution {}) from mission {} to mission {}",
@@ -8406,6 +8406,21 @@ pub async fn create_automation(
                 .await;
 
         if let Some(content) = cmd_content {
+            let target_mission_id = match control.mission_store.get_mission(mission_id).await {
+                Ok(Some(mission)) => {
+                    resolve_agent_finished_target_mission(mission_id, mission.status, &automation)
+                }
+                Ok(None) => mission_id,
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to load mission {} while resolving start_immediately target: {}",
+                        mission_id,
+                        e
+                    );
+                    mission_id
+                }
+            };
+
             // Record the execution in Running status – it will be completed
             // by complete_running_executions_for_mission when the agent
             // finishes processing.
@@ -8413,7 +8428,7 @@ pub async fn create_automation(
             let execution = mission_store::AutomationExecution {
                 id: execution_id,
                 automation_id: automation.id,
-                mission_id,
+                mission_id: target_mission_id,
                 triggered_at: mission_store::now_string(),
                 trigger_source: "start_immediately".to_string(),
                 status: mission_store::ExecutionStatus::Running,
@@ -8440,7 +8455,7 @@ pub async fn create_automation(
                     id: Uuid::new_v4(),
                     content,
                     agent: None,
-                    target_mission_id: Some(mission_id),
+                    target_mission_id: Some(target_mission_id),
                     respond: respond_tx,
                 })
                 .await;

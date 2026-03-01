@@ -100,8 +100,15 @@ struct AutomationsView: View {
                     title: "New Automation",
                     initialCommand: "",
                     initialTrigger: .interval(seconds: 300),
-                    onSave: { command, trigger in
-                        await createAutomation(command: command, trigger: trigger)
+                    initialFreshSession: .keep,
+                    initialNextSessionId: "",
+                    onSave: { command, trigger, freshSession, nextSessionId in
+                        await createAutomation(
+                            command: command,
+                            trigger: trigger,
+                            freshSession: freshSession,
+                            nextSessionId: nextSessionId
+                        )
                     }
                 )
             }
@@ -110,8 +117,16 @@ struct AutomationsView: View {
                     title: "Edit Automation",
                     initialCommand: automation.commandText,
                     initialTrigger: automation.trigger,
-                    onSave: { command, trigger in
-                        await updateAutomation(automation, command: command, trigger: trigger)
+                    initialFreshSession: automation.freshSession ?? .keep,
+                    initialNextSessionId: automation.variables["nextSessionId"] ?? "",
+                    onSave: { command, trigger, freshSession, nextSessionId in
+                        await updateAutomation(
+                            automation,
+                            command: command,
+                            trigger: trigger,
+                            freshSession: freshSession,
+                            nextSessionId: nextSessionId
+                        )
                     }
                 )
             }
@@ -151,16 +166,28 @@ struct AutomationsView: View {
         }
     }
 
-    private func createAutomation(command: String, trigger: AutomationTrigger) async {
+    private func createAutomation(
+        command: String,
+        trigger: AutomationTrigger,
+        freshSession: AutomationFreshSession,
+        nextSessionId: String
+    ) async {
         guard let missionId else { return }
+        let trimmedNextSessionId = nextSessionId.trimmingCharacters(in: .whitespacesAndNewlines)
+        var variables: [String: String] = [:]
+        if freshSession == .switchSession {
+            variables["nextSessionId"] = trimmedNextSessionId
+        }
+
         do {
             let created = try await api.createMissionAutomation(
                 missionId: missionId,
                 request: CreateAutomationRequest(
                     commandSource: .inline(content: command),
                     trigger: trigger,
-                    variables: [:],
-                    startImmediately: false
+                    variables: variables,
+                    startImmediately: false,
+                    freshSession: freshSession
                 )
             )
             automations.insert(created, at: 0)
@@ -171,15 +198,30 @@ struct AutomationsView: View {
         }
     }
 
-    private func updateAutomation(_ automation: Automation, command: String, trigger: AutomationTrigger) async {
+    private func updateAutomation(
+        _ automation: Automation,
+        command: String,
+        trigger: AutomationTrigger,
+        freshSession: AutomationFreshSession,
+        nextSessionId: String
+    ) async {
+        let trimmedNextSessionId = nextSessionId.trimmingCharacters(in: .whitespacesAndNewlines)
+        var updatedVariables = automation.variables
+        if freshSession == .switchSession {
+            updatedVariables["nextSessionId"] = trimmedNextSessionId
+        } else {
+            updatedVariables.removeValue(forKey: "nextSessionId")
+        }
+
         do {
             let updated = try await api.updateAutomation(
                 id: automation.id,
                 request: UpdateAutomationRequest(
                     commandSource: .inline(content: command),
                     trigger: trigger,
-                    variables: nil,
-                    active: nil
+                    variables: updatedVariables,
+                    active: nil,
+                    freshSession: freshSession
                 )
             )
             if let index = automations.firstIndex(where: { $0.id == automation.id }) {
@@ -234,6 +276,12 @@ private struct AutomationRow: View {
                 .foregroundStyle(Theme.textSecondary)
                 .lineLimit(2)
 
+            if let sessionModeLabel = automation.sessionModeLabel {
+                Text(sessionModeLabel)
+                    .font(.caption2)
+                    .foregroundStyle(Theme.textMuted)
+            }
+
             HStack {
                 if automation.commandSource.isInline && automation.trigger.isEditableInIOS {
                     Button("Edit") { onEdit() }
@@ -263,13 +311,17 @@ private struct AutomationEditorSheet: View {
     let title: String
     let initialCommand: String
     let initialTrigger: AutomationTrigger
-    let onSave: (String, AutomationTrigger) async -> Void
+    let initialFreshSession: AutomationFreshSession
+    let initialNextSessionId: String
+    let onSave: (String, AutomationTrigger, AutomationFreshSession, String) async -> Void
 
     @Environment(\.dismiss) private var dismiss
 
     @State private var command = ""
     @State private var triggerKind: TriggerKind = .interval
     @State private var intervalSeconds = 300
+    @State private var freshSessionKind: FreshSessionKind = .keep
+    @State private var nextSessionId = ""
     @State private var isSaving = false
 
     enum TriggerKind: String, CaseIterable, Identifiable {
@@ -284,6 +336,36 @@ private struct AutomationEditorSheet: View {
                 return "Interval"
             case .agentFinished:
                 return "After Turn"
+            }
+        }
+    }
+
+    enum FreshSessionKind: String, CaseIterable, Identifiable {
+        case keep
+        case always
+        case switchSession = "switch"
+
+        var id: String { rawValue }
+
+        var label: String {
+            switch self {
+            case .keep:
+                return "Keep"
+            case .always:
+                return "Always New"
+            case .switchSession:
+                return "Switch"
+            }
+        }
+
+        var value: AutomationFreshSession {
+            switch self {
+            case .always:
+                return .always
+            case .keep:
+                return .keep
+            case .switchSession:
+                return .switchSession
             }
         }
     }
@@ -311,6 +393,20 @@ private struct AutomationEditorSheet: View {
                         }
                     }
                 }
+
+                Section("Session") {
+                    Picker("Mode", selection: $freshSessionKind) {
+                        ForEach(FreshSessionKind.allCases) { kind in
+                            Text(kind.label).tag(kind)
+                        }
+                    }
+
+                    if freshSessionKind == .switchSession {
+                        TextField("Next session ID", text: $nextSessionId)
+                            .textInputAutocapitalization(.never)
+                            .autocorrectionDisabled()
+                    }
+                }
             }
             .navigationTitle(title)
             .navigationBarTitleDisplayMode(.inline)
@@ -323,11 +419,21 @@ private struct AutomationEditorSheet: View {
                     Button("Save") {
                         Task {
                             isSaving = true
-                            await onSave(command.trimmingCharacters(in: .whitespacesAndNewlines), selectedTrigger)
+                            await onSave(
+                                command.trimmingCharacters(in: .whitespacesAndNewlines),
+                                selectedTrigger,
+                                freshSessionKind.value,
+                                nextSessionId.trimmingCharacters(in: .whitespacesAndNewlines)
+                            )
                             isSaving = false
                         }
                     }
-                    .disabled(command.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || isSaving)
+                    .disabled(
+                        command.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ||
+                        isSaving ||
+                        (freshSessionKind == .switchSession &&
+                         nextSessionId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    )
                 }
             }
             .onAppear {
@@ -341,6 +447,8 @@ private struct AutomationEditorSheet: View {
                 case .webhook:
                     triggerKind = .interval
                 }
+                freshSessionKind = FreshSessionKind(rawValue: initialFreshSession.rawValue) ?? .keep
+                nextSessionId = initialNextSessionId
             }
         }
     }
@@ -371,6 +479,19 @@ private extension Automation {
             return "<library:\(name)>"
         case .localFile(let path):
             return "<file:\(path)>"
+        }
+    }
+
+    var sessionModeLabel: String? {
+        guard let freshSession else { return nil }
+        switch freshSession {
+        case .keep:
+            return "Session: Keep current"
+        case .always:
+            return "Session: Always new"
+        case .switchSession:
+            let nextSessionId = variables["nextSessionId"] ?? "(missing nextSessionId)"
+            return "Session: Switch to \(nextSessionId)"
         }
     }
 }
