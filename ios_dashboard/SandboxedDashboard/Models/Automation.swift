@@ -116,6 +116,7 @@ enum AutomationStopPolicy: Codable {
 enum AutomationFreshSession: String, Codable {
     case always
     case keep
+    case switchSession = "switch"
 }
 
 struct AutomationRetryConfig: Codable {

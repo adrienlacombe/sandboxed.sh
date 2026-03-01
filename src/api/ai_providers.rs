@@ -345,7 +345,7 @@ pub fn read_standard_accounts(working_dir: &Path) -> Vec<crate::provider_health:
         }
         // Extract actual API key from the auth entry.
         // Check all field name variants for consistency with get_api_key_for_provider.
-        let api_key = value
+        let mut api_key = value
             .get("key")
             .or_else(|| value.get("api_key"))
             .or_else(|| value.get("apiKey"))
@@ -362,8 +362,25 @@ pub fn read_standard_accounts(working_dir: &Path) -> Vec<crate::provider_health:
                 .and_then(|v| v.as_str())
                 .is_some_and(|s| !s.trim().is_empty());
 
+        // OpenAI/Anthropic OAuth entries include an access token that can be
+        // forwarded as a Bearer token for proxy routing.
+        if api_key.is_none()
+            && has_oauth
+            && matches!(
+                provider_type,
+                ProviderType::OpenAI | ProviderType::Anthropic
+            )
+        {
+            api_key = value
+                .get("access")
+                .or_else(|| value.get("access_token"))
+                .or_else(|| value.get("accessToken"))
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.trim().is_empty())
+                .map(|s| s.to_string());
+        }
+
         // Only include accounts that have credentials we can route with.
-        // For now, OAuth routing support is Google-specific.
         let has_routable_credentials =
             api_key.is_some() || (provider_type == ProviderType::Google && has_oauth);
         if !has_routable_credentials {

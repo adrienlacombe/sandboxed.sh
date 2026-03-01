@@ -28,7 +28,7 @@ export type StopPolicy =
   // Legacy value kept for backward compatibility with older payloads.
   | { type: "on_consecutive_failures"; count: number };
 
-export type FreshSession = "always" | "keep";
+export type FreshSession = "always" | "keep" | "switch";
 
 export interface Automation {
   id: string;
@@ -148,6 +148,7 @@ export async function updateAutomation(
     trigger?: TriggerType;
     variables?: Record<string, string>;
     stop_policy?: StopPolicy;
+    fresh_session?: FreshSession;
     active?: boolean;
   }
 ): Promise<Automation> {

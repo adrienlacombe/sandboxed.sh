@@ -211,7 +211,8 @@ export function MissionAutomationsDialog({
     type: 'when_failing_consecutively',
     count: 2,
   });
-  const [freshSession, setFreshSession] = useState<'always' | 'keep'>('keep');
+  const [freshSession, setFreshSession] = useState<'always' | 'keep' | 'switch'>('keep');
+  const [nextSessionId, setNextSessionId] = useState('');
   const [variables, setVariables] = useState<Array<{ key: string; value: string }>>([]);
   const [creating, setCreating] = useState(false);
   const [togglingId, setTogglingId] = useState<string | null>(null);
@@ -575,6 +576,14 @@ export function MissionAutomationsDialog({
       const k = v.key.trim();
       if (k) vars[k] = v.value;
     }
+    if (freshSession === 'switch') {
+      const target = nextSessionId.trim();
+      if (!target) {
+        toast.error('Session switch mode requires nextSessionId');
+        return;
+      }
+      vars.nextSessionId = target;
+    }
 
     const input: CreateAutomationInput = {
       command_source,
@@ -602,6 +611,7 @@ export function MissionAutomationsDialog({
       setIntervalUnit('minutes');
       setStopPolicy({ type: 'when_failing_consecutively', count: 2 });
       setFreshSession('keep');
+      setNextSessionId('');
       setVariables([]);
       if (promptTimerRef.current) {
         clearTimeout(promptTimerRef.current);
@@ -1008,7 +1018,9 @@ export function MissionAutomationsDialog({
                   <label className="block text-xs text-white/50 mb-1.5">Session mode</label>
                   <select
                     value={freshSession || 'keep'}
-                    onChange={(e) => setFreshSession(e.target.value as 'always' | 'keep')}
+                    onChange={(e) =>
+                      setFreshSession(e.target.value as 'always' | 'keep' | 'switch')
+                    }
                     className={cn(selectClass, 'w-full')}
                     style={selectStyle}
                   >
@@ -1018,10 +1030,33 @@ export function MissionAutomationsDialog({
                     <option value="always" className="bg-[#1a1a1a]">
                       Fresh session (clear context each run)
                     </option>
+                    <option value="switch" className="bg-[#1a1a1a]">
+                      Switch on completion
+                    </option>
                   </select>
                   <div className="mt-1 text-[11px] text-white/30">
-                    Fresh session clears all conversation history before each run.
+                    {freshSession === 'switch' ? (
+                      <>
+                        Switch mode routes completed-mission automations to another mission via{' '}
+                        <code className="text-indigo-400/70">nextSessionId</code>.
+                      </>
+                    ) : freshSession === 'always' ? (
+                      <>Fresh session clears conversation history before each run.</>
+                    ) : (
+                      <>Keep session continues automation runs in the current mission context.</>
+                    )}
                   </div>
+                  {freshSession === 'switch' && (
+                    <div className="mt-2">
+                      <label className="block text-xs text-white/50 mb-1.5">nextSessionId</label>
+                      <input
+                        value={nextSessionId}
+                        onChange={(e) => setNextSessionId(e.target.value)}
+                        placeholder="Target mission UUID"
+                        className="w-full rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2 text-sm text-white placeholder:text-white/30 focus:outline-none focus:border-indigo-500/50"
+                      />
+                    </div>
+                  )}
                 </div>
 
                 {/* Variables */}
@@ -1246,6 +1281,14 @@ export function MissionAutomationsDialog({
                                 <>
                                   <span>·</span>
                                   <span className="text-amber-400/70">Fresh session</span>
+                                </>
+                              )}
+                              {automation.fresh_session === 'switch' && (
+                                <>
+                                  <span>·</span>
+                                  <span className="text-indigo-300/80">
+                                    Switch to {automation.variables?.nextSessionId ?? '(missing nextSessionId)'}
+                                  </span>
                                 </>
                               )}
                               {hasVars && (
