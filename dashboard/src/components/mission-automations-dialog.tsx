@@ -1035,8 +1035,16 @@ export function MissionAutomationsDialog({
                     </option>
                   </select>
                   <div className="mt-1 text-[11px] text-white/30">
-                    Switch mode routes completed-mission automations to another mission via
-                    <code className="text-indigo-400/70">nextSessionId</code>.
+                    {freshSession === 'switch' ? (
+                      <>
+                        Switch mode routes completed-mission automations to another mission via{' '}
+                        <code className="text-indigo-400/70">nextSessionId</code>.
+                      </>
+                    ) : freshSession === 'always' ? (
+                      <>Fresh session clears conversation history before each run.</>
+                    ) : (
+                      <>Keep session continues automation runs in the current mission context.</>
+                    )}
                   </div>
                   {freshSession === 'switch' && (
                     <div className="mt-2">

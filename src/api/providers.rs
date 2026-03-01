@@ -1067,13 +1067,10 @@ pub async fn list_providers(
     }
     drop(cached);
 
-    let store_providers = state.ai_providers.list().await;
-    merge_store_provider_models(&mut config.providers, &store_providers, query.include_all);
-
     // Get the set of configured provider IDs
     let configured = get_configured_provider_ids(state.config.working_dir.as_path());
 
-    let providers = if query.include_all {
+    let mut providers = if query.include_all {
         config.providers
     } else {
         // Filter providers to only include those that are configured
@@ -1083,6 +1080,9 @@ pub async fn list_providers(
             .filter(|p| configured.contains(&p.id))
             .collect()
     };
+
+    let store_providers = state.ai_providers.list().await;
+    merge_store_provider_models(&mut providers, &store_providers, query.include_all);
 
     Json(ProvidersResponse { providers })
 }
