@@ -63,6 +63,12 @@ impl ProcessHandle {
 // ── NDJSON event types ────────────────────────────────────────────
 
 /// Events emitted by Claude Code / Amp CLIs in stream-json mode.
+///
+/// The `Unknown` variant acts as a forward-compatibility catch-all: if a future
+/// CLI version introduces a new event type, it will be deserialized as `Unknown`
+/// instead of causing a parse error.  This prevents startup timeouts caused by
+/// unrecognized event types being silently discarded (logged as warnings) before
+/// any known event arrives.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type")]
 pub enum CliEvent {
@@ -76,6 +82,9 @@ pub enum CliEvent {
     User(UserEvent),
     #[serde(rename = "result")]
     Result(ResultEvent),
+    /// Catch-all for unrecognized event types from newer CLI versions.
+    #[serde(other)]
+    Unknown,
 }
 
 /// MCP server status in the init event.
@@ -520,6 +529,10 @@ pub fn convert_cli_event(
                     res.subtype, res.total_cost_usd, res.duration_ms, res.num_turns
                 );
             }
+        }
+
+        CliEvent::Unknown => {
+            // Forward-compatibility: silently ignore unrecognized event types.
         }
     }
 
