@@ -226,8 +226,8 @@ struct CreateAutomationRequest: Encodable {
     let trigger: AutomationTrigger
     let variables: [String: String]
     let startImmediately: Bool
-    let stopPolicy: AutomationStopPolicy? = nil
-    let freshSession: AutomationFreshSession? = nil
+    var stopPolicy: AutomationStopPolicy? = nil
+    var freshSession: AutomationFreshSession? = nil
 
     enum CodingKeys: String, CodingKey {
         case commandSource = "command_source"
@@ -244,8 +244,8 @@ struct UpdateAutomationRequest: Encodable {
     let trigger: AutomationTrigger?
     let variables: [String: String]?
     let active: Bool?
-    let stopPolicy: AutomationStopPolicy? = nil
-    let freshSession: AutomationFreshSession? = nil
+    var stopPolicy: AutomationStopPolicy? = nil
+    var freshSession: AutomationFreshSession? = nil
 
     enum CodingKeys: String, CodingKey {
         case commandSource = "command_source"

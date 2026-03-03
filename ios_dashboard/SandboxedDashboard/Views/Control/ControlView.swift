@@ -1324,7 +1324,7 @@ struct ControlView: View {
         let messageSearchText: (ChatMessage) -> String = { message in
             if message.isToolCall {
                 let toolName = message.toolCallName ?? ""
-                let argsText = message.toolData?.args ?? ""
+                let argsText = message.toolData?.argsString ?? ""
                 let resultText = message.toolData?.resultString ?? ""
                 return "\(toolName) \(message.content) \(argsText) \(resultText)"
             }
@@ -3843,7 +3843,19 @@ private struct MissionSwitcherSheet: View {
     }
 
     private func normalizeMetadataText(_ text: String) -> String {
-        normalizeSearchText(text)
+        let lowered = text.lowercased()
+        let scalars = lowered.unicodeScalars.map { scalar -> Character in
+            if scalar.properties.isAlphabetic
+                || scalar.properties.numericType != nil
+                || CharacterSet.whitespacesAndNewlines.contains(scalar)
+            {
+                return Character(scalar)
+            }
+            return " "
+        }
+        return String(scalars)
+            .split(whereSeparator: \.isWhitespace)
+            .joined(separator: " ")
     }
 
     private let searchStopwords: Set<String> = [
