@@ -467,7 +467,7 @@ export function NewMissionDialog({
     if (selectedBackend === 'amp' && modelOverride) {
       setModelOverride('');
     }
-    if (selectedBackend !== 'codex' && modelEffort) {
+    if (selectedBackend !== 'codex' && selectedBackend !== 'claudecode' && modelEffort) {
       setModelEffort('');
     }
     // When switching backends, clear model override if current value isn't valid for the new backend
@@ -518,7 +518,7 @@ export function NewMissionDialog({
     const modelOverrideValue =
       selectedBackend === 'amp' || !normalizedModel ? undefined : normalizedModel;
     const modelEffortValue =
-      selectedBackend === 'codex' && modelEffort ? modelEffort : undefined;
+      (selectedBackend === 'codex' || selectedBackend === 'claudecode') && modelEffort ? modelEffort : undefined;
     return {
       workspaceId: newMissionWorkspace || undefined,
       agent: parsed?.agent || undefined,
@@ -731,7 +731,7 @@ export function NewMissionDialog({
               </p>
             </div>
 
-            {selectedBackend === 'codex' && (
+            {(selectedBackend === 'codex' || selectedBackend === 'claudecode') && (
               <div>
                 <label className="block text-xs text-white/50 mb-1.5">Model effort (optional)</label>
                 <select
@@ -745,7 +745,7 @@ export function NewMissionDialog({
                   <option value="high">High</option>
                 </select>
                 <p className="text-xs text-white/30 mt-1.5">
-                  Passed to Codex as reasoning effort.
+                  {selectedBackend === 'codex' ? 'Passed to Codex as reasoning effort.' : 'Passed to Claude Code as --effort flag.'}
                 </p>
               </div>
             )}

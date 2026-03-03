@@ -447,6 +447,11 @@ fn default_providers_config() -> ProvidersConfig {
                         name: "GPT-5.3 Codex".to_string(),
                         description: Some("Newest Codex coding model".to_string()),
                     },
+                    ProviderModel {
+                        id: "gpt-5.3-codex-spark".to_string(),
+                        name: "GPT-5.3 Codex Spark".to_string(),
+                        description: Some("Ultra-fast real-time coding on Cerebras".to_string()),
+                    },
                     // General-purpose models (API key only)
                     ProviderModel {
                         id: "gpt-5.3".to_string(),

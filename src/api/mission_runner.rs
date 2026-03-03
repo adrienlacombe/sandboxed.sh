@@ -1679,6 +1679,7 @@ async fn run_mission_turn(
                 &mission_work_dir,
                 &effective_msg,
                 config.default_model.as_deref(),
+                model_effort.as_deref(),
                 effective_agent.as_deref(),
                 mission_id,
                 events_tx.clone(),
@@ -1752,6 +1753,7 @@ async fn run_mission_turn(
                     &mission_work_dir,
                     &effective_msg,
                     config.default_model.as_deref(),
+                    model_effort.as_deref(),
                     effective_agent.as_deref(),
                     mission_id,
                     events_tx.clone(),
@@ -1799,6 +1801,7 @@ async fn run_mission_turn(
                             &mission_work_dir,
                             &effective_msg,
                             config.default_model.as_deref(),
+                            model_effort.as_deref(),
                             effective_agent.as_deref(),
                             mission_id,
                             events_tx.clone(),
@@ -2188,6 +2191,7 @@ pub fn run_claudecode_turn<'a>(
     work_dir: &'a std::path::Path,
     message: &'a str,
     model: Option<&'a str>,
+    model_effort: Option<&'a str>,
     agent: Option<&'a str>,
     mission_id: Uuid,
     events_tx: broadcast::Sender<AgentEvent>,
@@ -2679,6 +2683,11 @@ pub fn run_claudecode_turn<'a>(
         if let Some(m) = model {
             args.push("--model".to_string());
             args.push(m.to_string());
+        }
+
+        if let Some(effort) = model_effort {
+            args.push("--effort".to_string());
+            args.push(effort.to_string());
         }
 
         // For continuation turns, use --resume to resume existing session.
@@ -3335,6 +3344,7 @@ pub fn run_claudecode_turn<'a>(
                                                             work_dir,
                                                             &answer_text,
                                                             model,
+                                                            model_effort,
                                                             agent,
                                                             mission_id,
                                                             events_tx,

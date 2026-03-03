@@ -3672,8 +3672,8 @@ pub async fn create_mission(
         backend = Some(registry.default_id().to_string());
     }
 
-    // Model effort is currently supported for Codex missions.
-    if backend.as_deref() != Some("codex") {
+    // Model effort is supported for Codex and Claude Code missions.
+    if !matches!(backend.as_deref(), Some("codex") | Some("claudecode")) {
         model_effort = None;
     }
 
@@ -8122,6 +8122,7 @@ async fn run_single_control_turn(
                 &ctx.working_dir,
                 &user_message,
                 config.default_model.as_deref(),
+                requested_model_effort.as_deref(),
                 config.opencode_agent.as_deref(),
                 mid,
                 events_tx.clone(),
@@ -8196,6 +8197,7 @@ async fn run_single_control_turn(
                     &ctx.working_dir,
                     &retry_message,
                     config.default_model.as_deref(),
+                    requested_model_effort.as_deref(),
                     config.opencode_agent.as_deref(),
                     mid,
                     events_tx.clone(),
