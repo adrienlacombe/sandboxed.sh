@@ -3073,6 +3073,42 @@ pub fn run_claudecode_turn<'a>(
         let startup_deadline = Instant::now() + startup_timeout;
         let mut idle_deadline = Instant::now() + idle_timeout;
 
+        // Monitor child process exit. When Claude Code exits mid-tool-execution
+        // (e.g. while `gh` is still running), child processes can keep the PTY
+        // slave fd open, preventing the PTY reader from getting EOF. We detect
+        // the main process exit and break the loop with a grace period.
+        let process_exit_notify = {
+            let notify = Arc::new(tokio::sync::Notify::new());
+            if let Some(pid) = pty.process_id() {
+                let notify_clone = Arc::clone(&notify);
+                let exit_mission_id = mission_id.to_string();
+                tokio::task::spawn_blocking(move || {
+                    let pid = pid as i32;
+                    loop {
+                        // kill(pid, 0) checks if the process exists without
+                        // actually sending a signal.
+                        let alive = unsafe { libc::kill(pid, 0) } == 0;
+                        if !alive {
+                            tracing::debug!(
+                                mission_id = %exit_mission_id,
+                                pid = pid,
+                                "PTY child process has exited"
+                            );
+                            notify_clone.notify_one();
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(500));
+                    }
+                });
+            }
+            notify
+        };
+        let mut process_exited = false;
+        // Grace period: after process exits, wait briefly for remaining events
+        // before breaking the loop. This lets us capture any final `result` event
+        // that may already be buffered in the PTY/channel.
+        let mut process_exit_grace_deadline: Option<Instant> = None;
+
         // Process events until completion or cancellation
         loop {
             tokio::select! {
@@ -3113,6 +3149,28 @@ pub fn run_claudecode_turn<'a>(
                         0,
                     )
                     .with_terminal_reason(TerminalReason::LlmError);
+                }
+                _ = process_exit_notify.notified(), if !process_exited => {
+                    // The main PTY child (nsenter/claude) has exited.
+                    // Give a short grace period to drain any buffered events
+                    // (the `result` event may already be in the channel).
+                    process_exited = true;
+                    process_exit_grace_deadline = Some(Instant::now() + Duration::from_secs(3));
+                    tracing::info!(
+                        mission_id = %mission_id,
+                        "PTY child process exited, draining remaining events (3s grace)"
+                    );
+                }
+                _ = tokio::time::sleep_until(process_exit_grace_deadline.unwrap_or_else(|| Instant::now() + Duration::from_secs(86400))), if process_exited => {
+                    // Grace period expired after process exit — no `result` event arrived.
+                    tracing::warn!(
+                        mission_id = %mission_id,
+                        "Claude Code process exited without emitting a result event, breaking event loop"
+                    );
+                    // Kill any orphaned child processes still holding the PTY open
+                    pty.kill();
+                    reader_handle.abort();
+                    break;
                 }
                 line_opt = line_rx.recv() => {
                     let Some(raw_line) = line_opt else {

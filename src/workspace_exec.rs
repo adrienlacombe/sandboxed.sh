@@ -169,6 +169,15 @@ impl PtyChild {
         }
     }
 
+    /// Return the PID of the child process, if available.
+    pub fn process_id(&self) -> Option<u32> {
+        match &self.child {
+            PtyChildProcess::PortablePty(c) => c.process_id(),
+            #[cfg(unix)]
+            PtyChildProcess::Std(c) => Some(c.id()),
+        }
+    }
+
     /// Wait for the child process to exit. Must be called from a blocking context.
     pub fn wait(&mut self) -> std::io::Result<portable_pty::ExitStatus> {
         match &mut self.child {
