@@ -1400,13 +1400,15 @@ fn bind_command_params(
     bound
 }
 
-/// Check whether a failed turn result indicates a corrupt/stale Claude Code session
-/// that can be recovered by resetting the session and retrying.
+/// Check whether a failed turn result indicates a corrupt/stale/exhausted Claude Code
+/// session that can be recovered by resetting the session and retrying.
 ///
 /// This covers:
 /// - "no stream events after startup timeout" — CLI hangs on resume
 /// - API validation errors from corrupted conversation history (e.g. mismatched
 ///   tool_use_id / tool_result blocks after a session was partially lost)
+/// - Context window exhaustion ("Prompt is too long") — session accumulated too
+///   many turns/tool calls; resetting with a condensed history summary fits.
 pub fn is_session_corruption_error(result: &AgentResult) -> bool {
     if result.success || result.terminal_reason != Some(TerminalReason::LlmError) {
         return false;
@@ -1423,6 +1425,8 @@ pub fn is_session_corruption_error(result: &AgentResult) -> bool {
     || out.contains("must have a corresponding tool_use block")
     // Session was lost (e.g. after service restart or session expiry)
     || out.contains("No conversation found with session ID")
+    // Context window exhausted — too many turns/tool calls filled the context
+    || out.contains("Prompt is too long")
 }
 
 /// Execute a single turn for a mission.
@@ -2824,6 +2828,29 @@ pub fn run_claudecode_turn<'a>(
         let claude_config_path = format!("{}/settings.json", claude_config_dir);
         env.insert("CLAUDE_CONFIG".to_string(), claude_config_path);
 
+        // Trigger auto-compaction at 80% context capacity to prevent "Prompt is too long"
+        // errors on long-running missions. Claude Code's default (95%) is too aggressive
+        // and can fail to compact in time, permanently locking the session.
+        env.insert(
+            "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE".to_string(),
+            "80".to_string(),
+        );
+
+        // Prevent CLI tools from hanging in our PTY environment.
+        //
+        // The `gh` CLI's terminal renderer (lipgloss/glamour) sends escape sequences
+        // like `\033]11;?` (background color query) and `\033[6n` (cursor position)
+        // when it detects a TTY. Our PTY has no terminal emulator to respond, so
+        // these queries block forever. This specifically affects tabular commands
+        // like `gh issue list` and `gh pr list`.
+        //
+        // GH_NO_PAGER=1  — disables paging (prevents `less` from activating)
+        // NO_COLOR=1     — disables color and terminal capability queries
+        // GH_PROMPT_DISABLED=1 — disables interactive prompts
+        env.insert("GH_NO_PAGER".to_string(), "1".to_string());
+        env.insert("NO_COLOR".to_string(), "1".to_string());
+        env.insert("GH_PROMPT_DISABLED".to_string(), "1".to_string());
+
         if let Some(ref auth) = api_auth {
             match auth {
                 ClaudeCodeAuth::OAuthToken(token) => {
@@ -3279,6 +3306,26 @@ pub fn run_claudecode_turn<'a>(
                                                     args: input.clone(),
                                                     mission_id: Some(mission_id),
                                                 });
+
+                                                // Extend idle timeout when tool has its own timeout.
+                                                // Long-running commands (e.g. `lake build` with timeout: 600000ms)
+                                                // produce no PTY output while waiting, so our default idle
+                                                // timeout would kill the process prematurely.
+                                                if let Some(tool_timeout_ms) = input.get("timeout").and_then(|v| v.as_u64()) {
+                                                    let tool_timeout = Duration::from_millis(tool_timeout_ms);
+                                                    // Add a buffer beyond the tool's own timeout
+                                                    let extended = tool_timeout + Duration::from_secs(30);
+                                                    let new_deadline = Instant::now() + extended;
+                                                    if new_deadline > idle_deadline {
+                                                        tracing::info!(
+                                                            mission_id = %mission_id,
+                                                            tool_name = %name,
+                                                            tool_timeout_secs = tool_timeout_ms / 1000,
+                                                            "Extending idle timeout for long-running tool call"
+                                                        );
+                                                        idle_deadline = new_deadline;
+                                                    }
+                                                }
 
                                                 if name == "question" || name == "AskUserQuestion" || name.starts_with("ui_") {
                                                     if let Some(ref hub) = tool_hub {
@@ -11365,6 +11412,13 @@ mod tests {
     #[test]
     fn is_session_corruption_error_detects_lost_session() {
         let result = AgentResult::failure("No conversation found with session ID ses_abc", 0)
+            .with_terminal_reason(TerminalReason::LlmError);
+        assert!(is_session_corruption_error(&result));
+    }
+
+    #[test]
+    fn is_session_corruption_error_detects_prompt_too_long() {
+        let result = AgentResult::failure("Prompt is too long", 0)
             .with_terminal_reason(TerminalReason::LlmError);
         assert!(is_session_corruption_error(&result));
     }

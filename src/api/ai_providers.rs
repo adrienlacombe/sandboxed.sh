@@ -2078,10 +2078,10 @@ pub(crate) fn write_claudecode_credentials_from_entry(
 }
 
 #[derive(Debug, Clone)]
-struct OAuthTokenEntry {
-    refresh_token: String,
-    access_token: String,
-    expires_at: i64,
+pub struct OAuthTokenEntry {
+    pub refresh_token: String,
+    pub access_token: String,
+    pub expires_at: i64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2300,7 +2300,7 @@ fn read_anthropic_from_claude_credentials() -> Option<(OAuthTokenEntry, PathBuf)
     None
 }
 
-fn read_oauth_token_entry(provider_type: ProviderType) -> Option<OAuthTokenEntry> {
+pub fn read_oauth_token_entry(provider_type: ProviderType) -> Option<OAuthTokenEntry> {
     let mut candidates: Vec<(OAuthTokenEntry, OAuthTokenSource, Option<PathBuf>)> = Vec::new();
 
     // Tier 1: Open Agent's canonical credential store

@@ -1343,182 +1343,121 @@ async fn search_memory(Query(params): Query<SearchMemoryQuery>) -> Json<serde_js
 /// Background task that proactively refreshes OAuth tokens before they expire.
 ///
 /// This prevents the 24-hour reconnection issue by:
-/// 1. Checking all OAuth-enabled providers every 15 minutes
+/// 1. Checking credential files (credentials.json) for OAuth tokens every 15 minutes
 /// 2. Refreshing tokens that will expire within 1 hour
 /// 3. Syncing refreshed tokens to all storage tiers (sandboxed-sh, OpenCode, Claude CLI)
 /// 4. Handling refresh token rotation (updating stored refresh token if changed)
-async fn oauth_token_refresher_loop(ai_providers: Arc<crate::ai_providers::AIProviderStore>) {
+///
+/// The refresher checks credential files directly rather than relying on the
+/// AIProviderStore, because OAuth tokens from the callback are stored in
+/// credentials.json but may not have a corresponding AIProvider entry.
+async fn oauth_token_refresher_loop(_ai_providers: Arc<crate::ai_providers::AIProviderStore>) {
+    use crate::ai_providers::ProviderType;
+
     // Check every 15 minutes
     let check_interval = std::time::Duration::from_secs(15 * 60);
     // Refresh tokens that will expire within 1 hour
-    let refresh_threshold_ms = 60 * 60 * 1000; // 1 hour in milliseconds
+    let refresh_threshold_ms: i64 = 60 * 60 * 1000; // 1 hour in milliseconds
+
+    // Provider types that support OAuth
+    let oauth_capable_types = [
+        ProviderType::Anthropic,
+        ProviderType::OpenAI,
+        ProviderType::Google,
+    ];
 
     tracing::info!(
         "OAuth token refresher task started (check every 15 min, refresh if < 1 hour until expiry)"
     );
 
     // Run an initial check after a short delay (let the server finish booting).
-    // Without this, tokens expiring within the first 15 minutes would not be
-    // refreshed until the first loop iteration fires.
     tokio::time::sleep(std::time::Duration::from_secs(10)).await;
 
     loop {
-        let providers = ai_providers.list().await;
-        let oauth_providers: Vec<_> = providers.iter().filter(|p| p.has_oauth()).collect();
+        // Check credential files directly for each OAuth-capable provider type.
+        // This ensures we find tokens even if they aren't in the AIProviderStore.
+        let mut found_count = 0u32;
+        let mut refreshed_count = 0u32;
 
-        tracing::debug!(
-            total_providers = providers.len(),
-            oauth_providers = oauth_providers.len(),
-            "OAuth refresh check cycle starting"
-        );
+        for &provider_type in &oauth_capable_types {
+            let entry = match ai_providers_api::read_oauth_token_entry(provider_type) {
+                Some(e) => e,
+                None => continue,
+            };
 
-        for provider in providers {
-            // Skip non-OAuth providers
-            if !provider.has_oauth() {
+            // Skip entries without a refresh token
+            if entry.refresh_token.trim().is_empty() {
                 continue;
             }
 
-            let oauth = match &provider.oauth {
-                Some(o) => o,
-                None => {
-                    tracing::warn!(
-                        provider_id = %provider.id,
-                        provider_name = %provider.name,
-                        "Provider marked as has_oauth but oauth field is None"
-                    );
-                    continue;
-                }
-            };
+            found_count += 1;
 
-            // Check if token will expire soon
             let now_ms = chrono::Utc::now().timestamp_millis();
-            let time_until_expiry = oauth.expires_at - now_ms;
-
-            // Also check if token is already expired
+            let time_until_expiry = entry.expires_at - now_ms;
             let is_expired = time_until_expiry <= 0;
 
             tracing::debug!(
-                provider_id = %provider.id,
-                provider_name = %provider.name,
-                provider_type = ?provider.provider_type,
-                expires_at = oauth.expires_at,
-                now_ms = now_ms,
-                time_until_expiry_ms = time_until_expiry,
+                provider_type = ?provider_type,
+                expires_at = entry.expires_at,
                 expires_in_minutes = time_until_expiry / 1000 / 60,
                 is_expired = is_expired,
                 needs_refresh = time_until_expiry <= refresh_threshold_ms,
-                "Checking OAuth token status"
+                "Checking OAuth token from credentials file"
             );
 
             if time_until_expiry > refresh_threshold_ms {
-                // Token is still fresh, skip
                 continue;
             }
 
             if is_expired {
-                tracing::error!(
-                    provider_id = %provider.id,
-                    provider_name = %provider.name,
-                    provider_type = ?provider.provider_type,
+                tracing::warn!(
+                    provider_type = ?provider_type,
                     expired_since_minutes = (-time_until_expiry) / 1000 / 60,
-                    "OAuth token is ALREADY EXPIRED - this should not happen! Attempting emergency refresh..."
+                    "OAuth token is ALREADY EXPIRED, attempting refresh..."
                 );
             } else {
                 tracing::info!(
-                    provider_id = %provider.id,
-                    provider_name = %provider.name,
-                    provider_type = ?provider.provider_type,
+                    provider_type = ?provider_type,
                     expires_in_minutes = time_until_expiry / 1000 / 60,
                     "OAuth token will expire soon, refreshing proactively"
                 );
             }
 
-            // Use the lock-aware refresh function.  This acquires a file lock
-            // before refreshing, preventing race conditions with on-demand
-            // refreshes that also acquire the same lock.  Anthropic uses
-            // rotating refresh tokens — without locking, two concurrent
-            // refreshes can submit the same token and the second gets
-            // invalid_grant.
-            match ai_providers_api::refresh_oauth_token_with_lock(provider.provider_type).await {
-                Ok((new_access, new_refresh, expires_at)) => {
-                    // Update the in-memory provider store.
-                    // (Tier sync to disk is already done inside refresh_oauth_token_with_lock.)
-                    let mut updated_provider = provider.clone();
-                    updated_provider.oauth = Some(crate::ai_providers::OAuthCredentials {
-                        access_token: new_access.clone(),
-                        refresh_token: new_refresh.clone(),
-                        expires_at,
-                    });
-
-                    if ai_providers
-                        .update(provider.id, updated_provider)
-                        .await
-                        .is_none()
-                    {
-                        tracing::error!(
-                            provider_id = %provider.id,
-                            provider_name = %provider.name,
-                            "Failed to update provider with refreshed OAuth token (provider not found)"
-                        );
-                        continue;
-                    }
-
+            match ai_providers_api::refresh_oauth_token_with_lock(provider_type).await {
+                Ok((_new_access, _new_refresh, new_expires_at)) => {
+                    let new_time_until = new_expires_at - now_ms;
                     tracing::info!(
-                        provider_id = %provider.id,
-                        provider_name = %provider.name,
-                        provider_type = ?provider.provider_type,
-                        new_expires_in_minutes = (expires_at - now_ms) / 1000 / 60,
+                        provider_type = ?provider_type,
+                        new_expires_in_minutes = new_time_until / 1000 / 60,
                         "Successfully refreshed OAuth token proactively"
                     );
+                    refreshed_count += 1;
                 }
-                Err(e) => {
-                    // Check if this is an invalid_grant error (expired/revoked refresh token)
-                    match e {
-                        ai_providers_api::OAuthRefreshError::InvalidGrant(reason) => {
-                            tracing::warn!(
-                                provider_id = %provider.id,
-                                provider_name = %provider.name,
-                                provider_type = ?provider.provider_type,
-                                reason = %reason,
-                                "OAuth refresh token expired or revoked - setting provider to NeedsReauth"
-                            );
-
-                            // Set provider status to NeedsReauth so frontend can prompt user to re-authenticate
-                            if let Some(_updated) = ai_providers
-                                .set_status(
-                                    provider.id,
-                                    crate::ai_providers::ProviderStatus::NeedsReauth(reason),
-                                )
-                                .await
-                            {
-                                tracing::info!(
-                                    provider_id = %provider.id,
-                                    provider_name = %provider.name,
-                                    "Provider status updated to NeedsReauth"
-                                );
-                            } else {
-                                tracing::error!(
-                                    provider_id = %provider.id,
-                                    provider_name = %provider.name,
-                                    "Failed to update provider status to NeedsReauth (provider not found)"
-                                );
-                            }
-                        }
-                        ai_providers_api::OAuthRefreshError::Other(msg) => {
-                            tracing::error!(
-                                provider_id = %provider.id,
-                                provider_name = %provider.name,
-                                provider_type = ?provider.provider_type,
-                                error = %msg,
-                                "Failed to refresh OAuth token"
-                            );
-                        }
+                Err(e) => match e {
+                    ai_providers_api::OAuthRefreshError::InvalidGrant(reason) => {
+                        tracing::warn!(
+                            provider_type = ?provider_type,
+                            reason = %reason,
+                            "OAuth refresh token expired or revoked - user needs to re-authenticate"
+                        );
                     }
-                }
+                    ai_providers_api::OAuthRefreshError::Other(msg) => {
+                        tracing::error!(
+                            provider_type = ?provider_type,
+                            error = %msg,
+                            "Failed to refresh OAuth token"
+                        );
+                    }
+                },
             }
         }
 
-        // Sleep until the next check cycle.
+        tracing::debug!(
+            oauth_tokens_found = found_count,
+            oauth_tokens_refreshed = refreshed_count,
+            "OAuth refresh check cycle complete"
+        );
+
         tokio::time::sleep(check_interval).await;
     }
 }
