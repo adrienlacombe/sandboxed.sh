@@ -8138,10 +8138,12 @@ async fn run_single_control_turn(
             .await;
 
             // Claude Code can fail when resuming a session due to stale/corrupt state:
-            // - CLI hangs and emits no parseable stream events
+            // - CLI hangs and emits no parseable stream events (startup timeout)
             // - API rejects reconstructed history (e.g. mismatched tool_use_id)
             // When that happens, auto-reset the session_id and retry once fresh.
-            if is_continuation && super::mission_runner::is_session_corruption_error(&result) {
+            // This fires regardless of `is_continuation` — startup timeouts can happen
+            // even on the first turn if the session marker was stale.
+            if super::mission_runner::is_session_corruption_error(&result) {
                 let new_session_id = Uuid::new_v4().to_string();
                 tracing::warn!(
                     mission_id = %mid,
@@ -8205,7 +8207,7 @@ async fn run_single_control_turn(
                     None, // secrets - not available in control context
                     &config.working_dir,
                     Some(&new_session_id),
-                    is_continuation,
+                    false, // Fresh session — don't pass is_continuation=true
                     Some(tool_hub.clone()),
                     Some(status.clone()),
                     None, // override_auth

@@ -1699,15 +1699,22 @@ async fn run_mission_turn(
             .await;
 
             // Claude Code can fail when resuming a session due to stale/corrupt state:
-            // - CLI hangs and emits no parseable stream events
+            // - CLI hangs and emits no parseable stream events (startup timeout)
             // - API rejects reconstructed history (e.g. mismatched tool_use_id)
             // When that happens, auto-reset the session_id and retry once fresh.
-            if is_continuation && is_session_corruption_error(&result) {
+            //
+            // Previously this only fired when `is_continuation` was true, but startup
+            // timeouts can also happen on the first turn if the session marker file was
+            // stale (left over from a previous mission with the same session_id) or if
+            // the CLI hangs during initialization for other reasons.  Retrying with a
+            // fresh session is always safe regardless of turn count.
+            if is_session_corruption_error(&result) {
                 let new_session_id = Uuid::new_v4().to_string();
                 tracing::warn!(
                     mission_id = %mission_id,
                     old_session_id = ?session_id,
                     new_session_id = %new_session_id,
+                    is_continuation = is_continuation,
                     error = %result.output,
                     "Session corruption detected; resetting session and retrying once"
                 );
@@ -2724,7 +2731,37 @@ pub fn run_claudecode_turn<'a>(
         //
         // Using --resume with a non-existent session causes Claude Code to exit with
         // "No conversation found with session ID: ..." and code 1.
-        let use_resume = session_was_initiated;
+        //
+        // Additional safety: even when the marker file says the session was initiated,
+        // verify that Claude's session data directory actually exists on disk.
+        // A stale marker file (e.g., after container restart, HOME wipe, or service
+        // restart) combined with --resume causes the CLI to hang silently, triggering
+        // the startup timeout. This pre-validation avoids that entirely.
+        let session_data_exists = if session_was_initiated {
+            // Claude Code stores session data under $CLAUDE_CONFIG_DIR/projects/<hash>/
+            // or ~/.claude/projects/<hash>/.  We check the broader `.claude/projects`
+            // dir for *any* session data rather than guessing the exact hash, since the
+            // hash depends on the absolute cwd path inside the container.
+            let claude_projects_dir = work_dir.join(".claude").join("projects");
+            let has_projects = claude_projects_dir.exists()
+                && std::fs::read_dir(&claude_projects_dir)
+                    .map(|mut entries| entries.next().is_some())
+                    .unwrap_or(false);
+            if !has_projects {
+                tracing::warn!(
+                    mission_id = %mission_id,
+                    session_id = %session_id,
+                    projects_dir = %claude_projects_dir.display(),
+                    "Session marker exists but no Claude session data found on disk; \
+                     skipping --resume to avoid CLI hang"
+                );
+            }
+            has_projects
+        } else {
+            false
+        };
+
+        let use_resume = session_was_initiated && session_data_exists;
 
         if use_resume {
             args.push("--resume".to_string());
@@ -2734,9 +2771,16 @@ pub fn run_claudecode_turn<'a>(
                 session_id = %session_id,
                 is_continuation = is_continuation,
                 session_was_initiated = session_was_initiated,
+                session_data_exists = session_data_exists,
                 "Resuming existing Claude Code session"
             );
         } else {
+            // If the marker was stale (session data missing), remove it so it
+            // gets recreated with the current session ID.
+            if session_was_initiated && !session_data_exists {
+                let _ = std::fs::remove_file(&session_marker);
+            }
+
             // Create the marker file BEFORE starting the CLI to prevent races
             if let Err(e) = std::fs::write(&session_marker, &session_id) {
                 tracing::warn!(
@@ -3123,14 +3167,18 @@ pub fn run_claudecode_turn<'a>(
                 _ = tokio::time::sleep_until(startup_deadline), if !saw_non_init_event => {
                     tracing::warn!(
                         mission_id = %mission_id,
+                        use_resume = use_resume,
                         non_json_lines = non_json_output.len(),
                         non_json_sample = ?non_json_output.first(),
+                        cli_program = %program,
+                        cli_args_count = full_args.len(),
                         "Claude Code startup timeout - no stream events received"
                     );
                     pty.kill();
                     reader_handle.abort();
                     let mut msg = "Claude Code produced no stream events after startup timeout. The Claude CLI started but did not emit any stream-json events.".to_string();
                     msg.push_str("\n\nThis can happen when resuming an old/stuck Claude session or when the CLI hangs during initialization.");
+                    msg.push_str(&format!("\n\nDiagnostics: use_resume={}, session_id={}", use_resume, session_id));
                     if !non_json_output.is_empty() {
                         msg.push_str(&format!(
                             "\n\nNon-JSON output captured ({} lines):\n{}",
@@ -3557,6 +3605,14 @@ pub fn run_claudecode_turn<'a>(
                                         "Claude Code execution completed"
                                     );
                                     break;
+                                }
+                                ClaudeEvent::Unknown => {
+                                    // Forward-compatibility: unknown event types from
+                                    // newer CLI versions are silently ignored.
+                                    tracing::trace!(
+                                        mission_id = %mission_id,
+                                        "Ignoring unknown Claude event type"
+                                    );
                                 }
                             }
                 }
@@ -9909,6 +9965,9 @@ pub async fn run_amp_turn(
 
                                 // Result event means we're done
                                 break;
+                            }
+                            AmpEvent::Unknown => {
+                                // Forward-compatibility: silently ignore unknown events.
                             }
                         }
                     }
