@@ -745,7 +745,7 @@ export function NewMissionDialog({
                   <option value="high">High</option>
                 </select>
                 <p className="text-xs text-white/30 mt-1.5">
-                  {selectedBackend === 'codex' ? 'Passed to Codex as reasoning effort.' : 'Passed to Claude Code as --effort flag.'}
+                  {selectedBackend === 'codex' ? 'Passed to Codex as reasoning effort.' : 'Controls Claude Code adaptive reasoning depth (via CLAUDE_CODE_EFFORT_LEVEL).'}
                 </p>
               </div>
             )}
