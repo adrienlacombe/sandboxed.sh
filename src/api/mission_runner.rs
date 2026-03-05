@@ -2699,10 +2699,8 @@ pub fn run_claudecode_turn<'a>(
             args.push(bare.to_string());
         }
 
-        if let Some(effort) = model_effort {
-            args.push("--effort".to_string());
-            args.push(effort.to_string());
-        }
+        // Note: model_effort is set via CLAUDE_CODE_EFFORT_LEVEL env var below,
+        // not as a CLI flag (Claude Code CLI does not have an --effort flag).
 
         // For continuation turns, use --resume to resume existing session.
         // For first turn, use --session-id to create new session with that ID.
@@ -2871,6 +2869,17 @@ pub fn run_claudecode_turn<'a>(
         env.insert("CLAUDE_CONFIG_DIR".to_string(), claude_config_dir.clone());
         let claude_config_path = format!("{}/settings.json", claude_config_dir);
         env.insert("CLAUDE_CONFIG".to_string(), claude_config_path);
+
+        // Set effort level via environment variable.
+        // Claude Code reads CLAUDE_CODE_EFFORT_LEVEL to control adaptive reasoning depth.
+        if let Some(effort) = model_effort {
+            env.insert("CLAUDE_CODE_EFFORT_LEVEL".to_string(), effort.to_string());
+            tracing::info!(
+                mission_id = %mission_id,
+                effort = %effort,
+                "Setting Claude Code effort level via CLAUDE_CODE_EFFORT_LEVEL"
+            );
+        }
 
         // Trigger auto-compaction at 80% context capacity to prevent "Prompt is too long"
         // errors on long-running missions. Claude Code's default (95%) is too aggressive
