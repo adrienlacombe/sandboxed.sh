@@ -1,6 +1,6 @@
 # Installing sandboxed.sh
 
-There are two ways to install sandboxed.sh (formerly Sandboxed.sh):
+There are two ways to install sandboxed.sh (formerly Open Agent):
 
 ## Docker (recommended for most users)
 

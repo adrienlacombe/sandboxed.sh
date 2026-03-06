@@ -1,6 +1,6 @@
 # Installing sandboxed.sh with Docker
 
-Docker is the easiest way to run sandboxed.sh (formerly Sandboxed.sh). One command gets you a complete environment with the Rust backend, Next.js dashboard, and all AI harness CLIs pre-installed.
+Docker is the easiest way to run sandboxed.sh (formerly Open Agent). One command gets you a complete environment with the Rust backend, Next.js dashboard, and all AI harness CLIs pre-installed.
 
 ## Prerequisites
 
