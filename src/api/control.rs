@@ -8264,12 +8264,10 @@ async fn run_single_control_turn(
             ))
             .await;
 
-            if let Some(fallback_model) =
-                super::mission_runner::codex_chatgpt_fallback_for_result(
-                    requested_codex_model,
-                    &result,
-                )
-            {
+            if let Some(fallback_model) = super::mission_runner::codex_chatgpt_fallback_for_result(
+                requested_codex_model,
+                &result,
+            ) {
                 tracing::warn!(
                     mission_id = %mid,
                     requested_model = ?requested_codex_model,

@@ -3286,36 +3286,35 @@ pub async fn prepare_mission_workspace_with_skills_backend(
 
     // Load Claude Code config profile settings (hooks, custom defaults).
     // Profile is base; generated settings (MCPs, permissions, RTK) win on top.
-    let claudecode_profile_overlay: Option<serde_json::Value> =
-        if backend_id == "claudecode" {
-            if let Some(lib) = library {
-                let profile = config_profile.unwrap_or("default");
-                tracing::info!(
-                    mission = %mission_id,
-                    workspace = %workspace.name,
-                    profile = %profile,
-                    "Loading Claude Code settings from profile"
-                );
-                match lib.get_claudecode_raw_settings_for_profile(profile).await {
-                    Ok(s) if !s.as_object().map(|o| o.is_empty()).unwrap_or(true) => Some(s),
-                    Ok(_) => None,
-                    Err(e) => {
-                        tracing::warn!(
-                            mission = %mission_id,
-                            workspace = %workspace.name,
-                            profile = %profile,
-                            error = %e,
-                            "Failed to load Claude Code settings from profile, skipping"
-                        );
-                        None
-                    }
+    let claudecode_profile_overlay: Option<serde_json::Value> = if backend_id == "claudecode" {
+        if let Some(lib) = library {
+            let profile = config_profile.unwrap_or("default");
+            tracing::info!(
+                mission = %mission_id,
+                workspace = %workspace.name,
+                profile = %profile,
+                "Loading Claude Code settings from profile"
+            );
+            match lib.get_claudecode_raw_settings_for_profile(profile).await {
+                Ok(s) if !s.as_object().map(|o| o.is_empty()).unwrap_or(true) => Some(s),
+                Ok(_) => None,
+                Err(e) => {
+                    tracing::warn!(
+                        mission = %mission_id,
+                        workspace = %workspace.name,
+                        profile = %profile,
+                        error = %e,
+                        "Failed to load Claude Code settings from profile, skipping"
+                    );
+                    None
                 }
-            } else {
-                None
             }
         } else {
             None
-        };
+        }
+    } else {
+        None
+    };
 
     write_backend_config(
         &dir,
@@ -4569,7 +4568,8 @@ mod tests {
     #[test]
     fn test_merge_json_profile_key_survives_when_not_in_overlay() {
         let mut base = json!({"hooks": {"Stop": [{"matcher": ""}]}, "mcpServers": {}});
-        let overlay = json!({"mcpServers": {"workspace-mcp": {}}, "permissions": {"allow": ["Bash"]}});
+        let overlay =
+            json!({"mcpServers": {"workspace-mcp": {}}, "permissions": {"allow": ["Bash"]}});
         merge_json(&mut base, &overlay);
         // hooks from profile survive; mcpServers and permissions come from overlay
         assert!(base["hooks"]["Stop"].is_array());

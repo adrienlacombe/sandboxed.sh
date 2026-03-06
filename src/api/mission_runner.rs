@@ -1988,7 +1988,8 @@ async fn run_mission_turn(
                 )
                 .await;
 
-                if let Some(fallback_model) = codex_chatgpt_fallback_for_result(requested_model, &result)
+                if let Some(fallback_model) =
+                    codex_chatgpt_fallback_for_result(requested_model, &result)
                 {
                     tracing::warn!(
                         mission_id = %mission_id,
@@ -10503,15 +10504,8 @@ pub async fn run_codex_turn(
     if lower_final.contains("does not exist or you do not have access")
         || lower_final.contains("model_not_found")
     {
-        final_message
-            .push_str("\n\nTry model `gpt-5.4` or `gpt-5.3-codex` for Codex missions.");
-        if matches!(
-            model,
-            Some(
-                "gpt-5.3-codex"
-                    | "gpt-5.4-codex"
-            )
-        ) {
+        final_message.push_str("\n\nTry model `gpt-5.4` or `gpt-5.3-codex` for Codex missions.");
+        if matches!(model, Some("gpt-5.3-codex" | "gpt-5.4-codex")) {
             final_message.push_str(
                 "\n\nIf you expected this Codex model to work, your Codex CLI may be outdated. \
 Update it to the latest version (`npm install -g @openai/codex@latest`) and retry.",
@@ -10699,12 +10693,12 @@ fn cleanup_old_debug_files(
 #[cfg(test)]
 mod tests {
     use super::{
-        actual_cost_cents_from_total_cost_usd, bind_command_params, codex_key_fingerprint,
-        codex_chatgpt_fallback_for_result, codex_chatgpt_fallback_model, extract_model_from_message,
-        extract_opencode_session_id, extract_part_text, extract_str, extract_thought_line,
-        is_capacity_limited_error, is_codex_chatgpt_account_model_blocked, is_codex_node_wrapper,
-        is_rate_limited_error, is_session_corruption_error, is_tool_call_only_output,
-        opencode_output_needs_fallback, opencode_session_token_from_line,
+        actual_cost_cents_from_total_cost_usd, bind_command_params,
+        codex_chatgpt_fallback_for_result, codex_chatgpt_fallback_model, codex_key_fingerprint,
+        extract_model_from_message, extract_opencode_session_id, extract_part_text, extract_str,
+        extract_thought_line, is_capacity_limited_error, is_codex_chatgpt_account_model_blocked,
+        is_codex_node_wrapper, is_rate_limited_error, is_session_corruption_error,
+        is_tool_call_only_output, opencode_output_needs_fallback, opencode_session_token_from_line,
         parse_opencode_session_token, parse_opencode_sse_event, parse_opencode_stderr_text_part,
         preferred_model_for_cost, resolve_cost_cents_and_source, running_health,
         sanitized_opencode_stdout, stall_severity, strip_ansi_codes, strip_opencode_banner_lines,
@@ -10893,10 +10887,7 @@ mod tests {
             codex_chatgpt_fallback_model(Some("gpt-5.4-codex-high")),
             None
         );
-        assert_eq!(
-            codex_chatgpt_fallback_model(Some("gpt-5-codex")),
-            None
-        );
+        assert_eq!(codex_chatgpt_fallback_model(Some("gpt-5-codex")), None);
     }
 
     #[test]
