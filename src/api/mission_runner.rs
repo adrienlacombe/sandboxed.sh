@@ -92,6 +92,35 @@ fn codex_key_fingerprint(key: &str) -> String {
     format!("***{}", suffix)
 }
 
+fn codex_chatgpt_fallback_model(requested_model: Option<&str>) -> Option<&'static str> {
+    match requested_model.map(str::trim) {
+        Some("gpt-5.4-codex") => Some("gpt-5.4"),
+        _ => None,
+    }
+}
+
+fn is_codex_chatgpt_account_model_blocked(message: &str) -> bool {
+    let lower = message.to_lowercase();
+    lower.contains("not supported when using codex with a chatgpt account")
+        || (lower.contains("chatgpt account")
+            && (lower.contains("model is not supported")
+                || lower.contains("model isn't supported")
+                || lower.contains("invalid_request_error")))
+}
+
+pub(crate) fn codex_chatgpt_fallback_for_result(
+    requested_model: Option<&str>,
+    result: &AgentResult,
+) -> Option<&'static str> {
+    if result.success {
+        return None;
+    }
+    if !is_codex_chatgpt_account_model_blocked(&result.output) {
+        return None;
+    }
+    codex_chatgpt_fallback_model(requested_model)
+}
+
 fn codex_account_semaphore_for_key(api_key: &str) -> Arc<Semaphore> {
     let mut pool = CODEX_ACCOUNT_POOL
         .lock()
@@ -1940,13 +1969,14 @@ async fn run_mission_turn(
             result
         }
         "codex" => {
+            let requested_model = config.default_model.as_deref();
             let all_keys = super::ai_providers::get_all_openai_keys_for_codex(&config.working_dir);
             if all_keys.is_empty() {
-                run_codex_turn(
+                let mut result = run_codex_turn(
                     &workspace,
                     &mission_work_dir,
                     &convo,
-                    config.default_model.as_deref(),
+                    requested_model,
                     model_effort.as_deref(),
                     effective_agent.as_deref(),
                     mission_id,
@@ -1956,7 +1986,35 @@ async fn run_mission_turn(
                     session_id.as_deref(),
                     None,
                 )
-                .await
+                .await;
+
+                if let Some(fallback_model) =
+                    codex_chatgpt_fallback_for_result(requested_model, &result)
+                {
+                    tracing::warn!(
+                        mission_id = %mission_id,
+                        requested_model = ?requested_model,
+                        fallback_model,
+                        "Retrying Codex turn with fallback model for ChatGPT account compatibility"
+                    );
+                    result = run_codex_turn(
+                        &workspace,
+                        &mission_work_dir,
+                        &convo,
+                        Some(fallback_model),
+                        model_effort.as_deref(),
+                        effective_agent.as_deref(),
+                        mission_id,
+                        events_tx.clone(),
+                        cancel.clone(),
+                        &config.working_dir,
+                        session_id.as_deref(),
+                        None,
+                    )
+                    .await;
+                }
+
+                result
             } else {
                 let mut attempted_keys = HashSet::new();
                 let mut attempt_idx = 0usize;
@@ -1996,11 +2054,11 @@ async fn run_mission_turn(
                         "Running Codex turn with leased account slot"
                     );
 
-                    let result = run_codex_turn(
+                    let mut result = run_codex_turn(
                         &workspace,
                         &mission_work_dir,
                         &convo,
-                        config.default_model.as_deref(),
+                        requested_model,
                         model_effort.as_deref(),
                         effective_agent.as_deref(),
                         mission_id,
@@ -2011,6 +2069,34 @@ async fn run_mission_turn(
                         Some(&lease.key),
                     )
                     .await;
+
+                    if let Some(fallback_model) =
+                        codex_chatgpt_fallback_for_result(requested_model, &result)
+                    {
+                        tracing::warn!(
+                            mission_id = %mission_id,
+                            attempt = attempt_idx,
+                            requested_model = ?requested_model,
+                            fallback_model,
+                            key = %key_fingerprint,
+                            "Retrying Codex turn with fallback model for ChatGPT account compatibility"
+                        );
+                        result = run_codex_turn(
+                            &workspace,
+                            &mission_work_dir,
+                            &convo,
+                            Some(fallback_model),
+                            model_effort.as_deref(),
+                            effective_agent.as_deref(),
+                            mission_id,
+                            events_tx.clone(),
+                            cancel.clone(),
+                            &config.working_dir,
+                            session_id.as_deref(),
+                            Some(&lease.key),
+                        )
+                        .await;
+                    }
 
                     drop(lease);
 
@@ -10418,11 +10504,10 @@ pub async fn run_codex_turn(
     if lower_final.contains("does not exist or you do not have access")
         || lower_final.contains("model_not_found")
     {
-        final_message
-            .push_str("\n\nTry model `gpt-5-codex` or `gpt-5.1-codex` for Codex missions.");
-        if matches!(model, Some("gpt-5.3-codex") | Some("gpt-5.3-codex-spark")) {
+        final_message.push_str("\n\nTry model `gpt-5.4` or `gpt-5-codex` for Codex missions.");
+        if matches!(model, Some("gpt-5.3-codex" | "gpt-5.4-codex")) {
             final_message.push_str(
-                "\n\nIf you expected GPT-5.3 Codex to work, your Codex CLI may be outdated. \
+                "\n\nIf you expected this Codex model to work, your Codex CLI may be outdated. \
 Update it to the latest version (`npm install -g @openai/codex@latest`) and retry.",
             );
         }
@@ -10608,11 +10693,12 @@ fn cleanup_old_debug_files(
 #[cfg(test)]
 mod tests {
     use super::{
-        actual_cost_cents_from_total_cost_usd, bind_command_params, codex_key_fingerprint,
+        actual_cost_cents_from_total_cost_usd, bind_command_params,
+        codex_chatgpt_fallback_for_result, codex_chatgpt_fallback_model, codex_key_fingerprint,
         extract_model_from_message, extract_opencode_session_id, extract_part_text, extract_str,
-        extract_thought_line, is_capacity_limited_error, is_codex_node_wrapper,
-        is_rate_limited_error, is_session_corruption_error, is_tool_call_only_output,
-        opencode_output_needs_fallback, opencode_session_token_from_line,
+        extract_thought_line, is_capacity_limited_error, is_codex_chatgpt_account_model_blocked,
+        is_codex_node_wrapper, is_rate_limited_error, is_session_corruption_error,
+        is_tool_call_only_output, opencode_output_needs_fallback, opencode_session_token_from_line,
         parse_opencode_session_token, parse_opencode_sse_event, parse_opencode_stderr_text_part,
         preferred_model_for_cost, resolve_cost_cents_and_source, running_health,
         sanitized_opencode_stdout, stall_severity, strip_ansi_codes, strip_opencode_banner_lines,
@@ -10789,6 +10875,49 @@ mod tests {
         ));
         assert!(!is_capacity_limited_error("Error: 429 Too Many Requests"));
         assert!(!is_capacity_limited_error("Model finished successfully"));
+    }
+
+    #[test]
+    fn codex_chatgpt_fallback_model_maps_54_codex_alias() {
+        assert_eq!(
+            codex_chatgpt_fallback_model(Some("gpt-5.4-codex")),
+            Some("gpt-5.4")
+        );
+        assert_eq!(
+            codex_chatgpt_fallback_model(Some("gpt-5.4-codex-high")),
+            None
+        );
+        assert_eq!(codex_chatgpt_fallback_model(Some("gpt-5-codex")), None);
+    }
+
+    #[test]
+    fn is_codex_chatgpt_account_model_blocked_detects_error_payloads() {
+        assert!(is_codex_chatgpt_account_model_blocked(
+            r#"{"type":"error","status":400,"error":{"type":"invalid_request_error","message":"The 'gpt-5.4-codex' model is not supported when using Codex with a ChatGPT account."}}"#
+        ));
+        assert!(!is_codex_chatgpt_account_model_blocked(
+            "The model does not exist or you do not have access."
+        ));
+    }
+
+    #[test]
+    fn codex_chatgpt_fallback_for_result_requires_llm_error() {
+        let llm_error = AgentResult::failure(
+            r#"{"detail":"The 'gpt-5.4-codex' model is not supported when using Codex with a ChatGPT account."}"#,
+            0,
+        )
+        .with_terminal_reason(TerminalReason::LlmError);
+        assert_eq!(
+            codex_chatgpt_fallback_for_result(Some("gpt-5.4-codex"), &llm_error),
+            Some("gpt-5.4")
+        );
+
+        let rate_limited = AgentResult::failure("Too many requests", 0)
+            .with_terminal_reason(TerminalReason::RateLimited);
+        assert_eq!(
+            codex_chatgpt_fallback_for_result(Some("gpt-5.4-codex"), &rate_limited),
+            None
+        );
     }
 
     #[test]
