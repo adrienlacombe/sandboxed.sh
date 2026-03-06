@@ -411,6 +411,9 @@ fn default_providers_config() -> ProvidersConfig {
                 billing: "subscription".to_string(),
                 description: "ChatGPT Plus/Pro via OAuth".to_string(),
                 models: vec![
+                    // Keep this fallback list aligned with Codex upstream model IDs:
+                    // https://raw.githubusercontent.com/openai/codex/main/codex-rs/core/models.json
+                    // (authoritative source for Codex CLI model catalog).
                     // Codex-optimized models (for Codex CLI)
                     ProviderModel {
                         id: "gpt-5-codex".to_string(),
@@ -1171,6 +1174,7 @@ pub async fn list_backend_model_options(
 
     push_options("claudecode", Some(&["anthropic"]), false, None);
     // Codex model catalog includes codex-* IDs and gpt-5.4.
+    // Source of truth: https://raw.githubusercontent.com/openai/codex/main/codex-rs/core/models.json
     let codex_filter: &dyn Fn(&str) -> bool = &|id: &str| id.contains("codex") || id == "gpt-5.4";
     push_options("codex", Some(&["openai"]), false, Some(codex_filter));
     push_options("opencode", None, true, None);
