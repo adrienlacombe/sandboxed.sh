@@ -447,12 +447,12 @@ fn default_providers_config() -> ProvidersConfig {
                         name: "GPT-5.3 Codex".to_string(),
                         description: Some("Newest Codex coding model".to_string()),
                     },
+                    // Additional OpenAI models
                     ProviderModel {
-                        id: "gpt-5.3-codex-spark".to_string(),
-                        name: "GPT-5.3 Codex Spark".to_string(),
-                        description: Some("Ultra-fast real-time coding on Cerebras".to_string()),
+                        id: "gpt-5.4".to_string(),
+                        name: "GPT-5.4".to_string(),
+                        description: Some("Latest frontier coding model in Codex".to_string()),
                     },
-                    // General-purpose models (API key only)
                     ProviderModel {
                         id: "gpt-5.3".to_string(),
                         name: "GPT-5.3".to_string(),
@@ -1170,8 +1170,8 @@ pub async fn list_backend_model_options(
         };
 
     push_options("claudecode", Some(&["anthropic"]), false, None);
-    // Only show Codex-optimized models (contain "codex" in the ID).
-    let codex_filter: &dyn Fn(&str) -> bool = &|id: &str| id.contains("codex");
+    // Codex model catalog includes codex-* IDs and gpt-5.4.
+    let codex_filter: &dyn Fn(&str) -> bool = &|id: &str| id.contains("codex") || id == "gpt-5.4";
     push_options("codex", Some(&["openai"]), false, Some(codex_filter));
     push_options("opencode", None, true, None);
     backends.entry("amp".to_string()).or_default();

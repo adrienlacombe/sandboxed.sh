@@ -292,8 +292,9 @@ Configure your mission:
 
 3. **Model Override (optional)** - Force a specific model for this mission:
    - **Claude Code**: use a raw model ID (e.g., `claude-opus-4-6`)
-   - **Codex**: use a raw model ID (e.g., `gpt-5.3-codex`)
-   - **OpenCode**: use `provider/model` (e.g., `openai/gpt-5.3-codex`)
+   - **Codex**: use a raw model ID (e.g., `gpt-5.4` or `gpt-5.3-codex`)
+   - **OpenCode**: use `provider/model` (e.g., `openai/gpt-5.4`)
+   - **Model effort**: set effort separately (`low`, `medium`, `high`, `xhigh`) instead of encoding it in the model ID
 
 4. **Config Profile** - Override settings (optional):
    - **Default** - Use workspace configuration

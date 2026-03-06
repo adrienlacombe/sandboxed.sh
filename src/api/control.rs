@@ -8245,23 +8245,55 @@ async fn run_single_control_turn(
                 Ok(id) => id,
                 Err(r) => return r,
             };
-            Box::pin(super::mission_runner::run_codex_turn(
+            let requested_codex_model = requested_model
+                .as_deref()
+                .or(config.default_model.as_deref());
+            let mut result = Box::pin(super::mission_runner::run_codex_turn(
                 exec_workspace,
                 &ctx.working_dir,
                 &convo,
-                requested_model
-                    .as_deref()
-                    .or(config.default_model.as_deref()),
+                requested_codex_model,
                 requested_model_effort.as_deref(),
                 config.opencode_agent.as_deref(),
                 mid,
                 events_tx.clone(),
-                cancel,
+                cancel.clone(),
                 &config.working_dir,
                 session_id.as_deref(),
                 None,
             ))
-            .await
+            .await;
+
+            if let Some(fallback_model) =
+                super::mission_runner::codex_chatgpt_fallback_for_result(
+                    requested_codex_model,
+                    &result,
+                )
+            {
+                tracing::warn!(
+                    mission_id = %mid,
+                    requested_model = ?requested_codex_model,
+                    fallback_model,
+                    "Retrying Codex turn with fallback model for ChatGPT account compatibility (control path)"
+                );
+                result = Box::pin(super::mission_runner::run_codex_turn(
+                    exec_workspace,
+                    &ctx.working_dir,
+                    &convo,
+                    Some(fallback_model),
+                    requested_model_effort.as_deref(),
+                    config.opencode_agent.as_deref(),
+                    mid,
+                    events_tx.clone(),
+                    cancel,
+                    &config.working_dir,
+                    session_id.as_deref(),
+                    None,
+                ))
+                .await;
+            }
+
+            result
         }
         Some(backend) if backend != "opencode" => {
             let _ = events_tx.send(AgentEvent::Error {
