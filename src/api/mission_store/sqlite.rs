@@ -1588,6 +1588,11 @@ impl MissionStore for SqliteMissionStore {
     // === Event logging methods ===
 
     async fn log_event(&self, mission_id: Uuid, event: &AgentEvent) -> Result<(), String> {
+        if matches!(event, AgentEvent::UserMessage { queued: true, .. }) {
+            // Keep queued messages out of persisted mission history until they actually start.
+            return Ok(());
+        }
+
         let conn = self.conn.clone();
         let content_dir = self.content_dir.clone();
         let now = now_string();
@@ -1742,7 +1747,6 @@ impl MissionStore for SqliteMissionStore {
 
             // If this event has an event_id that already exists for this mission,
             // update the existing row's metadata instead of inserting a duplicate.
-            // This happens when a queued UserMessage is re-emitted with queued: false.
             if let Some(ref eid) = event_id {
                 let existing: Option<i64> = conn
                     .query_row(
@@ -3154,5 +3158,126 @@ mod tests {
         assert_eq!(actual, 30);
         assert_eq!(estimated, 15);
         assert_eq!(unknown, 0);
+    }
+
+    #[tokio::test]
+    async fn queued_user_messages_are_not_persisted_until_processing_starts() {
+        use crate::api::control::AgentEvent;
+        use uuid::Uuid;
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let store = SqliteMissionStore::new(temp_dir.path().to_path_buf(), "test-user")
+            .await
+            .expect("sqlite store");
+        let mission = store
+            .create_mission(Some("Queue order"), None, None, None, None, None, None)
+            .await
+            .expect("mission");
+
+        let queued_id = Uuid::new_v4();
+        store
+            .log_event(
+                mission.id,
+                &AgentEvent::UserMessage {
+                    id: queued_id,
+                    content: "B".to_string(),
+                    queued: true,
+                    mission_id: Some(mission.id),
+                },
+            )
+            .await
+            .expect("queued event should be ignored");
+
+        let events = store
+            .get_events(mission.id, None, None, None)
+            .await
+            .expect("events");
+        assert!(
+            events.is_empty(),
+            "queued messages should not be stored yet"
+        );
+
+        store
+            .log_event(
+                mission.id,
+                &AgentEvent::UserMessage {
+                    id: Uuid::new_v4(),
+                    content: "A".to_string(),
+                    queued: false,
+                    mission_id: Some(mission.id),
+                },
+            )
+            .await
+            .expect("first user");
+        store
+            .log_event(
+                mission.id,
+                &AgentEvent::AssistantMessage {
+                    id: Uuid::new_v4(),
+                    content: "reply A".to_string(),
+                    success: true,
+                    cost_cents: 0,
+                    cost_source: CostSource::Unknown,
+                    usage: None,
+                    model: None,
+                    model_normalized: None,
+                    mission_id: Some(mission.id),
+                    shared_files: None,
+                    resumable: false,
+                },
+            )
+            .await
+            .expect("reply A");
+        store
+            .log_event(
+                mission.id,
+                &AgentEvent::UserMessage {
+                    id: queued_id,
+                    content: "B".to_string(),
+                    queued: false,
+                    mission_id: Some(mission.id),
+                },
+            )
+            .await
+            .expect("dequeued B");
+        store
+            .log_event(
+                mission.id,
+                &AgentEvent::AssistantMessage {
+                    id: Uuid::new_v4(),
+                    content: "reply B".to_string(),
+                    success: true,
+                    cost_cents: 0,
+                    cost_source: CostSource::Unknown,
+                    usage: None,
+                    model: None,
+                    model_normalized: None,
+                    mission_id: Some(mission.id),
+                    shared_files: None,
+                    resumable: false,
+                },
+            )
+            .await
+            .expect("reply B");
+
+        let mission = store
+            .get_mission(mission.id)
+            .await
+            .expect("get mission")
+            .expect("mission exists");
+        let history: Vec<(String, String)> = mission
+            .history
+            .into_iter()
+            .map(|entry| (entry.role, entry.content))
+            .collect();
+        assert_eq!(
+            history,
+            vec![
+                ("user".to_string(), "A".to_string()),
+                ("assistant".to_string(), "reply A".to_string()),
+                ("user".to_string(), "B".to_string()),
+                ("assistant".to_string(), "reply B".to_string()),
+            ]
+        );
     }
 }
