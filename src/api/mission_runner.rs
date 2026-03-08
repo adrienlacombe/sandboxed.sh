@@ -273,17 +273,22 @@ fn strip_think_tags(text: &str) -> String {
     while pos < text.len() {
         if let Some(rel_start) = find_ci(&text[pos..], "<think>") {
             let abs_start = pos + rel_start;
-            result.push_str(&text[pos..abs_start]);
+            // rel_start is a byte index from as_bytes(); walk back to a char boundary
+            let safe_start = (0..=abs_start)
+                .rev()
+                .find(|&i| text.is_char_boundary(i))
+                .unwrap_or(0);
+            result.push_str(&text[pos..safe_start]);
 
-            let after_open = abs_start + 7; // len("<think>")
+            let after_open = safe_start + 7; // "<think>" is 7 ASCII bytes — always safe
             if after_open <= text.len() {
                 if let Some(rel_close) = find_ci(&text[after_open..], "</think>") {
-                    pos = after_open + rel_close + 8; // len("</think>")
+                    pos = after_open + rel_close + 8; // "</think>" is 8 ASCII bytes — always safe
                 } else {
-                    break;
+                    break; // unclosed tag: drop everything from <think> onwards
                 }
             } else {
-                break;
+                break; // unclosed tag: drop everything from <think> onwards
             }
         } else {
             result.push_str(&text[pos..]);
@@ -11391,6 +11396,20 @@ mod tests {
     fn strip_think_tags_empty_content() {
         let input = "<think></think>";
         assert_eq!(strip_think_tags(input), "");
+    }
+
+    #[test]
+    fn strip_think_tags_with_emoji_no_panic() {
+        let input = "Hello 🛡 world <think>reasoning</think> done";
+        let result = strip_think_tags(input);
+        assert_eq!(result, "Hello 🛡 world  done");
+    }
+
+    #[test]
+    fn strip_think_tags_emoji_inside_think_no_panic() {
+        let input = "before<think>🛡 reasoning 🎯</think>after";
+        let result = strip_think_tags(input);
+        assert_eq!(result, "beforeafter");
     }
 
     // ── extract_thought_line tests ────────────────────────────────────
