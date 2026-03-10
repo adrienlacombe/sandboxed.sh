@@ -181,7 +181,11 @@ impl CodexClient {
                 }
                 // Avoid exploding logs from very long lines.
                 if trimmed.len() > 400 {
-                    captured.push_str(&trimmed[..400]);
+                    let mut i = 400;
+                    while i > 0 && !trimmed.is_char_boundary(i) {
+                        i -= 1;
+                    }
+                    captured.push_str(&trimmed[..i]);
                     captured.push_str("...");
                 } else {
                     captured.push_str(trimmed);

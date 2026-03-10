@@ -348,3 +348,140 @@ test.describe("AI Providers", () => {
     await expect(page.getByText("Delete Test Provider")).not.toBeVisible();
   });
 });
+
+// ---------------------------------------------------------------------------
+// Account email display tests (using route mocking)
+// ---------------------------------------------------------------------------
+
+test.describe("AI Providers - Account Email Display", () => {
+  const mockProviders = [
+    {
+      id: "prov-1",
+      provider_type: "anthropic",
+      provider_type_name: "Anthropic",
+      name: "Anthropic",
+      label: null,
+      priority: 0,
+      has_api_key: false,
+      has_oauth: true,
+      base_url: null,
+      enabled: true,
+      is_default: true,
+      uses_oauth: true,
+      auth_methods: [],
+      status: { type: "connected" },
+      use_for_backends: ["claudecode"],
+      account_email: "alice@example.com",
+      created_at: "2025-01-01T00:00:00Z",
+      updated_at: "2025-01-01T00:00:00Z",
+    },
+    {
+      id: "prov-2",
+      provider_type: "anthropic",
+      provider_type_name: "Anthropic",
+      name: "Anthropic",
+      label: "Work",
+      priority: 1,
+      has_api_key: false,
+      has_oauth: true,
+      base_url: null,
+      enabled: true,
+      is_default: false,
+      uses_oauth: true,
+      auth_methods: [],
+      status: { type: "connected" },
+      use_for_backends: ["opencode"],
+      account_email: "bob@work.com",
+      created_at: "2025-01-02T00:00:00Z",
+      updated_at: "2025-01-02T00:00:00Z",
+    },
+    {
+      id: "prov-3",
+      provider_type: "openai",
+      provider_type_name: "OpenAI",
+      name: "OpenAI",
+      label: null,
+      priority: 2,
+      has_api_key: true,
+      has_oauth: false,
+      base_url: null,
+      enabled: true,
+      is_default: false,
+      uses_oauth: true,
+      auth_methods: [],
+      status: { type: "connected" },
+      use_for_backends: [],
+      account_email: null,
+      created_at: "2025-01-03T00:00:00Z",
+      updated_at: "2025-01-03T00:00:00Z",
+    },
+  ];
+
+  test.beforeEach(async ({ page }) => {
+    // Set up localStorage with a mock API URL before navigating
+    await page.goto("/settings");
+    await page.evaluate(() => {
+      localStorage.clear();
+      localStorage.setItem(
+        "settings",
+        JSON.stringify({ apiUrl: "http://mock-api" })
+      );
+    });
+
+    // Intercept the provider list API call
+    await page.route("**/api/ai/providers", (route) => {
+      if (route.request().method() === "GET") {
+        route.fulfill({
+          status: 200,
+          contentType: "application/json",
+          body: JSON.stringify(mockProviders),
+        });
+      } else {
+        route.continue();
+      }
+    });
+
+    // Also intercept provider types
+    await page.route("**/api/ai/providers/types", (route) => {
+      route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify([
+          { id: "anthropic", name: "Anthropic", uses_oauth: true, env_var: "ANTHROPIC_API_KEY" },
+          { id: "openai", name: "OpenAI", uses_oauth: true, env_var: "OPENAI_API_KEY" },
+        ]),
+      });
+    });
+
+    // Navigate to the providers page
+    await page.goto("/settings/providers");
+    await page.waitForTimeout(1000);
+  });
+
+  test("displays account_email below provider name when present", async ({ page }) => {
+    // The first Anthropic provider should show alice@example.com
+    const emailText = page.getByText("alice@example.com");
+    await expect(emailText).toBeVisible({ timeout: 10000 });
+  });
+
+  test("displays account_email for multiple providers of same type", async ({ page }) => {
+    // Both Anthropic providers should show their respective emails
+    await expect(page.getByText("alice@example.com")).toBeVisible({ timeout: 10000 });
+    await expect(page.getByText("bob@work.com")).toBeVisible({ timeout: 10000 });
+  });
+
+  test("does not show email line when account_email is null", async ({ page }) => {
+    // The OpenAI provider has no account_email, so no email text should appear for it
+    // Verify that the OpenAI provider name is visible
+    await expect(page.getByText("OpenAI").first()).toBeVisible({ timeout: 10000 });
+
+    // There should be exactly 2 email texts (alice and bob), not 3
+    const emailElements = page.locator("text=/.*@.*\\.com/");
+    await expect(emailElements).toHaveCount(2);
+  });
+
+  test("shows label alongside provider name for labeled providers", async ({ page }) => {
+    // The second Anthropic provider should show "(Work)" label
+    await expect(page.getByText("(Work)")).toBeVisible({ timeout: 10000 });
+  });
+});

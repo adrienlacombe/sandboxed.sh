@@ -146,7 +146,7 @@ impl AmpClient {
                     Err(e) => {
                         warn!(
                             error = %e,
-                            line = %if line.len() > 200 { &line[..200] } else { &line },
+                            line = %if line.len() > 200 { let mut i = 200; while i > 0 && !line.is_char_boundary(i) { i -= 1; } &line[..i] } else { &line },
                             "Failed to parse Amp event"
                         );
                     }

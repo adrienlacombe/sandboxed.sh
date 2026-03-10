@@ -1739,6 +1739,9 @@ pub struct ProviderResponse {
     pub status: ProviderStatusResponse,
     /// Which backends this provider is used for (e.g., ["opencode", "claudecode"])
     pub use_for_backends: Vec<String>,
+    /// Account identifier (email or username) from the connected OAuth account
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account_email: Option<String>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
@@ -1815,6 +1818,7 @@ fn build_provider_response(
     auth: Option<AuthKind>,
     default_provider: Option<ProviderType>,
     backends: Option<Vec<String>>,
+    account_email: Option<String>,
 ) -> ProviderResponse {
     let now = chrono::Utc::now();
     let name = config
@@ -1857,6 +1861,7 @@ fn build_provider_response(
         auth_methods: provider_type.auth_methods(),
         status,
         use_for_backends,
+        account_email,
         created_at: now,
         updated_at: now,
     }
@@ -3713,6 +3718,110 @@ fn remove_provider_backends(working_dir: &Path, provider_id: &str) -> Result<(),
     write_provider_backends_state(working_dir, &state)
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Provider Account Info State (provider_accounts.json)
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn provider_accounts_state_path(working_dir: &Path) -> PathBuf {
+    working_dir
+        .join(".sandboxed-sh")
+        .join("provider_accounts.json")
+}
+
+/// Read provider account info state from the state file.
+/// Returns a map of provider_id -> account email (e.g., "anthropic" -> "user@example.com")
+fn read_provider_accounts_state(working_dir: &Path) -> HashMap<String, String> {
+    let path = provider_accounts_state_path(working_dir);
+    let contents = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(_) => return HashMap::new(),
+    };
+    serde_json::from_str(&contents).unwrap_or_default()
+}
+
+/// Write provider account info state to the state file.
+fn write_provider_accounts_state(
+    working_dir: &Path,
+    accounts: &HashMap<String, String>,
+) -> Result<(), String> {
+    let path = provider_accounts_state_path(working_dir);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("Failed to create provider accounts directory: {}", e))?;
+    }
+    let contents = serde_json::to_string_pretty(accounts)
+        .map_err(|e| format!("Failed to serialize provider accounts: {}", e))?;
+    std::fs::write(path, contents)
+        .map_err(|e| format!("Failed to write provider accounts: {}", e))?;
+    Ok(())
+}
+
+/// Update account email for a specific provider in the state file.
+fn update_provider_account(
+    working_dir: &Path,
+    provider_id: &str,
+    email: String,
+) -> Result<(), String> {
+    let mut state = read_provider_accounts_state(working_dir);
+    state.insert(provider_id.to_string(), email);
+    write_provider_accounts_state(working_dir, &state)
+}
+
+/// Remove a provider from the accounts state file.
+fn remove_provider_account(working_dir: &Path, provider_id: &str) -> Result<(), String> {
+    let mut state = read_provider_accounts_state(working_dir);
+    state.remove(provider_id);
+    write_provider_accounts_state(working_dir, &state)
+}
+
+/// Extract email from a JWT id_token by decoding the payload (no signature verification).
+/// JWT format: header.payload.signature, where payload is base64url-encoded JSON.
+fn extract_email_from_jwt(token: &str) -> Option<String> {
+    let parts: Vec<&str> = token.split('.').collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    let bytes = URL_SAFE_NO_PAD.decode(parts[1]).ok()?;
+    let json: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    json.get("email")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+}
+
+/// Extract account email from an OAuth token response and persist it.
+///
+/// Tries `id_token` JWT first, then `access_token` JWT, then a plain `email` field.
+/// If an email is found, saves it to the provider accounts state file.
+fn extract_and_save_account_email(
+    token_data: &serde_json::Value,
+    working_dir: &Path,
+    provider_id: &str,
+    provider_label: &str,
+) -> Option<String> {
+    let email = token_data
+        .get("id_token")
+        .and_then(|v| v.as_str())
+        .and_then(extract_email_from_jwt)
+        .or_else(|| {
+            token_data
+                .get("access_token")
+                .and_then(|v| v.as_str())
+                .and_then(extract_email_from_jwt)
+        })
+        .or_else(|| {
+            token_data
+                .get("email")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        });
+    if let Some(ref e) = email {
+        if let Err(err) = update_provider_account(working_dir, provider_id, e.clone()) {
+            tracing::warn!("Failed to save {} account email: {}", provider_label, err);
+        }
+    }
+    email
+}
+
 /// Read OpenCode's current auth.json contents.
 fn read_opencode_auth() -> Result<serde_json::Value, String> {
     let auth_path = get_opencode_auth_path();
@@ -4006,6 +4115,7 @@ async fn list_providers(
     let default_provider = read_default_provider_state(&state.config.working_dir)
         .or_else(|| get_default_provider(&opencode_config));
     let backends_state = read_provider_backends_state(&state.config.working_dir);
+    let accounts_state = read_provider_accounts_state(&state.config.working_dir);
 
     let mut provider_ids: BTreeSet<String> = BTreeSet::new();
     for provider in auth_map.keys() {
@@ -4027,12 +4137,14 @@ async fn list_providers(
             let config_entry = get_provider_config_entry(&opencode_config, provider_type);
             let auth_kind = auth_map.get(&provider_type).copied();
             let backends = backends_state.get(provider_type.id()).cloned();
+            let account_email = accounts_state.get(provider_type.id()).cloned();
             Some(build_provider_response(
                 provider_type,
                 config_entry,
                 auth_kind,
                 default_provider,
                 backends,
+                account_email,
             ))
         })
         .collect();
@@ -4072,6 +4184,7 @@ async fn list_providers(
                     ProviderStatusResponse::NeedsAuth { auth_url: None }
                 },
                 use_for_backends: vec![default_backend],
+                account_email: provider.account_email.clone(),
                 created_at: now,
                 updated_at: now,
             });
@@ -4533,6 +4646,7 @@ async fn create_provider(
             use_for_backends: req
                 .use_for_backends
                 .unwrap_or_else(|| vec![default_backend]),
+            account_email: provider.account_email.clone(),
             created_at: now,
             updated_at: now,
         }));
@@ -4589,6 +4703,7 @@ async fn create_provider(
         auth_kind,
         default_provider,
         use_for_backends,
+        None,
     );
 
     tracing::info!(
@@ -4613,15 +4728,18 @@ async fn get_provider(
     let default_provider = read_default_provider_state(&state.config.working_dir)
         .or_else(|| get_default_provider(&opencode_config));
     let backends_state = read_provider_backends_state(&state.config.working_dir);
+    let accounts_state = read_provider_accounts_state(&state.config.working_dir);
     let config_entry = get_provider_config_entry(&opencode_config, provider_type);
     let auth_kind = auth_map.get(&provider_type).copied();
     let backends = backends_state.get(provider_type.id()).cloned();
+    let account_email = accounts_state.get(provider_type.id()).cloned();
     let response = build_provider_response(
         provider_type,
         config_entry,
         auth_kind,
         default_provider,
         backends,
+        account_email,
     );
     Ok(Json(response))
 }
@@ -4712,15 +4830,18 @@ async fn update_provider(
     let default_provider = read_default_provider_state(&state.config.working_dir)
         .or_else(|| get_default_provider(&opencode_config));
     let backends_state = read_provider_backends_state(&state.config.working_dir);
+    let accounts_state = read_provider_accounts_state(&state.config.working_dir);
     let config_entry = get_provider_config_entry(&opencode_config, provider_type);
     let auth_kind = auth_map.get(&provider_type).copied();
     let backends = backends_state.get(provider_type.id()).cloned();
+    let account_email = accounts_state.get(provider_type.id()).cloned();
     let response = build_provider_response(
         provider_type,
         config_entry,
         auth_kind,
         default_provider,
         backends,
+        account_email,
     );
 
     tracing::info!("Updated AI provider config: {} ({})", response.name, id);
@@ -4808,6 +4929,7 @@ async fn update_store_provider(
             ProviderStatusResponse::NeedsAuth { auth_url: None }
         },
         use_for_backends: vec![default_backend],
+        account_email: result.account_email.clone(),
         created_at: now,
         updated_at: result.updated_at,
     };
@@ -4863,6 +4985,11 @@ async fn delete_provider(
     // Remove provider backends state
     if let Err(e) = remove_provider_backends(&state.config.working_dir, provider_type.id()) {
         tracing::error!("Failed to remove provider backends state: {}", e);
+    }
+
+    // Clean up account email state
+    if let Err(e) = remove_provider_account(&state.config.working_dir, provider_type.id()) {
+        tracing::error!("Failed to remove provider account state: {}", e);
     }
 
     Ok((
@@ -4992,6 +5119,7 @@ async fn set_default(
                 ProviderStatusResponse::NeedsAuth { auth_url: None }
             },
             use_for_backends: vec![default_backend],
+            account_email: provider.account_email.clone(),
             created_at: now,
             updated_at: provider.updated_at,
         };
@@ -5009,16 +5137,19 @@ async fn set_default(
     let opencode_config = read_opencode_config(&config_path).map_err(internal_error)?;
     let auth_map = read_opencode_auth_map().map_err(internal_error)?;
     let backends_state = read_provider_backends_state(&state.config.working_dir);
+    let accounts_state = read_provider_accounts_state(&state.config.working_dir);
     let default_provider = Some(provider_type);
     let config_entry = get_provider_config_entry(&opencode_config, provider_type);
     let auth_kind = auth_map.get(&provider_type).copied();
     let backends = backends_state.get(provider_type.id()).cloned();
+    let account_email = accounts_state.get(provider_type.id()).cloned();
     let response = build_provider_response(
         provider_type,
         config_entry,
         auth_kind,
         default_provider,
         backends,
+        account_email,
     );
 
     tracing::info!("Set default AI provider: {} ({})", response.name, id);
@@ -5457,6 +5588,13 @@ async fn oauth_callback_inner(
                     }
                 }
 
+                let account_email = extract_and_save_account_email(
+                    &token_data,
+                    &state.config.working_dir,
+                    provider_type.id(),
+                    "Anthropic",
+                );
+
                 let default_provider = get_default_provider(&opencode_config);
                 let backends_state = read_provider_backends_state(&state.config.working_dir);
                 let config_entry = get_provider_config_entry(&opencode_config, provider_type);
@@ -5467,6 +5605,7 @@ async fn oauth_callback_inner(
                     Some(AuthKind::ApiKey),
                     default_provider,
                     backends,
+                    account_email,
                 );
 
                 tracing::info!("Created API key for provider: {} ({})", response.name, id);
@@ -5556,6 +5695,13 @@ async fn oauth_callback_inner(
                     }
                 }
 
+                let account_email = extract_and_save_account_email(
+                    &token_data,
+                    &state.config.working_dir,
+                    provider_type.id(),
+                    "Anthropic",
+                );
+
                 let default_provider = get_default_provider(&opencode_config);
                 let backends_state = read_provider_backends_state(&state.config.working_dir);
                 let config_entry = get_provider_config_entry(&opencode_config, provider_type);
@@ -5566,6 +5712,7 @@ async fn oauth_callback_inner(
                     Some(AuthKind::OAuth),
                     default_provider,
                     backends,
+                    account_email,
                 );
 
                 Ok(Json(response))
@@ -5699,6 +5846,13 @@ async fn oauth_callback_inner(
                 }
             }
 
+            let account_email = extract_and_save_account_email(
+                &token_data,
+                &state.config.working_dir,
+                provider_type.id(),
+                "OpenAI",
+            );
+
             let config_path = get_opencode_config_path(&state.config.working_dir);
             let opencode_config = read_opencode_config(&config_path).map_err(internal_error)?;
             let backends_state = read_provider_backends_state(&state.config.working_dir);
@@ -5711,6 +5865,7 @@ async fn oauth_callback_inner(
                 Some(AuthKind::OAuth),
                 default_provider,
                 backends,
+                account_email,
             );
 
             Ok(Json(response))
@@ -5801,6 +5956,13 @@ async fn oauth_callback_inner(
                 tracing::error!("Failed to sync Google credentials to OpenCode: {}", e);
             }
 
+            let account_email = extract_and_save_account_email(
+                &token_data,
+                &state.config.working_dir,
+                provider_type.id(),
+                "Google",
+            );
+
             let config_path = get_opencode_config_path(&state.config.working_dir);
             let opencode_config = read_opencode_config(&config_path).map_err(internal_error)?;
             let backends_state = read_provider_backends_state(&state.config.working_dir);
@@ -5813,6 +5975,7 @@ async fn oauth_callback_inner(
                 Some(AuthKind::OAuth),
                 default_provider,
                 backends,
+                account_email,
             );
 
             tracing::info!("Google OAuth credentials saved for provider: {}", id);

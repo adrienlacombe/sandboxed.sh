@@ -330,6 +330,9 @@ pub struct AIProvider {
     /// Whether this is the default provider
     #[serde(default)]
     pub is_default: bool,
+    /// Account identifier (email or username) from OAuth or user-provided
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_email: Option<String>,
     /// Connection status (populated at runtime)
     #[serde(skip)]
     pub status: ProviderStatus,
@@ -372,6 +375,7 @@ impl AIProvider {
             npm_package: None,
             enabled: true,
             is_default: false,
+            account_email: None,
             status: ProviderStatus::Unknown,
             created_at: now,
             updated_at: now,
