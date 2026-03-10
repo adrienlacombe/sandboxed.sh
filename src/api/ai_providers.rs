@@ -3800,9 +3800,14 @@ fn extract_and_save_account_email(
 ) -> Option<String> {
     let email = token_data
         .get("id_token")
-        .or_else(|| token_data.get("access_token"))
         .and_then(|v| v.as_str())
         .and_then(extract_email_from_jwt)
+        .or_else(|| {
+            token_data
+                .get("access_token")
+                .and_then(|v| v.as_str())
+                .and_then(extract_email_from_jwt)
+        })
         .or_else(|| {
             token_data
                 .get("email")
