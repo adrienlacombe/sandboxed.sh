@@ -179,7 +179,9 @@ impl ClaudeCodeClient {
                             e,
                             if line.len() > 200 {
                                 let mut i = 200;
-                                while i > 0 && !line.is_char_boundary(i) { i -= 1; }
+                                while i > 0 && !line.is_char_boundary(i) {
+                                    i -= 1;
+                                }
                                 format!("{}...", &line[..i])
                             } else {
                                 line.clone()
