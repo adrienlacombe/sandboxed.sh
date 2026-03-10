@@ -5060,6 +5060,20 @@ struct RoutedAutomationMessage {
     target_mission_id: Uuid,
 }
 
+fn enqueue_agent_finished_messages(
+    queue: &mut VecDeque<(Uuid, String, Option<String>, Option<Uuid>)>,
+    messages: Vec<RoutedAutomationMessage>,
+) {
+    for message in messages {
+        queue.push_back((
+            Uuid::new_v4(),
+            message.content,
+            None,
+            Some(message.target_mission_id),
+        ));
+    }
+}
+
 fn next_session_id_from_automation_variables(
     automation: &super::mission_store::Automation,
 ) -> Option<Uuid> {
@@ -7210,15 +7224,7 @@ async fn control_actor_loop(
                                 &workspaces,
                             )
                             .await;
-                            for message in messages.into_iter().rev() {
-                                // Push to front so it runs before unrelated queued items, but preserve order.
-                                queue.push_front((
-                                    Uuid::new_v4(),
-                                    message.content,
-                                    None,
-                                    Some(message.target_mission_id),
-                                ));
-                            }
+                            enqueue_agent_finished_messages(&mut queue, messages);
                         }
                     }
                 }
@@ -11840,6 +11846,45 @@ Investigate <service/> failures.
         assert_eq!(
             automation_library_command_body("  Echo current status. \n"),
             "Echo current status."
+        );
+    }
+
+    #[test]
+    fn test_enqueue_agent_finished_messages_appends_after_existing_queue_items() {
+        let existing_target = Uuid::new_v4();
+        let restart_target = Uuid::new_v4();
+        let mut queue = VecDeque::from([(
+            Uuid::new_v4(),
+            "queued user message".to_string(),
+            None,
+            Some(existing_target),
+        )]);
+
+        enqueue_agent_finished_messages(
+            &mut queue,
+            vec![
+                RoutedAutomationMessage {
+                    content: "restart 1".to_string(),
+                    target_mission_id: restart_target,
+                },
+                RoutedAutomationMessage {
+                    content: "restart 2".to_string(),
+                    target_mission_id: restart_target,
+                },
+            ],
+        );
+
+        let ordered: Vec<(String, Option<Uuid>)> = queue
+            .into_iter()
+            .map(|(_, content, _, mission_id)| (content, mission_id))
+            .collect();
+        assert_eq!(
+            ordered,
+            vec![
+                ("queued user message".to_string(), Some(existing_target)),
+                ("restart 1".to_string(), Some(restart_target)),
+                ("restart 2".to_string(), Some(restart_target)),
+            ]
         );
     }
 
