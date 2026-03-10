@@ -58,3 +58,7 @@ workspaces/
 
 # Local experiments
 vllm-gb10-dgx-spark/
+
+# iOS build artifacts
+ios_dashboard/.build/
+ios_dashboard/SandboxedDashboard.xcodeproj/
