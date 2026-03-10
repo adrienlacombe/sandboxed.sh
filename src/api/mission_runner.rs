@@ -3864,7 +3864,7 @@ fn strip_ansi_codes(input: &str) -> Cow<'_, str> {
     let bytes = input.as_bytes();
     if !bytes
         .iter()
-        .any(|byte| *byte == 0x1b || *byte == 0x9b || is_disallowed_control(*byte))
+        .any(|byte| *byte == 0x1b || is_disallowed_control(*byte))
     {
         return Cow::Borrowed(input);
     }
@@ -3874,11 +3874,9 @@ fn strip_ansi_codes(input: &str) -> Cow<'_, str> {
     let mut idx = 0;
 
     while idx < bytes.len() {
-        // UTF-8 continuation bytes (0x80-0xBF) cannot be standalone control
-        // characters. Without this guard, a byte like 0x9B (C1 CSI) matched
-        // as a control character when it is actually the 3rd byte of a 4-byte
-        // emoji (e.g. 🛠 = F0 9F 9B A0) causes a slice panic at a non-char
-        // boundary.
+        // Skip UTF-8 continuation bytes (0x80-0xBF). These are never
+        // standalone control characters in valid UTF-8 — they only appear
+        // as trailing bytes of multi-byte sequences (e.g. 🛠 = F0 9F 9B A0).
         if !input.is_char_boundary(idx) {
             idx += 1;
             continue;
@@ -3887,11 +3885,6 @@ fn strip_ansi_codes(input: &str) -> Cow<'_, str> {
             0x1b => {
                 cleaned.push_str(&input[last_copy..idx]);
                 idx = consume_escape_sequence(bytes, idx);
-                last_copy = idx;
-            }
-            0x9b => {
-                cleaned.push_str(&input[last_copy..idx]);
-                idx = consume_csi_sequence(bytes, idx + 1);
                 last_copy = idx;
             }
             byte if is_disallowed_control(byte) => {
