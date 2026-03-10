@@ -1213,13 +1213,13 @@ async fn write_opencode_config(
         write_commands_as_opencode_skills(workspace_dir, commands).await?;
     }
 
-    // Write RTK PreToolUse hook for Claude Code (which oh-my-opencode wraps).
-    // This enables RTK compression for the native Bash tool used by the agent.
-    // Since OpenCode wraps Claude Code, we need to write a minimal
-    // `.claude/settings.local.json` containing the hooks config so the
-    // underlying Claude Code process discovers the hook.
+    // Write Bash PreToolUse hook for Claude Code (which oh-my-opencode wraps).
+    // This fixes gh CLI hanging in PTY and enables RTK compression for the
+    // native Bash tool used by the agent. Since OpenCode wraps Claude Code,
+    // we need to write a minimal `.claude/settings.local.json` containing the
+    // hooks config so the underlying Claude Code process discovers the hook.
     if let Some(hooks) =
-        write_rtk_hook_if_enabled(workspace_dir, workspace_root, workspace_type).await?
+        write_bash_pretool_hook(workspace_dir, workspace_root, workspace_type).await?
     {
         let claude_dir = workspace_dir.join(".claude");
         tokio::fs::create_dir_all(&claude_dir).await?;
@@ -1244,18 +1244,16 @@ async fn write_opencode_config(
 ///
 /// For the OpenCode backend this is also called so that the underlying Claude
 /// Code process (wrapped by oh-my-opencode) picks up the hook.
-async fn write_rtk_hook_if_enabled(
+async fn write_bash_pretool_hook(
     workspace_dir: &Path,
     workspace_root: &Path,
     workspace_type: WorkspaceType,
 ) -> anyhow::Result<Option<serde_json::Value>> {
-    if !rtk_enabled() {
-        return Ok(None);
-    }
+    let use_rtk = rtk_enabled();
 
     // For container workspaces, copy the RTK binary from host into the container
     let is_container = workspace_type == WorkspaceType::Container && nspawn::nspawn_available();
-    if is_container {
+    if use_rtk && is_container {
         if let Some(host_rtk) = rtk_binary_path() {
             let dest_dir = workspace_root.join("usr").join("local").join("bin");
             std::fs::create_dir_all(&dest_dir).ok();
@@ -1282,19 +1280,24 @@ async fn write_rtk_hook_if_enabled(
             }
         } else {
             tracing::warn!("RTK enabled but binary not found on host");
-            return Ok(None);
         }
     }
 
-    // Write the hook script to .claude/hooks/rtk-wrap.sh
+    // Write the hook script to .claude/hooks/bash-pretool.sh
+    //
+    // This hook serves two purposes:
+    // 1. **gh terminal fix** (always): Wraps `gh` commands with `env TERM=dumb` to prevent
+    //    lipgloss from sending terminal capability queries (OSC 11, DSR) that hang forever
+    //    in our PTY environment (no terminal emulator to respond).
+    // 2. **RTK compression** (when enabled): Rewrites eligible commands to use RTK
+    //    subcommands for 60-90% token compression on CLI output.
     let hooks_dir = workspace_dir.join(".claude").join("hooks");
     tokio::fs::create_dir_all(&hooks_dir).await?;
-    let rtk_hook_path = hooks_dir.join("rtk-wrap.sh");
-    let rtk_hook_script = r#"#!/bin/bash
-# RTK PreToolUse hook: rewrites eligible bash commands to use RTK subcommands.
-# This reduces token consumption by 60-90% on common CLI output.
-# RTK has specific subcommands — we map the first word of the command to the
-# corresponding RTK subcommand and pass the rest as arguments after --.
+    let hook_path = hooks_dir.join("bash-pretool.sh");
+    let hook_script = r#"#!/bin/bash
+# PreToolUse hook for Bash commands.
+# 1. Fixes gh CLI hanging in PTY by setting TERM=dumb (prevents lipgloss terminal queries)
+# 2. Optionally rewrites commands to use RTK for token compression
 set -euo pipefail
 
 INPUT=$(cat)
@@ -1310,85 +1313,102 @@ case "$COMMAND" in
   *"&&"*|*"||"*|*"|"*|*"<<"*|*"("*|*";"*|*'`'*|*'$('*) exit 0 ;;
 esac
 
-# Find rtk binary
-RTK_PATH=""
-for p in /usr/local/bin/rtk /usr/bin/rtk; do
-  if [ -x "$p" ]; then RTK_PATH="$p"; break; fi
-done
-if [ -z "$RTK_PATH" ]; then exit 0; fi
-
 # Extract the base command (first word, ignoring path prefix)
 FIRST_WORD=$(echo "$COMMAND" | awk '{print $1}')
 BASE_CMD=$(basename "$FIRST_WORD")
 REST=$(echo "$COMMAND" | sed "s|^[^ ]* *||")
 
+emit_rewrite() {
+  jq -n --arg cmd "$1" '{
+    hookSpecificOutput: {
+      hookEventName: "PreToolUse",
+      permissionDecision: "allow",
+      updatedInput: { command: $cmd }
+    }
+  }'
+}
+
+# Find rtk binary (for optional compression)
+RTK_PATH=""
+for p in /usr/local/bin/rtk /usr/bin/rtk; do
+  if [ -x "$p" ]; then RTK_PATH="$p"; break; fi
+done
+
 # Map base commands to RTK subcommands (only commands RTK natively supports)
 RTK_SUB=""
-case "$BASE_CMD" in
-  ls)        RTK_SUB="ls" ;;
-  tree)      RTK_SUB="tree" ;;
-  git)       RTK_SUB="git" ;;
-  gh)        RTK_SUB="gh" ;;
-  grep|rg)   RTK_SUB="grep" ;;
-  cargo)     RTK_SUB="cargo" ;;
-  npm)       RTK_SUB="npm" ;;
-  npx)       RTK_SUB="npx" ;;
-  bun)       RTK_SUB="npm" ;;
-  bunx)      RTK_SUB="npx" ;;
-  pnpm)      RTK_SUB="pnpm" ;;
-  docker)    RTK_SUB="docker" ;;
-  kubectl)   RTK_SUB="kubectl" ;;
-  vitest)    RTK_SUB="vitest" ;;
-  pytest)    RTK_SUB="pytest" ;;
-  go)        RTK_SUB="go" ;;
-  tsc)       RTK_SUB="tsc" ;;
-  eslint)    RTK_SUB="lint" ;;
-  ruff)      RTK_SUB="ruff" ;;
-  curl)      RTK_SUB="curl" ;;
-  pip|uv)    RTK_SUB="pip" ;;
-  diff)      RTK_SUB="diff" ;;
-esac
-
-if [ -z "$RTK_SUB" ]; then exit 0; fi
-
-# Build the rewritten command: rtk <sub> -- <original args>
-if [ -n "$REST" ]; then
-  NEW_CMD="$RTK_PATH $RTK_SUB -- $REST"
-else
-  NEW_CMD="$RTK_PATH $RTK_SUB"
+if [ -n "$RTK_PATH" ]; then
+  case "$BASE_CMD" in
+    ls)        RTK_SUB="ls" ;;
+    tree)      RTK_SUB="tree" ;;
+    git)       RTK_SUB="git" ;;
+    gh)        RTK_SUB="gh" ;;
+    grep|rg)   RTK_SUB="grep" ;;
+    cargo)     RTK_SUB="cargo" ;;
+    npm)       RTK_SUB="npm" ;;
+    npx)       RTK_SUB="npx" ;;
+    bun)       RTK_SUB="npm" ;;
+    bunx)      RTK_SUB="npx" ;;
+    pnpm)      RTK_SUB="pnpm" ;;
+    docker)    RTK_SUB="docker" ;;
+    kubectl)   RTK_SUB="kubectl" ;;
+    vitest)    RTK_SUB="vitest" ;;
+    pytest)    RTK_SUB="pytest" ;;
+    go)        RTK_SUB="go" ;;
+    tsc)       RTK_SUB="tsc" ;;
+    eslint)    RTK_SUB="lint" ;;
+    ruff)      RTK_SUB="ruff" ;;
+    curl)      RTK_SUB="curl" ;;
+    pip|uv)    RTK_SUB="pip" ;;
+    diff)      RTK_SUB="diff" ;;
+  esac
 fi
 
-# Rewrite the command to use RTK
-jq -n --arg cmd "$NEW_CMD" '{
-  hookSpecificOutput: {
-    hookEventName: "PreToolUse",
-    permissionDecision: "allow",
-    updatedInput: { command: $cmd }
-  }
-}'
+# If RTK supports this command, rewrite to use RTK (which pipes internally, fixing PTY too)
+if [ -n "$RTK_SUB" ]; then
+  if [ -n "$REST" ]; then
+    emit_rewrite "$RTK_PATH $RTK_SUB -- $REST"
+  else
+    emit_rewrite "$RTK_PATH $RTK_SUB"
+  fi
+  exit 0
+fi
+
+# No RTK available — still fix gh commands that hang in PTY environments.
+# The gh CLI (via lipgloss/glamour) sends terminal capability queries like
+# OSC 11 (background color) and DSR (cursor position) when TERM != dumb.
+# Our PTY has no terminal emulator to respond, causing indefinite hangs.
+case "$BASE_CMD" in
+  gh)
+    emit_rewrite "env TERM=dumb $COMMAND"
+    exit 0
+    ;;
+esac
+
+exit 0
 "#;
-    tokio::fs::write(&rtk_hook_path, rtk_hook_script).await?;
+    tokio::fs::write(&hook_path, hook_script).await?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         let perms = std::fs::Permissions::from_mode(0o755);
-        std::fs::set_permissions(&rtk_hook_path, perms)?;
+        std::fs::set_permissions(&hook_path, perms)?;
     }
 
     // For container workspaces, translate the hook path from host to container-relative
     let hook_command = if is_container {
-        if let Ok(rel) = rtk_hook_path.strip_prefix(workspace_root) {
+        if let Ok(rel) = hook_path.strip_prefix(workspace_root) {
             format!("/{}", rel.to_string_lossy())
         } else {
-            rtk_hook_path.to_string_lossy().to_string()
+            hook_path.to_string_lossy().to_string()
         }
     } else {
-        rtk_hook_path.to_string_lossy().to_string()
+        hook_path.to_string_lossy().to_string()
     };
     tracing::info!(
         hook_path = %hook_command,
         is_container = is_container,
-        "RTK PreToolUse hook written"
+        use_rtk = use_rtk,
+        "Bash PreToolUse hook written"
     );
 
     Ok(Some(json!({
@@ -1495,10 +1515,10 @@ async fn write_claudecode_config(
         }
     });
 
-    // Add RTK PreToolUse hook if enabled — rewrites eligible Bash commands
-    // to prefix them with `rtk` for token compression.
+    // Add Bash PreToolUse hook — fixes gh CLI hanging in PTY environments
+    // and optionally rewrites commands with RTK for token compression.
     if let Some(hooks) =
-        write_rtk_hook_if_enabled(workspace_dir, workspace_root, workspace_type).await?
+        write_bash_pretool_hook(workspace_dir, workspace_root, workspace_type).await?
     {
         settings
             .as_object_mut()
