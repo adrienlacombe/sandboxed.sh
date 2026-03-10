@@ -273,14 +273,11 @@ fn strip_think_tags(text: &str) -> String {
     while pos < text.len() {
         if let Some(rel_start) = find_ci(&text[pos..], "<think>") {
             let abs_start = pos + rel_start;
-            // rel_start is a byte index from as_bytes(); walk back to a char boundary
-            let safe_start = (0..=abs_start)
-                .rev()
-                .find(|&i| text.is_char_boundary(i))
-                .unwrap_or(0);
-            result.push_str(&text[pos..safe_start]);
+            // find_ci searches for ASCII "<think>", so abs_start always lands on
+            // a char boundary (the `<` byte). No boundary walk-back needed.
+            result.push_str(&text[pos..abs_start]);
 
-            let after_open = safe_start + 7; // "<think>" is 7 ASCII bytes — always safe
+            let after_open = abs_start + 7; // "<think>" is 7 ASCII bytes
             if after_open <= text.len() {
                 if let Some(rel_close) = find_ci(&text[after_open..], "</think>") {
                     pos = after_open + rel_close + 8; // "</think>" is 8 ASCII bytes — always safe

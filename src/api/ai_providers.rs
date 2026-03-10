@@ -20,10 +20,7 @@ use axum::{
     routing::{delete, get, post, put},
     Json, Router,
 };
-use base64::{
-    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
-    Engine as _,
-};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -3784,19 +3781,40 @@ fn extract_email_from_jwt(token: &str) -> Option<String> {
     if parts.len() != 3 {
         return None;
     }
-    let payload = parts[1];
-    // base64url decode: replace URL-safe chars and add padding
-    let padded = match payload.len() % 4 {
-        2 => format!("{}==", payload),
-        3 => format!("{}=", payload),
-        _ => payload.to_string(),
-    };
-    let decoded = padded.replace('-', "+").replace('_', "/");
-    let bytes = STANDARD.decode(&decoded).ok()?;
+    let bytes = URL_SAFE_NO_PAD.decode(parts[1]).ok()?;
     let json: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
     json.get("email")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
+}
+
+/// Extract account email from an OAuth token response and persist it.
+///
+/// Tries `id_token` JWT first, then `access_token` JWT, then a plain `email` field.
+/// If an email is found, saves it to the provider accounts state file.
+fn extract_and_save_account_email(
+    token_data: &serde_json::Value,
+    working_dir: &Path,
+    provider_id: &str,
+    provider_label: &str,
+) -> Option<String> {
+    let email = token_data
+        .get("id_token")
+        .or_else(|| token_data.get("access_token"))
+        .and_then(|v| v.as_str())
+        .and_then(extract_email_from_jwt)
+        .or_else(|| {
+            token_data
+                .get("email")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        });
+    if let Some(ref e) = email {
+        if let Err(err) = update_provider_account(working_dir, provider_id, e.clone()) {
+            tracing::warn!("Failed to save {} account email: {}", provider_label, err);
+        }
+    }
+    email
 }
 
 /// Read OpenCode's current auth.json contents.
@@ -5565,27 +5583,12 @@ async fn oauth_callback_inner(
                     }
                 }
 
-                // Try to extract account email from token response
-                let account_email = token_data
-                    .get("id_token")
-                    .or_else(|| token_data.get("access_token"))
-                    .and_then(|v| v.as_str())
-                    .and_then(extract_email_from_jwt)
-                    .or_else(|| {
-                        token_data
-                            .get("email")
-                            .and_then(|v| v.as_str())
-                            .map(|s| s.to_string())
-                    });
-                if let Some(ref email) = account_email {
-                    if let Err(e) = update_provider_account(
-                        &state.config.working_dir,
-                        provider_type.id(),
-                        email.clone(),
-                    ) {
-                        tracing::warn!("Failed to save Anthropic account email: {}", e);
-                    }
-                }
+                let account_email = extract_and_save_account_email(
+                    &token_data,
+                    &state.config.working_dir,
+                    provider_type.id(),
+                    "Anthropic",
+                );
 
                 let default_provider = get_default_provider(&opencode_config);
                 let backends_state = read_provider_backends_state(&state.config.working_dir);
@@ -5687,27 +5690,12 @@ async fn oauth_callback_inner(
                     }
                 }
 
-                // Try to extract account email from token response
-                let account_email = token_data
-                    .get("id_token")
-                    .or_else(|| token_data.get("access_token"))
-                    .and_then(|v| v.as_str())
-                    .and_then(extract_email_from_jwt)
-                    .or_else(|| {
-                        token_data
-                            .get("email")
-                            .and_then(|v| v.as_str())
-                            .map(|s| s.to_string())
-                    });
-                if let Some(ref email) = account_email {
-                    if let Err(e) = update_provider_account(
-                        &state.config.working_dir,
-                        provider_type.id(),
-                        email.clone(),
-                    ) {
-                        tracing::warn!("Failed to save Anthropic account email: {}", e);
-                    }
-                }
+                let account_email = extract_and_save_account_email(
+                    &token_data,
+                    &state.config.working_dir,
+                    provider_type.id(),
+                    "Anthropic",
+                );
 
                 let default_provider = get_default_provider(&opencode_config);
                 let backends_state = read_provider_backends_state(&state.config.working_dir);
@@ -5853,20 +5841,12 @@ async fn oauth_callback_inner(
                 }
             }
 
-            // Extract account email from id_token JWT if available
-            let account_email = token_data
-                .get("id_token")
-                .and_then(|v| v.as_str())
-                .and_then(extract_email_from_jwt);
-            if let Some(ref email) = account_email {
-                if let Err(e) = update_provider_account(
-                    &state.config.working_dir,
-                    provider_type.id(),
-                    email.clone(),
-                ) {
-                    tracing::warn!("Failed to save OpenAI account email: {}", e);
-                }
-            }
+            let account_email = extract_and_save_account_email(
+                &token_data,
+                &state.config.working_dir,
+                provider_type.id(),
+                "OpenAI",
+            );
 
             let config_path = get_opencode_config_path(&state.config.working_dir);
             let opencode_config = read_opencode_config(&config_path).map_err(internal_error)?;
@@ -5971,20 +5951,12 @@ async fn oauth_callback_inner(
                 tracing::error!("Failed to sync Google credentials to OpenCode: {}", e);
             }
 
-            // Extract account email from id_token JWT if available
-            let account_email = token_data
-                .get("id_token")
-                .and_then(|v| v.as_str())
-                .and_then(extract_email_from_jwt);
-            if let Some(ref email) = account_email {
-                if let Err(e) = update_provider_account(
-                    &state.config.working_dir,
-                    provider_type.id(),
-                    email.clone(),
-                ) {
-                    tracing::warn!("Failed to save Google account email: {}", e);
-                }
-            }
+            let account_email = extract_and_save_account_email(
+                &token_data,
+                &state.config.working_dir,
+                provider_type.id(),
+                "Google",
+            );
 
             let config_path = get_opencode_config_path(&state.config.working_dir);
             let opencode_config = read_opencode_config(&config_path).map_err(internal_error)?;
