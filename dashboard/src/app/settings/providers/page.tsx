@@ -340,12 +340,19 @@ export default function ProvidersPage() {
                         !provider.enabled && 'opacity-40'
                       )}>
                         <span className="text-base">{config.icon}</span>
-                        <span className="text-sm text-white/80 flex-1 truncate">
-                          {provider.name}
-                          {provider.label && (
-                            <span className="ml-1.5 text-xs text-white/40">({provider.label})</span>
+                        <div className="flex-1 min-w-0">
+                          <span className="text-sm text-white/80 truncate block">
+                            {provider.name}
+                            {provider.label && (
+                              <span className="ml-1.5 text-xs text-white/40">({provider.label})</span>
+                            )}
+                          </span>
+                          {provider.account_email && (
+                            <span className="text-[11px] text-white/35 truncate block">
+                              {provider.account_email}
+                            </span>
                           )}
-                        </span>
+                        </div>
 
                         {provider.use_for_backends && provider.use_for_backends.length > 0 && (
                           <div className="flex items-center gap-1">

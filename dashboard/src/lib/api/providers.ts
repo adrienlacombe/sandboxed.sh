@@ -81,6 +81,8 @@ export interface AIProvider {
   auth_methods: AIProviderAuthMethod[];
   status: AIProviderStatus;
   use_for_backends: string[];
+  /** Account identifier (email) from the connected OAuth account */
+  account_email?: string | null;
   created_at: string;
   updated_at: string;
 }
