@@ -273,17 +273,22 @@ fn strip_think_tags(text: &str) -> String {
     while pos < text.len() {
         if let Some(rel_start) = find_ci(&text[pos..], "<think>") {
             let abs_start = pos + rel_start;
-            result.push_str(&text[pos..abs_start]);
+            // rel_start is a byte index from as_bytes(); walk back to a char boundary
+            let safe_start = (0..=abs_start)
+                .rev()
+                .find(|&i| text.is_char_boundary(i))
+                .unwrap_or(0);
+            result.push_str(&text[pos..safe_start]);
 
-            let after_open = abs_start + 7; // len("<think>")
+            let after_open = safe_start + 7; // "<think>" is 7 ASCII bytes — always safe
             if after_open <= text.len() {
                 if let Some(rel_close) = find_ci(&text[after_open..], "</think>") {
-                    pos = after_open + rel_close + 8; // len("</think>")
+                    pos = after_open + rel_close + 8; // "</think>" is 8 ASCII bytes — always safe
                 } else {
-                    break;
+                    break; // unclosed tag: drop everything from <think> onwards
                 }
             } else {
-                break;
+                break; // unclosed tag: drop everything from <think> onwards
             }
         } else {
             result.push_str(&text[pos..]);
@@ -3872,6 +3877,15 @@ fn strip_ansi_codes(input: &str) -> Cow<'_, str> {
     let mut idx = 0;
 
     while idx < bytes.len() {
+        // UTF-8 continuation bytes (0x80-0xBF) cannot be standalone control
+        // characters. Without this guard, a byte like 0x9B (C1 CSI) matched
+        // as a control character when it is actually the 3rd byte of a 4-byte
+        // emoji (e.g. 🛠 = F0 9F 9B A0) causes a slice panic at a non-char
+        // boundary.
+        if !input.is_char_boundary(idx) {
+            idx += 1;
+            continue;
+        }
         match bytes[idx] {
             0x1b => {
                 cleaned.push_str(&input[last_copy..idx]);
@@ -11393,6 +11407,20 @@ mod tests {
         assert_eq!(strip_think_tags(input), "");
     }
 
+    #[test]
+    fn strip_think_tags_with_emoji_no_panic() {
+        let input = "Hello 🛡 world <think>reasoning</think> done";
+        let result = strip_think_tags(input);
+        assert_eq!(result, "Hello 🛡 world  done");
+    }
+
+    #[test]
+    fn strip_think_tags_emoji_inside_think_no_panic() {
+        let input = "before<think>🛡 reasoning 🎯</think>after";
+        let result = strip_think_tags(input);
+        assert_eq!(result, "beforeafter");
+    }
+
     // ── extract_thought_line tests ────────────────────────────────────
 
     #[test]
@@ -11459,6 +11487,27 @@ mod tests {
     #[test]
     fn strip_ansi_codes_empty_string() {
         assert_eq!(strip_ansi_codes(""), "");
+    }
+
+    #[test]
+    fn strip_ansi_codes_emoji_with_0x9b_continuation_byte_does_not_panic() {
+        // 🛠 = U+1F6E0, UTF-8: F0 9F 9B A0.  The 0x9B byte is the C1 CSI
+        // character when standalone, but here it is a UTF-8 continuation byte.
+        // strip_ansi_codes must not panic or slice at a non-char boundary.
+        let input = "prefix 🛠 suffix";
+        let result = strip_ansi_codes(input);
+        assert!(result.contains("🛠"), "emoji must be preserved: {result}");
+        assert!(result.contains("prefix"));
+        assert!(result.contains("suffix"));
+    }
+
+    #[test]
+    fn strip_ansi_codes_camoufox_snapshot_with_emoji_preserved() {
+        // Regression: camoufox Twitter snapshot containing 🛠 caused a panic
+        // at byte index 21675 (inside the emoji) via the 0x9B match arm.
+        let snapshot = format!("{}{}{}", "a".repeat(20000), "🛠", "b".repeat(2000));
+        let result = strip_ansi_codes(&snapshot);
+        assert!(result.contains("🛠"), "emoji in large string must survive");
     }
 
     #[test]
