@@ -153,6 +153,55 @@ fn actual_cost_cents_from_total_cost_usd(total_cost_usd: Option<f64>) -> Option<
     })
 }
 
+fn truncate_diagnostic_snippet(value: &str, max_len: usize) -> String {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    if trimmed.len() <= max_len {
+        return trimmed.to_string();
+    }
+    let end = safe_truncate_index(trimmed, max_len);
+    format!("{}...", &trimmed[..end])
+}
+
+fn claudecode_incomplete_turn_message(
+    exit_summary: &str,
+    partial_output: Option<&str>,
+    non_json_output: &[String],
+    process_exited_without_result: bool,
+) -> String {
+    let mut message = if process_exited_without_result {
+        format!(
+            "Claude Code exited without emitting a terminal result event. Exit status: {}.",
+            exit_summary
+        )
+    } else {
+        format!(
+            "Claude Code did not emit a terminal result event before the turn ended. Exit status: {}.",
+            exit_summary
+        )
+    };
+
+    if let Some(output) = partial_output.map(|value| truncate_diagnostic_snippet(value, 1200)) {
+        if !output.is_empty() {
+            message.push_str(
+                "\n\nPartial assistant output was captured, but the turn is being treated as incomplete until a Claude result event is observed.",
+            );
+            message.push_str("\n\nPartial output:\n");
+            message.push_str(&output);
+        }
+    } else if !non_json_output.is_empty() {
+        message.push_str("\n\nNon-JSON output captured:\n");
+        message.push_str(&non_json_output.join("\n"));
+    }
+
+    message.push_str(
+        "\n\nTreating this as resumable transport failure rather than successful completion.",
+    );
+    message
+}
+
 async fn lease_codex_account(
     working_dir: &std::path::Path,
     tried_keys: &HashSet<String>,
@@ -3186,6 +3235,8 @@ pub fn run_claudecode_turn<'a>(
         let mut observed_model: Option<String> = None;
         let mut final_result = String::new();
         let mut had_error = false;
+        let mut saw_terminal_result_event = false;
+        let mut process_exited_without_result = false;
 
         // Track content block types and accumulated content for Claude Code streaming
         // This is needed because Claude sends incremental deltas that need to be accumulated
@@ -3312,6 +3363,7 @@ pub fn run_claudecode_turn<'a>(
                         mission_id = %mission_id,
                         "Claude Code process exited without emitting a result event, breaking event loop"
                     );
+                    process_exited_without_result = true;
                     // Kill any orphaned child processes still holding the PTY open
                     pty.kill();
                     reader_handle.abort();
@@ -3672,6 +3724,7 @@ pub fn run_claudecode_turn<'a>(
                                     }
                                 }
                                 ClaudeEvent::Result(res) => {
+                                    saw_terminal_result_event = true;
                                     if let Some(cost) = res.total_cost_usd {
                                         total_cost_usd = Some(cost);
                                     }
@@ -3769,6 +3822,25 @@ pub fn run_claudecode_turn<'a>(
                 mission_id = %mission_id,
                 "Using accumulated text buffer as final result ({} chars)",
                 final_result.len()
+            );
+        }
+
+        if !had_error && !saw_terminal_result_event {
+            had_error = true;
+            let exit_summary = describe_pty_exit_status(&exit_status);
+            let partial_output = (!final_result.trim().is_empty()).then_some(final_result.as_str());
+            tracing::warn!(
+                mission_id = %mission_id,
+                exit_status = %exit_summary,
+                process_exited_without_result,
+                had_partial_output = partial_output.is_some(),
+                "Claude Code turn ended without a terminal result event; treating as incomplete"
+            );
+            final_result = claudecode_incomplete_turn_message(
+                &exit_summary,
+                partial_output,
+                &non_json_output,
+                process_exited_without_result,
             );
         }
 
@@ -10699,16 +10771,16 @@ mod tests {
     use super::{
         actual_cost_cents_from_total_cost_usd, bind_command_params,
         codex_chatgpt_fallback_for_result, codex_chatgpt_fallback_model, codex_key_fingerprint,
-        extract_model_from_message, extract_opencode_session_id, extract_part_text, extract_str,
-        extract_thought_line, is_capacity_limited_error, is_codex_chatgpt_account_model_blocked,
-        is_codex_node_wrapper, is_rate_limited_error, is_session_corruption_error,
-        is_tool_call_only_output, opencode_output_needs_fallback, opencode_session_token_from_line,
-        parse_opencode_session_token, parse_opencode_sse_event, parse_opencode_stderr_text_part,
-        preferred_model_for_cost, resolve_cost_cents_and_source, running_health,
-        sanitized_opencode_stdout, stall_severity, strip_ansi_codes, strip_opencode_banner_lines,
-        strip_think_tags, summarize_recent_opencode_stderr, sync_opencode_agent_config,
-        MissionHealth, MissionRunState, MissionStallSeverity, OpencodeSseState, STALL_SEVERE_SECS,
-        STALL_WARN_SECS,
+        claudecode_incomplete_turn_message, extract_model_from_message,
+        extract_opencode_session_id, extract_part_text, extract_str, extract_thought_line,
+        is_capacity_limited_error, is_codex_chatgpt_account_model_blocked, is_codex_node_wrapper,
+        is_rate_limited_error, is_session_corruption_error, is_tool_call_only_output,
+        opencode_output_needs_fallback, opencode_session_token_from_line, parse_opencode_session_token,
+        parse_opencode_sse_event, parse_opencode_stderr_text_part, preferred_model_for_cost,
+        resolve_cost_cents_and_source, running_health, sanitized_opencode_stdout, stall_severity,
+        strip_ansi_codes, strip_opencode_banner_lines, strip_think_tags,
+        summarize_recent_opencode_stderr, sync_opencode_agent_config, MissionHealth,
+        MissionRunState, MissionStallSeverity, OpencodeSseState, STALL_SEVERE_SECS, STALL_WARN_SECS,
     };
     use crate::agents::{AgentResult, CostSource, TerminalReason};
     use crate::library::types::CommandParam;
@@ -11722,6 +11794,36 @@ mod tests {
         let result = AgentResult::failure("rate limit exceeded", 0)
             .with_terminal_reason(TerminalReason::LlmError);
         assert!(!is_session_corruption_error(&result));
+    }
+
+    #[test]
+    fn claudecode_incomplete_turn_message_marks_partial_output_as_incomplete() {
+        let message = claudecode_incomplete_turn_message(
+            "ExitStatus(unix_wait_status(0))",
+            Some("Ran tests and started summarizing the fix."),
+            &[],
+            true,
+        );
+
+        assert!(message.contains("exited without emitting a terminal result event"));
+        assert!(message.contains("Partial assistant output was captured"));
+        assert!(message.contains("Ran tests and started summarizing the fix."));
+        assert!(message.contains("resumable transport failure"));
+    }
+
+    #[test]
+    fn claudecode_incomplete_turn_message_falls_back_to_non_json_output() {
+        let message = claudecode_incomplete_turn_message(
+            "signal: Some(\"Killed\")",
+            None,
+            &["partial stderr".to_string(), "another line".to_string()],
+            false,
+        );
+
+        assert!(message.contains("did not emit a terminal result event"));
+        assert!(message.contains("Non-JSON output captured"));
+        assert!(message.contains("partial stderr"));
+        assert!(message.contains("another line"));
     }
 
     // ── parse_opencode_session_token tests ────────────────────────────
