@@ -1767,7 +1767,9 @@ pub(crate) fn claudecode_transport_recovery_strategy(
             if has_session_id && !attempted_same_session_resume {
                 return ClaudeTransportRecoveryStrategy::ResumeCurrentSession;
             }
-            return ClaudeTransportRecoveryStrategy::None;
+            if !attempted_session_reset {
+                return ClaudeTransportRecoveryStrategy::ResetSessionFresh;
+            }
         }
         Some(ClaudeTransportFailureStage::AwaitingClaude)
         | Some(ClaudeTransportFailureStage::AwaitingToolResults) => {
@@ -12413,7 +12415,7 @@ mod tests {
     }
 
     #[test]
-    fn claudecode_transport_recovery_strategy_preserves_post_tool_session_after_resume_attempt() {
+    fn claudecode_transport_recovery_strategy_escalates_post_tool_ambiguity_after_resume_attempt() {
         let result = AgentResult::failure("post-tool ambiguity", 0)
             .with_terminal_reason(TerminalReason::LlmError)
             .with_data(claudecode_transport_failure_data(
@@ -12425,7 +12427,7 @@ mod tests {
 
         assert_eq!(
             claudecode_transport_recovery_strategy(&result, true, true, false),
-            ClaudeTransportRecoveryStrategy::None
+            ClaudeTransportRecoveryStrategy::ResetSessionFresh
         );
     }
 
