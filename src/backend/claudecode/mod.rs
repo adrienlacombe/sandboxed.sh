@@ -14,6 +14,31 @@ use crate::backend::{AgentInfo, Backend, Session, SessionConfig};
 
 use client::{ClaudeCodeClient, ClaudeCodeConfig};
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ClaudeStreamEndState {
+    Complete,
+    MissingTerminalResult,
+    MissingTerminalResultWithPendingTools { pending_tool_names: Vec<String> },
+}
+
+fn classify_claude_stream_end(
+    saw_terminal_result: bool,
+    pending_tools: &HashMap<String, String>,
+) -> ClaudeStreamEndState {
+    if !pending_tools.is_empty() {
+        let mut pending_tool_names: Vec<String> = pending_tools.values().cloned().collect();
+        pending_tool_names.sort();
+        pending_tool_names.dedup();
+        return ClaudeStreamEndState::MissingTerminalResultWithPendingTools { pending_tool_names };
+    }
+
+    if saw_terminal_result {
+        ClaudeStreamEndState::Complete
+    } else {
+        ClaudeStreamEndState::MissingTerminalResult
+    }
+}
+
 /// Claude Code backend that spawns the Claude CLI for mission execution.
 pub struct ClaudeCodeBackend {
     id: String,
@@ -123,8 +148,12 @@ impl Backend for ClaudeCodeBackend {
         let handle = tokio::spawn(async move {
             // Track pending tool calls for name lookup AND completion tracking
             let mut pending_tools: HashMap<String, String> = HashMap::new();
+            let mut saw_terminal_result = false;
 
             while let Some(event) = claude_rx.recv().await {
+                if matches!(event, client::ClaudeEvent::Result(_)) {
+                    saw_terminal_result = true;
+                }
                 let exec_events = convert_cli_event(event, &mut pending_tools);
 
                 for exec_event in exec_events {
@@ -145,30 +174,42 @@ impl Backend for ClaudeCodeBackend {
                 }
             }
 
-            // Only send MessageComplete if no tools are pending
-            // This prevents premature completion when Claude CLI exits while tools are still running
-            if !pending_tools.is_empty() {
-                warn!(
-                    "Claude CLI process exited with {} pending tools: {:?}. This may indicate a bug.",
-                    pending_tools.len(),
-                    pending_tools.keys().collect::<Vec<_>>()
-                );
-                // Send error event instead of MessageComplete
-                let _ = tx
-                    .send(ExecutionEvent::Error {
-                        message: format!(
-                            "Claude CLI process exited unexpectedly with {} pending tools",
-                            pending_tools.len()
-                        ),
-                    })
-                    .await;
-            } else {
-                // No pending tools - safe to send MessageComplete
-                let _ = tx
-                    .send(ExecutionEvent::MessageComplete {
-                        session_id: session_id.clone(),
-                    })
-                    .await;
+            match classify_claude_stream_end(saw_terminal_result, &pending_tools) {
+                ClaudeStreamEndState::Complete => {
+                    let _ = tx
+                        .send(ExecutionEvent::MessageComplete {
+                            session_id: session_id.clone(),
+                        })
+                        .await;
+                }
+                ClaudeStreamEndState::MissingTerminalResult => {
+                    warn!(
+                        "Claude CLI stream ended without a terminal result event; treating as transport failure"
+                    );
+                    let _ = tx
+                        .send(ExecutionEvent::Error {
+                            message:
+                                "Claude CLI stream ended before emitting a terminal result event"
+                                    .to_string(),
+                        })
+                        .await;
+                }
+                ClaudeStreamEndState::MissingTerminalResultWithPendingTools {
+                    pending_tool_names,
+                } => {
+                    warn!(
+                        pending_tools = ?pending_tool_names,
+                        "Claude CLI stream ended with pending tools before a terminal result event"
+                    );
+                    let _ = tx
+                        .send(ExecutionEvent::Error {
+                            message: format!(
+                                "Claude CLI stream ended with pending tools before a terminal result event: {}",
+                                pending_tool_names.join(", ")
+                            ),
+                        })
+                        .await;
+                }
             }
 
             // Note: claude_handle is dropped here, but the process is managed
@@ -188,6 +229,7 @@ pub fn registry_entry() -> Arc<dyn Backend> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     #[tokio::test]
     async fn test_list_agents() {
@@ -211,5 +253,37 @@ mod tests {
             .unwrap();
         assert!(!session.id.is_empty());
         assert_eq!(session.directory, "/tmp");
+    }
+
+    #[test]
+    fn classify_claude_stream_end_requires_terminal_result_even_without_tools() {
+        let pending = HashMap::new();
+        assert_eq!(
+            classify_claude_stream_end(false, &pending),
+            ClaudeStreamEndState::MissingTerminalResult
+        );
+    }
+
+    #[test]
+    fn classify_claude_stream_end_reports_pending_tools_before_terminal_result() {
+        let mut pending = HashMap::new();
+        pending.insert("toolu_1".to_string(), "Bash".to_string());
+        pending.insert("toolu_2".to_string(), "Read".to_string());
+
+        assert_eq!(
+            classify_claude_stream_end(false, &pending),
+            ClaudeStreamEndState::MissingTerminalResultWithPendingTools {
+                pending_tool_names: vec!["Bash".to_string(), "Read".to_string()],
+            }
+        );
+    }
+
+    #[test]
+    fn classify_claude_stream_end_allows_completion_after_terminal_result() {
+        let pending = HashMap::new();
+        assert_eq!(
+            classify_claude_stream_end(true, &pending),
+            ClaudeStreamEndState::Complete
+        );
     }
 }
