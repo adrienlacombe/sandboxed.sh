@@ -1497,6 +1497,8 @@ fn bind_command_params(
 ///
 /// This covers:
 /// - "no stream events after startup timeout" — CLI hangs on resume
+/// - incomplete turns where Claude emitted activity but never produced a
+///   terminal `result` event before process exit or idle timeout
 /// - API validation errors from corrupted conversation history (e.g. mismatched
 ///   tool_use_id / tool_result blocks after a session was partially lost)
 /// - Context window exhaustion ("Prompt is too long") — session accumulated too
@@ -1509,6 +1511,16 @@ pub fn is_session_corruption_error(result: &AgentResult) -> bool {
     // Stuck session: CLI started but emitted no parseable events
     out.starts_with(
         "Claude Code produced no stream events after startup timeout",
+    )
+    // Claude produced activity but transport ended before any terminal result event.
+    || out.starts_with(
+        "Claude Code exited without emitting a terminal result event",
+    )
+    || out.starts_with(
+        "Claude Code stopped producing output before emitting a terminal result event",
+    )
+    || out.starts_with(
+        "Claude Code did not emit a terminal result event before the turn ended",
     )
     // API rejected the reconstructed conversation history
     || out.contains("unexpected tool_use_id found in tool_result blocks")
@@ -11810,6 +11822,36 @@ mod tests {
     fn is_session_corruption_error_detects_prompt_too_long() {
         let result = AgentResult::failure("Prompt is too long", 0)
             .with_terminal_reason(TerminalReason::LlmError);
+        assert!(is_session_corruption_error(&result));
+    }
+
+    #[test]
+    fn is_session_corruption_error_detects_incomplete_turn_after_process_exit() {
+        let result = AgentResult::failure(
+            "Claude Code exited without emitting a terminal result event. Exit status: 0.\n\nTreating this as resumable transport failure rather than successful completion.",
+            0,
+        )
+        .with_terminal_reason(TerminalReason::LlmError);
+        assert!(is_session_corruption_error(&result));
+    }
+
+    #[test]
+    fn is_session_corruption_error_detects_incomplete_turn_after_idle_timeout() {
+        let result = AgentResult::failure(
+            "Claude Code stopped producing output before emitting a terminal result event and hit the idle timeout. Exit status: signal: 9.\n\nTreating this as resumable transport failure rather than successful completion.",
+            0,
+        )
+        .with_terminal_reason(TerminalReason::LlmError);
+        assert!(is_session_corruption_error(&result));
+    }
+
+    #[test]
+    fn is_session_corruption_error_detects_generic_incomplete_turn_message() {
+        let result = AgentResult::failure(
+            "Claude Code did not emit a terminal result event before the turn ended. Exit status: ExitStatus { code: 1, signal: Some(\"Killed\") }.\n\nTreating this as resumable transport failure rather than successful completion.",
+            0,
+        )
+        .with_terminal_reason(TerminalReason::LlmError);
         assert!(is_session_corruption_error(&result));
     }
 
