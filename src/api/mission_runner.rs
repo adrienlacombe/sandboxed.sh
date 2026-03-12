@@ -196,6 +196,17 @@ fn claudecode_transport_failure_stage_for_wait_state(
     }
 }
 
+fn claudecode_transport_failure_stage_for_incomplete_turn(
+    saw_non_init_event: bool,
+    wait_state: ClaudeTurnWaitState,
+) -> ClaudeTransportFailureStage {
+    if saw_non_init_event {
+        claudecode_transport_failure_stage_for_wait_state(wait_state)
+    } else {
+        ClaudeTransportFailureStage::Startup
+    }
+}
+
 fn claudecode_transport_failure_stage_label(stage: ClaudeTransportFailureStage) -> &'static str {
     match stage {
         ClaudeTransportFailureStage::Startup => "startup",
@@ -3650,8 +3661,6 @@ pub fn run_claudecode_turn<'a>(
         // before breaking the loop. This lets us capture any final `result` event
         // that may already be buffered in the PTY/channel.
         let mut process_exit_grace_deadline: Option<Instant> = None;
-        let mut idle_timeout_wait_state = ClaudeTurnWaitState::AwaitingClaude;
-
         // Process events until completion or cancellation
         loop {
             tokio::select! {
@@ -3716,7 +3725,6 @@ pub fn run_claudecode_turn<'a>(
                     pty.kill();
                     reader_handle.abort();
                     idle_timeout_triggered = true;
-                    idle_timeout_wait_state = turn_wait_state;
                     break;
                 }
                 _ = process_exit_notify.notified(), if !process_exited => {
@@ -4253,8 +4261,10 @@ pub fn run_claudecode_turn<'a>(
                     &session_id,
                 );
             } else {
-                let stage =
-                    claudecode_transport_failure_stage_for_wait_state(idle_timeout_wait_state);
+                let stage = claudecode_transport_failure_stage_for_incomplete_turn(
+                    saw_non_init_event,
+                    turn_wait_state,
+                );
                 transport_failure_stage = Some(stage);
                 let partial_output =
                     (!final_result.trim().is_empty()).then_some(final_result.as_str());
@@ -4278,7 +4288,7 @@ pub fn run_claudecode_turn<'a>(
                         malformed_json_output: &malformed_json_output,
                         process_exited_without_result,
                         idle_timeout_triggered,
-                        wait_state: idle_timeout_wait_state,
+                        wait_state: turn_wait_state,
                         pending_tools: &pending_tool_names,
                     },
                 );
@@ -11233,12 +11243,13 @@ mod tests {
         claudecode_idle_timeout_for_state, claudecode_incomplete_turn_message,
         claudecode_malformed_startup_message, claudecode_pre_turn_transport_message,
         claudecode_resume_current_session_message, claudecode_transport_failure_data,
-        claudecode_transport_failure_stage, claudecode_transport_recovery_strategy,
-        codex_chatgpt_fallback_for_result, codex_chatgpt_fallback_model, codex_key_fingerprint,
-        extract_model_from_message, extract_opencode_session_id, extract_part_text, extract_str,
-        extract_thought_line, is_capacity_limited_error, is_codex_chatgpt_account_model_blocked,
-        is_codex_node_wrapper, is_rate_limited_error, is_session_corruption_error,
-        is_tool_call_only_output, opencode_output_needs_fallback, opencode_session_token_from_line,
+        claudecode_transport_failure_stage, claudecode_transport_failure_stage_for_incomplete_turn,
+        claudecode_transport_recovery_strategy, codex_chatgpt_fallback_for_result,
+        codex_chatgpt_fallback_model, codex_key_fingerprint, extract_model_from_message,
+        extract_opencode_session_id, extract_part_text, extract_str, extract_thought_line,
+        is_capacity_limited_error, is_codex_chatgpt_account_model_blocked, is_codex_node_wrapper,
+        is_rate_limited_error, is_session_corruption_error, is_tool_call_only_output,
+        opencode_output_needs_fallback, opencode_session_token_from_line,
         parse_opencode_session_token, parse_opencode_sse_event, parse_opencode_stderr_text_part,
         preferred_model_for_cost, resolve_cost_cents_and_source, running_health,
         sanitized_opencode_stdout, stall_severity, strip_ansi_codes, strip_opencode_banner_lines,
@@ -12404,6 +12415,28 @@ mod tests {
             Some(ClaudeTransportFailureStage::AwaitingTerminalResult)
         );
         assert!(is_session_corruption_error(&result));
+    }
+
+    #[test]
+    fn claudecode_transport_failure_stage_for_incomplete_turn_uses_current_post_tool_wait_state() {
+        assert_eq!(
+            claudecode_transport_failure_stage_for_incomplete_turn(
+                true,
+                ClaudeTurnWaitState::AwaitingTerminalResult,
+            ),
+            ClaudeTransportFailureStage::AwaitingTerminalResult
+        );
+    }
+
+    #[test]
+    fn claudecode_transport_failure_stage_for_incomplete_turn_preserves_tool_wait_state() {
+        assert_eq!(
+            claudecode_transport_failure_stage_for_incomplete_turn(
+                true,
+                ClaudeTurnWaitState::AwaitingToolResults,
+            ),
+            ClaudeTransportFailureStage::AwaitingToolResults
+        );
     }
 
     #[test]
