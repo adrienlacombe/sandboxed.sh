@@ -173,6 +173,76 @@ enum ClaudeTurnWaitState {
     AwaitingTerminalResult,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClaudeTransportFailureStage {
+    Startup,
+    AwaitingClaude,
+    AwaitingToolResults,
+    AwaitingTerminalResult,
+}
+
+fn claudecode_transport_failure_stage_for_wait_state(
+    state: ClaudeTurnWaitState,
+) -> ClaudeTransportFailureStage {
+    match state {
+        ClaudeTurnWaitState::Startup => ClaudeTransportFailureStage::Startup,
+        ClaudeTurnWaitState::AwaitingClaude => ClaudeTransportFailureStage::AwaitingClaude,
+        ClaudeTurnWaitState::AwaitingToolResults => {
+            ClaudeTransportFailureStage::AwaitingToolResults
+        }
+        ClaudeTurnWaitState::AwaitingTerminalResult => {
+            ClaudeTransportFailureStage::AwaitingTerminalResult
+        }
+    }
+}
+
+fn claudecode_transport_failure_stage_label(stage: ClaudeTransportFailureStage) -> &'static str {
+    match stage {
+        ClaudeTransportFailureStage::Startup => "startup",
+        ClaudeTransportFailureStage::AwaitingClaude => "awaiting_claude",
+        ClaudeTransportFailureStage::AwaitingToolResults => "awaiting_tool_results",
+        ClaudeTransportFailureStage::AwaitingTerminalResult => "awaiting_terminal_result",
+    }
+}
+
+fn claudecode_transport_failure_stage_from_label(
+    label: &str,
+) -> Option<ClaudeTransportFailureStage> {
+    match label {
+        "startup" => Some(ClaudeTransportFailureStage::Startup),
+        "awaiting_claude" => Some(ClaudeTransportFailureStage::AwaitingClaude),
+        "awaiting_tool_results" => Some(ClaudeTransportFailureStage::AwaitingToolResults),
+        "awaiting_terminal_result" => Some(ClaudeTransportFailureStage::AwaitingTerminalResult),
+        _ => None,
+    }
+}
+
+fn claudecode_transport_failure_data(
+    stage: ClaudeTransportFailureStage,
+    idle_timeout_triggered: bool,
+    process_exited_without_result: bool,
+    pending_tool_names: &[String],
+) -> serde_json::Value {
+    serde_json::json!({
+        "claudecode_transport_failure": {
+            "stage": claudecode_transport_failure_stage_label(stage),
+            "idle_timeout_triggered": idle_timeout_triggered,
+            "process_exited_without_result": process_exited_without_result,
+            "pending_tool_names": pending_tool_names,
+        }
+    })
+}
+
+fn claudecode_transport_failure_stage(result: &AgentResult) -> Option<ClaudeTransportFailureStage> {
+    result
+        .data
+        .as_ref()
+        .and_then(|data| data.get("claudecode_transport_failure"))
+        .and_then(|value| value.get("stage"))
+        .and_then(|value| value.as_str())
+        .and_then(claudecode_transport_failure_stage_from_label)
+}
+
 fn claudecode_idle_timeout_for_state(
     state: ClaudeTurnWaitState,
     idle_timeout: Duration,
@@ -1626,6 +1696,11 @@ pub fn is_session_corruption_error(result: &AgentResult) -> bool {
     if result.success || result.terminal_reason != Some(TerminalReason::LlmError) {
         return false;
     }
+
+    if claudecode_transport_failure_stage(result).is_some() {
+        return true;
+    }
+
     let out = &result.output;
     // Stuck session: CLI started but emitted no parseable events.
     // Match on stable transport markers instead of exact prefixes so retry
@@ -1649,7 +1724,7 @@ pub fn is_session_corruption_error(result: &AgentResult) -> bool {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ClaudeTransportRecoveryStrategy {
+pub(crate) enum ClaudeTransportRecoveryStrategy {
     None,
     ResumeCurrentSession,
     ResetSessionFresh,
@@ -1660,6 +1735,10 @@ fn is_claudecode_incomplete_turn_transport_error(result: &AgentResult) -> bool {
         return false;
     }
 
+    if let Some(stage) = claudecode_transport_failure_stage(result) {
+        return !matches!(stage, ClaudeTransportFailureStage::Startup);
+    }
+
     let out = &result.output;
     out.contains("Claude Code exited without emitting a terminal result event")
         || out.contains(
@@ -1668,7 +1747,7 @@ fn is_claudecode_incomplete_turn_transport_error(result: &AgentResult) -> bool {
         || out.contains("Claude Code did not emit a terminal result event before the turn ended")
 }
 
-fn claudecode_transport_recovery_strategy(
+pub(crate) fn claudecode_transport_recovery_strategy(
     result: &AgentResult,
     has_session_id: bool,
     attempted_same_session_resume: bool,
@@ -1678,21 +1757,45 @@ fn claudecode_transport_recovery_strategy(
         return ClaudeTransportRecoveryStrategy::None;
     }
 
-    if has_session_id
-        && is_claudecode_incomplete_turn_transport_error(result)
-        && !attempted_same_session_resume
-    {
-        return ClaudeTransportRecoveryStrategy::ResumeCurrentSession;
-    }
+    match claudecode_transport_failure_stage(result) {
+        Some(ClaudeTransportFailureStage::Startup) => {
+            if !attempted_session_reset {
+                return ClaudeTransportRecoveryStrategy::ResetSessionFresh;
+            }
+        }
+        Some(ClaudeTransportFailureStage::AwaitingTerminalResult) => {
+            if has_session_id && !attempted_same_session_resume {
+                return ClaudeTransportRecoveryStrategy::ResumeCurrentSession;
+            }
+            return ClaudeTransportRecoveryStrategy::None;
+        }
+        Some(ClaudeTransportFailureStage::AwaitingClaude)
+        | Some(ClaudeTransportFailureStage::AwaitingToolResults) => {
+            if has_session_id && !attempted_same_session_resume {
+                return ClaudeTransportRecoveryStrategy::ResumeCurrentSession;
+            }
+            if !attempted_session_reset {
+                return ClaudeTransportRecoveryStrategy::ResetSessionFresh;
+            }
+        }
+        None => {
+            if has_session_id
+                && is_claudecode_incomplete_turn_transport_error(result)
+                && !attempted_same_session_resume
+            {
+                return ClaudeTransportRecoveryStrategy::ResumeCurrentSession;
+            }
 
-    if !attempted_session_reset {
-        return ClaudeTransportRecoveryStrategy::ResetSessionFresh;
+            if !attempted_session_reset {
+                return ClaudeTransportRecoveryStrategy::ResetSessionFresh;
+            }
+        }
     }
 
     ClaudeTransportRecoveryStrategy::None
 }
 
-fn claudecode_resume_current_session_message() -> &'static str {
+pub(crate) fn claudecode_resume_current_session_message() -> &'static str {
     "Your previous response in this session ended before the final answer finished streaming. Continue from the current session state without restarting completed tool calls. If the work is already done, provide only the remaining final answer."
 }
 
@@ -3453,6 +3556,7 @@ pub fn run_claudecode_turn<'a>(
         let mut saw_terminal_result_event = false;
         let mut process_exited_without_result = false;
         let mut idle_timeout_triggered = false;
+        let mut transport_failure_stage: Option<ClaudeTransportFailureStage> = None;
 
         // Track content block types and accumulated content for Claude Code streaming
         // This is needed because Claude sends incremental deltas that need to be accumulated
@@ -3584,7 +3688,13 @@ pub fn run_claudecode_turn<'a>(
                         ));
                     }
                     return AgentResult::failure(msg, 0)
-                        .with_terminal_reason(TerminalReason::LlmError);
+                        .with_terminal_reason(TerminalReason::LlmError)
+                        .with_data(claudecode_transport_failure_data(
+                            ClaudeTransportFailureStage::Startup,
+                            false,
+                            false,
+                            &[],
+                        ));
                 }
                 _ = tokio::time::sleep_until(idle_deadline), if saw_non_init_event => {
                     tracing::warn!(
@@ -4116,6 +4226,7 @@ pub fn run_claudecode_turn<'a>(
             had_error = true;
             let exit_summary = describe_pty_exit_status(&exit_status);
             if !saw_non_init_event {
+                transport_failure_stage = Some(ClaudeTransportFailureStage::Startup);
                 tracing::warn!(
                     mission_id = %mission_id,
                     exit_status = %exit_summary,
@@ -4133,6 +4244,9 @@ pub fn run_claudecode_turn<'a>(
                     &session_id,
                 );
             } else {
+                let stage =
+                    claudecode_transport_failure_stage_for_wait_state(idle_timeout_wait_state);
+                transport_failure_stage = Some(stage);
                 let partial_output =
                     (!final_result.trim().is_empty()).then_some(final_result.as_str());
                 let pending_tool_names: Vec<String> = pending_tools
@@ -4232,6 +4346,15 @@ pub fn run_claudecode_turn<'a>(
             AgentResult::success(final_result, cost_cents)
                 .with_terminal_reason(TerminalReason::TurnComplete)
         };
+        if let Some(stage) = transport_failure_stage {
+            let pending_tool_names: Vec<String> = pending_tools.values().cloned().collect();
+            result = result.with_data(claudecode_transport_failure_data(
+                stage,
+                idle_timeout_triggered,
+                process_exited_without_result,
+                &pending_tool_names,
+            ));
+        }
         if let Some(model) = model_for_cost {
             result = result.with_model(model.to_string());
         }
@@ -11098,7 +11221,8 @@ mod tests {
         actual_cost_cents_from_total_cost_usd, bind_command_params,
         claudecode_idle_timeout_for_state, claudecode_incomplete_turn_message,
         claudecode_malformed_startup_message, claudecode_pre_turn_transport_message,
-        claudecode_resume_current_session_message, claudecode_transport_recovery_strategy,
+        claudecode_resume_current_session_message, claudecode_transport_failure_data,
+        claudecode_transport_failure_stage, claudecode_transport_recovery_strategy,
         codex_chatgpt_fallback_for_result, codex_chatgpt_fallback_model, codex_key_fingerprint,
         extract_model_from_message, extract_opencode_session_id, extract_part_text, extract_str,
         extract_thought_line, is_capacity_limited_error, is_codex_chatgpt_account_model_blocked,
@@ -11108,8 +11232,9 @@ mod tests {
         preferred_model_for_cost, resolve_cost_cents_and_source, running_health,
         sanitized_opencode_stdout, stall_severity, strip_ansi_codes, strip_opencode_banner_lines,
         strip_think_tags, summarize_recent_opencode_stderr, sync_opencode_agent_config,
-        ClaudeTransportRecoveryStrategy, ClaudeTurnWaitState, MissionHealth, MissionRunState,
-        MissionStallSeverity, OpencodeSseState, STALL_SEVERE_SECS, STALL_WARN_SECS,
+        ClaudeTransportFailureStage, ClaudeTransportRecoveryStrategy, ClaudeTurnWaitState,
+        MissionHealth, MissionRunState, MissionStallSeverity, OpencodeSseState, STALL_SEVERE_SECS,
+        STALL_WARN_SECS,
     };
     use crate::agents::{AgentResult, CostSource, TerminalReason};
     use crate::library::types::CommandParam;
@@ -12249,6 +12374,58 @@ mod tests {
         assert_eq!(
             claudecode_transport_recovery_strategy(&result, true, false, false),
             ClaudeTransportRecoveryStrategy::ResetSessionFresh
+        );
+    }
+
+    #[test]
+    fn claudecode_transport_failure_stage_reads_structured_post_tool_data() {
+        let result = AgentResult::failure("post-tool ambiguity", 0)
+            .with_terminal_reason(TerminalReason::LlmError)
+            .with_data(claudecode_transport_failure_data(
+                ClaudeTransportFailureStage::AwaitingTerminalResult,
+                true,
+                false,
+                &["Bash".to_string()],
+            ));
+
+        assert_eq!(
+            claudecode_transport_failure_stage(&result),
+            Some(ClaudeTransportFailureStage::AwaitingTerminalResult)
+        );
+        assert!(is_session_corruption_error(&result));
+    }
+
+    #[test]
+    fn claudecode_transport_recovery_strategy_prefers_resume_for_structured_post_tool_ambiguity() {
+        let result = AgentResult::failure("post-tool ambiguity", 0)
+            .with_terminal_reason(TerminalReason::LlmError)
+            .with_data(claudecode_transport_failure_data(
+                ClaudeTransportFailureStage::AwaitingTerminalResult,
+                true,
+                false,
+                &[],
+            ));
+
+        assert_eq!(
+            claudecode_transport_recovery_strategy(&result, true, false, false),
+            ClaudeTransportRecoveryStrategy::ResumeCurrentSession
+        );
+    }
+
+    #[test]
+    fn claudecode_transport_recovery_strategy_preserves_post_tool_session_after_resume_attempt() {
+        let result = AgentResult::failure("post-tool ambiguity", 0)
+            .with_terminal_reason(TerminalReason::LlmError)
+            .with_data(claudecode_transport_failure_data(
+                ClaudeTransportFailureStage::AwaitingTerminalResult,
+                true,
+                false,
+                &[],
+            ));
+
+        assert_eq!(
+            claudecode_transport_recovery_strategy(&result, true, true, false),
+            ClaudeTransportRecoveryStrategy::None
         );
     }
 

@@ -8042,10 +8042,14 @@ async fn run_single_control_turn(
             // where the session exists but history may not have assistant messages yet).
             let is_continuation =
                 force_session_resume || history.iter().any(|(role, _)| role == "assistant");
+            let mut effective_message = user_message.clone();
+            let mut effective_session_id = session_id.clone();
+            let mut attempted_same_session_resume = false;
+            let mut attempted_session_reset = false;
             let mut result = Box::pin(super::mission_runner::run_claudecode_turn(
                 exec_workspace,
                 &ctx.working_dir,
-                &user_message,
+                &effective_message,
                 config.default_model.as_deref(),
                 requested_model_effort.as_deref(),
                 config.opencode_agent.as_deref(),
@@ -8054,7 +8058,7 @@ async fn run_single_control_turn(
                 cancel.clone(),
                 None, // secrets - not available in control context
                 &config.working_dir,
-                session_id.as_deref(),
+                effective_session_id.as_deref(),
                 is_continuation,
                 Some(tool_hub.clone()),
                 Some(status.clone()),
@@ -8062,82 +8066,112 @@ async fn run_single_control_turn(
             ))
             .await;
 
-            // Claude Code can fail when resuming a session due to stale/corrupt state:
-            // - CLI hangs and emits no parseable stream events (startup timeout)
-            // - API rejects reconstructed history (e.g. mismatched tool_use_id)
-            // When that happens, auto-reset the session_id and retry once fresh.
-            // This fires regardless of `is_continuation` — startup timeouts can happen
-            // even on the first turn if the session marker was stale.
-            if super::mission_runner::is_session_corruption_error(&result) {
-                let new_session_id = Uuid::new_v4().to_string();
-                tracing::warn!(
-                    mission_id = %mid,
-                    old_session_id = ?session_id,
-                    new_session_id = %new_session_id,
-                    error = %result.output,
-                    "Session corruption detected; resetting session and retrying once"
-                );
-
-                // Persist the new session ID via the existing event pipeline.
-                // The control actor listens for this event and updates the mission store.
-                let _ = events_tx.send(AgentEvent::SessionIdUpdate {
-                    mission_id: mid,
-                    session_id: new_session_id.clone(),
-                });
-
-                // Delete the stale session marker so the retry creates it with the new
-                // session ID.  Without this, if the retry fails before writing the marker
-                // (e.g. connectivity check), the marker still holds the old session ID.
-                // A subsequent attempt would see a mismatch (DB has new ID, marker has
-                // old ID) and start a blank session — losing all conversation history.
-                let session_marker = ctx.working_dir.join(".claude-session-initiated");
-                if session_marker.exists() {
-                    let _ = std::fs::remove_file(&session_marker);
-                }
-
-                // The retry starts a fresh Claude Code session (no --resume), so Claude
-                // won't have any prior conversation.  Prepend recent history to the
-                // prompt so the agent retains context from earlier turns.
-                let history_for_retry = match history.last() {
-                    Some((role, content)) if role == "user" && content == &user_message => {
-                        &history[..history.len() - 1]
+            loop {
+                match super::mission_runner::claudecode_transport_recovery_strategy(
+                    &result,
+                    effective_session_id.is_some(),
+                    attempted_same_session_resume,
+                    attempted_session_reset,
+                ) {
+                    super::mission_runner::ClaudeTransportRecoveryStrategy::None => break,
+                    super::mission_runner::ClaudeTransportRecoveryStrategy::ResumeCurrentSession => {
+                        attempted_same_session_resume = true;
+                        tracing::warn!(
+                            mission_id = %mid,
+                            session_id = ?effective_session_id,
+                            error = %result.output,
+                            "Incomplete Claude turn detected; retrying once by continuing the current session"
+                        );
+                        effective_message =
+                            super::mission_runner::claudecode_resume_current_session_message()
+                                .to_string();
+                        result = Box::pin(super::mission_runner::run_claudecode_turn(
+                            exec_workspace,
+                            &ctx.working_dir,
+                            &effective_message,
+                            config.default_model.as_deref(),
+                            requested_model_effort.as_deref(),
+                            config.opencode_agent.as_deref(),
+                            mid,
+                            events_tx.clone(),
+                            cancel.clone(),
+                            None,
+                            &config.working_dir,
+                            effective_session_id.as_deref(),
+                            true,
+                            Some(tool_hub.clone()),
+                            Some(status.clone()),
+                            None,
+                        ))
+                        .await;
                     }
-                    _ => history.as_slice(),
-                };
-                let retry_message = if history_for_retry.is_empty() {
-                    user_message.clone()
-                } else {
-                    let history_ctx = build_history_context(
-                        history_for_retry,
-                        config.context.max_history_total_chars,
-                    );
-                    format!(
-                        "## Prior conversation (session was reset due to a transient error)\n\n\
-                         {history_ctx}\
-                         ## Current message\n\n\
-                         {user_message}"
-                    )
-                };
+                    super::mission_runner::ClaudeTransportRecoveryStrategy::ResetSessionFresh => {
+                        attempted_session_reset = true;
+                        let new_session_id = Uuid::new_v4().to_string();
+                        tracing::warn!(
+                            mission_id = %mid,
+                            old_session_id = ?effective_session_id,
+                            new_session_id = %new_session_id,
+                            attempted_same_session_resume,
+                            error = %result.output,
+                            "Session corruption detected; resetting session and retrying once"
+                        );
 
-                result = Box::pin(super::mission_runner::run_claudecode_turn(
-                    exec_workspace,
-                    &ctx.working_dir,
-                    &retry_message,
-                    config.default_model.as_deref(),
-                    requested_model_effort.as_deref(),
-                    config.opencode_agent.as_deref(),
-                    mid,
-                    events_tx.clone(),
-                    cancel.clone(),
-                    None, // secrets - not available in control context
-                    &config.working_dir,
-                    Some(&new_session_id),
-                    false, // Fresh session — don't pass is_continuation=true
-                    Some(tool_hub.clone()),
-                    Some(status.clone()),
-                    None, // override_auth
-                ))
-                .await;
+                        let _ = events_tx.send(AgentEvent::SessionIdUpdate {
+                            mission_id: mid,
+                            session_id: new_session_id.clone(),
+                        });
+
+                        let session_marker = ctx.working_dir.join(".claude-session-initiated");
+                        if session_marker.exists() {
+                            let _ = std::fs::remove_file(&session_marker);
+                        }
+
+                        let history_for_retry = match history.last() {
+                            Some((role, content)) if role == "user" && content == &user_message => {
+                                &history[..history.len() - 1]
+                            }
+                            _ => history.as_slice(),
+                        };
+                        let retry_message = if history_for_retry.is_empty() {
+                            user_message.clone()
+                        } else {
+                            let history_ctx = build_history_context(
+                                history_for_retry,
+                                config.context.max_history_total_chars,
+                            );
+                            format!(
+                                "## Prior conversation (session was reset due to a transient error)\n\n\
+                                 {history_ctx}\
+                                 ## Current message\n\n\
+                                 {user_message}"
+                            )
+                        };
+
+                        effective_message = retry_message;
+                        effective_session_id = Some(new_session_id);
+
+                        result = Box::pin(super::mission_runner::run_claudecode_turn(
+                            exec_workspace,
+                            &ctx.working_dir,
+                            &effective_message,
+                            config.default_model.as_deref(),
+                            requested_model_effort.as_deref(),
+                            config.opencode_agent.as_deref(),
+                            mid,
+                            events_tx.clone(),
+                            cancel.clone(),
+                            None,
+                            &config.working_dir,
+                            effective_session_id.as_deref(),
+                            false,
+                            Some(tool_hub.clone()),
+                            Some(status.clone()),
+                            None,
+                        ))
+                        .await;
+                    }
+                }
             }
 
             result
