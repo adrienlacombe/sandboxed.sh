@@ -1534,23 +1534,15 @@ pub fn is_session_corruption_error(result: &AgentResult) -> bool {
         return false;
     }
     let out = &result.output;
-    // Stuck session: CLI started but emitted no parseable events
-    out.starts_with(
-        "Claude Code produced no stream events after startup timeout",
-    )
-    || out.starts_with(
-        "Claude Code emitted malformed stream-json output before startup completed",
-    )
+    // Stuck session: CLI started but emitted no parseable events.
+    // Match on stable transport markers instead of exact prefixes so retry
+    // still triggers if the wrapper prepends extra diagnostics/context.
+    out.contains("Claude Code produced no stream events after startup timeout")
+    || out.contains("Claude Code emitted malformed stream-json output before startup completed")
     // Claude produced activity but transport ended before any terminal result event.
-    || out.starts_with(
-        "Claude Code exited without emitting a terminal result event",
-    )
-    || out.starts_with(
-        "Claude Code stopped producing output before emitting a terminal result event",
-    )
-    || out.starts_with(
-        "Claude Code did not emit a terminal result event before the turn ended",
-    )
+    || out.contains("Claude Code exited without emitting a terminal result event")
+    || out.contains("Claude Code stopped producing output before emitting a terminal result event")
+    || out.contains("Claude Code did not emit a terminal result event before the turn ended")
     // API rejected the reconstructed conversation history
     || out.contains("unexpected tool_use_id found in tool_result blocks")
     || out.contains("tool_use block must have a corresponding tool_result")
@@ -11921,6 +11913,26 @@ mod tests {
     fn is_session_corruption_error_detects_generic_incomplete_turn_message() {
         let result = AgentResult::failure(
             "Claude Code did not emit a terminal result event before the turn ended. Exit status: ExitStatus { code: 1, signal: Some(\"Killed\") }.\n\nTreating this as resumable transport failure rather than successful completion.",
+            0,
+        )
+        .with_terminal_reason(TerminalReason::LlmError);
+        assert!(is_session_corruption_error(&result));
+    }
+
+    #[test]
+    fn is_session_corruption_error_detects_wrapped_incomplete_turn_message() {
+        let result = AgentResult::failure(
+            "Mission runner retry candidate:\nClaude Code exited without emitting a terminal result event. Exit status: 0.\n\nTreating this as resumable transport failure rather than successful completion.",
+            0,
+        )
+        .with_terminal_reason(TerminalReason::LlmError);
+        assert!(is_session_corruption_error(&result));
+    }
+
+    #[test]
+    fn is_session_corruption_error_detects_wrapped_malformed_startup_message() {
+        let result = AgentResult::failure(
+            "Retrying Claude session after startup parse failure.\nClaude Code emitted malformed stream-json output before startup completed.\n\nTreating this as resumable transport corruption rather than successful startup.",
             0,
         )
         .with_terminal_reason(TerminalReason::LlmError);
