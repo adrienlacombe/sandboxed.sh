@@ -300,6 +300,38 @@ fn claudecode_malformed_startup_message(
     msg
 }
 
+fn claudecode_pre_turn_transport_message(
+    exit_summary: &str,
+    non_json_output: &[String],
+    malformed_json_output: &[String],
+    use_resume: bool,
+    session_id: &str,
+) -> String {
+    if !malformed_json_output.is_empty() {
+        let mut message =
+            claudecode_malformed_startup_message(malformed_json_output, use_resume, session_id);
+        message.push_str(&format!("\n\nExit status: {}", exit_summary));
+        return message;
+    }
+
+    let mut message = format!(
+        "Claude Code ended before startup completed and did not emit any parseable stream-json turn events. Exit status: {}.",
+        exit_summary
+    );
+    message.push_str(
+        "\n\nTreating this as resumable startup transport failure rather than successful completion.",
+    );
+    message.push_str(&format!(
+        "\n\nDiagnostics: use_resume={}, session_id={}",
+        use_resume, session_id
+    ));
+    if !non_json_output.is_empty() {
+        message.push_str("\n\nNon-JSON output captured:\n");
+        message.push_str(&non_json_output.join("\n"));
+    }
+    message
+}
+
 async fn lease_codex_account(
     working_dir: &std::path::Path,
     tried_keys: &HashSet<String>,
@@ -1600,6 +1632,7 @@ pub fn is_session_corruption_error(result: &AgentResult) -> bool {
     // still triggers if the wrapper prepends extra diagnostics/context.
     out.contains("Claude Code produced no stream events after startup timeout")
     || out.contains("Claude Code emitted malformed stream-json output before startup completed")
+    || out.contains("Claude Code ended before startup completed and did not emit any parseable stream-json turn events")
     // Claude produced activity but transport ended before any terminal result event.
     || out.contains("Claude Code exited without emitting a terminal result event")
     || out.contains("Claude Code stopped producing output before emitting a terminal result event")
@@ -4082,29 +4115,49 @@ pub fn run_claudecode_turn<'a>(
         if !had_error && !saw_terminal_result_event {
             had_error = true;
             let exit_summary = describe_pty_exit_status(&exit_status);
-            let partial_output = (!final_result.trim().is_empty()).then_some(final_result.as_str());
-            let pending_tool_names: Vec<String> = pending_tools
-                .values()
-                .map(|name| format!("- {}", name))
-                .collect();
-            tracing::warn!(
-                mission_id = %mission_id,
-                exit_status = %exit_summary,
-                process_exited_without_result,
-                idle_timeout_triggered,
-                had_partial_output = partial_output.is_some(),
-                "Claude Code turn ended without a terminal result event; treating as incomplete"
-            );
-            final_result = claudecode_incomplete_turn_message(
-                &exit_summary,
-                partial_output,
-                &non_json_output,
-                &malformed_json_output,
-                process_exited_without_result,
-                idle_timeout_triggered,
-                idle_timeout_wait_state,
-                &pending_tool_names,
-            );
+            if !saw_non_init_event {
+                tracing::warn!(
+                    mission_id = %mission_id,
+                    exit_status = %exit_summary,
+                    process_exited_without_result,
+                    idle_timeout_triggered,
+                    non_json_lines = non_json_output.len(),
+                    malformed_json_lines = malformed_json_output.len(),
+                    "Claude Code ended before any usable turn events; treating as startup transport failure"
+                );
+                final_result = claudecode_pre_turn_transport_message(
+                    &exit_summary,
+                    &non_json_output,
+                    &malformed_json_output,
+                    use_resume,
+                    &session_id,
+                );
+            } else {
+                let partial_output =
+                    (!final_result.trim().is_empty()).then_some(final_result.as_str());
+                let pending_tool_names: Vec<String> = pending_tools
+                    .values()
+                    .map(|name| format!("- {}", name))
+                    .collect();
+                tracing::warn!(
+                    mission_id = %mission_id,
+                    exit_status = %exit_summary,
+                    process_exited_without_result,
+                    idle_timeout_triggered,
+                    had_partial_output = partial_output.is_some(),
+                    "Claude Code turn ended without a terminal result event; treating as incomplete"
+                );
+                final_result = claudecode_incomplete_turn_message(
+                    &exit_summary,
+                    partial_output,
+                    &non_json_output,
+                    &malformed_json_output,
+                    process_exited_without_result,
+                    idle_timeout_triggered,
+                    idle_timeout_wait_state,
+                    &pending_tool_names,
+                );
+            }
         }
 
         if final_result.trim().is_empty() && !had_error {
@@ -11044,13 +11097,13 @@ mod tests {
     use super::{
         actual_cost_cents_from_total_cost_usd, bind_command_params,
         claudecode_idle_timeout_for_state, claudecode_incomplete_turn_message,
-        claudecode_malformed_startup_message, claudecode_resume_current_session_message,
-        claudecode_transport_recovery_strategy, codex_chatgpt_fallback_for_result,
-        codex_chatgpt_fallback_model, codex_key_fingerprint, extract_model_from_message,
-        extract_opencode_session_id, extract_part_text, extract_str, extract_thought_line,
-        is_capacity_limited_error, is_codex_chatgpt_account_model_blocked, is_codex_node_wrapper,
-        is_rate_limited_error, is_session_corruption_error, is_tool_call_only_output,
-        opencode_output_needs_fallback, opencode_session_token_from_line,
+        claudecode_malformed_startup_message, claudecode_pre_turn_transport_message,
+        claudecode_resume_current_session_message, claudecode_transport_recovery_strategy,
+        codex_chatgpt_fallback_for_result, codex_chatgpt_fallback_model, codex_key_fingerprint,
+        extract_model_from_message, extract_opencode_session_id, extract_part_text, extract_str,
+        extract_thought_line, is_capacity_limited_error, is_codex_chatgpt_account_model_blocked,
+        is_codex_node_wrapper, is_rate_limited_error, is_session_corruption_error,
+        is_tool_call_only_output, opencode_output_needs_fallback, opencode_session_token_from_line,
         parse_opencode_session_token, parse_opencode_sse_event, parse_opencode_stderr_text_part,
         preferred_model_for_cost, resolve_cost_cents_and_source, running_health,
         sanitized_opencode_stdout, stall_severity, strip_ansi_codes, strip_opencode_banner_lines,
@@ -12127,6 +12180,16 @@ mod tests {
     }
 
     #[test]
+    fn is_session_corruption_error_detects_pre_turn_transport_message() {
+        let result = AgentResult::failure(
+            "Claude Code ended before startup completed and did not emit any parseable stream-json turn events. Exit status: signal: 9.\n\nTreating this as resumable startup transport failure rather than successful completion.\n\nDiagnostics: use_resume=true, session_id=session-123",
+            0,
+        )
+        .with_terminal_reason(TerminalReason::LlmError);
+        assert!(is_session_corruption_error(&result));
+    }
+
+    #[test]
     fn is_session_corruption_error_false_for_other_llm_error() {
         let result = AgentResult::failure("rate limit exceeded", 0)
             .with_terminal_reason(TerminalReason::LlmError);
@@ -12165,6 +12228,20 @@ mod tests {
     fn claudecode_transport_recovery_strategy_resets_for_malformed_startup_without_resume() {
         let result = AgentResult::failure(
             "Claude Code emitted malformed stream-json output before startup completed.\n\nTreating this as resumable transport corruption rather than successful startup.",
+            0,
+        )
+        .with_terminal_reason(TerminalReason::LlmError);
+
+        assert_eq!(
+            claudecode_transport_recovery_strategy(&result, true, false, false),
+            ClaudeTransportRecoveryStrategy::ResetSessionFresh
+        );
+    }
+
+    #[test]
+    fn claudecode_transport_recovery_strategy_resets_for_pre_turn_transport_failure() {
+        let result = AgentResult::failure(
+            "Claude Code ended before startup completed and did not emit any parseable stream-json turn events. Exit status: signal: 9.\n\nTreating this as resumable startup transport failure rather than successful completion.\n\nDiagnostics: use_resume=true, session_id=session-123",
             0,
         )
         .with_terminal_reason(TerminalReason::LlmError);
@@ -12275,6 +12352,23 @@ mod tests {
         assert!(message.contains("use_resume=true"));
         assert!(message.contains("session-123"));
         assert!(message.contains("Parse error: expected value"));
+    }
+
+    #[test]
+    fn claudecode_pre_turn_transport_message_marks_output_as_resumable_startup_failure() {
+        let message = claudecode_pre_turn_transport_message(
+            "signal: 9",
+            &["wrapper: process died".to_string()],
+            &[],
+            true,
+            "session-123",
+        );
+
+        assert!(message.contains("ended before startup completed"));
+        assert!(message.contains("resumable startup transport failure"));
+        assert!(message.contains("wrapper: process died"));
+        assert!(message.contains("use_resume=true"));
+        assert!(message.contains("session_id=session-123"));
     }
 
     #[test]
