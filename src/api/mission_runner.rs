@@ -281,36 +281,40 @@ fn claudecode_idle_deadline(
     }
 }
 
-fn claudecode_incomplete_turn_message(
-    exit_summary: &str,
-    partial_output: Option<&str>,
-    non_json_output: &[String],
-    malformed_json_output: &[String],
+struct ClaudeIncompleteTurnContext<'a> {
+    partial_output: Option<&'a str>,
+    non_json_output: &'a [String],
+    malformed_json_output: &'a [String],
     process_exited_without_result: bool,
     idle_timeout_triggered: bool,
     wait_state: ClaudeTurnWaitState,
-    pending_tools: &[String],
+    pending_tools: &'a [String],
+}
+
+fn claudecode_incomplete_turn_message(
+    exit_summary: &str,
+    ctx: ClaudeIncompleteTurnContext<'_>,
 ) -> String {
-    let mut message = if idle_timeout_triggered
-        && matches!(wait_state, ClaudeTurnWaitState::AwaitingToolResults)
+    let mut message = if ctx.idle_timeout_triggered
+        && matches!(ctx.wait_state, ClaudeTurnWaitState::AwaitingToolResults)
     {
         format!(
             "Claude Code stopped producing output while waiting for tool results before emitting a terminal result event and hit the tool-wait idle timeout. Exit status: {}.",
             exit_summary
         )
-    } else if idle_timeout_triggered
-        && matches!(wait_state, ClaudeTurnWaitState::AwaitingTerminalResult)
+    } else if ctx.idle_timeout_triggered
+        && matches!(ctx.wait_state, ClaudeTurnWaitState::AwaitingTerminalResult)
     {
         format!(
             "Claude Code stopped producing output after all observed tool results completed but before emitting a terminal result event, and hit the post-tool-result idle timeout. Exit status: {}.",
             exit_summary
         )
-    } else if idle_timeout_triggered {
+    } else if ctx.idle_timeout_triggered {
         format!(
             "Claude Code stopped producing output before emitting a terminal result event and hit the idle timeout. Exit status: {}.",
             exit_summary
         )
-    } else if process_exited_without_result {
+    } else if ctx.process_exited_without_result {
         format!(
             "Claude Code exited without emitting a terminal result event. Exit status: {}.",
             exit_summary
@@ -322,7 +326,10 @@ fn claudecode_incomplete_turn_message(
         )
     };
 
-    if let Some(output) = partial_output.map(|value| truncate_diagnostic_snippet(value, 1200)) {
+    if let Some(output) = ctx
+        .partial_output
+        .map(|value| truncate_diagnostic_snippet(value, 1200))
+    {
         if !output.is_empty() {
             message.push_str(
                 "\n\nPartial assistant output was captured, but the turn is being treated as incomplete until a Claude result event is observed.",
@@ -330,17 +337,17 @@ fn claudecode_incomplete_turn_message(
             message.push_str("\n\nPartial output:\n");
             message.push_str(&output);
         }
-    } else if !non_json_output.is_empty() {
+    } else if !ctx.non_json_output.is_empty() {
         message.push_str("\n\nNon-JSON output captured:\n");
-        message.push_str(&non_json_output.join("\n"));
-    } else if !malformed_json_output.is_empty() {
+        message.push_str(&ctx.non_json_output.join("\n"));
+    } else if !ctx.malformed_json_output.is_empty() {
         message.push_str("\n\nMalformed JSON output captured:\n");
-        message.push_str(&malformed_json_output.join("\n"));
+        message.push_str(&ctx.malformed_json_output.join("\n"));
     }
 
-    if !pending_tools.is_empty() {
+    if !ctx.pending_tools.is_empty() {
         message.push_str("\n\nPending tool calls at timeout:\n");
-        message.push_str(&pending_tools.join("\n"));
+        message.push_str(&ctx.pending_tools.join("\n"));
     }
 
     message.push_str(
@@ -4265,13 +4272,15 @@ pub fn run_claudecode_turn<'a>(
                 );
                 final_result = claudecode_incomplete_turn_message(
                     &exit_summary,
-                    partial_output,
-                    &non_json_output,
-                    &malformed_json_output,
-                    process_exited_without_result,
-                    idle_timeout_triggered,
-                    idle_timeout_wait_state,
-                    &pending_tool_names,
+                    ClaudeIncompleteTurnContext {
+                        partial_output,
+                        non_json_output: &non_json_output,
+                        malformed_json_output: &malformed_json_output,
+                        process_exited_without_result,
+                        idle_timeout_triggered,
+                        wait_state: idle_timeout_wait_state,
+                        pending_tools: &pending_tool_names,
+                    },
                 );
             }
         }
@@ -11234,9 +11243,9 @@ mod tests {
         preferred_model_for_cost, resolve_cost_cents_and_source, running_health,
         sanitized_opencode_stdout, stall_severity, strip_ansi_codes, strip_opencode_banner_lines,
         strip_think_tags, summarize_recent_opencode_stderr, sync_opencode_agent_config,
-        ClaudeTransportFailureStage, ClaudeTransportRecoveryStrategy, ClaudeTurnWaitState,
-        MissionHealth, MissionRunState, MissionStallSeverity, OpencodeSseState, STALL_SEVERE_SECS,
-        STALL_WARN_SECS,
+        ClaudeIncompleteTurnContext, ClaudeTransportFailureStage, ClaudeTransportRecoveryStrategy,
+        ClaudeTurnWaitState, MissionHealth, MissionRunState, MissionStallSeverity,
+        OpencodeSseState, STALL_SEVERE_SECS, STALL_WARN_SECS,
     };
     use crate::agents::{AgentResult, CostSource, TerminalReason};
     use crate::library::types::CommandParam;
@@ -12442,13 +12451,15 @@ mod tests {
     fn claudecode_incomplete_turn_message_marks_partial_output_as_incomplete() {
         let message = claudecode_incomplete_turn_message(
             "ExitStatus(unix_wait_status(0))",
-            Some("Ran tests and started summarizing the fix."),
-            &[],
-            &[],
-            true,
-            false,
-            ClaudeTurnWaitState::AwaitingClaude,
-            &[],
+            ClaudeIncompleteTurnContext {
+                partial_output: Some("Ran tests and started summarizing the fix."),
+                non_json_output: &[],
+                malformed_json_output: &[],
+                process_exited_without_result: true,
+                idle_timeout_triggered: false,
+                wait_state: ClaudeTurnWaitState::AwaitingClaude,
+                pending_tools: &[],
+            },
         );
 
         assert!(message.contains("exited without emitting a terminal result event"));
@@ -12461,13 +12472,15 @@ mod tests {
     fn claudecode_incomplete_turn_message_falls_back_to_non_json_output() {
         let message = claudecode_incomplete_turn_message(
             "signal: Some(\"Killed\")",
-            None,
-            &["partial stderr".to_string(), "another line".to_string()],
-            &[],
-            false,
-            false,
-            ClaudeTurnWaitState::AwaitingClaude,
-            &[],
+            ClaudeIncompleteTurnContext {
+                partial_output: None,
+                non_json_output: &["partial stderr".to_string(), "another line".to_string()],
+                malformed_json_output: &[],
+                process_exited_without_result: false,
+                idle_timeout_triggered: false,
+                wait_state: ClaudeTurnWaitState::AwaitingClaude,
+                pending_tools: &[],
+            },
         );
 
         assert!(message.contains("did not emit a terminal result event"));
@@ -12480,13 +12493,15 @@ mod tests {
     fn claudecode_incomplete_turn_message_marks_idle_timeout_as_resumable() {
         let message = claudecode_incomplete_turn_message(
             "signal: Some(\"Killed\")",
-            Some("Started running tests before going quiet."),
-            &[],
-            &[],
-            false,
-            true,
-            ClaudeTurnWaitState::AwaitingClaude,
-            &["- Bash".to_string(), "- Read".to_string()],
+            ClaudeIncompleteTurnContext {
+                partial_output: Some("Started running tests before going quiet."),
+                non_json_output: &[],
+                malformed_json_output: &[],
+                process_exited_without_result: false,
+                idle_timeout_triggered: true,
+                wait_state: ClaudeTurnWaitState::AwaitingClaude,
+                pending_tools: &["- Bash".to_string(), "- Read".to_string()],
+            },
         );
 
         assert!(message.contains("hit the idle timeout"));
@@ -12501,16 +12516,18 @@ mod tests {
     fn claudecode_incomplete_turn_message_falls_back_to_malformed_json_output() {
         let message = claudecode_incomplete_turn_message(
             "signal: Some(\"Killed\")",
-            None,
-            &[],
-            &[
-                "Parse error: eof while parsing an object | line: {\"type\":\"assistant\""
-                    .to_string(),
-            ],
-            false,
-            false,
-            ClaudeTurnWaitState::AwaitingClaude,
-            &[],
+            ClaudeIncompleteTurnContext {
+                partial_output: None,
+                non_json_output: &[],
+                malformed_json_output: &[
+                    "Parse error: eof while parsing an object | line: {\"type\":\"assistant\""
+                        .to_string(),
+                ],
+                process_exited_without_result: false,
+                idle_timeout_triggered: false,
+                wait_state: ClaudeTurnWaitState::AwaitingClaude,
+                pending_tools: &[],
+            },
         );
 
         assert!(message.contains("Malformed JSON output captured"));
@@ -12589,13 +12606,15 @@ mod tests {
     fn claudecode_incomplete_turn_message_marks_tool_wait_idle_timeout_as_resumable() {
         let message = claudecode_incomplete_turn_message(
             "signal: Some(\"Killed\")",
-            Some("Waiting for the long-running Bash command to finish."),
-            &[],
-            &[],
-            false,
-            true,
-            ClaudeTurnWaitState::AwaitingToolResults,
-            &["- Bash".to_string()],
+            ClaudeIncompleteTurnContext {
+                partial_output: Some("Waiting for the long-running Bash command to finish."),
+                non_json_output: &[],
+                malformed_json_output: &[],
+                process_exited_without_result: false,
+                idle_timeout_triggered: true,
+                wait_state: ClaudeTurnWaitState::AwaitingToolResults,
+                pending_tools: &["- Bash".to_string()],
+            },
         );
 
         assert!(message.contains("waiting for tool results"));
@@ -12607,13 +12626,17 @@ mod tests {
     fn claudecode_incomplete_turn_message_marks_post_tool_result_idle_timeout_as_resumable() {
         let message = claudecode_incomplete_turn_message(
             "signal: Some(\"Killed\")",
-            Some("Tool output arrived, but Claude never sent the final result."),
-            &[],
-            &[],
-            false,
-            true,
-            ClaudeTurnWaitState::AwaitingTerminalResult,
-            &[],
+            ClaudeIncompleteTurnContext {
+                partial_output: Some(
+                    "Tool output arrived, but Claude never sent the final result.",
+                ),
+                non_json_output: &[],
+                malformed_json_output: &[],
+                process_exited_without_result: false,
+                idle_timeout_triggered: true,
+                wait_state: ClaudeTurnWaitState::AwaitingTerminalResult,
+                pending_tools: &[],
+            },
         );
 
         assert!(message.contains("after all observed tool results completed"));
