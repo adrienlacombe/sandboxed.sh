@@ -169,6 +169,7 @@ fn claudecode_incomplete_turn_message(
     exit_summary: &str,
     partial_output: Option<&str>,
     non_json_output: &[String],
+    malformed_json_output: &[String],
     process_exited_without_result: bool,
     idle_timeout_triggered: bool,
     pending_tools: &[String],
@@ -201,6 +202,9 @@ fn claudecode_incomplete_turn_message(
     } else if !non_json_output.is_empty() {
         message.push_str("\n\nNon-JSON output captured:\n");
         message.push_str(&non_json_output.join("\n"));
+    } else if !malformed_json_output.is_empty() {
+        message.push_str("\n\nMalformed JSON output captured:\n");
+        message.push_str(&malformed_json_output.join("\n"));
     }
 
     if !pending_tools.is_empty() {
@@ -212,6 +216,27 @@ fn claudecode_incomplete_turn_message(
         "\n\nTreating this as resumable transport failure rather than successful completion.",
     );
     message
+}
+
+fn claudecode_malformed_startup_message(
+    diagnostics: &[String],
+    use_resume: bool,
+    session_id: &str,
+) -> String {
+    let mut msg =
+        "Claude Code emitted malformed stream-json output before startup completed.".to_string();
+    msg.push_str(
+        "\n\nTreating this as resumable transport corruption rather than successful startup.",
+    );
+    msg.push_str(&format!(
+        "\n\nDiagnostics: use_resume={}, session_id={}",
+        use_resume, session_id
+    ));
+    if !diagnostics.is_empty() {
+        msg.push_str("\n\nMalformed JSON output captured:\n");
+        msg.push_str(&diagnostics.join("\n"));
+    }
+    msg
 }
 
 async fn lease_codex_account(
@@ -1497,6 +1522,7 @@ fn bind_command_params(
 ///
 /// This covers:
 /// - "no stream events after startup timeout" — CLI hangs on resume
+/// - malformed stream-json output before startup completed
 /// - incomplete turns where Claude emitted activity but never produced a
 ///   terminal `result` event before process exit or idle timeout
 /// - API validation errors from corrupted conversation history (e.g. mismatched
@@ -1511,6 +1537,9 @@ pub fn is_session_corruption_error(result: &AgentResult) -> bool {
     // Stuck session: CLI started but emitted no parseable events
     out.starts_with(
         "Claude Code produced no stream events after startup timeout",
+    )
+    || out.starts_with(
+        "Claude Code emitted malformed stream-json output before startup completed",
     )
     // Claude produced activity but transport ended before any terminal result event.
     || out.starts_with(
@@ -3248,6 +3277,7 @@ pub fn run_claudecode_turn<'a>(
         });
 
         let mut non_json_output: Vec<String> = Vec::new();
+        let mut malformed_json_output: Vec<String> = Vec::new();
 
         // Track tool calls for result mapping
         let mut pending_tools: HashMap<String, String> = HashMap::new();
@@ -3342,16 +3372,27 @@ pub fn run_claudecode_turn<'a>(
                         mission_id = %mission_id,
                         use_resume = use_resume,
                         non_json_lines = non_json_output.len(),
+                        malformed_json_lines = malformed_json_output.len(),
                         non_json_sample = ?non_json_output.first(),
+                        malformed_json_sample = ?malformed_json_output.first(),
                         cli_program = %program,
                         cli_args_count = full_args.len(),
                         "Claude Code startup timeout - no stream events received"
                     );
                     pty.kill();
                     reader_handle.abort();
-                    let mut msg = "Claude Code produced no stream events after startup timeout. The Claude CLI started but did not emit any stream-json events.".to_string();
-                    msg.push_str("\n\nThis can happen when resuming an old/stuck Claude session or when the CLI hangs during initialization.");
-                    msg.push_str(&format!("\n\nDiagnostics: use_resume={}, session_id={}", use_resume, session_id));
+                    let mut msg = if !malformed_json_output.is_empty() {
+                        claudecode_malformed_startup_message(
+                            &malformed_json_output,
+                            use_resume,
+                            &session_id,
+                        )
+                    } else {
+                        let mut msg = "Claude Code produced no stream events after startup timeout. The Claude CLI started but did not emit any stream-json events.".to_string();
+                        msg.push_str("\n\nThis can happen when resuming an old/stuck Claude session or when the CLI hangs during initialization.");
+                        msg.push_str(&format!("\n\nDiagnostics: use_resume={}, session_id={}", use_resume, session_id));
+                        msg
+                    };
                     if !non_json_output.is_empty() {
                         msg.push_str(&format!(
                             "\n\nNon-JSON output captured ({} lines):\n{}",
@@ -3428,6 +3469,16 @@ pub fn run_claudecode_turn<'a>(
                     let claude_event: ClaudeEvent = match serde_json::from_str(line) {
                         Ok(event) => event,
                         Err(e) => {
+                            if malformed_json_output.len() < 20 {
+                                let excerpt = if line.len() > 200 {
+                                    let end = safe_truncate_index(line, 200);
+                                    format!("{}...", &line[..end])
+                                } else {
+                                    line.to_string()
+                                };
+                                malformed_json_output
+                                    .push(format!("Parse error: {} | line: {}", e, excerpt));
+                            }
                             tracing::warn!(
                                 mission_id = %mission_id,
                                 "Failed to parse Claude event: {} - line: {}",
@@ -3873,6 +3924,7 @@ pub fn run_claudecode_turn<'a>(
                 &exit_summary,
                 partial_output,
                 &non_json_output,
+                &malformed_json_output,
                 process_exited_without_result,
                 idle_timeout_triggered,
                 &pending_tool_names,
@@ -3890,6 +3942,16 @@ pub fn run_claudecode_turn<'a>(
                 final_result = format!(
                     "Claude Code produced no parseable output. Last output: {}",
                     non_json_output.join(" | ")
+                );
+            } else if !malformed_json_output.is_empty() {
+                tracing::warn!(
+                    mission_id = %mission_id,
+                    exit_status = ?exit_status,
+                    "Claude Code produced malformed JSON output"
+                );
+                final_result = format!(
+                    "Claude Code produced malformed stream-json output. Last malformed lines: {}",
+                    malformed_json_output.join(" | ")
                 );
             } else {
                 let exit_summary = describe_pty_exit_status(&exit_status);
@@ -10805,12 +10867,12 @@ fn cleanup_old_debug_files(
 mod tests {
     use super::{
         actual_cost_cents_from_total_cost_usd, bind_command_params,
-        claudecode_incomplete_turn_message, codex_chatgpt_fallback_for_result,
-        codex_chatgpt_fallback_model, codex_key_fingerprint, extract_model_from_message,
-        extract_opencode_session_id, extract_part_text, extract_str, extract_thought_line,
-        is_capacity_limited_error, is_codex_chatgpt_account_model_blocked, is_codex_node_wrapper,
-        is_rate_limited_error, is_session_corruption_error, is_tool_call_only_output,
-        opencode_output_needs_fallback, opencode_session_token_from_line,
+        claudecode_incomplete_turn_message, claudecode_malformed_startup_message,
+        codex_chatgpt_fallback_for_result, codex_chatgpt_fallback_model, codex_key_fingerprint,
+        extract_model_from_message, extract_opencode_session_id, extract_part_text, extract_str,
+        extract_thought_line, is_capacity_limited_error, is_codex_chatgpt_account_model_blocked,
+        is_codex_node_wrapper, is_rate_limited_error, is_session_corruption_error,
+        is_tool_call_only_output, opencode_output_needs_fallback, opencode_session_token_from_line,
         parse_opencode_session_token, parse_opencode_sse_event, parse_opencode_stderr_text_part,
         preferred_model_for_cost, resolve_cost_cents_and_source, running_health,
         sanitized_opencode_stdout, stall_severity, strip_ansi_codes, strip_opencode_banner_lines,
@@ -11782,6 +11844,16 @@ mod tests {
     }
 
     #[test]
+    fn is_session_corruption_error_detects_malformed_startup_output() {
+        let result = AgentResult::failure(
+            "Claude Code emitted malformed stream-json output before startup completed",
+            0,
+        )
+        .with_terminal_reason(TerminalReason::LlmError);
+        assert!(is_session_corruption_error(&result));
+    }
+
+    #[test]
     fn is_session_corruption_error_detects_tool_use_id_mismatch() {
         let result = AgentResult::failure("unexpected tool_use_id found in tool_result blocks", 0)
             .with_terminal_reason(TerminalReason::LlmError);
@@ -11868,6 +11940,7 @@ mod tests {
             "ExitStatus(unix_wait_status(0))",
             Some("Ran tests and started summarizing the fix."),
             &[],
+            &[],
             true,
             false,
             &[],
@@ -11885,6 +11958,7 @@ mod tests {
             "signal: Some(\"Killed\")",
             None,
             &["partial stderr".to_string(), "another line".to_string()],
+            &[],
             false,
             false,
             &[],
@@ -11902,6 +11976,7 @@ mod tests {
             "signal: Some(\"Killed\")",
             Some("Started running tests before going quiet."),
             &[],
+            &[],
             false,
             true,
             &["- Bash".to_string(), "- Read".to_string()],
@@ -11913,6 +11988,41 @@ mod tests {
         assert!(message.contains("- Bash"));
         assert!(message.contains("- Read"));
         assert!(message.contains("resumable transport failure"));
+    }
+
+    #[test]
+    fn claudecode_incomplete_turn_message_falls_back_to_malformed_json_output() {
+        let message = claudecode_incomplete_turn_message(
+            "signal: Some(\"Killed\")",
+            None,
+            &[],
+            &[
+                "Parse error: eof while parsing an object | line: {\"type\":\"assistant\""
+                    .to_string(),
+            ],
+            false,
+            false,
+            &[],
+        );
+
+        assert!(message.contains("Malformed JSON output captured"));
+        assert!(message.contains("Parse error: eof while parsing an object"));
+        assert!(message.contains("resumable transport failure"));
+    }
+
+    #[test]
+    fn claudecode_malformed_startup_message_marks_output_as_resumable_transport_corruption() {
+        let message = claudecode_malformed_startup_message(
+            &["Parse error: expected value at line 1 column 42 | line: {bad".to_string()],
+            true,
+            "session-123",
+        );
+
+        assert!(message.contains("malformed stream-json output before startup completed"));
+        assert!(message.contains("resumable transport corruption"));
+        assert!(message.contains("use_resume=true"));
+        assert!(message.contains("session-123"));
+        assert!(message.contains("Parse error: expected value"));
     }
 
     // ── parse_opencode_session_token tests ────────────────────────────
