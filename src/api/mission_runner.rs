@@ -170,16 +170,21 @@ enum ClaudeTurnWaitState {
     Startup,
     AwaitingClaude,
     AwaitingToolResults,
+    AwaitingTerminalResult,
 }
 
 fn claudecode_idle_timeout_for_state(
     state: ClaudeTurnWaitState,
     idle_timeout: Duration,
     tool_idle_timeout: Duration,
+    post_tool_result_idle_timeout: Duration,
 ) -> Duration {
     match state {
         ClaudeTurnWaitState::Startup | ClaudeTurnWaitState::AwaitingClaude => idle_timeout,
         ClaudeTurnWaitState::AwaitingToolResults => std::cmp::max(idle_timeout, tool_idle_timeout),
+        ClaudeTurnWaitState::AwaitingTerminalResult => {
+            std::cmp::max(idle_timeout, post_tool_result_idle_timeout)
+        }
     }
 }
 
@@ -188,10 +193,16 @@ fn claudecode_idle_deadline(
     now: tokio::time::Instant,
     idle_timeout: Duration,
     tool_idle_timeout: Duration,
+    post_tool_result_idle_timeout: Duration,
     tool_timeout_override: Option<tokio::time::Instant>,
 ) -> tokio::time::Instant {
-    let state_deadline =
-        now + claudecode_idle_timeout_for_state(state, idle_timeout, tool_idle_timeout);
+    let state_deadline = now
+        + claudecode_idle_timeout_for_state(
+            state,
+            idle_timeout,
+            tool_idle_timeout,
+            post_tool_result_idle_timeout,
+        );
     match state {
         ClaudeTurnWaitState::AwaitingToolResults => {
             tool_timeout_override.map_or(state_deadline, |deadline| deadline.max(state_deadline))
@@ -207,12 +218,21 @@ fn claudecode_incomplete_turn_message(
     malformed_json_output: &[String],
     process_exited_without_result: bool,
     idle_timeout_triggered: bool,
-    idle_while_waiting_on_tools: bool,
+    wait_state: ClaudeTurnWaitState,
     pending_tools: &[String],
 ) -> String {
-    let mut message = if idle_timeout_triggered && idle_while_waiting_on_tools {
+    let mut message = if idle_timeout_triggered
+        && matches!(wait_state, ClaudeTurnWaitState::AwaitingToolResults)
+    {
         format!(
             "Claude Code stopped producing output while waiting for tool results before emitting a terminal result event and hit the tool-wait idle timeout. Exit status: {}.",
+            exit_summary
+        )
+    } else if idle_timeout_triggered
+        && matches!(wait_state, ClaudeTurnWaitState::AwaitingTerminalResult)
+    {
+        format!(
+            "Claude Code stopped producing output after all observed tool results completed but before emitting a terminal result event, and hit the post-tool-result idle timeout. Exit status: {}.",
             exit_summary
         )
     } else if idle_timeout_triggered {
@@ -3356,6 +3376,12 @@ pub fn run_claudecode_turn<'a>(
                 .and_then(|v| v.parse::<u64>().ok())
                 .unwrap_or(1800),
         );
+        let post_tool_result_idle_timeout = Duration::from_secs(
+            std::env::var("SANDBOXED_SH_CLAUDECODE_POST_TOOL_RESULT_IDLE_TIMEOUT_SECS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(30),
+        );
         let startup_deadline = Instant::now() + startup_timeout;
         let mut turn_wait_state = ClaudeTurnWaitState::Startup;
         let mut tool_timeout_override: Option<tokio::time::Instant> = None;
@@ -3364,6 +3390,7 @@ pub fn run_claudecode_turn<'a>(
             Instant::now(),
             idle_timeout,
             tool_idle_timeout,
+            post_tool_result_idle_timeout,
             tool_timeout_override,
         );
 
@@ -3402,7 +3429,7 @@ pub fn run_claudecode_turn<'a>(
         // before breaking the loop. This lets us capture any final `result` event
         // that may already be buffered in the PTY/channel.
         let mut process_exit_grace_deadline: Option<Instant> = None;
-        let mut idle_timed_out_while_waiting_on_tools = false;
+        let mut idle_timeout_wait_state = ClaudeTurnWaitState::AwaitingClaude;
 
         // Process events until completion or cancellation
         loop {
@@ -3462,8 +3489,7 @@ pub fn run_claudecode_turn<'a>(
                     pty.kill();
                     reader_handle.abort();
                     idle_timeout_triggered = true;
-                    idle_timed_out_while_waiting_on_tools =
-                        matches!(turn_wait_state, ClaudeTurnWaitState::AwaitingToolResults);
+                    idle_timeout_wait_state = turn_wait_state;
                     break;
                 }
                 _ = process_exit_notify.notified(), if !process_exited => {
@@ -3836,8 +3862,13 @@ pub fn run_claudecode_turn<'a>(
                                                 .remove(&tool_use_id)
                                                 .unwrap_or_else(|| "unknown".to_string());
                                             if pending_tools.is_empty() {
-                                                turn_wait_state = ClaudeTurnWaitState::AwaitingClaude;
+                                                turn_wait_state =
+                                                    ClaudeTurnWaitState::AwaitingTerminalResult;
                                                 tool_timeout_override = None;
+                                                tracing::debug!(
+                                                    mission_id = %mission_id,
+                                                    "All observed Claude tool results completed; waiting for terminal result"
+                                                );
                                             }
 
                                             // Convert content to string representation (handles both text and image results)
@@ -3910,6 +3941,7 @@ pub fn run_claudecode_turn<'a>(
                         Instant::now(),
                         idle_timeout,
                         tool_idle_timeout,
+                        post_tool_result_idle_timeout,
                         tool_timeout_override,
                     );
                 }
@@ -3995,7 +4027,7 @@ pub fn run_claudecode_turn<'a>(
                 &malformed_json_output,
                 process_exited_without_result,
                 idle_timeout_triggered,
-                idle_timed_out_while_waiting_on_tools,
+                idle_timeout_wait_state,
                 &pending_tool_names,
             );
         }
@@ -12034,7 +12066,7 @@ mod tests {
             &[],
             true,
             false,
-            false,
+            ClaudeTurnWaitState::AwaitingClaude,
             &[],
         );
 
@@ -12053,7 +12085,7 @@ mod tests {
             &[],
             false,
             false,
-            false,
+            ClaudeTurnWaitState::AwaitingClaude,
             &[],
         );
 
@@ -12072,7 +12104,7 @@ mod tests {
             &[],
             false,
             true,
-            false,
+            ClaudeTurnWaitState::AwaitingClaude,
             &["- Bash".to_string(), "- Read".to_string()],
         );
 
@@ -12096,7 +12128,7 @@ mod tests {
             ],
             false,
             false,
-            false,
+            ClaudeTurnWaitState::AwaitingClaude,
             &[],
         );
 
@@ -12124,18 +12156,34 @@ mod tests {
     fn claudecode_idle_timeout_for_waiting_tool_uses_tool_budget() {
         let idle = Duration::from_secs(30);
         let tool_idle = Duration::from_secs(120);
+        let post_tool_idle = Duration::from_secs(45);
 
         assert_eq!(
             claudecode_idle_timeout_for_state(
                 ClaudeTurnWaitState::AwaitingToolResults,
                 idle,
                 tool_idle,
+                post_tool_idle,
             ),
             tool_idle
         );
         assert_eq!(
-            claudecode_idle_timeout_for_state(ClaudeTurnWaitState::AwaitingClaude, idle, tool_idle),
+            claudecode_idle_timeout_for_state(
+                ClaudeTurnWaitState::AwaitingClaude,
+                idle,
+                tool_idle,
+                post_tool_idle,
+            ),
             idle
+        );
+        assert_eq!(
+            claudecode_idle_timeout_for_state(
+                ClaudeTurnWaitState::AwaitingTerminalResult,
+                idle,
+                tool_idle,
+                post_tool_idle,
+            ),
+            post_tool_idle
         );
     }
 
@@ -12148,12 +12196,30 @@ mod tests {
             &[],
             false,
             true,
-            true,
+            ClaudeTurnWaitState::AwaitingToolResults,
             &["- Bash".to_string()],
         );
 
         assert!(message.contains("waiting for tool results"));
         assert!(message.contains("tool-wait idle timeout"));
+        assert!(message.contains("resumable transport failure"));
+    }
+
+    #[test]
+    fn claudecode_incomplete_turn_message_marks_post_tool_result_idle_timeout_as_resumable() {
+        let message = claudecode_incomplete_turn_message(
+            "signal: Some(\"Killed\")",
+            Some("Tool output arrived, but Claude never sent the final result."),
+            &[],
+            &[],
+            false,
+            true,
+            ClaudeTurnWaitState::AwaitingTerminalResult,
+            &[],
+        );
+
+        assert!(message.contains("after all observed tool results completed"));
+        assert!(message.contains("post-tool-result idle timeout"));
         assert!(message.contains("resumable transport failure"));
     }
 
