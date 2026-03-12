@@ -165,6 +165,41 @@ fn truncate_diagnostic_snippet(value: &str, max_len: usize) -> String {
     format!("{}...", &trimmed[..end])
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClaudeTurnWaitState {
+    Startup,
+    AwaitingClaude,
+    AwaitingToolResults,
+}
+
+fn claudecode_idle_timeout_for_state(
+    state: ClaudeTurnWaitState,
+    idle_timeout: Duration,
+    tool_idle_timeout: Duration,
+) -> Duration {
+    match state {
+        ClaudeTurnWaitState::Startup | ClaudeTurnWaitState::AwaitingClaude => idle_timeout,
+        ClaudeTurnWaitState::AwaitingToolResults => std::cmp::max(idle_timeout, tool_idle_timeout),
+    }
+}
+
+fn claudecode_idle_deadline(
+    state: ClaudeTurnWaitState,
+    now: tokio::time::Instant,
+    idle_timeout: Duration,
+    tool_idle_timeout: Duration,
+    tool_timeout_override: Option<tokio::time::Instant>,
+) -> tokio::time::Instant {
+    let state_deadline =
+        now + claudecode_idle_timeout_for_state(state, idle_timeout, tool_idle_timeout);
+    match state {
+        ClaudeTurnWaitState::AwaitingToolResults => {
+            tool_timeout_override.map_or(state_deadline, |deadline| deadline.max(state_deadline))
+        }
+        _ => state_deadline,
+    }
+}
+
 fn claudecode_incomplete_turn_message(
     exit_summary: &str,
     partial_output: Option<&str>,
@@ -172,9 +207,15 @@ fn claudecode_incomplete_turn_message(
     malformed_json_output: &[String],
     process_exited_without_result: bool,
     idle_timeout_triggered: bool,
+    idle_while_waiting_on_tools: bool,
     pending_tools: &[String],
 ) -> String {
-    let mut message = if idle_timeout_triggered {
+    let mut message = if idle_timeout_triggered && idle_while_waiting_on_tools {
+        format!(
+            "Claude Code stopped producing output while waiting for tool results before emitting a terminal result event and hit the tool-wait idle timeout. Exit status: {}.",
+            exit_summary
+        )
+    } else if idle_timeout_triggered {
         format!(
             "Claude Code stopped producing output before emitting a terminal result event and hit the idle timeout. Exit status: {}.",
             exit_summary
@@ -3309,8 +3350,22 @@ pub fn run_claudecode_turn<'a>(
                 .and_then(|v| v.parse::<u64>().ok())
                 .unwrap_or(600),
         );
+        let tool_idle_timeout = Duration::from_secs(
+            std::env::var("SANDBOXED_SH_CLAUDECODE_TOOL_IDLE_TIMEOUT_SECS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(1800),
+        );
         let startup_deadline = Instant::now() + startup_timeout;
-        let mut idle_deadline = Instant::now() + idle_timeout;
+        let mut turn_wait_state = ClaudeTurnWaitState::Startup;
+        let mut tool_timeout_override: Option<tokio::time::Instant> = None;
+        let mut idle_deadline = claudecode_idle_deadline(
+            turn_wait_state,
+            Instant::now(),
+            idle_timeout,
+            tool_idle_timeout,
+            tool_timeout_override,
+        );
 
         // Monitor child process exit. When Claude Code exits mid-tool-execution
         // (e.g. while `gh` is still running), child processes can keep the PTY
@@ -3347,6 +3402,7 @@ pub fn run_claudecode_turn<'a>(
         // before breaking the loop. This lets us capture any final `result` event
         // that may already be buffered in the PTY/channel.
         let mut process_exit_grace_deadline: Option<Instant> = None;
+        let mut idle_timed_out_while_waiting_on_tools = false;
 
         // Process events until completion or cancellation
         loop {
@@ -3398,6 +3454,7 @@ pub fn run_claudecode_turn<'a>(
                 _ = tokio::time::sleep_until(idle_deadline), if saw_non_init_event => {
                     tracing::warn!(
                         mission_id = %mission_id,
+                        wait_state = ?turn_wait_state,
                         pending_tool_count = pending_tools.len(),
                         had_partial_output = !final_result.trim().is_empty() || !text_buffer.is_empty(),
                         "Claude Code idle timeout after activity; treating turn as incomplete"
@@ -3405,6 +3462,8 @@ pub fn run_claudecode_turn<'a>(
                     pty.kill();
                     reader_handle.abort();
                     idle_timeout_triggered = true;
+                    idle_timed_out_while_waiting_on_tools =
+                        matches!(turn_wait_state, ClaudeTurnWaitState::AwaitingToolResults);
                     break;
                 }
                 _ = process_exit_notify.notified(), if !process_exited => {
@@ -3435,8 +3494,6 @@ pub fn run_claudecode_turn<'a>(
                         // EOF - PTY closed
                         break;
                     };
-
-                    idle_deadline = Instant::now() + idle_timeout;
 
                     let raw_line = raw_line.trim_end_matches(&['\r', '\n'][..]);
                     let cleaned = strip_ansi_codes(raw_line);
@@ -3488,6 +3545,9 @@ pub fn run_claudecode_turn<'a>(
 
                     if !matches!(claude_event, ClaudeEvent::System(_)) {
                         saw_non_init_event = true;
+                        if matches!(turn_wait_state, ClaudeTurnWaitState::Startup) {
+                            turn_wait_state = ClaudeTurnWaitState::AwaitingClaude;
+                        }
                     }
 
                             match claude_event {
@@ -3578,6 +3638,7 @@ pub fn run_claudecode_turn<'a>(
                                             if content_block.block_type == "tool_use" {
                                                 if let (Some(id), Some(name)) = (content_block.id, content_block.name) {
                                                     pending_tools.insert(id, name);
+                                                    turn_wait_state = ClaudeTurnWaitState::AwaitingToolResults;
                                                 }
                                             }
                                         }
@@ -3626,6 +3687,7 @@ pub fn run_claudecode_turn<'a>(
                                             }
                                             ContentBlock::ToolUse { id, name, input } => {
                                                 pending_tools.insert(id.clone(), name.clone());
+                                                turn_wait_state = ClaudeTurnWaitState::AwaitingToolResults;
                                                 let _ = events_tx.send(AgentEvent::ToolCall {
                                                     tool_call_id: id.clone(),
                                                     name: name.clone(),
@@ -3642,14 +3704,17 @@ pub fn run_claudecode_turn<'a>(
                                                     // Add a buffer beyond the tool's own timeout
                                                     let extended = tool_timeout + Duration::from_secs(30);
                                                     let new_deadline = Instant::now() + extended;
-                                                    if new_deadline > idle_deadline {
+                                                    let should_extend = tool_timeout_override
+                                                        .map(|current| new_deadline > current)
+                                                        .unwrap_or(true);
+                                                    if should_extend {
                                                         tracing::info!(
                                                             mission_id = %mission_id,
                                                             tool_name = %name,
                                                             tool_timeout_secs = tool_timeout_ms / 1000,
                                                             "Extending idle timeout for long-running tool call"
                                                         );
-                                                        idle_deadline = new_deadline;
+                                                        tool_timeout_override = Some(new_deadline);
                                                     }
                                                 }
 
@@ -3770,6 +3835,10 @@ pub fn run_claudecode_turn<'a>(
                                             let name = pending_tools
                                                 .remove(&tool_use_id)
                                                 .unwrap_or_else(|| "unknown".to_string());
+                                            if pending_tools.is_empty() {
+                                                turn_wait_state = ClaudeTurnWaitState::AwaitingClaude;
+                                                tool_timeout_override = None;
+                                            }
 
                                             // Convert content to string representation (handles both text and image results)
                                             let content_str = content.to_string_lossy();
@@ -3836,6 +3905,13 @@ pub fn run_claudecode_turn<'a>(
                                     );
                                 }
                             }
+                    idle_deadline = claudecode_idle_deadline(
+                        turn_wait_state,
+                        Instant::now(),
+                        idle_timeout,
+                        tool_idle_timeout,
+                        tool_timeout_override,
+                    );
                 }
             }
         }
@@ -3919,6 +3995,7 @@ pub fn run_claudecode_turn<'a>(
                 &malformed_json_output,
                 process_exited_without_result,
                 idle_timeout_triggered,
+                idle_timed_out_while_waiting_on_tools,
                 &pending_tool_names,
             );
         }
@@ -10859,24 +10936,26 @@ fn cleanup_old_debug_files(
 mod tests {
     use super::{
         actual_cost_cents_from_total_cost_usd, bind_command_params,
-        claudecode_incomplete_turn_message, claudecode_malformed_startup_message,
-        codex_chatgpt_fallback_for_result, codex_chatgpt_fallback_model, codex_key_fingerprint,
-        extract_model_from_message, extract_opencode_session_id, extract_part_text, extract_str,
-        extract_thought_line, is_capacity_limited_error, is_codex_chatgpt_account_model_blocked,
-        is_codex_node_wrapper, is_rate_limited_error, is_session_corruption_error,
-        is_tool_call_only_output, opencode_output_needs_fallback, opencode_session_token_from_line,
+        claudecode_idle_timeout_for_state, claudecode_incomplete_turn_message,
+        claudecode_malformed_startup_message, codex_chatgpt_fallback_for_result,
+        codex_chatgpt_fallback_model, codex_key_fingerprint, extract_model_from_message,
+        extract_opencode_session_id, extract_part_text, extract_str, extract_thought_line,
+        is_capacity_limited_error, is_codex_chatgpt_account_model_blocked, is_codex_node_wrapper,
+        is_rate_limited_error, is_session_corruption_error, is_tool_call_only_output,
+        opencode_output_needs_fallback, opencode_session_token_from_line,
         parse_opencode_session_token, parse_opencode_sse_event, parse_opencode_stderr_text_part,
         preferred_model_for_cost, resolve_cost_cents_and_source, running_health,
         sanitized_opencode_stdout, stall_severity, strip_ansi_codes, strip_opencode_banner_lines,
         strip_think_tags, summarize_recent_opencode_stderr, sync_opencode_agent_config,
-        MissionHealth, MissionRunState, MissionStallSeverity, OpencodeSseState, STALL_SEVERE_SECS,
-        STALL_WARN_SECS,
+        ClaudeTurnWaitState, MissionHealth, MissionRunState, MissionStallSeverity,
+        OpencodeSseState, STALL_SEVERE_SECS, STALL_WARN_SECS,
     };
     use crate::agents::{AgentResult, CostSource, TerminalReason};
     use crate::library::types::CommandParam;
     use serde_json::json;
     use std::borrow::Cow;
     use std::fs;
+    use std::time::Duration;
     use uuid::Uuid;
 
     #[test]
@@ -11955,6 +12034,7 @@ mod tests {
             &[],
             true,
             false,
+            false,
             &[],
         );
 
@@ -11971,6 +12051,7 @@ mod tests {
             None,
             &["partial stderr".to_string(), "another line".to_string()],
             &[],
+            false,
             false,
             false,
             &[],
@@ -11991,6 +12072,7 @@ mod tests {
             &[],
             false,
             true,
+            false,
             &["- Bash".to_string(), "- Read".to_string()],
         );
 
@@ -12014,6 +12096,7 @@ mod tests {
             ],
             false,
             false,
+            false,
             &[],
         );
 
@@ -12035,6 +12118,43 @@ mod tests {
         assert!(message.contains("use_resume=true"));
         assert!(message.contains("session-123"));
         assert!(message.contains("Parse error: expected value"));
+    }
+
+    #[test]
+    fn claudecode_idle_timeout_for_waiting_tool_uses_tool_budget() {
+        let idle = Duration::from_secs(30);
+        let tool_idle = Duration::from_secs(120);
+
+        assert_eq!(
+            claudecode_idle_timeout_for_state(
+                ClaudeTurnWaitState::AwaitingToolResults,
+                idle,
+                tool_idle,
+            ),
+            tool_idle
+        );
+        assert_eq!(
+            claudecode_idle_timeout_for_state(ClaudeTurnWaitState::AwaitingClaude, idle, tool_idle),
+            idle
+        );
+    }
+
+    #[test]
+    fn claudecode_incomplete_turn_message_marks_tool_wait_idle_timeout_as_resumable() {
+        let message = claudecode_incomplete_turn_message(
+            "signal: Some(\"Killed\")",
+            Some("Waiting for the long-running Bash command to finish."),
+            &[],
+            &[],
+            false,
+            true,
+            true,
+            &["- Bash".to_string()],
+        );
+
+        assert!(message.contains("waiting for tool results"));
+        assert!(message.contains("tool-wait idle timeout"));
+        assert!(message.contains("resumable transport failure"));
     }
 
     // ── parse_opencode_session_token tests ────────────────────────────
