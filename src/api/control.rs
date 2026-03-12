@@ -4505,142 +4505,76 @@ fn spawn_control_session(
     state
 }
 
-/// Background task that periodically cleans up missions that are no longer running.
+/// Apply the stale-mission safety net once.
 ///
-/// Two checks on each tick:
-/// 1. **Orphan detection**: any mission marked `active` in the DB but not present
-///    in the in-memory `running_missions` list is an orphan whose harness process
-///    died without updating the DB. These are marked `interrupted` immediately.
-/// 2. **Stale timeout**: missions that have been active longer than `stale_hours`
-///    without any activity update are marked `completed` as a safety net.
+/// We intentionally do not infer "orphaned" from `MissionStatus::Active` alone here.
+/// Missions remain `active` between turns while waiting for the next user message or
+/// queued automation, so the periodic cleanup task cannot safely treat "not currently
+/// running" as an interruption without spuriously flipping healthy Claude missions to
+/// `interrupted`.
+async fn cleanup_stale_active_missions_once(
+    mission_store: &Arc<dyn MissionStore>,
+    stale_hours: u64,
+    events_tx: &broadcast::Sender<AgentEvent>,
+) {
+    match mission_store.get_stale_active_missions(stale_hours).await {
+        Ok(stale_missions) => {
+            for mission in stale_missions {
+                tracing::info!(
+                    "Auto-closing stale mission {}: '{}' (inactive since {})",
+                    mission.id,
+                    mission.title.as_deref().unwrap_or("Untitled"),
+                    mission.updated_at
+                );
+
+                if let Err(e) = mission_store
+                    .update_mission_status(mission.id, MissionStatus::Completed)
+                    .await
+                {
+                    tracing::warn!("Failed to auto-close stale mission {}: {}", mission.id, e);
+                } else {
+                    maybe_schedule_mission_metadata_refresh_for_status(
+                        mission_store,
+                        events_tx,
+                        mission.id,
+                        MissionStatus::Completed,
+                    );
+                    let _ = events_tx.send(AgentEvent::MissionStatusChanged {
+                        mission_id: mission.id,
+                        status: MissionStatus::Completed,
+                        summary: Some(format!(
+                            "Auto-closed after {} hours of inactivity",
+                            stale_hours
+                        )),
+                    });
+                }
+            }
+        }
+        Err(e) => {
+            tracing::warn!("Failed to check for stale missions: {}", e);
+        }
+    }
+}
+
+/// Background task that periodically cleans up stale missions.
 async fn stale_mission_cleanup_loop(
     mission_store: Arc<dyn MissionStore>,
     stale_hours: u64,
-    cmd_tx: mpsc::Sender<ControlCommand>,
+    _cmd_tx: mpsc::Sender<ControlCommand>,
     events_tx: broadcast::Sender<AgentEvent>,
 ) {
-    // Check every 5 minutes (fast enough to catch orphans promptly).
+    // Check every 5 minutes; the stale timeout remains a safety net for missions that
+    // never receive an explicit terminal status.
     let check_interval = std::time::Duration::from_secs(300);
 
     tracing::info!(
-        "Mission cleanup task started: orphan check every 5 min, stale timeout {} hours",
+        "Mission cleanup task started: stale timeout {} hours",
         stale_hours
     );
 
     loop {
         tokio::time::sleep(check_interval).await;
-
-        // --- Orphan detection: active in DB but not running in-process ---
-        match mission_store.get_all_active_missions().await {
-            Ok(active_missions) if !active_missions.is_empty() => {
-                let running_ids: Option<std::collections::HashSet<Uuid>> = {
-                    let (tx, rx) = tokio::sync::oneshot::channel();
-                    if cmd_tx
-                        .send(ControlCommand::ListRunning { respond: tx })
-                        .await
-                        .is_err()
-                    {
-                        None
-                    } else {
-                        match tokio::time::timeout(std::time::Duration::from_secs(5), rx).await {
-                            Ok(Ok(running)) => Some(
-                                running
-                                    .into_iter()
-                                    .map(|r| r.mission_id)
-                                    .collect::<std::collections::HashSet<_>>(),
-                            ),
-                            Ok(Err(_)) => None,
-                            Err(_) => None,
-                        }
-                    }
-                };
-
-                if let Some(running_ids) = running_ids {
-                    for mission in &active_missions {
-                        if !running_ids.contains(&mission.id) {
-                            tracing::info!(
-                                "Orphan detected: mission {} '{}' is active in DB but has no running process (last update: {})",
-                                mission.id,
-                                mission.title.as_deref().unwrap_or("Untitled"),
-                                mission.updated_at
-                            );
-                            if let Err(e) = mission_store
-                                .update_mission_status(mission.id, MissionStatus::Interrupted)
-                                .await
-                            {
-                                tracing::warn!(
-                                    "Failed to mark orphaned mission {} as interrupted: {}",
-                                    mission.id,
-                                    e
-                                );
-                            } else {
-                                maybe_schedule_mission_metadata_refresh_for_status(
-                                    &mission_store,
-                                    &events_tx,
-                                    mission.id,
-                                    MissionStatus::Interrupted,
-                                );
-                                let _ = events_tx.send(AgentEvent::MissionStatusChanged {
-                                    mission_id: mission.id,
-                                    status: MissionStatus::Interrupted,
-                                    summary: Some(
-                                        "Interrupted: harness process is no longer running"
-                                            .to_string(),
-                                    ),
-                                });
-                            }
-                        }
-                    }
-                } else {
-                    tracing::warn!(
-                        "Mission cleanup: failed to list running missions; skipping orphan check tick"
-                    );
-                }
-            }
-            Ok(_) => {}
-            Err(e) => {
-                tracing::warn!("Failed to check for orphaned missions: {}", e);
-            }
-        }
-
-        // --- Stale timeout: safety net for missions that somehow stay active ---
-        match mission_store.get_stale_active_missions(stale_hours).await {
-            Ok(stale_missions) => {
-                for mission in stale_missions {
-                    tracing::info!(
-                        "Auto-closing stale mission {}: '{}' (inactive since {})",
-                        mission.id,
-                        mission.title.as_deref().unwrap_or("Untitled"),
-                        mission.updated_at
-                    );
-
-                    if let Err(e) = mission_store
-                        .update_mission_status(mission.id, MissionStatus::Completed)
-                        .await
-                    {
-                        tracing::warn!("Failed to auto-close stale mission {}: {}", mission.id, e);
-                    } else {
-                        maybe_schedule_mission_metadata_refresh_for_status(
-                            &mission_store,
-                            &events_tx,
-                            mission.id,
-                            MissionStatus::Completed,
-                        );
-                        let _ = events_tx.send(AgentEvent::MissionStatusChanged {
-                            mission_id: mission.id,
-                            status: MissionStatus::Completed,
-                            summary: Some(format!(
-                                "Auto-closed after {} hours of inactivity",
-                                stale_hours
-                            )),
-                        });
-                    }
-                }
-            }
-            Err(e) => {
-                tracing::warn!("Failed to check for stale missions: {}", e);
-            }
-        }
+        cleanup_stale_active_missions_once(&mission_store, stale_hours, &events_tx).await;
     }
 }
 
@@ -5071,6 +5005,150 @@ fn enqueue_agent_finished_messages(
             None,
             Some(message.target_mission_id),
         ));
+    }
+}
+
+fn queue_has_pending_target_mission(
+    queue: &VecDeque<(Uuid, String, Option<String>, Option<Uuid>)>,
+    mission_id: Uuid,
+) -> bool {
+    queue
+        .iter()
+        .any(|(_id, _msg, _agent, target_mid)| *target_mid == Some(mission_id))
+}
+
+fn mission_status_for_terminal_reason(
+    reason: TerminalReason,
+    complete_turn_without_follow_up: bool,
+) -> Option<(MissionStatus, &'static str)> {
+    match reason {
+        TerminalReason::TurnComplete if complete_turn_without_follow_up => {
+            Some((MissionStatus::Completed, "completed"))
+        }
+        TerminalReason::TurnComplete => None,
+        TerminalReason::Completed => Some((MissionStatus::Completed, "completed")),
+        TerminalReason::Cancelled => Some((MissionStatus::Interrupted, "cancelled")),
+        TerminalReason::MaxIterations => Some((MissionStatus::Blocked, "max_iterations")),
+        TerminalReason::LlmError => Some((MissionStatus::Failed, "llm_error")),
+        TerminalReason::Stalled => Some((MissionStatus::Failed, "stalled")),
+        TerminalReason::InfiniteLoop => Some((MissionStatus::Failed, "infinite_loop")),
+        TerminalReason::RateLimited => Some((MissionStatus::Failed, "rate_limited")),
+        TerminalReason::CapacityLimited => Some((MissionStatus::Failed, "capacity_limited")),
+    }
+}
+
+fn mission_status_summary_for_terminal_reason(reason: TerminalReason) -> Option<String> {
+    match reason {
+        TerminalReason::TurnComplete | TerminalReason::Completed => None,
+        TerminalReason::MaxIterations => Some("Reached iteration limit".to_string()),
+        TerminalReason::Cancelled => Some("Cancelled by user".to_string()),
+        TerminalReason::Stalled => Some("No progress detected".to_string()),
+        TerminalReason::InfiniteLoop => Some("Detected repetitive behavior".to_string()),
+        TerminalReason::LlmError => Some("Model error".to_string()),
+        TerminalReason::RateLimited => Some("Provider rate limited".to_string()),
+        TerminalReason::CapacityLimited => Some("Provider capacity limit reached".to_string()),
+    }
+}
+
+async fn maybe_finalize_terminal_mission(
+    mission_store: &Arc<dyn MissionStore>,
+    events_tx: &tokio::sync::broadcast::Sender<AgentEvent>,
+    mission_id: Uuid,
+    terminal_reason: Option<TerminalReason>,
+    complete_turn_without_follow_up: bool,
+    log_context: &str,
+) {
+    let Some(reason) = terminal_reason else {
+        return;
+    };
+    let Some((new_status, terminal_reason_str)) =
+        mission_status_for_terminal_reason(reason, complete_turn_without_follow_up)
+    else {
+        tracing::debug!(
+            mission_id = %mission_id,
+            reason = ?reason,
+            context = log_context,
+            "Skipping mission finalization for non-terminal turn state"
+        );
+        return;
+    };
+
+    match mission_store.get_mission(mission_id).await {
+        Ok(Some(mission)) => {
+            if !matches!(
+                mission.status,
+                MissionStatus::Active | MissionStatus::Interrupted | MissionStatus::Pending
+            ) {
+                tracing::debug!(
+                    mission_id = %mission_id,
+                    status = ?mission.status,
+                    context = log_context,
+                    "Skipping mission finalization because mission already has terminal status"
+                );
+                return;
+            }
+
+            if new_status == MissionStatus::Completed
+                && mission_has_active_automation(mission_store, mission_id).await
+            {
+                tracing::info!(
+                    mission_id = %mission_id,
+                    context = log_context,
+                    "Skipping mission completion because active automations are enabled"
+                );
+                return;
+            }
+
+            tracing::info!(
+                mission_id = %mission_id,
+                status = ?new_status,
+                reason = ?reason,
+                context = log_context,
+                "Finalizing mission after terminal turn"
+            );
+            if let Err(e) = mission_store
+                .update_mission_status_with_reason(
+                    mission_id,
+                    new_status,
+                    Some(terminal_reason_str),
+                )
+                .await
+            {
+                tracing::warn!(
+                    mission_id = %mission_id,
+                    context = log_context,
+                    "Failed to finalize mission after terminal turn: {}",
+                    e
+                );
+            } else {
+                maybe_schedule_mission_metadata_refresh_for_status(
+                    mission_store,
+                    events_tx,
+                    mission_id,
+                    new_status,
+                );
+                let _ = events_tx.send(AgentEvent::MissionStatusChanged {
+                    mission_id,
+                    status: new_status,
+                    summary: mission_status_summary_for_terminal_reason(reason),
+                });
+            }
+        }
+        Ok(None) => {
+            tracing::warn!(
+                mission_id = %mission_id,
+                context = log_context,
+                "Mission not found for terminal finalization"
+            );
+        }
+        Err(e) => {
+            tracing::warn!(
+                mission_id = %mission_id,
+                context = log_context,
+                "Failed to load mission for terminal finalization: {}",
+                e
+            );
+        }
     }
 }
 
@@ -6892,8 +6970,10 @@ async fn control_actor_loop(
                     running_cancel = None;
                     running_mission_id = None;
                     main_runner_activity = None;
+                    let mut completed_terminal_reason = None;
                     match res {
                         Ok((_mid, _user_msg, agent_result)) => {
+                            completed_terminal_reason = agent_result.terminal_reason;
                             // Only append assistant to local history if this mission is still the current mission.
                             // Note: User message was already added before execution started.
                             // If the user created a new mission mid-execution, history was cleared for that new mission,
@@ -6953,115 +7033,16 @@ async fn control_actor_loop(
                             // We also check the current mission status from DB to handle:
                             // - Explicit complete_mission calls (which update DB status)
                             // - Parallel missions (each has its own DB status)
-                            if agent_result.terminal_reason.is_some() {
-                                // Use completed_mission_id (the actual mission that just finished)
-                                // instead of current_mission (which can change when user creates a new mission)
-                                if let Some(mission_id) = completed_mission_id {
-                                    match mission_store.get_mission(mission_id).await {
-                                        Ok(Some(mission)) => {
-                                            // Auto-complete if mission is Active OR Interrupted (resumed missions may
-                                            // still have Interrupted status if the status update event was not persisted)
-                                            if matches!(mission.status, MissionStatus::Active | MissionStatus::Interrupted) {
-                                                let status_and_reason = agent_result.terminal_reason.and_then(|reason| {
-                                                    match reason {
-                                                        TerminalReason::TurnComplete => None,
-                                                        TerminalReason::Completed => {
-                                                            Some((reason, MissionStatus::Completed, "completed"))
-                                                        }
-                                                        TerminalReason::Cancelled => {
-                                                            Some((reason, MissionStatus::Interrupted, "cancelled"))
-                                                        }
-                                                        TerminalReason::MaxIterations => {
-                                                            Some((reason, MissionStatus::Blocked, "max_iterations"))
-                                                        }
-                                                        TerminalReason::LlmError => {
-                                                            Some((reason, MissionStatus::Failed, "llm_error"))
-                                                        }
-                                                        TerminalReason::Stalled => {
-                                                            Some((reason, MissionStatus::Failed, "stalled"))
-                                                        }
-                                                        TerminalReason::InfiniteLoop => {
-                                                            Some((reason, MissionStatus::Failed, "infinite_loop"))
-                                                        }
-                                                        TerminalReason::RateLimited => {
-                                                            Some((reason, MissionStatus::Failed, "rate_limited"))
-                                                        }
-                                                        TerminalReason::CapacityLimited => {
-                                                            Some((reason, MissionStatus::Failed, "capacity_limited"))
-                                                        }
-                                                    }
-                                                });
-                                                if let Some((reason, new_status, terminal_reason_str)) = status_and_reason {
-                                                    if new_status == MissionStatus::Completed
-                                                        && mission_has_active_automation(&mission_store, mission_id).await
-                                                    {
-                                                        tracing::info!(
-                                                            "Skipping auto-complete for mission {} because active automations are enabled",
-                                                            mission_id
-                                                        );
-                                                    } else {
-                                                        tracing::info!(
-                                                            "Auto-completing mission {} with status '{:?}' (terminal_reason: {:?})",
-                                                            mission_id, new_status, agent_result.terminal_reason
-                                                        );
-                                                        if let Err(e) = mission_store
-                                                            .update_mission_status_with_reason(mission_id, new_status, Some(terminal_reason_str))
-                                                            .await
-                                                        {
-                                                            tracing::warn!("Failed to auto-complete mission: {}", e);
-                                                        } else {
-                                                            maybe_schedule_mission_metadata_refresh_for_status(
-                                                                &mission_store,
-                                                                &events_tx,
-                                                                mission_id,
-                                                                new_status,
-                                                            );
-                                                            // Send status change event - the actual completion content
-                                                            // is already in the assistant_message event, so we just provide
-                                                            // a clean summary based on how the mission ended
-                                                            let summary = match reason {
-                                                                TerminalReason::TurnComplete => None,
-                                                                TerminalReason::Completed => None,
-                                                                TerminalReason::MaxIterations => Some("Reached iteration limit".to_string()),
-                                                                TerminalReason::Cancelled => Some("Cancelled by user".to_string()),
-                                                                TerminalReason::Stalled => Some("No progress detected".to_string()),
-                                                                TerminalReason::InfiniteLoop => Some("Detected repetitive behavior".to_string()),
-                                                                TerminalReason::LlmError => Some("Model error".to_string()),
-                                                                TerminalReason::RateLimited => Some("Provider rate limited".to_string()),
-                                                                TerminalReason::CapacityLimited => Some("Provider capacity limit reached".to_string()),
-                                                            };
-                                                            let _ = events_tx.send(AgentEvent::MissionStatusChanged {
-                                                                mission_id,
-                                                                status: new_status,
-                                                                summary,
-                                                            });
-                                                        }
-                                                    }
-                                                } else {
-                                                    tracing::debug!(
-                                                        "Skipping auto-complete for mission {}: turn ended but mission is not explicitly completed",
-                                                        mission_id
-                                                    );
-                                                }
-                                            } else {
-                                                tracing::debug!(
-                                                    "Skipping auto-complete: mission {} already has status {:?}",
-                                                    mission_id, mission.status
-                                                );
-                                            }
-                                        }
-                                        Ok(None) => {
-                                            tracing::warn!("Mission {} not found for auto-complete", mission_id);
-                                        }
-                                        Err(e) => {
-                                            tracing::warn!(
-                                                "Failed to load mission {} for auto-complete: {}",
-                                                mission_id,
-                                                e
-                                            );
-                                        }
-                                    }
-                                }
+                            if let Some(mission_id) = completed_mission_id {
+                                maybe_finalize_terminal_mission(
+                                    &mission_store,
+                                    &events_tx,
+                                    mission_id,
+                                    agent_result.terminal_reason,
+                                    false,
+                                    "turn finished before follow-up enqueue",
+                                )
+                                .await;
                             }
 
                             // Parse rich tags and validate referenced files
@@ -7225,6 +7206,18 @@ async fn control_actor_loop(
                             )
                             .await;
                             enqueue_agent_finished_messages(&mut queue, messages);
+                        }
+
+                        if !queue_has_pending_target_mission(&queue, mission_id) {
+                            maybe_finalize_terminal_mission(
+                                &mission_store,
+                                &events_tx,
+                                mission_id,
+                                completed_terminal_reason,
+                                true,
+                                "turn finished with no same-mission follow-up queued",
+                            )
+                            .await;
                         }
                     }
                 }
@@ -7509,89 +7502,15 @@ async fn control_actor_loop(
 
                                 // If no queued messages, update status and mark for cleanup
                                 if !started {
-                                    // Only update status if agent hasn't already set a terminal status.
-                                    // Include Interrupted: missions started via StartParallel may still
-                                    // have Interrupted status if they were previously cancelled.
-                                    if let Ok(Some(mission)) = mission_store.get_mission(*mission_id).await {
-                                        let should_update = matches!(
-                                            mission.status,
-                                            MissionStatus::Pending | MissionStatus::Active | MissionStatus::Interrupted
-                                        );
-                                        if should_update {
-                                            let status_and_summary = result.terminal_reason.and_then(|reason| {
-                                                match reason {
-                                                    TerminalReason::TurnComplete => None,
-                                                    TerminalReason::Completed => {
-                                                        Some((MissionStatus::Completed, None))
-                                                    }
-                                                    TerminalReason::Cancelled => Some((
-                                                        MissionStatus::Interrupted,
-                                                        Some("Cancelled by user".to_string()),
-                                                    )),
-                                                    TerminalReason::MaxIterations => Some((
-                                                        MissionStatus::Blocked,
-                                                        Some("Reached iteration limit".to_string()),
-                                                    )),
-                                                    TerminalReason::Stalled => Some((
-                                                        MissionStatus::Failed,
-                                                        Some("No progress detected".to_string()),
-                                                    )),
-                                                    TerminalReason::InfiniteLoop => Some((
-                                                        MissionStatus::Failed,
-                                                        Some("Detected repetitive behavior".to_string()),
-                                                    )),
-                                                    TerminalReason::LlmError => Some((
-                                                        MissionStatus::Failed,
-                                                        Some("Model error".to_string()),
-                                                    )),
-                                                    TerminalReason::RateLimited => Some((
-                                                        MissionStatus::Failed,
-                                                        Some("Provider rate limited".to_string()),
-                                                    )),
-                                                    TerminalReason::CapacityLimited => Some((
-                                                        MissionStatus::Failed,
-                                                        Some("Provider capacity limit reached".to_string()),
-                                                    )),
-                                                }
-                                            });
-
-                                            if let Some((new_status, summary)) = status_and_summary {
-                                                if new_status == MissionStatus::Completed
-                                                    && mission_has_active_automation(&mission_store, *mission_id).await
-                                                {
-                                                    tracing::info!(
-                                                        "Skipping parallel completion for mission {} because active automations are enabled",
-                                                        mission_id
-                                                    );
-                                                } else if let Err(e) = mission_store
-                                                    .update_mission_status(*mission_id, new_status)
-                                                    .await
-                                                {
-                                                    tracing::warn!(
-                                                        "Failed to update parallel mission status: {}",
-                                                        e
-                                                    );
-                                                } else {
-                                                    maybe_schedule_mission_metadata_refresh_for_status(
-                                                        &mission_store,
-                                                        &events_tx,
-                                                        *mission_id,
-                                                        new_status,
-                                                    );
-                                                    let _ = events_tx.send(AgentEvent::MissionStatusChanged {
-                                                        mission_id: *mission_id,
-                                                        status: new_status,
-                                                        summary,
-                                                    });
-                                                }
-                                            } else {
-                                                tracing::debug!(
-                                                    "Skipping parallel auto-complete for mission {}: turn ended but mission is not explicitly completed",
-                                                    mission_id
-                                                );
-                                            }
-                                        }
-                                    }
+                                    maybe_finalize_terminal_mission(
+                                        &mission_store,
+                                        &events_tx,
+                                        *mission_id,
+                                        result.terminal_reason,
+                                        true,
+                                        "parallel turn finished with no follow-up queued",
+                                    )
+                                    .await;
                                     completed_missions.push(*mission_id);
                                 }
                             }
@@ -8123,10 +8042,14 @@ async fn run_single_control_turn(
             // where the session exists but history may not have assistant messages yet).
             let is_continuation =
                 force_session_resume || history.iter().any(|(role, _)| role == "assistant");
+            let mut effective_message = user_message.clone();
+            let mut effective_session_id = session_id.clone();
+            let mut attempted_same_session_resume = false;
+            let mut attempted_session_reset = false;
             let mut result = Box::pin(super::mission_runner::run_claudecode_turn(
                 exec_workspace,
                 &ctx.working_dir,
-                &user_message,
+                &effective_message,
                 config.default_model.as_deref(),
                 requested_model_effort.as_deref(),
                 config.opencode_agent.as_deref(),
@@ -8135,7 +8058,7 @@ async fn run_single_control_turn(
                 cancel.clone(),
                 None, // secrets - not available in control context
                 &config.working_dir,
-                session_id.as_deref(),
+                effective_session_id.as_deref(),
                 is_continuation,
                 Some(tool_hub.clone()),
                 Some(status.clone()),
@@ -8143,82 +8066,112 @@ async fn run_single_control_turn(
             ))
             .await;
 
-            // Claude Code can fail when resuming a session due to stale/corrupt state:
-            // - CLI hangs and emits no parseable stream events (startup timeout)
-            // - API rejects reconstructed history (e.g. mismatched tool_use_id)
-            // When that happens, auto-reset the session_id and retry once fresh.
-            // This fires regardless of `is_continuation` — startup timeouts can happen
-            // even on the first turn if the session marker was stale.
-            if super::mission_runner::is_session_corruption_error(&result) {
-                let new_session_id = Uuid::new_v4().to_string();
-                tracing::warn!(
-                    mission_id = %mid,
-                    old_session_id = ?session_id,
-                    new_session_id = %new_session_id,
-                    error = %result.output,
-                    "Session corruption detected; resetting session and retrying once"
-                );
-
-                // Persist the new session ID via the existing event pipeline.
-                // The control actor listens for this event and updates the mission store.
-                let _ = events_tx.send(AgentEvent::SessionIdUpdate {
-                    mission_id: mid,
-                    session_id: new_session_id.clone(),
-                });
-
-                // Delete the stale session marker so the retry creates it with the new
-                // session ID.  Without this, if the retry fails before writing the marker
-                // (e.g. connectivity check), the marker still holds the old session ID.
-                // A subsequent attempt would see a mismatch (DB has new ID, marker has
-                // old ID) and start a blank session — losing all conversation history.
-                let session_marker = ctx.working_dir.join(".claude-session-initiated");
-                if session_marker.exists() {
-                    let _ = std::fs::remove_file(&session_marker);
-                }
-
-                // The retry starts a fresh Claude Code session (no --resume), so Claude
-                // won't have any prior conversation.  Prepend recent history to the
-                // prompt so the agent retains context from earlier turns.
-                let history_for_retry = match history.last() {
-                    Some((role, content)) if role == "user" && content == &user_message => {
-                        &history[..history.len() - 1]
+            loop {
+                match super::mission_runner::claudecode_transport_recovery_strategy(
+                    &result,
+                    effective_session_id.is_some(),
+                    attempted_same_session_resume,
+                    attempted_session_reset,
+                ) {
+                    super::mission_runner::ClaudeTransportRecoveryStrategy::None => break,
+                    super::mission_runner::ClaudeTransportRecoveryStrategy::ResumeCurrentSession => {
+                        attempted_same_session_resume = true;
+                        tracing::warn!(
+                            mission_id = %mid,
+                            session_id = ?effective_session_id,
+                            error = %result.output,
+                            "Incomplete Claude turn detected; retrying once by continuing the current session"
+                        );
+                        effective_message =
+                            super::mission_runner::claudecode_resume_current_session_message()
+                                .to_string();
+                        result = Box::pin(super::mission_runner::run_claudecode_turn(
+                            exec_workspace,
+                            &ctx.working_dir,
+                            &effective_message,
+                            config.default_model.as_deref(),
+                            requested_model_effort.as_deref(),
+                            config.opencode_agent.as_deref(),
+                            mid,
+                            events_tx.clone(),
+                            cancel.clone(),
+                            None,
+                            &config.working_dir,
+                            effective_session_id.as_deref(),
+                            true,
+                            Some(tool_hub.clone()),
+                            Some(status.clone()),
+                            None,
+                        ))
+                        .await;
                     }
-                    _ => history.as_slice(),
-                };
-                let retry_message = if history_for_retry.is_empty() {
-                    user_message.clone()
-                } else {
-                    let history_ctx = build_history_context(
-                        history_for_retry,
-                        config.context.max_history_total_chars,
-                    );
-                    format!(
-                        "## Prior conversation (session was reset due to a transient error)\n\n\
-                         {history_ctx}\
-                         ## Current message\n\n\
-                         {user_message}"
-                    )
-                };
+                    super::mission_runner::ClaudeTransportRecoveryStrategy::ResetSessionFresh => {
+                        attempted_session_reset = true;
+                        let new_session_id = Uuid::new_v4().to_string();
+                        tracing::warn!(
+                            mission_id = %mid,
+                            old_session_id = ?effective_session_id,
+                            new_session_id = %new_session_id,
+                            attempted_same_session_resume,
+                            error = %result.output,
+                            "Session corruption detected; resetting session and retrying once"
+                        );
 
-                result = Box::pin(super::mission_runner::run_claudecode_turn(
-                    exec_workspace,
-                    &ctx.working_dir,
-                    &retry_message,
-                    config.default_model.as_deref(),
-                    requested_model_effort.as_deref(),
-                    config.opencode_agent.as_deref(),
-                    mid,
-                    events_tx.clone(),
-                    cancel.clone(),
-                    None, // secrets - not available in control context
-                    &config.working_dir,
-                    Some(&new_session_id),
-                    false, // Fresh session — don't pass is_continuation=true
-                    Some(tool_hub.clone()),
-                    Some(status.clone()),
-                    None, // override_auth
-                ))
-                .await;
+                        let _ = events_tx.send(AgentEvent::SessionIdUpdate {
+                            mission_id: mid,
+                            session_id: new_session_id.clone(),
+                        });
+
+                        let session_marker = ctx.working_dir.join(".claude-session-initiated");
+                        if session_marker.exists() {
+                            let _ = std::fs::remove_file(&session_marker);
+                        }
+
+                        let history_for_retry = match history.last() {
+                            Some((role, content)) if role == "user" && content == &user_message => {
+                                &history[..history.len() - 1]
+                            }
+                            _ => history.as_slice(),
+                        };
+                        let retry_message = if history_for_retry.is_empty() {
+                            user_message.clone()
+                        } else {
+                            let history_ctx = build_history_context(
+                                history_for_retry,
+                                config.context.max_history_total_chars,
+                            );
+                            format!(
+                                "## Prior conversation (session was reset due to a transient error)\n\n\
+                                 {history_ctx}\
+                                 ## Current message\n\n\
+                                 {user_message}"
+                            )
+                        };
+
+                        effective_message = retry_message;
+                        effective_session_id = Some(new_session_id);
+
+                        result = Box::pin(super::mission_runner::run_claudecode_turn(
+                            exec_workspace,
+                            &ctx.working_dir,
+                            &effective_message,
+                            config.default_model.as_deref(),
+                            requested_model_effort.as_deref(),
+                            config.opencode_agent.as_deref(),
+                            mid,
+                            events_tx.clone(),
+                            cancel.clone(),
+                            None,
+                            &config.working_dir,
+                            effective_session_id.as_deref(),
+                            false,
+                            Some(tool_hub.clone()),
+                            Some(status.clone()),
+                            None,
+                        ))
+                        .await;
+                    }
+                }
             }
 
             result
@@ -9119,6 +9072,37 @@ mod tests {
             &automation,
         );
         assert_eq!(target, source_mission_id);
+    }
+
+    #[tokio::test]
+    async fn cleanup_stale_active_missions_once_keeps_recent_active_mission_active() {
+        let store: Arc<dyn MissionStore> = Arc::new(mission_store::InMemoryMissionStore::new());
+        let mission = store
+            .create_mission(
+                Some("Claude retry validation"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("mission should be created");
+        store
+            .update_mission_status(mission.id, MissionStatus::Active)
+            .await
+            .expect("mission should become active");
+
+        let (events_tx, _events_rx) = broadcast::channel(8);
+        cleanup_stale_active_missions_once(&store, 24, &events_tx).await;
+
+        let stored = store
+            .get_mission(mission.id)
+            .await
+            .expect("mission lookup should succeed")
+            .expect("mission should exist");
+        assert_eq!(stored.status, MissionStatus::Active);
     }
 
     #[test]
@@ -11885,6 +11869,41 @@ Investigate <service/> failures.
                 ("restart 1".to_string(), Some(restart_target)),
                 ("restart 2".to_string(), Some(restart_target)),
             ]
+        );
+    }
+
+    #[test]
+    fn test_queue_has_pending_target_mission_matches_same_mission_only() {
+        let mission_id = Uuid::new_v4();
+        let other_mission_id = Uuid::new_v4();
+        let queue = VecDeque::from([
+            (
+                Uuid::new_v4(),
+                "other mission".to_string(),
+                None,
+                Some(other_mission_id),
+            ),
+            (
+                Uuid::new_v4(),
+                "current mission".to_string(),
+                None,
+                Some(mission_id),
+            ),
+        ]);
+
+        assert!(queue_has_pending_target_mission(&queue, mission_id));
+        assert!(!queue_has_pending_target_mission(&queue, Uuid::new_v4()));
+    }
+
+    #[test]
+    fn test_mission_status_for_terminal_reason_defers_turn_complete_until_idle_finalization() {
+        assert_eq!(
+            mission_status_for_terminal_reason(TerminalReason::TurnComplete, false),
+            None
+        );
+        assert_eq!(
+            mission_status_for_terminal_reason(TerminalReason::TurnComplete, true),
+            Some((MissionStatus::Completed, "completed"))
         );
     }
 

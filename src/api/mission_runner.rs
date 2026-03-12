@@ -153,6 +153,273 @@ fn actual_cost_cents_from_total_cost_usd(total_cost_usd: Option<f64>) -> Option<
     })
 }
 
+fn truncate_diagnostic_snippet(value: &str, max_len: usize) -> String {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    if trimmed.len() <= max_len {
+        return trimmed.to_string();
+    }
+    let end = safe_truncate_index(trimmed, max_len);
+    format!("{}...", &trimmed[..end])
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClaudeTurnWaitState {
+    Startup,
+    AwaitingClaude,
+    AwaitingToolResults,
+    AwaitingTerminalResult,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClaudeTransportFailureStage {
+    Startup,
+    AwaitingClaude,
+    AwaitingToolResults,
+    AwaitingTerminalResult,
+}
+
+fn claudecode_transport_failure_stage_for_wait_state(
+    state: ClaudeTurnWaitState,
+) -> ClaudeTransportFailureStage {
+    match state {
+        ClaudeTurnWaitState::Startup => ClaudeTransportFailureStage::Startup,
+        ClaudeTurnWaitState::AwaitingClaude => ClaudeTransportFailureStage::AwaitingClaude,
+        ClaudeTurnWaitState::AwaitingToolResults => {
+            ClaudeTransportFailureStage::AwaitingToolResults
+        }
+        ClaudeTurnWaitState::AwaitingTerminalResult => {
+            ClaudeTransportFailureStage::AwaitingTerminalResult
+        }
+    }
+}
+
+fn claudecode_transport_failure_stage_for_incomplete_turn(
+    saw_non_init_event: bool,
+    wait_state: ClaudeTurnWaitState,
+) -> ClaudeTransportFailureStage {
+    if saw_non_init_event {
+        claudecode_transport_failure_stage_for_wait_state(wait_state)
+    } else {
+        ClaudeTransportFailureStage::Startup
+    }
+}
+
+fn claudecode_transport_failure_stage_label(stage: ClaudeTransportFailureStage) -> &'static str {
+    match stage {
+        ClaudeTransportFailureStage::Startup => "startup",
+        ClaudeTransportFailureStage::AwaitingClaude => "awaiting_claude",
+        ClaudeTransportFailureStage::AwaitingToolResults => "awaiting_tool_results",
+        ClaudeTransportFailureStage::AwaitingTerminalResult => "awaiting_terminal_result",
+    }
+}
+
+fn claudecode_transport_failure_stage_from_label(
+    label: &str,
+) -> Option<ClaudeTransportFailureStage> {
+    match label {
+        "startup" => Some(ClaudeTransportFailureStage::Startup),
+        "awaiting_claude" => Some(ClaudeTransportFailureStage::AwaitingClaude),
+        "awaiting_tool_results" => Some(ClaudeTransportFailureStage::AwaitingToolResults),
+        "awaiting_terminal_result" => Some(ClaudeTransportFailureStage::AwaitingTerminalResult),
+        _ => None,
+    }
+}
+
+fn claudecode_transport_failure_data(
+    stage: ClaudeTransportFailureStage,
+    idle_timeout_triggered: bool,
+    process_exited_without_result: bool,
+    pending_tool_names: &[String],
+) -> serde_json::Value {
+    serde_json::json!({
+        "claudecode_transport_failure": {
+            "stage": claudecode_transport_failure_stage_label(stage),
+            "idle_timeout_triggered": idle_timeout_triggered,
+            "process_exited_without_result": process_exited_without_result,
+            "pending_tool_names": pending_tool_names,
+        }
+    })
+}
+
+fn claudecode_transport_failure_stage(result: &AgentResult) -> Option<ClaudeTransportFailureStage> {
+    result
+        .data
+        .as_ref()
+        .and_then(|data| data.get("claudecode_transport_failure"))
+        .and_then(|value| value.get("stage"))
+        .and_then(|value| value.as_str())
+        .and_then(claudecode_transport_failure_stage_from_label)
+}
+
+fn claudecode_idle_timeout_for_state(
+    state: ClaudeTurnWaitState,
+    idle_timeout: Duration,
+    tool_idle_timeout: Duration,
+    post_tool_result_idle_timeout: Duration,
+) -> Duration {
+    match state {
+        ClaudeTurnWaitState::Startup | ClaudeTurnWaitState::AwaitingClaude => idle_timeout,
+        ClaudeTurnWaitState::AwaitingToolResults => std::cmp::max(idle_timeout, tool_idle_timeout),
+        ClaudeTurnWaitState::AwaitingTerminalResult => {
+            std::cmp::max(idle_timeout, post_tool_result_idle_timeout)
+        }
+    }
+}
+
+fn claudecode_idle_deadline(
+    state: ClaudeTurnWaitState,
+    now: tokio::time::Instant,
+    idle_timeout: Duration,
+    tool_idle_timeout: Duration,
+    post_tool_result_idle_timeout: Duration,
+    tool_timeout_override: Option<tokio::time::Instant>,
+) -> tokio::time::Instant {
+    let state_deadline = now
+        + claudecode_idle_timeout_for_state(
+            state,
+            idle_timeout,
+            tool_idle_timeout,
+            post_tool_result_idle_timeout,
+        );
+    match state {
+        ClaudeTurnWaitState::AwaitingToolResults => {
+            tool_timeout_override.map_or(state_deadline, |deadline| deadline.max(state_deadline))
+        }
+        _ => state_deadline,
+    }
+}
+
+struct ClaudeIncompleteTurnContext<'a> {
+    partial_output: Option<&'a str>,
+    non_json_output: &'a [String],
+    malformed_json_output: &'a [String],
+    process_exited_without_result: bool,
+    idle_timeout_triggered: bool,
+    wait_state: ClaudeTurnWaitState,
+    pending_tools: &'a [String],
+}
+
+fn claudecode_incomplete_turn_message(
+    exit_summary: &str,
+    ctx: ClaudeIncompleteTurnContext<'_>,
+) -> String {
+    let mut message = if ctx.idle_timeout_triggered
+        && matches!(ctx.wait_state, ClaudeTurnWaitState::AwaitingToolResults)
+    {
+        format!(
+            "Claude Code stopped producing output while waiting for tool results before emitting a terminal result event and hit the tool-wait idle timeout. Exit status: {}.",
+            exit_summary
+        )
+    } else if ctx.idle_timeout_triggered
+        && matches!(ctx.wait_state, ClaudeTurnWaitState::AwaitingTerminalResult)
+    {
+        format!(
+            "Claude Code stopped producing output after all observed tool results completed but before emitting a terminal result event, and hit the post-tool-result idle timeout. Exit status: {}.",
+            exit_summary
+        )
+    } else if ctx.idle_timeout_triggered {
+        format!(
+            "Claude Code stopped producing output before emitting a terminal result event and hit the idle timeout. Exit status: {}.",
+            exit_summary
+        )
+    } else if ctx.process_exited_without_result {
+        format!(
+            "Claude Code exited without emitting a terminal result event. Exit status: {}.",
+            exit_summary
+        )
+    } else {
+        format!(
+            "Claude Code did not emit a terminal result event before the turn ended. Exit status: {}.",
+            exit_summary
+        )
+    };
+
+    if let Some(output) = ctx
+        .partial_output
+        .map(|value| truncate_diagnostic_snippet(value, 1200))
+    {
+        if !output.is_empty() {
+            message.push_str(
+                "\n\nPartial assistant output was captured, but the turn is being treated as incomplete until a Claude result event is observed.",
+            );
+            message.push_str("\n\nPartial output:\n");
+            message.push_str(&output);
+        }
+    } else if !ctx.non_json_output.is_empty() {
+        message.push_str("\n\nNon-JSON output captured:\n");
+        message.push_str(&ctx.non_json_output.join("\n"));
+    } else if !ctx.malformed_json_output.is_empty() {
+        message.push_str("\n\nMalformed JSON output captured:\n");
+        message.push_str(&ctx.malformed_json_output.join("\n"));
+    }
+
+    if !ctx.pending_tools.is_empty() {
+        message.push_str("\n\nPending tool calls at timeout:\n");
+        message.push_str(&ctx.pending_tools.join("\n"));
+    }
+
+    message.push_str(
+        "\n\nTreating this as resumable transport failure rather than successful completion.",
+    );
+    message
+}
+
+fn claudecode_malformed_startup_message(
+    diagnostics: &[String],
+    use_resume: bool,
+    session_id: &str,
+) -> String {
+    let mut msg =
+        "Claude Code emitted malformed stream-json output before startup completed.".to_string();
+    msg.push_str(
+        "\n\nTreating this as resumable transport corruption rather than successful startup.",
+    );
+    msg.push_str(&format!(
+        "\n\nDiagnostics: use_resume={}, session_id={}",
+        use_resume, session_id
+    ));
+    if !diagnostics.is_empty() {
+        msg.push_str("\n\nMalformed JSON output captured:\n");
+        msg.push_str(&diagnostics.join("\n"));
+    }
+    msg
+}
+
+fn claudecode_pre_turn_transport_message(
+    exit_summary: &str,
+    non_json_output: &[String],
+    malformed_json_output: &[String],
+    use_resume: bool,
+    session_id: &str,
+) -> String {
+    if !malformed_json_output.is_empty() {
+        let mut message =
+            claudecode_malformed_startup_message(malformed_json_output, use_resume, session_id);
+        message.push_str(&format!("\n\nExit status: {}", exit_summary));
+        return message;
+    }
+
+    let mut message = format!(
+        "Claude Code ended before startup completed and did not emit any parseable stream-json turn events. Exit status: {}.",
+        exit_summary
+    );
+    message.push_str(
+        "\n\nTreating this as resumable startup transport failure rather than successful completion.",
+    );
+    message.push_str(&format!(
+        "\n\nDiagnostics: use_resume={}, session_id={}",
+        use_resume, session_id
+    ));
+    if !non_json_output.is_empty() {
+        message.push_str("\n\nNon-JSON output captured:\n");
+        message.push_str(&non_json_output.join("\n"));
+    }
+    message
+}
+
 async fn lease_codex_account(
     working_dir: &std::path::Path,
     tried_keys: &HashSet<String>,
@@ -1436,6 +1703,9 @@ fn bind_command_params(
 ///
 /// This covers:
 /// - "no stream events after startup timeout" — CLI hangs on resume
+/// - malformed stream-json output before startup completed
+/// - incomplete turns where Claude emitted activity but never produced a
+///   terminal `result` event before process exit or idle timeout
 /// - API validation errors from corrupted conversation history (e.g. mismatched
 ///   tool_use_id / tool_result blocks after a session was partially lost)
 /// - Context window exhaustion ("Prompt is too long") — session accumulated too
@@ -1444,11 +1714,22 @@ pub fn is_session_corruption_error(result: &AgentResult) -> bool {
     if result.success || result.terminal_reason != Some(TerminalReason::LlmError) {
         return false;
     }
+
+    if claudecode_transport_failure_stage(result).is_some() {
+        return true;
+    }
+
     let out = &result.output;
-    // Stuck session: CLI started but emitted no parseable events
-    out.starts_with(
-        "Claude Code produced no stream events after startup timeout",
-    )
+    // Stuck session: CLI started but emitted no parseable events.
+    // Match on stable transport markers instead of exact prefixes so retry
+    // still triggers if the wrapper prepends extra diagnostics/context.
+    out.contains("Claude Code produced no stream events after startup timeout")
+    || out.contains("Claude Code emitted malformed stream-json output before startup completed")
+    || out.contains("Claude Code ended before startup completed and did not emit any parseable stream-json turn events")
+    // Claude produced activity but transport ended before any terminal result event.
+    || out.contains("Claude Code exited without emitting a terminal result event")
+    || out.contains("Claude Code stopped producing output before emitting a terminal result event")
+    || out.contains("Claude Code did not emit a terminal result event before the turn ended")
     // API rejected the reconstructed conversation history
     || out.contains("unexpected tool_use_id found in tool_result blocks")
     || out.contains("tool_use block must have a corresponding tool_result")
@@ -1458,6 +1739,84 @@ pub fn is_session_corruption_error(result: &AgentResult) -> bool {
     || out.contains("No conversation found with session ID")
     // Context window exhausted — too many turns/tool calls filled the context
     || out.contains("Prompt is too long")
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ClaudeTransportRecoveryStrategy {
+    None,
+    ResumeCurrentSession,
+    ResetSessionFresh,
+}
+
+fn is_claudecode_incomplete_turn_transport_error(result: &AgentResult) -> bool {
+    if result.success || result.terminal_reason != Some(TerminalReason::LlmError) {
+        return false;
+    }
+
+    if let Some(stage) = claudecode_transport_failure_stage(result) {
+        return !matches!(stage, ClaudeTransportFailureStage::Startup);
+    }
+
+    let out = &result.output;
+    out.contains("Claude Code exited without emitting a terminal result event")
+        || out.contains(
+            "Claude Code stopped producing output before emitting a terminal result event",
+        )
+        || out.contains("Claude Code did not emit a terminal result event before the turn ended")
+}
+
+pub(crate) fn claudecode_transport_recovery_strategy(
+    result: &AgentResult,
+    has_session_id: bool,
+    attempted_same_session_resume: bool,
+    attempted_session_reset: bool,
+) -> ClaudeTransportRecoveryStrategy {
+    if !is_session_corruption_error(result) {
+        return ClaudeTransportRecoveryStrategy::None;
+    }
+
+    match claudecode_transport_failure_stage(result) {
+        Some(ClaudeTransportFailureStage::Startup) => {
+            if !attempted_session_reset {
+                return ClaudeTransportRecoveryStrategy::ResetSessionFresh;
+            }
+        }
+        Some(ClaudeTransportFailureStage::AwaitingTerminalResult) => {
+            if has_session_id && !attempted_same_session_resume {
+                return ClaudeTransportRecoveryStrategy::ResumeCurrentSession;
+            }
+            if !attempted_session_reset {
+                return ClaudeTransportRecoveryStrategy::ResetSessionFresh;
+            }
+        }
+        Some(ClaudeTransportFailureStage::AwaitingClaude)
+        | Some(ClaudeTransportFailureStage::AwaitingToolResults) => {
+            if has_session_id && !attempted_same_session_resume {
+                return ClaudeTransportRecoveryStrategy::ResumeCurrentSession;
+            }
+            if !attempted_session_reset {
+                return ClaudeTransportRecoveryStrategy::ResetSessionFresh;
+            }
+        }
+        None => {
+            if has_session_id
+                && is_claudecode_incomplete_turn_transport_error(result)
+                && !attempted_same_session_resume
+            {
+                return ClaudeTransportRecoveryStrategy::ResumeCurrentSession;
+            }
+
+            if !attempted_session_reset {
+                return ClaudeTransportRecoveryStrategy::ResetSessionFresh;
+            }
+        }
+    }
+
+    ClaudeTransportRecoveryStrategy::None
+}
+
+pub(crate) fn claudecode_resume_current_session_message() -> &'static str {
+    "Your previous response in this session ended before the final answer finished streaming. Continue from the current session state without restarting completed tool calls. If the work is already done, provide only the remaining final answer."
 }
 
 /// Execute a single turn for a mission.
@@ -1708,6 +2067,8 @@ async fn run_mission_turn(
             // session corruption recovery rebuilds the message).
             let mut effective_msg = user_message.clone();
             let mut effective_sid = session_id.clone();
+            let mut attempted_same_session_resume = false;
+            let mut attempted_session_reset = false;
 
             let mut result = run_claudecode_turn(
                 &workspace,
@@ -1729,86 +2090,111 @@ async fn run_mission_turn(
             )
             .await;
 
-            // Claude Code can fail when resuming a session due to stale/corrupt state:
-            // - CLI hangs and emits no parseable stream events (startup timeout)
-            // - API rejects reconstructed history (e.g. mismatched tool_use_id)
-            // When that happens, auto-reset the session_id and retry once fresh.
-            //
-            // Previously this only fired when `is_continuation` was true, but startup
-            // timeouts can also happen on the first turn if the session marker file was
-            // stale (left over from a previous mission with the same session_id) or if
-            // the CLI hangs during initialization for other reasons.  Retrying with a
-            // fresh session is always safe regardless of turn count.
-            if is_session_corruption_error(&result) {
-                let new_session_id = Uuid::new_v4().to_string();
-                tracing::warn!(
-                    mission_id = %mission_id,
-                    old_session_id = ?session_id,
-                    new_session_id = %new_session_id,
-                    is_continuation = is_continuation,
-                    error = %result.output,
-                    "Session corruption detected; resetting session and retrying once"
-                );
-
-                // Persist the new session ID via the event pipeline.
-                let _ = events_tx.send(AgentEvent::SessionIdUpdate {
-                    mission_id,
-                    session_id: new_session_id.clone(),
-                });
-
-                // Delete the stale session marker so the retry creates a fresh one.
-                let session_marker = mission_work_dir.join(".claude-session-initiated");
-                if session_marker.exists() {
-                    let _ = std::fs::remove_file(&session_marker);
-                }
-
-                // Build retry message with history context so the agent retains
-                // context from earlier turns (the fresh session has no memory).
-                let history_for_retry = match history.last() {
-                    Some((role, content)) if role == "user" && content == &user_message => {
-                        &history[..history.len() - 1]
+            loop {
+                match claudecode_transport_recovery_strategy(
+                    &result,
+                    effective_sid.is_some(),
+                    attempted_same_session_resume,
+                    attempted_session_reset,
+                ) {
+                    ClaudeTransportRecoveryStrategy::None => break,
+                    ClaudeTransportRecoveryStrategy::ResumeCurrentSession => {
+                        attempted_same_session_resume = true;
+                        tracing::warn!(
+                            mission_id = %mission_id,
+                            session_id = ?effective_sid,
+                            error = %result.output,
+                            "Incomplete Claude turn detected; retrying once by continuing the current session"
+                        );
+                        effective_msg = claudecode_resume_current_session_message().to_string();
+                        result = run_claudecode_turn(
+                            &workspace,
+                            &mission_work_dir,
+                            &effective_msg,
+                            config.default_model.as_deref(),
+                            model_effort.as_deref(),
+                            effective_agent.as_deref(),
+                            mission_id,
+                            events_tx.clone(),
+                            cancel.clone(),
+                            secrets.clone(),
+                            &config.working_dir,
+                            effective_sid.as_deref(),
+                            true,
+                            Some(Arc::clone(&tool_hub)),
+                            Some(Arc::clone(&status)),
+                            None,
+                        )
+                        .await;
                     }
-                    _ => history.as_slice(),
-                };
-                let retry_message = if history_for_retry.is_empty() {
-                    user_message.clone()
-                } else {
-                    let history_ctx = build_history_context(
-                        history_for_retry,
-                        config.context.max_history_total_chars,
-                    );
-                    format!(
-                        "## Prior conversation (session was reset due to a transient error)\n\n\
-                         {history_ctx}\
-                         ## Current message\n\n\
-                         {user_message}"
-                    )
-                };
+                    ClaudeTransportRecoveryStrategy::ResetSessionFresh => {
+                        attempted_session_reset = true;
+                        let new_session_id = Uuid::new_v4().to_string();
+                        tracing::warn!(
+                            mission_id = %mission_id,
+                            old_session_id = ?effective_sid,
+                            new_session_id = %new_session_id,
+                            attempted_same_session_resume,
+                            is_continuation = is_continuation,
+                            error = %result.output,
+                            "Claude transport recovery is rotating to a fresh session"
+                        );
 
-                // Update effective context so account rotation uses the
-                // recovery message and new session, not the stale originals.
-                effective_msg = retry_message;
-                effective_sid = Some(new_session_id);
+                        let _ = events_tx.send(AgentEvent::SessionIdUpdate {
+                            mission_id,
+                            session_id: new_session_id.clone(),
+                        });
 
-                result = run_claudecode_turn(
-                    &workspace,
-                    &mission_work_dir,
-                    &effective_msg,
-                    config.default_model.as_deref(),
-                    model_effort.as_deref(),
-                    effective_agent.as_deref(),
-                    mission_id,
-                    events_tx.clone(),
-                    cancel.clone(),
-                    secrets.clone(),
-                    &config.working_dir,
-                    effective_sid.as_deref(),
-                    false, // Fresh session — don't pass is_continuation=true
-                    Some(Arc::clone(&tool_hub)),
-                    Some(Arc::clone(&status)),
-                    None, // override_auth
-                )
-                .await;
+                        let session_marker = mission_work_dir.join(".claude-session-initiated");
+                        if session_marker.exists() {
+                            let _ = std::fs::remove_file(&session_marker);
+                        }
+
+                        let history_for_retry = match history.last() {
+                            Some((role, content)) if role == "user" && content == &user_message => {
+                                &history[..history.len() - 1]
+                            }
+                            _ => history.as_slice(),
+                        };
+                        let retry_message = if history_for_retry.is_empty() {
+                            user_message.clone()
+                        } else {
+                            let history_ctx = build_history_context(
+                                history_for_retry,
+                                config.context.max_history_total_chars,
+                            );
+                            format!(
+                                "## Prior conversation (session was reset due to a transient error)\n\n\
+                                 {history_ctx}\
+                                 ## Current message\n\n\
+                                 {user_message}"
+                            )
+                        };
+
+                        effective_msg = retry_message;
+                        effective_sid = Some(new_session_id);
+
+                        result = run_claudecode_turn(
+                            &workspace,
+                            &mission_work_dir,
+                            &effective_msg,
+                            config.default_model.as_deref(),
+                            model_effort.as_deref(),
+                            effective_agent.as_deref(),
+                            mission_id,
+                            events_tx.clone(),
+                            cancel.clone(),
+                            secrets.clone(),
+                            &config.working_dir,
+                            effective_sid.as_deref(),
+                            false,
+                            Some(Arc::clone(&tool_hub)),
+                            Some(Arc::clone(&status)),
+                            None,
+                        )
+                        .await;
+                    }
+                }
             }
 
             // Account rotation: if rate-limited, try alternate Anthropic credentials.
@@ -3175,6 +3561,7 @@ pub fn run_claudecode_turn<'a>(
         });
 
         let mut non_json_output: Vec<String> = Vec::new();
+        let mut malformed_json_output: Vec<String> = Vec::new();
 
         // Track tool calls for result mapping
         let mut pending_tools: HashMap<String, String> = HashMap::new();
@@ -3186,6 +3573,10 @@ pub fn run_claudecode_turn<'a>(
         let mut observed_model: Option<String> = None;
         let mut final_result = String::new();
         let mut had_error = false;
+        let mut saw_terminal_result_event = false;
+        let mut process_exited_without_result = false;
+        let mut idle_timeout_triggered = false;
+        let mut transport_failure_stage: Option<ClaudeTransportFailureStage> = None;
 
         // Track content block types and accumulated content for Claude Code streaming
         // This is needed because Claude sends incremental deltas that need to be accumulated
@@ -3211,8 +3602,29 @@ pub fn run_claudecode_turn<'a>(
                 .and_then(|v| v.parse::<u64>().ok())
                 .unwrap_or(600),
         );
+        let tool_idle_timeout = Duration::from_secs(
+            std::env::var("SANDBOXED_SH_CLAUDECODE_TOOL_IDLE_TIMEOUT_SECS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(1800),
+        );
+        let post_tool_result_idle_timeout = Duration::from_secs(
+            std::env::var("SANDBOXED_SH_CLAUDECODE_POST_TOOL_RESULT_IDLE_TIMEOUT_SECS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(30),
+        );
         let startup_deadline = Instant::now() + startup_timeout;
-        let mut idle_deadline = Instant::now() + idle_timeout;
+        let mut turn_wait_state = ClaudeTurnWaitState::Startup;
+        let mut tool_timeout_override: Option<tokio::time::Instant> = None;
+        let mut idle_deadline = claudecode_idle_deadline(
+            turn_wait_state,
+            Instant::now(),
+            idle_timeout,
+            tool_idle_timeout,
+            post_tool_result_idle_timeout,
+            tool_timeout_override,
+        );
 
         // Monitor child process exit. When Claude Code exits mid-tool-execution
         // (e.g. while `gh` is still running), child processes can keep the PTY
@@ -3249,7 +3661,6 @@ pub fn run_claudecode_turn<'a>(
         // before breaking the loop. This lets us capture any final `result` event
         // that may already be buffered in the PTY/channel.
         let mut process_exit_grace_deadline: Option<Instant> = None;
-
         // Process events until completion or cancellation
         loop {
             tokio::select! {
@@ -3266,16 +3677,27 @@ pub fn run_claudecode_turn<'a>(
                         mission_id = %mission_id,
                         use_resume = use_resume,
                         non_json_lines = non_json_output.len(),
+                        malformed_json_lines = malformed_json_output.len(),
                         non_json_sample = ?non_json_output.first(),
+                        malformed_json_sample = ?malformed_json_output.first(),
                         cli_program = %program,
                         cli_args_count = full_args.len(),
                         "Claude Code startup timeout - no stream events received"
                     );
                     pty.kill();
                     reader_handle.abort();
-                    let mut msg = "Claude Code produced no stream events after startup timeout. The Claude CLI started but did not emit any stream-json events.".to_string();
-                    msg.push_str("\n\nThis can happen when resuming an old/stuck Claude session or when the CLI hangs during initialization.");
-                    msg.push_str(&format!("\n\nDiagnostics: use_resume={}, session_id={}", use_resume, session_id));
+                    let mut msg = if !malformed_json_output.is_empty() {
+                        claudecode_malformed_startup_message(
+                            &malformed_json_output,
+                            use_resume,
+                            &session_id,
+                        )
+                    } else {
+                        let mut msg = "Claude Code produced no stream events after startup timeout. The Claude CLI started but did not emit any stream-json events.".to_string();
+                        msg.push_str("\n\nThis can happen when resuming an old/stuck Claude session or when the CLI hangs during initialization.");
+                        msg.push_str(&format!("\n\nDiagnostics: use_resume={}, session_id={}", use_resume, session_id));
+                        msg
+                    };
                     if !non_json_output.is_empty() {
                         msg.push_str(&format!(
                             "\n\nNon-JSON output captured ({} lines):\n{}",
@@ -3284,16 +3706,26 @@ pub fn run_claudecode_turn<'a>(
                         ));
                     }
                     return AgentResult::failure(msg, 0)
-                        .with_terminal_reason(TerminalReason::LlmError);
+                        .with_terminal_reason(TerminalReason::LlmError)
+                        .with_data(claudecode_transport_failure_data(
+                            ClaudeTransportFailureStage::Startup,
+                            false,
+                            false,
+                            &[],
+                        ));
                 }
                 _ = tokio::time::sleep_until(idle_deadline), if saw_non_init_event => {
+                    tracing::warn!(
+                        mission_id = %mission_id,
+                        wait_state = ?turn_wait_state,
+                        pending_tool_count = pending_tools.len(),
+                        had_partial_output = !final_result.trim().is_empty() || !text_buffer.is_empty(),
+                        "Claude Code idle timeout after activity; treating turn as incomplete"
+                    );
                     pty.kill();
                     reader_handle.abort();
-                    return AgentResult::failure(
-                        "Claude Code produced no output for an extended period and was terminated (idle timeout).".to_string(),
-                        0,
-                    )
-                    .with_terminal_reason(TerminalReason::LlmError);
+                    idle_timeout_triggered = true;
+                    break;
                 }
                 _ = process_exit_notify.notified(), if !process_exited => {
                     // The main PTY child (nsenter/claude) has exited.
@@ -3312,6 +3744,7 @@ pub fn run_claudecode_turn<'a>(
                         mission_id = %mission_id,
                         "Claude Code process exited without emitting a result event, breaking event loop"
                     );
+                    process_exited_without_result = true;
                     // Kill any orphaned child processes still holding the PTY open
                     pty.kill();
                     reader_handle.abort();
@@ -3322,8 +3755,6 @@ pub fn run_claudecode_turn<'a>(
                         // EOF - PTY closed
                         break;
                     };
-
-                    idle_deadline = Instant::now() + idle_timeout;
 
                     let raw_line = raw_line.trim_end_matches(&['\r', '\n'][..]);
                     let cleaned = strip_ansi_codes(raw_line);
@@ -3348,6 +3779,16 @@ pub fn run_claudecode_turn<'a>(
                     let claude_event: ClaudeEvent = match serde_json::from_str(line) {
                         Ok(event) => event,
                         Err(e) => {
+                            if malformed_json_output.len() < 20 {
+                                let excerpt = if line.len() > 200 {
+                                    let end = safe_truncate_index(line, 200);
+                                    format!("{}...", &line[..end])
+                                } else {
+                                    line.to_string()
+                                };
+                                malformed_json_output
+                                    .push(format!("Parse error: {} | line: {}", e, excerpt));
+                            }
                             tracing::warn!(
                                 mission_id = %mission_id,
                                 "Failed to parse Claude event: {} - line: {}",
@@ -3365,6 +3806,9 @@ pub fn run_claudecode_turn<'a>(
 
                     if !matches!(claude_event, ClaudeEvent::System(_)) {
                         saw_non_init_event = true;
+                        if matches!(turn_wait_state, ClaudeTurnWaitState::Startup) {
+                            turn_wait_state = ClaudeTurnWaitState::AwaitingClaude;
+                        }
                     }
 
                             match claude_event {
@@ -3455,6 +3899,7 @@ pub fn run_claudecode_turn<'a>(
                                             if content_block.block_type == "tool_use" {
                                                 if let (Some(id), Some(name)) = (content_block.id, content_block.name) {
                                                     pending_tools.insert(id, name);
+                                                    turn_wait_state = ClaudeTurnWaitState::AwaitingToolResults;
                                                 }
                                             }
                                         }
@@ -3503,6 +3948,7 @@ pub fn run_claudecode_turn<'a>(
                                             }
                                             ContentBlock::ToolUse { id, name, input } => {
                                                 pending_tools.insert(id.clone(), name.clone());
+                                                turn_wait_state = ClaudeTurnWaitState::AwaitingToolResults;
                                                 let _ = events_tx.send(AgentEvent::ToolCall {
                                                     tool_call_id: id.clone(),
                                                     name: name.clone(),
@@ -3519,14 +3965,17 @@ pub fn run_claudecode_turn<'a>(
                                                     // Add a buffer beyond the tool's own timeout
                                                     let extended = tool_timeout + Duration::from_secs(30);
                                                     let new_deadline = Instant::now() + extended;
-                                                    if new_deadline > idle_deadline {
+                                                    let should_extend = tool_timeout_override
+                                                        .map(|current| new_deadline > current)
+                                                        .unwrap_or(true);
+                                                    if should_extend {
                                                         tracing::info!(
                                                             mission_id = %mission_id,
                                                             tool_name = %name,
                                                             tool_timeout_secs = tool_timeout_ms / 1000,
                                                             "Extending idle timeout for long-running tool call"
                                                         );
-                                                        idle_deadline = new_deadline;
+                                                        tool_timeout_override = Some(new_deadline);
                                                     }
                                                 }
 
@@ -3647,6 +4096,15 @@ pub fn run_claudecode_turn<'a>(
                                             let name = pending_tools
                                                 .remove(&tool_use_id)
                                                 .unwrap_or_else(|| "unknown".to_string());
+                                            if pending_tools.is_empty() {
+                                                turn_wait_state =
+                                                    ClaudeTurnWaitState::AwaitingTerminalResult;
+                                                tool_timeout_override = None;
+                                                tracing::debug!(
+                                                    mission_id = %mission_id,
+                                                    "All observed Claude tool results completed; waiting for terminal result"
+                                                );
+                                            }
 
                                             // Convert content to string representation (handles both text and image results)
                                             let content_str = content.to_string_lossy();
@@ -3672,6 +4130,7 @@ pub fn run_claudecode_turn<'a>(
                                     }
                                 }
                                 ClaudeEvent::Result(res) => {
+                                    saw_terminal_result_event = true;
                                     if let Some(cost) = res.total_cost_usd {
                                         total_cost_usd = Some(cost);
                                     }
@@ -3712,6 +4171,14 @@ pub fn run_claudecode_turn<'a>(
                                     );
                                 }
                             }
+                    idle_deadline = claudecode_idle_deadline(
+                        turn_wait_state,
+                        Instant::now(),
+                        idle_timeout,
+                        tool_idle_timeout,
+                        post_tool_result_idle_timeout,
+                        tool_timeout_override,
+                    );
                 }
             }
         }
@@ -3772,6 +4239,62 @@ pub fn run_claudecode_turn<'a>(
             );
         }
 
+        if !had_error && !saw_terminal_result_event {
+            had_error = true;
+            let exit_summary = describe_pty_exit_status(&exit_status);
+            if !saw_non_init_event {
+                transport_failure_stage = Some(ClaudeTransportFailureStage::Startup);
+                tracing::warn!(
+                    mission_id = %mission_id,
+                    exit_status = %exit_summary,
+                    process_exited_without_result,
+                    idle_timeout_triggered,
+                    non_json_lines = non_json_output.len(),
+                    malformed_json_lines = malformed_json_output.len(),
+                    "Claude Code ended before any usable turn events; treating as startup transport failure"
+                );
+                final_result = claudecode_pre_turn_transport_message(
+                    &exit_summary,
+                    &non_json_output,
+                    &malformed_json_output,
+                    use_resume,
+                    &session_id,
+                );
+            } else {
+                let stage = claudecode_transport_failure_stage_for_incomplete_turn(
+                    saw_non_init_event,
+                    turn_wait_state,
+                );
+                transport_failure_stage = Some(stage);
+                let partial_output =
+                    (!final_result.trim().is_empty()).then_some(final_result.as_str());
+                let pending_tool_names: Vec<String> = pending_tools
+                    .values()
+                    .map(|name| format!("- {}", name))
+                    .collect();
+                tracing::warn!(
+                    mission_id = %mission_id,
+                    exit_status = %exit_summary,
+                    process_exited_without_result,
+                    idle_timeout_triggered,
+                    had_partial_output = partial_output.is_some(),
+                    "Claude Code turn ended without a terminal result event; treating as incomplete"
+                );
+                final_result = claudecode_incomplete_turn_message(
+                    &exit_summary,
+                    ClaudeIncompleteTurnContext {
+                        partial_output,
+                        non_json_output: &non_json_output,
+                        malformed_json_output: &malformed_json_output,
+                        process_exited_without_result,
+                        idle_timeout_triggered,
+                        wait_state: turn_wait_state,
+                        pending_tools: &pending_tool_names,
+                    },
+                );
+            }
+        }
+
         if final_result.trim().is_empty() && !had_error {
             had_error = true;
             if !non_json_output.is_empty() {
@@ -3783,6 +4306,16 @@ pub fn run_claudecode_turn<'a>(
                 final_result = format!(
                     "Claude Code produced no parseable output. Last output: {}",
                     non_json_output.join(" | ")
+                );
+            } else if !malformed_json_output.is_empty() {
+                tracing::warn!(
+                    mission_id = %mission_id,
+                    exit_status = ?exit_status,
+                    "Claude Code produced malformed JSON output"
+                );
+                final_result = format!(
+                    "Claude Code produced malformed stream-json output. Last malformed lines: {}",
+                    malformed_json_output.join(" | ")
                 );
             } else {
                 let exit_summary = describe_pty_exit_status(&exit_status);
@@ -3834,6 +4367,15 @@ pub fn run_claudecode_turn<'a>(
             AgentResult::success(final_result, cost_cents)
                 .with_terminal_reason(TerminalReason::TurnComplete)
         };
+        if let Some(stage) = transport_failure_stage {
+            let pending_tool_names: Vec<String> = pending_tools.values().cloned().collect();
+            result = result.with_data(claudecode_transport_failure_data(
+                stage,
+                idle_timeout_triggered,
+                process_exited_without_result,
+                &pending_tool_names,
+            ));
+        }
         if let Some(model) = model_for_cost {
             result = result.with_model(model.to_string());
         }
@@ -10698,23 +11240,30 @@ fn cleanup_old_debug_files(
 mod tests {
     use super::{
         actual_cost_cents_from_total_cost_usd, bind_command_params,
-        codex_chatgpt_fallback_for_result, codex_chatgpt_fallback_model, codex_key_fingerprint,
-        extract_model_from_message, extract_opencode_session_id, extract_part_text, extract_str,
-        extract_thought_line, is_capacity_limited_error, is_codex_chatgpt_account_model_blocked,
-        is_codex_node_wrapper, is_rate_limited_error, is_session_corruption_error,
-        is_tool_call_only_output, opencode_output_needs_fallback, opencode_session_token_from_line,
+        claudecode_idle_timeout_for_state, claudecode_incomplete_turn_message,
+        claudecode_malformed_startup_message, claudecode_pre_turn_transport_message,
+        claudecode_resume_current_session_message, claudecode_transport_failure_data,
+        claudecode_transport_failure_stage, claudecode_transport_failure_stage_for_incomplete_turn,
+        claudecode_transport_recovery_strategy, codex_chatgpt_fallback_for_result,
+        codex_chatgpt_fallback_model, codex_key_fingerprint, extract_model_from_message,
+        extract_opencode_session_id, extract_part_text, extract_str, extract_thought_line,
+        is_capacity_limited_error, is_codex_chatgpt_account_model_blocked, is_codex_node_wrapper,
+        is_rate_limited_error, is_session_corruption_error, is_tool_call_only_output,
+        opencode_output_needs_fallback, opencode_session_token_from_line,
         parse_opencode_session_token, parse_opencode_sse_event, parse_opencode_stderr_text_part,
         preferred_model_for_cost, resolve_cost_cents_and_source, running_health,
         sanitized_opencode_stdout, stall_severity, strip_ansi_codes, strip_opencode_banner_lines,
         strip_think_tags, summarize_recent_opencode_stderr, sync_opencode_agent_config,
-        MissionHealth, MissionRunState, MissionStallSeverity, OpencodeSseState, STALL_SEVERE_SECS,
-        STALL_WARN_SECS,
+        ClaudeIncompleteTurnContext, ClaudeTransportFailureStage, ClaudeTransportRecoveryStrategy,
+        ClaudeTurnWaitState, MissionHealth, MissionRunState, MissionStallSeverity,
+        OpencodeSseState, STALL_SEVERE_SECS, STALL_WARN_SECS,
     };
     use crate::agents::{AgentResult, CostSource, TerminalReason};
     use crate::library::types::CommandParam;
     use serde_json::json;
     use std::borrow::Cow;
     use std::fs;
+    use std::time::Duration;
     use uuid::Uuid;
 
     #[test]
@@ -11674,6 +12223,16 @@ mod tests {
     }
 
     #[test]
+    fn is_session_corruption_error_detects_malformed_startup_output() {
+        let result = AgentResult::failure(
+            "Claude Code emitted malformed stream-json output before startup completed",
+            0,
+        )
+        .with_terminal_reason(TerminalReason::LlmError);
+        assert!(is_session_corruption_error(&result));
+    }
+
+    #[test]
     fn is_session_corruption_error_detects_tool_use_id_mismatch() {
         let result = AgentResult::failure("unexpected tool_use_id found in tool_result blocks", 0)
             .with_terminal_reason(TerminalReason::LlmError);
@@ -11718,10 +12277,404 @@ mod tests {
     }
 
     #[test]
+    fn is_session_corruption_error_detects_incomplete_turn_after_process_exit() {
+        let result = AgentResult::failure(
+            "Claude Code exited without emitting a terminal result event. Exit status: 0.\n\nTreating this as resumable transport failure rather than successful completion.",
+            0,
+        )
+        .with_terminal_reason(TerminalReason::LlmError);
+        assert!(is_session_corruption_error(&result));
+    }
+
+    #[test]
+    fn is_session_corruption_error_detects_incomplete_turn_after_idle_timeout() {
+        let result = AgentResult::failure(
+            "Claude Code stopped producing output before emitting a terminal result event and hit the idle timeout. Exit status: signal: 9.\n\nTreating this as resumable transport failure rather than successful completion.",
+            0,
+        )
+        .with_terminal_reason(TerminalReason::LlmError);
+        assert!(is_session_corruption_error(&result));
+    }
+
+    #[test]
+    fn is_session_corruption_error_detects_generic_incomplete_turn_message() {
+        let result = AgentResult::failure(
+            "Claude Code did not emit a terminal result event before the turn ended. Exit status: ExitStatus { code: 1, signal: Some(\"Killed\") }.\n\nTreating this as resumable transport failure rather than successful completion.",
+            0,
+        )
+        .with_terminal_reason(TerminalReason::LlmError);
+        assert!(is_session_corruption_error(&result));
+    }
+
+    #[test]
+    fn is_session_corruption_error_detects_wrapped_incomplete_turn_message() {
+        let result = AgentResult::failure(
+            "Mission runner retry candidate:\nClaude Code exited without emitting a terminal result event. Exit status: 0.\n\nTreating this as resumable transport failure rather than successful completion.",
+            0,
+        )
+        .with_terminal_reason(TerminalReason::LlmError);
+        assert!(is_session_corruption_error(&result));
+    }
+
+    #[test]
+    fn is_session_corruption_error_detects_wrapped_malformed_startup_message() {
+        let result = AgentResult::failure(
+            "Retrying Claude session after startup parse failure.\nClaude Code emitted malformed stream-json output before startup completed.\n\nTreating this as resumable transport corruption rather than successful startup.",
+            0,
+        )
+        .with_terminal_reason(TerminalReason::LlmError);
+        assert!(is_session_corruption_error(&result));
+    }
+
+    #[test]
+    fn is_session_corruption_error_detects_pre_turn_transport_message() {
+        let result = AgentResult::failure(
+            "Claude Code ended before startup completed and did not emit any parseable stream-json turn events. Exit status: signal: 9.\n\nTreating this as resumable startup transport failure rather than successful completion.\n\nDiagnostics: use_resume=true, session_id=session-123",
+            0,
+        )
+        .with_terminal_reason(TerminalReason::LlmError);
+        assert!(is_session_corruption_error(&result));
+    }
+
+    #[test]
     fn is_session_corruption_error_false_for_other_llm_error() {
         let result = AgentResult::failure("rate limit exceeded", 0)
             .with_terminal_reason(TerminalReason::LlmError);
         assert!(!is_session_corruption_error(&result));
+    }
+
+    #[test]
+    fn claudecode_transport_recovery_strategy_prefers_same_session_resume_for_incomplete_turn() {
+        let result = AgentResult::failure(
+            "Claude Code exited without emitting a terminal result event. Exit status: 0.\n\nTreating this as resumable transport failure rather than successful completion.",
+            0,
+        )
+        .with_terminal_reason(TerminalReason::LlmError);
+
+        assert_eq!(
+            claudecode_transport_recovery_strategy(&result, true, false, false),
+            ClaudeTransportRecoveryStrategy::ResumeCurrentSession
+        );
+    }
+
+    #[test]
+    fn claudecode_transport_recovery_strategy_resets_after_resume_attempt() {
+        let result = AgentResult::failure(
+            "Claude Code stopped producing output before emitting a terminal result event and hit the idle timeout. Exit status: signal: 9.\n\nTreating this as resumable transport failure rather than successful completion.",
+            0,
+        )
+        .with_terminal_reason(TerminalReason::LlmError);
+
+        assert_eq!(
+            claudecode_transport_recovery_strategy(&result, true, true, false),
+            ClaudeTransportRecoveryStrategy::ResetSessionFresh
+        );
+    }
+
+    #[test]
+    fn claudecode_transport_recovery_strategy_resets_for_malformed_startup_without_resume() {
+        let result = AgentResult::failure(
+            "Claude Code emitted malformed stream-json output before startup completed.\n\nTreating this as resumable transport corruption rather than successful startup.",
+            0,
+        )
+        .with_terminal_reason(TerminalReason::LlmError);
+
+        assert_eq!(
+            claudecode_transport_recovery_strategy(&result, true, false, false),
+            ClaudeTransportRecoveryStrategy::ResetSessionFresh
+        );
+    }
+
+    #[test]
+    fn claudecode_transport_recovery_strategy_resets_for_pre_turn_transport_failure() {
+        let result = AgentResult::failure(
+            "Claude Code ended before startup completed and did not emit any parseable stream-json turn events. Exit status: signal: 9.\n\nTreating this as resumable startup transport failure rather than successful completion.\n\nDiagnostics: use_resume=true, session_id=session-123",
+            0,
+        )
+        .with_terminal_reason(TerminalReason::LlmError);
+
+        assert_eq!(
+            claudecode_transport_recovery_strategy(&result, true, false, false),
+            ClaudeTransportRecoveryStrategy::ResetSessionFresh
+        );
+    }
+
+    #[test]
+    fn claudecode_transport_failure_stage_reads_structured_post_tool_data() {
+        let result = AgentResult::failure("post-tool ambiguity", 0)
+            .with_terminal_reason(TerminalReason::LlmError)
+            .with_data(claudecode_transport_failure_data(
+                ClaudeTransportFailureStage::AwaitingTerminalResult,
+                true,
+                false,
+                &["Bash".to_string()],
+            ));
+
+        assert_eq!(
+            claudecode_transport_failure_stage(&result),
+            Some(ClaudeTransportFailureStage::AwaitingTerminalResult)
+        );
+        assert!(is_session_corruption_error(&result));
+    }
+
+    #[test]
+    fn claudecode_transport_failure_stage_for_incomplete_turn_uses_current_post_tool_wait_state() {
+        assert_eq!(
+            claudecode_transport_failure_stage_for_incomplete_turn(
+                true,
+                ClaudeTurnWaitState::AwaitingTerminalResult,
+            ),
+            ClaudeTransportFailureStage::AwaitingTerminalResult
+        );
+    }
+
+    #[test]
+    fn claudecode_transport_failure_stage_for_incomplete_turn_preserves_tool_wait_state() {
+        assert_eq!(
+            claudecode_transport_failure_stage_for_incomplete_turn(
+                true,
+                ClaudeTurnWaitState::AwaitingToolResults,
+            ),
+            ClaudeTransportFailureStage::AwaitingToolResults
+        );
+    }
+
+    #[test]
+    fn claudecode_transport_recovery_strategy_prefers_resume_for_structured_post_tool_ambiguity() {
+        let result = AgentResult::failure("post-tool ambiguity", 0)
+            .with_terminal_reason(TerminalReason::LlmError)
+            .with_data(claudecode_transport_failure_data(
+                ClaudeTransportFailureStage::AwaitingTerminalResult,
+                true,
+                false,
+                &[],
+            ));
+
+        assert_eq!(
+            claudecode_transport_recovery_strategy(&result, true, false, false),
+            ClaudeTransportRecoveryStrategy::ResumeCurrentSession
+        );
+    }
+
+    #[test]
+    fn claudecode_transport_recovery_strategy_escalates_post_tool_ambiguity_after_resume_attempt() {
+        let result = AgentResult::failure("post-tool ambiguity", 0)
+            .with_terminal_reason(TerminalReason::LlmError)
+            .with_data(claudecode_transport_failure_data(
+                ClaudeTransportFailureStage::AwaitingTerminalResult,
+                true,
+                false,
+                &[],
+            ));
+
+        assert_eq!(
+            claudecode_transport_recovery_strategy(&result, true, true, false),
+            ClaudeTransportRecoveryStrategy::ResetSessionFresh
+        );
+    }
+
+    #[test]
+    fn claudecode_resume_current_session_message_avoids_repeating_tool_calls() {
+        let message = claudecode_resume_current_session_message();
+        assert!(message.contains("Continue from the current session state"));
+        assert!(message.contains("without restarting completed tool calls"));
+    }
+
+    #[test]
+    fn claudecode_incomplete_turn_message_marks_partial_output_as_incomplete() {
+        let message = claudecode_incomplete_turn_message(
+            "ExitStatus(unix_wait_status(0))",
+            ClaudeIncompleteTurnContext {
+                partial_output: Some("Ran tests and started summarizing the fix."),
+                non_json_output: &[],
+                malformed_json_output: &[],
+                process_exited_without_result: true,
+                idle_timeout_triggered: false,
+                wait_state: ClaudeTurnWaitState::AwaitingClaude,
+                pending_tools: &[],
+            },
+        );
+
+        assert!(message.contains("exited without emitting a terminal result event"));
+        assert!(message.contains("Partial assistant output was captured"));
+        assert!(message.contains("Ran tests and started summarizing the fix."));
+        assert!(message.contains("resumable transport failure"));
+    }
+
+    #[test]
+    fn claudecode_incomplete_turn_message_falls_back_to_non_json_output() {
+        let message = claudecode_incomplete_turn_message(
+            "signal: Some(\"Killed\")",
+            ClaudeIncompleteTurnContext {
+                partial_output: None,
+                non_json_output: &["partial stderr".to_string(), "another line".to_string()],
+                malformed_json_output: &[],
+                process_exited_without_result: false,
+                idle_timeout_triggered: false,
+                wait_state: ClaudeTurnWaitState::AwaitingClaude,
+                pending_tools: &[],
+            },
+        );
+
+        assert!(message.contains("did not emit a terminal result event"));
+        assert!(message.contains("Non-JSON output captured"));
+        assert!(message.contains("partial stderr"));
+        assert!(message.contains("another line"));
+    }
+
+    #[test]
+    fn claudecode_incomplete_turn_message_marks_idle_timeout_as_resumable() {
+        let message = claudecode_incomplete_turn_message(
+            "signal: Some(\"Killed\")",
+            ClaudeIncompleteTurnContext {
+                partial_output: Some("Started running tests before going quiet."),
+                non_json_output: &[],
+                malformed_json_output: &[],
+                process_exited_without_result: false,
+                idle_timeout_triggered: true,
+                wait_state: ClaudeTurnWaitState::AwaitingClaude,
+                pending_tools: &["- Bash".to_string(), "- Read".to_string()],
+            },
+        );
+
+        assert!(message.contains("hit the idle timeout"));
+        assert!(message.contains("Started running tests before going quiet."));
+        assert!(message.contains("Pending tool calls at timeout"));
+        assert!(message.contains("- Bash"));
+        assert!(message.contains("- Read"));
+        assert!(message.contains("resumable transport failure"));
+    }
+
+    #[test]
+    fn claudecode_incomplete_turn_message_falls_back_to_malformed_json_output() {
+        let message = claudecode_incomplete_turn_message(
+            "signal: Some(\"Killed\")",
+            ClaudeIncompleteTurnContext {
+                partial_output: None,
+                non_json_output: &[],
+                malformed_json_output: &[
+                    "Parse error: eof while parsing an object | line: {\"type\":\"assistant\""
+                        .to_string(),
+                ],
+                process_exited_without_result: false,
+                idle_timeout_triggered: false,
+                wait_state: ClaudeTurnWaitState::AwaitingClaude,
+                pending_tools: &[],
+            },
+        );
+
+        assert!(message.contains("Malformed JSON output captured"));
+        assert!(message.contains("Parse error: eof while parsing an object"));
+        assert!(message.contains("resumable transport failure"));
+    }
+
+    #[test]
+    fn claudecode_malformed_startup_message_marks_output_as_resumable_transport_corruption() {
+        let message = claudecode_malformed_startup_message(
+            &["Parse error: expected value at line 1 column 42 | line: {bad".to_string()],
+            true,
+            "session-123",
+        );
+
+        assert!(message.contains("malformed stream-json output before startup completed"));
+        assert!(message.contains("resumable transport corruption"));
+        assert!(message.contains("use_resume=true"));
+        assert!(message.contains("session-123"));
+        assert!(message.contains("Parse error: expected value"));
+    }
+
+    #[test]
+    fn claudecode_pre_turn_transport_message_marks_output_as_resumable_startup_failure() {
+        let message = claudecode_pre_turn_transport_message(
+            "signal: 9",
+            &["wrapper: process died".to_string()],
+            &[],
+            true,
+            "session-123",
+        );
+
+        assert!(message.contains("ended before startup completed"));
+        assert!(message.contains("resumable startup transport failure"));
+        assert!(message.contains("wrapper: process died"));
+        assert!(message.contains("use_resume=true"));
+        assert!(message.contains("session_id=session-123"));
+    }
+
+    #[test]
+    fn claudecode_idle_timeout_for_waiting_tool_uses_tool_budget() {
+        let idle = Duration::from_secs(30);
+        let tool_idle = Duration::from_secs(120);
+        let post_tool_idle = Duration::from_secs(45);
+
+        assert_eq!(
+            claudecode_idle_timeout_for_state(
+                ClaudeTurnWaitState::AwaitingToolResults,
+                idle,
+                tool_idle,
+                post_tool_idle,
+            ),
+            tool_idle
+        );
+        assert_eq!(
+            claudecode_idle_timeout_for_state(
+                ClaudeTurnWaitState::AwaitingClaude,
+                idle,
+                tool_idle,
+                post_tool_idle,
+            ),
+            idle
+        );
+        assert_eq!(
+            claudecode_idle_timeout_for_state(
+                ClaudeTurnWaitState::AwaitingTerminalResult,
+                idle,
+                tool_idle,
+                post_tool_idle,
+            ),
+            post_tool_idle
+        );
+    }
+
+    #[test]
+    fn claudecode_incomplete_turn_message_marks_tool_wait_idle_timeout_as_resumable() {
+        let message = claudecode_incomplete_turn_message(
+            "signal: Some(\"Killed\")",
+            ClaudeIncompleteTurnContext {
+                partial_output: Some("Waiting for the long-running Bash command to finish."),
+                non_json_output: &[],
+                malformed_json_output: &[],
+                process_exited_without_result: false,
+                idle_timeout_triggered: true,
+                wait_state: ClaudeTurnWaitState::AwaitingToolResults,
+                pending_tools: &["- Bash".to_string()],
+            },
+        );
+
+        assert!(message.contains("waiting for tool results"));
+        assert!(message.contains("tool-wait idle timeout"));
+        assert!(message.contains("resumable transport failure"));
+    }
+
+    #[test]
+    fn claudecode_incomplete_turn_message_marks_post_tool_result_idle_timeout_as_resumable() {
+        let message = claudecode_incomplete_turn_message(
+            "signal: Some(\"Killed\")",
+            ClaudeIncompleteTurnContext {
+                partial_output: Some(
+                    "Tool output arrived, but Claude never sent the final result.",
+                ),
+                non_json_output: &[],
+                malformed_json_output: &[],
+                process_exited_without_result: false,
+                idle_timeout_triggered: true,
+                wait_state: ClaudeTurnWaitState::AwaitingTerminalResult,
+                pending_tools: &[],
+            },
+        );
+
+        assert!(message.contains("after all observed tool results completed"));
+        assert!(message.contains("post-tool-result idle timeout"));
+        assert!(message.contains("resumable transport failure"));
     }
 
     // ── parse_opencode_session_token tests ────────────────────────────
