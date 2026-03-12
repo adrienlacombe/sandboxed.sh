@@ -170,8 +170,15 @@ fn claudecode_incomplete_turn_message(
     partial_output: Option<&str>,
     non_json_output: &[String],
     process_exited_without_result: bool,
+    idle_timeout_triggered: bool,
+    pending_tools: &[String],
 ) -> String {
-    let mut message = if process_exited_without_result {
+    let mut message = if idle_timeout_triggered {
+        format!(
+            "Claude Code stopped producing output before emitting a terminal result event and hit the idle timeout. Exit status: {}.",
+            exit_summary
+        )
+    } else if process_exited_without_result {
         format!(
             "Claude Code exited without emitting a terminal result event. Exit status: {}.",
             exit_summary
@@ -194,6 +201,11 @@ fn claudecode_incomplete_turn_message(
     } else if !non_json_output.is_empty() {
         message.push_str("\n\nNon-JSON output captured:\n");
         message.push_str(&non_json_output.join("\n"));
+    }
+
+    if !pending_tools.is_empty() {
+        message.push_str("\n\nPending tool calls at timeout:\n");
+        message.push_str(&pending_tools.join("\n"));
     }
 
     message.push_str(
@@ -3237,6 +3249,7 @@ pub fn run_claudecode_turn<'a>(
         let mut had_error = false;
         let mut saw_terminal_result_event = false;
         let mut process_exited_without_result = false;
+        let mut idle_timeout_triggered = false;
 
         // Track content block types and accumulated content for Claude Code streaming
         // This is needed because Claude sends incremental deltas that need to be accumulated
@@ -3338,13 +3351,16 @@ pub fn run_claudecode_turn<'a>(
                         .with_terminal_reason(TerminalReason::LlmError);
                 }
                 _ = tokio::time::sleep_until(idle_deadline), if saw_non_init_event => {
+                    tracing::warn!(
+                        mission_id = %mission_id,
+                        pending_tool_count = pending_tools.len(),
+                        had_partial_output = !final_result.trim().is_empty() || !text_buffer.is_empty(),
+                        "Claude Code idle timeout after activity; treating turn as incomplete"
+                    );
                     pty.kill();
                     reader_handle.abort();
-                    return AgentResult::failure(
-                        "Claude Code produced no output for an extended period and was terminated (idle timeout).".to_string(),
-                        0,
-                    )
-                    .with_terminal_reason(TerminalReason::LlmError);
+                    idle_timeout_triggered = true;
+                    break;
                 }
                 _ = process_exit_notify.notified(), if !process_exited => {
                     // The main PTY child (nsenter/claude) has exited.
@@ -3829,10 +3845,15 @@ pub fn run_claudecode_turn<'a>(
             had_error = true;
             let exit_summary = describe_pty_exit_status(&exit_status);
             let partial_output = (!final_result.trim().is_empty()).then_some(final_result.as_str());
+            let pending_tool_names: Vec<String> = pending_tools
+                .values()
+                .map(|name| format!("- {}", name))
+                .collect();
             tracing::warn!(
                 mission_id = %mission_id,
                 exit_status = %exit_summary,
                 process_exited_without_result,
+                idle_timeout_triggered,
                 had_partial_output = partial_output.is_some(),
                 "Claude Code turn ended without a terminal result event; treating as incomplete"
             );
@@ -3841,6 +3862,8 @@ pub fn run_claudecode_turn<'a>(
                 partial_output,
                 &non_json_output,
                 process_exited_without_result,
+                idle_timeout_triggered,
+                &pending_tool_names,
             );
         }
 
@@ -10770,17 +10793,18 @@ fn cleanup_old_debug_files(
 mod tests {
     use super::{
         actual_cost_cents_from_total_cost_usd, bind_command_params,
-        codex_chatgpt_fallback_for_result, codex_chatgpt_fallback_model, codex_key_fingerprint,
-        claudecode_incomplete_turn_message, extract_model_from_message,
+        claudecode_incomplete_turn_message, codex_chatgpt_fallback_for_result,
+        codex_chatgpt_fallback_model, codex_key_fingerprint, extract_model_from_message,
         extract_opencode_session_id, extract_part_text, extract_str, extract_thought_line,
         is_capacity_limited_error, is_codex_chatgpt_account_model_blocked, is_codex_node_wrapper,
         is_rate_limited_error, is_session_corruption_error, is_tool_call_only_output,
-        opencode_output_needs_fallback, opencode_session_token_from_line, parse_opencode_session_token,
-        parse_opencode_sse_event, parse_opencode_stderr_text_part, preferred_model_for_cost,
-        resolve_cost_cents_and_source, running_health, sanitized_opencode_stdout, stall_severity,
-        strip_ansi_codes, strip_opencode_banner_lines, strip_think_tags,
-        summarize_recent_opencode_stderr, sync_opencode_agent_config, MissionHealth,
-        MissionRunState, MissionStallSeverity, OpencodeSseState, STALL_SEVERE_SECS, STALL_WARN_SECS,
+        opencode_output_needs_fallback, opencode_session_token_from_line,
+        parse_opencode_session_token, parse_opencode_sse_event, parse_opencode_stderr_text_part,
+        preferred_model_for_cost, resolve_cost_cents_and_source, running_health,
+        sanitized_opencode_stdout, stall_severity, strip_ansi_codes, strip_opencode_banner_lines,
+        strip_think_tags, summarize_recent_opencode_stderr, sync_opencode_agent_config,
+        MissionHealth, MissionRunState, MissionStallSeverity, OpencodeSseState, STALL_SEVERE_SECS,
+        STALL_WARN_SECS,
     };
     use crate::agents::{AgentResult, CostSource, TerminalReason};
     use crate::library::types::CommandParam;
@@ -11803,6 +11827,8 @@ mod tests {
             Some("Ran tests and started summarizing the fix."),
             &[],
             true,
+            false,
+            &[],
         );
 
         assert!(message.contains("exited without emitting a terminal result event"));
@@ -11818,12 +11844,33 @@ mod tests {
             None,
             &["partial stderr".to_string(), "another line".to_string()],
             false,
+            false,
+            &[],
         );
 
         assert!(message.contains("did not emit a terminal result event"));
         assert!(message.contains("Non-JSON output captured"));
         assert!(message.contains("partial stderr"));
         assert!(message.contains("another line"));
+    }
+
+    #[test]
+    fn claudecode_incomplete_turn_message_marks_idle_timeout_as_resumable() {
+        let message = claudecode_incomplete_turn_message(
+            "signal: Some(\"Killed\")",
+            Some("Started running tests before going quiet."),
+            &[],
+            false,
+            true,
+            &["- Bash".to_string(), "- Read".to_string()],
+        );
+
+        assert!(message.contains("hit the idle timeout"));
+        assert!(message.contains("Started running tests before going quiet."));
+        assert!(message.contains("Pending tool calls at timeout"));
+        assert!(message.contains("- Bash"));
+        assert!(message.contains("- Read"));
+        assert!(message.contains("resumable transport failure"));
     }
 
     // ── parse_opencode_session_token tests ────────────────────────────
