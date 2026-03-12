@@ -1615,6 +1615,54 @@ pub fn is_session_corruption_error(result: &AgentResult) -> bool {
     || out.contains("Prompt is too long")
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClaudeTransportRecoveryStrategy {
+    None,
+    ResumeCurrentSession,
+    ResetSessionFresh,
+}
+
+fn is_claudecode_incomplete_turn_transport_error(result: &AgentResult) -> bool {
+    if result.success || result.terminal_reason != Some(TerminalReason::LlmError) {
+        return false;
+    }
+
+    let out = &result.output;
+    out.contains("Claude Code exited without emitting a terminal result event")
+        || out.contains(
+            "Claude Code stopped producing output before emitting a terminal result event",
+        )
+        || out.contains("Claude Code did not emit a terminal result event before the turn ended")
+}
+
+fn claudecode_transport_recovery_strategy(
+    result: &AgentResult,
+    has_session_id: bool,
+    attempted_same_session_resume: bool,
+    attempted_session_reset: bool,
+) -> ClaudeTransportRecoveryStrategy {
+    if !is_session_corruption_error(result) {
+        return ClaudeTransportRecoveryStrategy::None;
+    }
+
+    if has_session_id
+        && is_claudecode_incomplete_turn_transport_error(result)
+        && !attempted_same_session_resume
+    {
+        return ClaudeTransportRecoveryStrategy::ResumeCurrentSession;
+    }
+
+    if !attempted_session_reset {
+        return ClaudeTransportRecoveryStrategy::ResetSessionFresh;
+    }
+
+    ClaudeTransportRecoveryStrategy::None
+}
+
+fn claudecode_resume_current_session_message() -> &'static str {
+    "Your previous response in this session ended before the final answer finished streaming. Continue from the current session state without restarting completed tool calls. If the work is already done, provide only the remaining final answer."
+}
+
 /// Execute a single turn for a mission.
 #[allow(clippy::too_many_arguments)]
 async fn run_mission_turn(
@@ -1863,6 +1911,8 @@ async fn run_mission_turn(
             // session corruption recovery rebuilds the message).
             let mut effective_msg = user_message.clone();
             let mut effective_sid = session_id.clone();
+            let mut attempted_same_session_resume = false;
+            let mut attempted_session_reset = false;
 
             let mut result = run_claudecode_turn(
                 &workspace,
@@ -1884,86 +1934,111 @@ async fn run_mission_turn(
             )
             .await;
 
-            // Claude Code can fail when resuming a session due to stale/corrupt state:
-            // - CLI hangs and emits no parseable stream events (startup timeout)
-            // - API rejects reconstructed history (e.g. mismatched tool_use_id)
-            // When that happens, auto-reset the session_id and retry once fresh.
-            //
-            // Previously this only fired when `is_continuation` was true, but startup
-            // timeouts can also happen on the first turn if the session marker file was
-            // stale (left over from a previous mission with the same session_id) or if
-            // the CLI hangs during initialization for other reasons.  Retrying with a
-            // fresh session is always safe regardless of turn count.
-            if is_session_corruption_error(&result) {
-                let new_session_id = Uuid::new_v4().to_string();
-                tracing::warn!(
-                    mission_id = %mission_id,
-                    old_session_id = ?session_id,
-                    new_session_id = %new_session_id,
-                    is_continuation = is_continuation,
-                    error = %result.output,
-                    "Session corruption detected; resetting session and retrying once"
-                );
-
-                // Persist the new session ID via the event pipeline.
-                let _ = events_tx.send(AgentEvent::SessionIdUpdate {
-                    mission_id,
-                    session_id: new_session_id.clone(),
-                });
-
-                // Delete the stale session marker so the retry creates a fresh one.
-                let session_marker = mission_work_dir.join(".claude-session-initiated");
-                if session_marker.exists() {
-                    let _ = std::fs::remove_file(&session_marker);
-                }
-
-                // Build retry message with history context so the agent retains
-                // context from earlier turns (the fresh session has no memory).
-                let history_for_retry = match history.last() {
-                    Some((role, content)) if role == "user" && content == &user_message => {
-                        &history[..history.len() - 1]
+            loop {
+                match claudecode_transport_recovery_strategy(
+                    &result,
+                    effective_sid.is_some(),
+                    attempted_same_session_resume,
+                    attempted_session_reset,
+                ) {
+                    ClaudeTransportRecoveryStrategy::None => break,
+                    ClaudeTransportRecoveryStrategy::ResumeCurrentSession => {
+                        attempted_same_session_resume = true;
+                        tracing::warn!(
+                            mission_id = %mission_id,
+                            session_id = ?effective_sid,
+                            error = %result.output,
+                            "Incomplete Claude turn detected; retrying once by continuing the current session"
+                        );
+                        effective_msg = claudecode_resume_current_session_message().to_string();
+                        result = run_claudecode_turn(
+                            &workspace,
+                            &mission_work_dir,
+                            &effective_msg,
+                            config.default_model.as_deref(),
+                            model_effort.as_deref(),
+                            effective_agent.as_deref(),
+                            mission_id,
+                            events_tx.clone(),
+                            cancel.clone(),
+                            secrets.clone(),
+                            &config.working_dir,
+                            effective_sid.as_deref(),
+                            true,
+                            Some(Arc::clone(&tool_hub)),
+                            Some(Arc::clone(&status)),
+                            None,
+                        )
+                        .await;
                     }
-                    _ => history.as_slice(),
-                };
-                let retry_message = if history_for_retry.is_empty() {
-                    user_message.clone()
-                } else {
-                    let history_ctx = build_history_context(
-                        history_for_retry,
-                        config.context.max_history_total_chars,
-                    );
-                    format!(
-                        "## Prior conversation (session was reset due to a transient error)\n\n\
-                         {history_ctx}\
-                         ## Current message\n\n\
-                         {user_message}"
-                    )
-                };
+                    ClaudeTransportRecoveryStrategy::ResetSessionFresh => {
+                        attempted_session_reset = true;
+                        let new_session_id = Uuid::new_v4().to_string();
+                        tracing::warn!(
+                            mission_id = %mission_id,
+                            old_session_id = ?effective_sid,
+                            new_session_id = %new_session_id,
+                            attempted_same_session_resume,
+                            is_continuation = is_continuation,
+                            error = %result.output,
+                            "Claude transport recovery is rotating to a fresh session"
+                        );
 
-                // Update effective context so account rotation uses the
-                // recovery message and new session, not the stale originals.
-                effective_msg = retry_message;
-                effective_sid = Some(new_session_id);
+                        let _ = events_tx.send(AgentEvent::SessionIdUpdate {
+                            mission_id,
+                            session_id: new_session_id.clone(),
+                        });
 
-                result = run_claudecode_turn(
-                    &workspace,
-                    &mission_work_dir,
-                    &effective_msg,
-                    config.default_model.as_deref(),
-                    model_effort.as_deref(),
-                    effective_agent.as_deref(),
-                    mission_id,
-                    events_tx.clone(),
-                    cancel.clone(),
-                    secrets.clone(),
-                    &config.working_dir,
-                    effective_sid.as_deref(),
-                    false, // Fresh session — don't pass is_continuation=true
-                    Some(Arc::clone(&tool_hub)),
-                    Some(Arc::clone(&status)),
-                    None, // override_auth
-                )
-                .await;
+                        let session_marker = mission_work_dir.join(".claude-session-initiated");
+                        if session_marker.exists() {
+                            let _ = std::fs::remove_file(&session_marker);
+                        }
+
+                        let history_for_retry = match history.last() {
+                            Some((role, content)) if role == "user" && content == &user_message => {
+                                &history[..history.len() - 1]
+                            }
+                            _ => history.as_slice(),
+                        };
+                        let retry_message = if history_for_retry.is_empty() {
+                            user_message.clone()
+                        } else {
+                            let history_ctx = build_history_context(
+                                history_for_retry,
+                                config.context.max_history_total_chars,
+                            );
+                            format!(
+                                "## Prior conversation (session was reset due to a transient error)\n\n\
+                                 {history_ctx}\
+                                 ## Current message\n\n\
+                                 {user_message}"
+                            )
+                        };
+
+                        effective_msg = retry_message;
+                        effective_sid = Some(new_session_id);
+
+                        result = run_claudecode_turn(
+                            &workspace,
+                            &mission_work_dir,
+                            &effective_msg,
+                            config.default_model.as_deref(),
+                            model_effort.as_deref(),
+                            effective_agent.as_deref(),
+                            mission_id,
+                            events_tx.clone(),
+                            cancel.clone(),
+                            secrets.clone(),
+                            &config.working_dir,
+                            effective_sid.as_deref(),
+                            false,
+                            Some(Arc::clone(&tool_hub)),
+                            Some(Arc::clone(&status)),
+                            None,
+                        )
+                        .await;
+                    }
+                }
             }
 
             // Account rotation: if rate-limited, try alternate Anthropic credentials.
@@ -10969,7 +11044,8 @@ mod tests {
     use super::{
         actual_cost_cents_from_total_cost_usd, bind_command_params,
         claudecode_idle_timeout_for_state, claudecode_incomplete_turn_message,
-        claudecode_malformed_startup_message, codex_chatgpt_fallback_for_result,
+        claudecode_malformed_startup_message, claudecode_resume_current_session_message,
+        claudecode_transport_recovery_strategy, codex_chatgpt_fallback_for_result,
         codex_chatgpt_fallback_model, codex_key_fingerprint, extract_model_from_message,
         extract_opencode_session_id, extract_part_text, extract_str, extract_thought_line,
         is_capacity_limited_error, is_codex_chatgpt_account_model_blocked, is_codex_node_wrapper,
@@ -10979,8 +11055,8 @@ mod tests {
         preferred_model_for_cost, resolve_cost_cents_and_source, running_health,
         sanitized_opencode_stdout, stall_severity, strip_ansi_codes, strip_opencode_banner_lines,
         strip_think_tags, summarize_recent_opencode_stderr, sync_opencode_agent_config,
-        ClaudeTurnWaitState, MissionHealth, MissionRunState, MissionStallSeverity,
-        OpencodeSseState, STALL_SEVERE_SECS, STALL_WARN_SECS,
+        ClaudeTransportRecoveryStrategy, ClaudeTurnWaitState, MissionHealth, MissionRunState,
+        MissionStallSeverity, OpencodeSseState, STALL_SEVERE_SECS, STALL_WARN_SECS,
     };
     use crate::agents::{AgentResult, CostSource, TerminalReason};
     use crate::library::types::CommandParam;
@@ -12055,6 +12131,55 @@ mod tests {
         let result = AgentResult::failure("rate limit exceeded", 0)
             .with_terminal_reason(TerminalReason::LlmError);
         assert!(!is_session_corruption_error(&result));
+    }
+
+    #[test]
+    fn claudecode_transport_recovery_strategy_prefers_same_session_resume_for_incomplete_turn() {
+        let result = AgentResult::failure(
+            "Claude Code exited without emitting a terminal result event. Exit status: 0.\n\nTreating this as resumable transport failure rather than successful completion.",
+            0,
+        )
+        .with_terminal_reason(TerminalReason::LlmError);
+
+        assert_eq!(
+            claudecode_transport_recovery_strategy(&result, true, false, false),
+            ClaudeTransportRecoveryStrategy::ResumeCurrentSession
+        );
+    }
+
+    #[test]
+    fn claudecode_transport_recovery_strategy_resets_after_resume_attempt() {
+        let result = AgentResult::failure(
+            "Claude Code stopped producing output before emitting a terminal result event and hit the idle timeout. Exit status: signal: 9.\n\nTreating this as resumable transport failure rather than successful completion.",
+            0,
+        )
+        .with_terminal_reason(TerminalReason::LlmError);
+
+        assert_eq!(
+            claudecode_transport_recovery_strategy(&result, true, true, false),
+            ClaudeTransportRecoveryStrategy::ResetSessionFresh
+        );
+    }
+
+    #[test]
+    fn claudecode_transport_recovery_strategy_resets_for_malformed_startup_without_resume() {
+        let result = AgentResult::failure(
+            "Claude Code emitted malformed stream-json output before startup completed.\n\nTreating this as resumable transport corruption rather than successful startup.",
+            0,
+        )
+        .with_terminal_reason(TerminalReason::LlmError);
+
+        assert_eq!(
+            claudecode_transport_recovery_strategy(&result, true, false, false),
+            ClaudeTransportRecoveryStrategy::ResetSessionFresh
+        );
+    }
+
+    #[test]
+    fn claudecode_resume_current_session_message_avoids_repeating_tool_calls() {
+        let message = claudecode_resume_current_session_message();
+        assert!(message.contains("Continue from the current session state"));
+        assert!(message.contains("without restarting completed tool calls"));
     }
 
     #[test]
