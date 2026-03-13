@@ -387,12 +387,22 @@ export const EnhancedInput = forwardRef<EnhancedInputHandle, EnhancedInputProps>
   }, [value, onChange]);
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
-    // Cmd/Ctrl+Z on empty input: restore last sent message
+    // Cmd/Ctrl+Z: navigate history back (empty input or already browsing)
     if (e.key === 'z' && (e.metaKey || e.ctrlKey) && !e.shiftKey) {
       const isEmpty = displayValue.trim() === '';
-      if (isEmpty && sentHistoryRef.current.length > 0) {
+      const isBrowsing = historyIndexRef.current !== -1;
+      if ((isEmpty || isBrowsing) && sentHistoryRef.current.length > 0) {
         e.preventDefault();
         navigateHistory('back');
+        return;
+      }
+    }
+
+    // Cmd/Ctrl+Shift+Z: navigate history forward (while browsing)
+    if (e.key === 'z' && (e.metaKey || e.ctrlKey) && e.shiftKey) {
+      if (historyIndexRef.current !== -1) {
+        e.preventDefault();
+        navigateHistory('forward');
         return;
       }
     }
