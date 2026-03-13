@@ -280,6 +280,67 @@ pub fn not_found_or_internal(e: impl std::fmt::Display) -> (axum::http::StatusCo
     }
 }
 
+/// Maximum recursion depth for `copy_dir_recursive`.
+const MAX_COPY_DEPTH: u32 = 32;
+
+/// Recursively copy a directory, preserving symlinks as-is (symlink-safe with depth limit).
+///
+/// Uses `symlink_metadata` to avoid following symlinks into loops and caps
+/// recursion at [`MAX_COPY_DEPTH`] to prevent runaway traversal.
+pub async fn copy_dir_recursive(
+    src: &std::path::Path,
+    dst: &std::path::Path,
+) -> anyhow::Result<()> {
+    copy_dir_recursive_inner(src, dst, 0).await
+}
+
+#[async_recursion::async_recursion]
+async fn copy_dir_recursive_inner(
+    src: &std::path::Path,
+    dst: &std::path::Path,
+    depth: u32,
+) -> anyhow::Result<()> {
+    if depth > MAX_COPY_DEPTH {
+        anyhow::bail!(
+            "copy_dir_recursive: exceeded max depth ({}) at {:?} — possible symlink loop",
+            MAX_COPY_DEPTH,
+            src
+        );
+    }
+
+    tokio::fs::create_dir_all(dst).await?;
+
+    let mut entries = tokio::fs::read_dir(src).await?;
+    while let Some(entry) = entries.next_entry().await? {
+        let entry_path = entry.path();
+        let file_name = entry.file_name();
+        let dest_path = dst.join(&file_name);
+
+        // Use symlink_metadata to avoid following symlinks into loops
+        let metadata = tokio::fs::symlink_metadata(&entry_path).await?;
+        if metadata.is_symlink() {
+            // Copy symlink as-is rather than following it
+            let target = tokio::fs::read_link(&entry_path).await?;
+            let _ = tokio::fs::remove_file(&dest_path).await;
+            tokio::fs::symlink(&target, &dest_path).await?;
+        } else if metadata.is_dir() {
+            copy_dir_recursive_inner(&entry_path, &dest_path, depth + 1).await?;
+        } else {
+            if let Some(parent) = dest_path.parent() {
+                tokio::fs::create_dir_all(parent).await?;
+            }
+            tokio::fs::copy(&entry_path, &dest_path).await?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Returns `true` if the given IO error is an ELOOP (too many levels of symbolic links).
+pub fn is_eloop(e: &std::io::Error) -> bool {
+    e.raw_os_error() == Some(libc::ELOOP)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

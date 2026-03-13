@@ -13,7 +13,6 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use async_recursion::async_recursion;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -4072,50 +4071,7 @@ async fn seed_shard_data(container_root: &Path) -> anyhow::Result<bool> {
     Ok(true)
 }
 
-const MAX_COPY_DEPTH: u32 = 32;
-
-#[async_recursion]
-async fn copy_dir_recursive(src: &Path, dst: &Path) -> anyhow::Result<()> {
-    copy_dir_recursive_inner(src, dst, 0).await
-}
-
-#[async_recursion]
-async fn copy_dir_recursive_inner(src: &Path, dst: &Path, depth: u32) -> anyhow::Result<()> {
-    if depth > MAX_COPY_DEPTH {
-        anyhow::bail!(
-            "copy_dir_recursive: exceeded max depth ({}) at {:?} — possible symlink loop",
-            MAX_COPY_DEPTH,
-            src
-        );
-    }
-
-    tokio::fs::create_dir_all(dst).await?;
-
-    let mut entries = tokio::fs::read_dir(src).await?;
-    while let Some(entry) = entries.next_entry().await? {
-        let entry_path = entry.path();
-        let file_name = entry.file_name();
-        let dest_path = dst.join(&file_name);
-
-        // Use symlink_metadata to avoid following symlinks into loops
-        let metadata = tokio::fs::symlink_metadata(&entry_path).await?;
-        if metadata.is_symlink() {
-            // Copy symlink as-is rather than following it
-            let target = tokio::fs::read_link(&entry_path).await?;
-            let _ = tokio::fs::remove_file(&dest_path).await;
-            tokio::fs::symlink(&target, &dest_path).await?;
-        } else if metadata.is_dir() {
-            copy_dir_recursive_inner(&entry_path, &dest_path, depth + 1).await?;
-        } else {
-            if let Some(parent) = dest_path.parent() {
-                tokio::fs::create_dir_all(parent).await?;
-            }
-            tokio::fs::copy(&entry_path, &dest_path).await?;
-        }
-    }
-
-    Ok(())
-}
+use crate::util::copy_dir_recursive;
 
 async fn bootstrap_workspace_harnesses(workspace: &Workspace) -> anyhow::Result<()> {
     if workspace.workspace_type != WorkspaceType::Container || !use_nspawn_for_workspace(workspace)

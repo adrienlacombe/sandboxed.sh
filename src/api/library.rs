@@ -2280,7 +2280,7 @@ async fn install_from_registry(
         ));
     }
 
-    copy_dir_recursive(&source_dir, &target_dir)
+    crate::util::copy_dir_recursive(&source_dir, &target_dir)
         .await
         .map_err(internal_error)?;
 
@@ -2312,52 +2312,7 @@ async fn install_from_registry(
     Ok(Json(skill))
 }
 
-/// Recursively copy a directory (symlink-safe with depth limit).
-#[async_recursion::async_recursion]
-async fn copy_dir_recursive(
-    src: &std::path::Path,
-    dst: &std::path::Path,
-) -> Result<(), std::io::Error> {
-    copy_dir_recursive_inner(src, dst, 0).await
-}
-
-#[async_recursion::async_recursion]
-async fn copy_dir_recursive_inner(
-    src: &std::path::Path,
-    dst: &std::path::Path,
-    depth: u32,
-) -> Result<(), std::io::Error> {
-    if depth > 32 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!(
-                "copy_dir_recursive: exceeded max depth (32) at {:?} — possible symlink loop",
-                src
-            ),
-        ));
-    }
-
-    tokio::fs::create_dir_all(dst).await?;
-
-    let mut entries = tokio::fs::read_dir(src).await?;
-    while let Some(entry) = entries.next_entry().await? {
-        let src_path = entry.path();
-        let dst_path = dst.join(entry.file_name());
-
-        let metadata = tokio::fs::symlink_metadata(&src_path).await?;
-        if metadata.is_symlink() {
-            let target = tokio::fs::read_link(&src_path).await?;
-            let _ = tokio::fs::remove_file(&dst_path).await;
-            tokio::fs::symlink(&target, &dst_path).await?;
-        } else if metadata.is_dir() {
-            copy_dir_recursive_inner(&src_path, &dst_path, depth + 1).await?;
-        } else {
-            tokio::fs::copy(&src_path, &dst_path).await?;
-        }
-    }
-
-    Ok(())
-}
+// Uses crate::util::copy_dir_recursive (shared implementation)
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Unit Tests

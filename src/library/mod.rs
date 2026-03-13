@@ -756,7 +756,7 @@ impl LibraryStore {
         }
 
         // Copy the skill directory to target
-        if let Err(e) = Self::copy_dir_recursive(&source_dir, &target_dir).await {
+        if let Err(e) = Self::copy_dir_recursive_skip_git(&source_dir, &target_dir).await {
             let _ = fs::remove_dir_all(&temp_dir).await;
             return Err(e);
         }
@@ -815,48 +815,14 @@ impl LibraryStore {
         Ok(())
     }
 
-    /// Recursively copy a directory (symlink-safe with depth limit).
-    #[async_recursion::async_recursion]
-    async fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
-        Self::copy_dir_recursive_inner(src, dst, 0).await
-    }
-
-    #[async_recursion::async_recursion]
-    async fn copy_dir_recursive_inner(src: &Path, dst: &Path, depth: u32) -> Result<()> {
-        if depth > 32 {
-            anyhow::bail!(
-                "copy_dir_recursive: exceeded max depth (32) at {:?} — possible symlink loop",
-                src
-            );
+    /// Recursively copy a directory, skipping `.git`.
+    async fn copy_dir_recursive_skip_git(src: &Path, dst: &Path) -> Result<()> {
+        // Remove .git from destination after copying
+        crate::util::copy_dir_recursive(src, dst).await?;
+        let git_dir = dst.join(".git");
+        if git_dir.exists() {
+            let _ = fs::remove_dir_all(&git_dir).await;
         }
-
-        fs::create_dir_all(dst).await?;
-
-        let mut entries = fs::read_dir(src).await?;
-        while let Some(entry) = entries.next_entry().await? {
-            let entry_path = entry.path();
-            let file_name = entry.file_name();
-            let dst_path = dst.join(&file_name);
-
-            // Skip .git directory
-            if file_name == ".git" {
-                continue;
-            }
-
-            // Use symlink_metadata to avoid following symlinks into loops
-            let metadata = fs::symlink_metadata(&entry_path).await?;
-            if metadata.is_symlink() {
-                // Copy symlink as-is rather than following it
-                let target = fs::read_link(&entry_path).await?;
-                let _ = fs::remove_file(&dst_path).await;
-                fs::symlink(&target, &dst_path).await?;
-            } else if metadata.is_dir() {
-                Self::copy_dir_recursive_inner(&entry_path, &dst_path, depth + 1).await?;
-            } else {
-                fs::copy(&entry_path, &dst_path).await?;
-            }
-        }
-
         Ok(())
     }
 

@@ -256,9 +256,12 @@ pub async fn resolve_path_for_workspace(
     let canonical = if resolved.exists() || std::fs::symlink_metadata(&resolved).is_ok() {
         match resolved.canonicalize() {
             Ok(c) => c,
-            Err(e) if e.raw_os_error() == Some(40) /* ELOOP */ => {
+            Err(e) if crate::util::is_eloop(&e) => {
                 // Symlink loop — if the path itself is a symlink, try to clean it up
-                if std::fs::symlink_metadata(&resolved).map(|m| m.is_symlink()).unwrap_or(false) {
+                if std::fs::symlink_metadata(&resolved)
+                    .map(|m| m.is_symlink())
+                    .unwrap_or(false)
+                {
                     tracing::warn!(
                         path = %resolved.display(),
                         "Stale symlink loop detected, removing"
