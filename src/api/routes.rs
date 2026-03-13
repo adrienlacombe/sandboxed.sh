@@ -18,6 +18,7 @@ use axum::{
 };
 use futures::stream::Stream;
 use serde::Deserialize;
+use tower_http::compression::CompressionLayer;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 use uuid::Uuid;
@@ -736,6 +737,13 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
     let app = Router::new()
         .merge(public_routes)
         .merge(protected_routes)
+        .layer(
+            CompressionLayer::new()
+                .gzip(true)
+                .no_br()
+                .no_deflate()
+                .no_zstd(),
+        )
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
         .with_state(Arc::clone(&state));

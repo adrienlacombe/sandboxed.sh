@@ -55,11 +55,18 @@ async function chatCompletion(
       }),
     });
 
-    if (!res.ok) return null;
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      console.warn(
+        `[LLM] Chat completion failed: HTTP ${res.status}${text ? ` — ${text.slice(0, 200)}` : ""}`,
+      );
+      return null;
+    }
 
     const data = (await res.json()) as ChatCompletionResponse;
     return data.choices?.[0]?.message?.content?.trim() ?? null;
-  } catch {
+  } catch (err) {
+    console.warn("[LLM] Chat completion error:", err);
     return null;
   }
 }

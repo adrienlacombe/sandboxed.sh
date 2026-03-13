@@ -76,6 +76,33 @@ export const EnhancedInput = forwardRef<EnhancedInputHandle, EnhancedInputProps>
   // Track locked agent badge separately for cleaner UX
   const [lockedAgent, setLockedAgent] = useState<string | null>(null);
 
+  // Message history for undo / arrow-key recall
+  const HISTORY_KEY = 'enhanced-input-message-history';
+  const MAX_HISTORY = 10;
+  const sentHistoryRef = useRef<string[]>([]);
+  const historyIndexRef = useRef(-1); // -1 = not browsing history
+  const savedDraftRef = useRef(''); // saves current draft when entering history
+
+  // Load history from localStorage on mount
+  useEffect(() => {
+    try {
+      const stored = localStorage.getItem(HISTORY_KEY);
+      if (stored) sentHistoryRef.current = JSON.parse(stored);
+    } catch { /* ignore */ }
+  }, []);
+
+  const pushToHistory = useCallback((message: string) => {
+    const trimmed = message.trim();
+    if (!trimmed) return;
+    const history = sentHistoryRef.current;
+    // Deduplicate: remove if already most recent
+    if (history.length > 0 && history[history.length - 1] === trimmed) return;
+    history.push(trimmed);
+    if (history.length > MAX_HISTORY) history.splice(0, history.length - MAX_HISTORY);
+    try { localStorage.setItem(HISTORY_KEY, JSON.stringify(history)); } catch { /* ignore */ }
+    historyIndexRef.current = -1;
+  }, []);
+
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const autocompleteRef = useRef<HTMLDivElement>(null);
 
@@ -324,7 +351,52 @@ export const EnhancedInput = forwardRef<EnhancedInputHandle, EnhancedInputProps>
     return descriptions[name] || 'Specialized agent';
   };
 
+  const navigateHistory = useCallback((direction: 'back' | 'forward') => {
+    const history = sentHistoryRef.current;
+    if (history.length === 0) return false;
+
+    if (direction === 'back') {
+      if (historyIndexRef.current === -1) {
+        // Entering history mode — save current draft
+        savedDraftRef.current = value;
+        historyIndexRef.current = history.length - 1;
+      } else if (historyIndexRef.current > 0) {
+        historyIndexRef.current--;
+      } else {
+        return false; // Already at oldest
+      }
+      const msg = history[historyIndexRef.current];
+      setLockedAgent(null);
+      onChange(msg);
+      return true;
+    } else {
+      if (historyIndexRef.current === -1) return false; // Not in history mode
+      if (historyIndexRef.current < history.length - 1) {
+        historyIndexRef.current++;
+        const msg = history[historyIndexRef.current];
+        setLockedAgent(null);
+        onChange(msg);
+      } else {
+        // Past newest → restore draft
+        historyIndexRef.current = -1;
+        setLockedAgent(null);
+        onChange(savedDraftRef.current);
+      }
+      return true;
+    }
+  }, [value, onChange]);
+
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    // Cmd/Ctrl+Z on empty input: restore last sent message
+    if (e.key === 'z' && (e.metaKey || e.ctrlKey) && !e.shiftKey) {
+      const isEmpty = displayValue.trim() === '';
+      if (isEmpty && sentHistoryRef.current.length > 0) {
+        e.preventDefault();
+        navigateHistory('back');
+        return;
+      }
+    }
+
     // Handle backspace on locked agent badge
     if (e.key === 'Backspace' && lockedAgent && displayValue === '') {
       e.preventDefault();
@@ -362,6 +434,26 @@ export const EnhancedInput = forwardRef<EnhancedInputHandle, EnhancedInputProps>
       }
     }
 
+    // Up arrow on empty input or at position 0: navigate history back
+    if (e.key === 'ArrowUp' && !showAutocomplete) {
+      const textarea = textareaRef.current;
+      const isEmpty = displayValue.trim() === '';
+      const atStart = textarea && textarea.selectionStart === 0 && textarea.selectionEnd === 0;
+      if (isEmpty || (atStart && !displayValue.includes('\n'))) {
+        if (navigateHistory('back')) {
+          e.preventDefault();
+          return;
+        }
+      }
+    }
+
+    // Down arrow while browsing history: navigate forward
+    if (e.key === 'ArrowDown' && !showAutocomplete && historyIndexRef.current !== -1) {
+      e.preventDefault();
+      navigateHistory('forward');
+      return;
+    }
+
     // Normal Enter to submit (without Shift)
     if (e.key === 'Enter' && !e.shiftKey && !showAutocomplete) {
       e.preventDefault();
@@ -389,6 +481,12 @@ export const EnhancedInput = forwardRef<EnhancedInputHandle, EnhancedInputProps>
     const trimmedValue = displayValue.trim();
     if (!trimmedValue && !lockedAgent) return;
     if (disabled) return;
+
+    // Save to history before clearing (include agent prefix for full recall)
+    const fullMessage = lockedAgent
+      ? (trimmedValue ? `@${lockedAgent} ${trimmedValue}` : `@${lockedAgent}`)
+      : value.trim();
+    pushToHistory(fullMessage);
 
     if (lockedAgent) {
       // Locked agent badge mode
@@ -488,6 +586,8 @@ export const EnhancedInput = forwardRef<EnhancedInputHandle, EnhancedInputProps>
       }
     }
 
+    // User is typing normally — exit history browsing mode
+    historyIndexRef.current = -1;
     onChange(newValue);
   };
 

@@ -248,13 +248,40 @@ pub async fn resolve_path_for_workspace(
 
     // Canonicalize to resolve ".." and symlinks, then validate within workspace
     // For non-existent paths, we validate the parent directory exists and is within workspace
-    let canonical = if resolved.exists() {
-        resolved.canonicalize().map_err(|e| {
-            (
-                StatusCode::BAD_REQUEST,
-                format!("Failed to resolve path: {}", e),
-            )
-        })?
+    //
+    // Special handling for symlinks: if `canonicalize` fails with ELOOP (symlink loop)
+    // or the target is a dangling/looping symlink, fall back to the resolved path without
+    // canonicalization.  This avoids a 500 when the `context` directory is a stale symlink
+    // left over from a previous mission's workspace preparation.
+    let canonical = if resolved.exists() || std::fs::symlink_metadata(&resolved).is_ok() {
+        match resolved.canonicalize() {
+            Ok(c) => c,
+            Err(e) if e.raw_os_error() == Some(40) /* ELOOP */ => {
+                // Symlink loop — if the path itself is a symlink, try to clean it up
+                if std::fs::symlink_metadata(&resolved).map(|m| m.is_symlink()).unwrap_or(false) {
+                    tracing::warn!(
+                        path = %resolved.display(),
+                        "Stale symlink loop detected, removing"
+                    );
+                    let _ = std::fs::remove_file(&resolved);
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        format!(
+                            "Path was a stale symlink loop and has been cleaned up: {}. Please retry.",
+                            resolved.display()
+                        ),
+                    ));
+                }
+                // Not a symlink itself but something deeper loops — use as-is
+                resolved.clone()
+            }
+            Err(e) => {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    format!("Failed to resolve path: {}", e),
+                ));
+            }
+        }
     } else {
         // For new files, check that the parent is within workspace
         let parent = resolved.parent().ok_or_else(|| {
@@ -501,6 +528,26 @@ pub async fn list(
     State(_state): State<Arc<AppState>>,
     Query(q): Query<PathQuery>,
 ) -> Result<Json<Vec<FsEntry>>, (StatusCode, String)> {
+    let path = Path::new(&q.path);
+
+    // Check if path is a symlink loop before trying to read it
+    if let Ok(meta) = tokio::fs::symlink_metadata(path).await {
+        if meta.is_symlink() {
+            // Verify the symlink target is resolvable
+            if path.canonicalize().is_err() {
+                tracing::warn!(path = %path.display(), "Stale symlink loop detected in list(), cleaning up");
+                let _ = tokio::fs::remove_file(path).await;
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    format!(
+                        "Path was a stale symlink loop and has been cleaned up: {}. Please retry.",
+                        path.display()
+                    ),
+                ));
+            }
+        }
+    }
+
     let entries = list_directory_local(&q.path)
         .await
         .map_err(internal_error)?;
@@ -515,20 +562,24 @@ async fn list_directory_local(path: &str) -> anyhow::Result<Vec<FsEntry>> {
     let mut dir = tokio::fs::read_dir(path).await?;
 
     while let Some(entry) = dir.next_entry().await? {
-        let metadata = match entry.metadata().await {
+        // Use symlink_metadata so we don't follow symlinks (avoids ELOOP on circular links)
+        let sym_meta = match tokio::fs::symlink_metadata(entry.path()).await {
             Ok(m) => m,
             Err(_) => continue,
         };
 
-        let kind = if metadata.is_dir() {
-            "dir"
-        } else if metadata.is_symlink() {
+        let kind = if sym_meta.is_symlink() {
             "link"
-        } else if metadata.is_file() {
+        } else if sym_meta.is_dir() {
+            "dir"
+        } else if sym_meta.is_file() {
             "file"
         } else {
             "other"
         };
+
+        // For size, use the symlink metadata (won't follow broken links)
+        let metadata = &sym_meta;
 
         let mtime = metadata.mtime();
 
