@@ -533,19 +533,26 @@ pub async fn list(
 ) -> Result<Json<Vec<FsEntry>>, (StatusCode, String)> {
     let path = Path::new(&q.path);
 
-    // Check if path is a symlink loop before trying to read it
+    // Check if path is a symlink loop (ELOOP) before trying to read it.
+    // Only auto-clean on ELOOP — dangling symlinks or permission errors are left alone.
     if let Ok(meta) = tokio::fs::symlink_metadata(path).await {
         if meta.is_symlink() {
-            // Verify the symlink target is resolvable
-            if path.canonicalize().is_err() {
-                tracing::warn!(path = %path.display(), "Stale symlink loop detected in list(), cleaning up");
-                let _ = tokio::fs::remove_file(path).await;
+            if let Err(e) = path.canonicalize() {
+                if crate::util::is_eloop(&e) {
+                    tracing::warn!(path = %path.display(), "Stale symlink loop detected in list(), cleaning up");
+                    let _ = tokio::fs::remove_file(path).await;
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        format!(
+                            "Path was a stale symlink loop and has been cleaned up: {}. Please retry.",
+                            path.display()
+                        ),
+                    ));
+                }
+                // For other errors (dangling, permission), just return the error
                 return Err((
                     StatusCode::BAD_REQUEST,
-                    format!(
-                        "Path was a stale symlink loop and has been cleaned up: {}. Please retry.",
-                        path.display()
-                    ),
+                    format!("Cannot resolve symlink: {}", e),
                 ));
             }
         }

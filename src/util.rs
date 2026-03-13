@@ -291,7 +291,16 @@ pub async fn copy_dir_recursive(
     src: &std::path::Path,
     dst: &std::path::Path,
 ) -> anyhow::Result<()> {
-    copy_dir_recursive_inner(src, dst, 0).await
+    copy_dir_recursive_inner(src, dst, 0, &[]).await
+}
+
+/// Like [`copy_dir_recursive`] but skips directories whose name matches any entry in `skip`.
+pub async fn copy_dir_recursive_skip(
+    src: &std::path::Path,
+    dst: &std::path::Path,
+    skip: &[&str],
+) -> anyhow::Result<()> {
+    copy_dir_recursive_inner(src, dst, 0, skip).await
 }
 
 #[async_recursion::async_recursion]
@@ -299,6 +308,7 @@ async fn copy_dir_recursive_inner(
     src: &std::path::Path,
     dst: &std::path::Path,
     depth: u32,
+    skip: &'async_recursion [&'async_recursion str],
 ) -> anyhow::Result<()> {
     if depth > MAX_COPY_DEPTH {
         anyhow::bail!(
@@ -316,6 +326,15 @@ async fn copy_dir_recursive_inner(
         let file_name = entry.file_name();
         let dest_path = dst.join(&file_name);
 
+        // Skip directories by name (e.g. ".git")
+        if !skip.is_empty() {
+            if let Some(name) = file_name.to_str() {
+                if skip.contains(&name) {
+                    continue;
+                }
+            }
+        }
+
         // Use symlink_metadata to avoid following symlinks into loops
         let metadata = tokio::fs::symlink_metadata(&entry_path).await?;
         if metadata.is_symlink() {
@@ -324,7 +343,7 @@ async fn copy_dir_recursive_inner(
             let _ = tokio::fs::remove_file(&dest_path).await;
             tokio::fs::symlink(&target, &dest_path).await?;
         } else if metadata.is_dir() {
-            copy_dir_recursive_inner(&entry_path, &dest_path, depth + 1).await?;
+            copy_dir_recursive_inner(&entry_path, &dest_path, depth + 1, skip).await?;
         } else {
             if let Some(parent) = dest_path.parent() {
                 tokio::fs::create_dir_all(parent).await?;

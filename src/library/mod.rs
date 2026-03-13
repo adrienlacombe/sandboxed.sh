@@ -815,15 +815,9 @@ impl LibraryStore {
         Ok(())
     }
 
-    /// Recursively copy a directory, skipping `.git`.
+    /// Recursively copy a directory, skipping `.git` at all levels.
     async fn copy_dir_recursive_skip_git(src: &Path, dst: &Path) -> Result<()> {
-        // Remove .git from destination after copying
-        crate::util::copy_dir_recursive(src, dst).await?;
-        let git_dir = dst.join(".git");
-        if git_dir.exists() {
-            let _ = fs::remove_dir_all(&git_dir).await;
-        }
-        Ok(())
+        crate::util::copy_dir_recursive_skip(src, dst, &[".git"]).await
     }
 
     // ─────────────────────────────────────────────────────────────────────────
