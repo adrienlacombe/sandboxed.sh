@@ -3788,6 +3788,37 @@ fn extract_email_from_jwt(token: &str) -> Option<String> {
         .map(|s| s.to_string())
 }
 
+/// Fetch account email from Anthropic's userinfo endpoint using an access token.
+///
+/// Calls `GET /v1/oauth/userinfo` on the Anthropic console. This is needed because
+/// Anthropic's OAuth token response doesn't include an `id_token` or email claim.
+async fn fetch_anthropic_account_email(access_token: &str) -> Option<String> {
+    let client = reqwest::Client::new();
+    let resp = client
+        .get("https://console.anthropic.com/v1/oauth/userinfo")
+        .header("Authorization", format!("Bearer {}", access_token))
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        tracing::debug!(
+            status = %resp.status(),
+            "Anthropic userinfo endpoint returned non-success"
+        );
+        return None;
+    }
+    let data: serde_json::Value = resp.json().await.ok()?;
+    data.get("email")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .or_else(|| {
+            // Some providers use "name" or "id" as fallback identifier
+            data.get("name")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        })
+}
+
 /// Extract account email from an OAuth token response and persist it.
 ///
 /// Tries `id_token` JWT first, then `access_token` JWT, then a plain `email` field.
@@ -5588,12 +5619,26 @@ async fn oauth_callback_inner(
                     }
                 }
 
-                let account_email = extract_and_save_account_email(
+                let mut account_email = extract_and_save_account_email(
                     &token_data,
                     &state.config.working_dir,
                     provider_type.id(),
                     "Anthropic",
                 );
+
+                // Anthropic tokens don't include email claims — fetch via userinfo
+                if account_email.is_none() {
+                    if let Some(at) = token_data["access_token"].as_str() {
+                        if let Some(email) = fetch_anthropic_account_email(at).await {
+                            let _ = update_provider_account(
+                                &state.config.working_dir,
+                                provider_type.id(),
+                                email.clone(),
+                            );
+                            account_email = Some(email);
+                        }
+                    }
+                }
 
                 let default_provider = get_default_provider(&opencode_config);
                 let backends_state = read_provider_backends_state(&state.config.working_dir);
@@ -5695,12 +5740,26 @@ async fn oauth_callback_inner(
                     }
                 }
 
-                let account_email = extract_and_save_account_email(
+                let mut account_email = extract_and_save_account_email(
                     &token_data,
                     &state.config.working_dir,
                     provider_type.id(),
                     "Anthropic",
                 );
+
+                // Anthropic tokens don't include email claims — fetch via userinfo
+                if account_email.is_none() {
+                    if let Some(at) = token_data["access_token"].as_str() {
+                        if let Some(email) = fetch_anthropic_account_email(at).await {
+                            let _ = update_provider_account(
+                                &state.config.working_dir,
+                                provider_type.id(),
+                                email.clone(),
+                            );
+                            account_email = Some(email);
+                        }
+                    }
+                }
 
                 let default_provider = get_default_provider(&opencode_config);
                 let backends_state = read_provider_backends_state(&state.config.working_dir);
