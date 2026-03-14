@@ -257,20 +257,34 @@ pub async fn resolve_path_for_workspace(
         match resolved.canonicalize() {
             Ok(c) => c,
             Err(e) if crate::util::is_eloop(&e) => {
-                // Symlink loop — if the path itself is a symlink, try to clean it up
+                // Symlink loop — if the path itself is a symlink, try to clean it up,
+                // but only if it's within the workspace boundary (prevent path traversal).
                 if std::fs::symlink_metadata(&resolved)
                     .map(|m| m.is_symlink())
                     .unwrap_or(false)
                 {
-                    tracing::warn!(
-                        path = %resolved.display(),
-                        "Stale symlink loop detected, removing"
-                    );
-                    let _ = std::fs::remove_file(&resolved);
+                    let context_root_check = state.config.working_dir.join("context");
+                    let in_bounds = resolved.starts_with(&workspace_root)
+                        || (mission_id.is_some() && resolved.starts_with(&context_root_check));
+                    if in_bounds {
+                        tracing::warn!(
+                            path = %resolved.display(),
+                            "Stale symlink loop detected, removing"
+                        );
+                        let _ = std::fs::remove_file(&resolved);
+                        return Err((
+                            StatusCode::BAD_REQUEST,
+                            format!(
+                                "Path was a stale symlink loop and has been cleaned up: {}. Please retry.",
+                                resolved.display()
+                            ),
+                        ));
+                    }
+                    // Outside workspace — don't delete, just return error
                     return Err((
                         StatusCode::BAD_REQUEST,
                         format!(
-                            "Path was a stale symlink loop and has been cleaned up: {}. Please retry.",
+                            "Symlink loop detected outside workspace: {}",
                             resolved.display()
                         ),
                     ));

@@ -394,18 +394,20 @@ export const EnhancedInput = forwardRef<EnhancedInputHandle, EnhancedInputProps>
       const isEmpty = displayValue.trim() === '';
       const isBrowsing = historyIndexRef.current !== -1;
       if ((isEmpty || isBrowsing) && sentHistoryRef.current.length > 0) {
-        e.preventDefault();
-        navigateHistory('back');
-        return;
+        if (navigateHistory('back')) {
+          e.preventDefault();
+          return;
+        }
       }
     }
 
     // Cmd/Ctrl+Shift+Z: navigate history forward (while browsing)
     if (e.key.toLowerCase() === 'z' && (e.metaKey || e.ctrlKey) && e.shiftKey) {
       if (historyIndexRef.current !== -1) {
-        e.preventDefault();
-        navigateHistory('forward');
-        return;
+        if (navigateHistory('forward')) {
+          e.preventDefault();
+          return;
+        }
       }
     }
 
