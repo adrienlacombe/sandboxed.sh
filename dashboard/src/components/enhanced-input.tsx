@@ -82,6 +82,7 @@ export const EnhancedInput = forwardRef<EnhancedInputHandle, EnhancedInputProps>
   const sentHistoryRef = useRef<string[]>([]);
   const historyIndexRef = useRef(-1); // -1 = not browsing history
   const savedDraftRef = useRef(''); // saves current draft when entering history
+  const savedLockedAgentRef = useRef<string | null>(null); // saves lockedAgent when entering history
 
   // Load history from localStorage on mount
   useEffect(() => {
@@ -357,8 +358,9 @@ export const EnhancedInput = forwardRef<EnhancedInputHandle, EnhancedInputProps>
 
     if (direction === 'back') {
       if (historyIndexRef.current === -1) {
-        // Entering history mode — save current draft
+        // Entering history mode — save current draft and locked agent
         savedDraftRef.current = value;
+        savedLockedAgentRef.current = lockedAgent;
         historyIndexRef.current = history.length - 1;
       } else if (historyIndexRef.current > 0) {
         historyIndexRef.current--;
@@ -377,14 +379,14 @@ export const EnhancedInput = forwardRef<EnhancedInputHandle, EnhancedInputProps>
         setLockedAgent(null);
         onChange(msg);
       } else {
-        // Past newest → restore draft
+        // Past newest → restore draft and locked agent
         historyIndexRef.current = -1;
-        setLockedAgent(null);
+        setLockedAgent(savedLockedAgentRef.current);
         onChange(savedDraftRef.current);
       }
       return true;
     }
-  }, [value, onChange]);
+  }, [value, lockedAgent, onChange]);
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     // Cmd/Ctrl+Z: navigate history back (empty input or already browsing)
