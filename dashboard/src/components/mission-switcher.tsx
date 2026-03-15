@@ -46,18 +46,24 @@ function getWorkspaceLabel(
 
 function getMissionDisplayName(
   mission: Mission,
-  workspaceNameById?: Record<string, string>
+  _workspaceNameById?: Record<string, string>
 ): string {
-  const parts: string[] = [];
-  const workspaceLabel = getWorkspaceLabel(mission, workspaceNameById);
-  if (workspaceLabel) {
-    parts.push(workspaceLabel);
+  // Use title as primary name when available, fall back to animal codename
+  const title = mission.title?.trim();
+  if (title) {
+    return title.length > 70 ? title.slice(0, 70) + '...' : title;
   }
-  parts.push(getMissionShortName(mission.id));
-  return parts.join(' · ');
+  return getMissionShortName(mission.id);
 }
 
 export function getMissionCardTitle(mission: Mission): string | null {
+  // When a backend title exists, it's already shown as the display name,
+  // so show the short_description as subtitle instead.
+  if (mission.title?.trim()) {
+    return mission.short_description?.trim() || null;
+  }
+  // No backend title: display name is the animal codename, so show the
+  // first user message as subtitle.
   const title = getMissionTitle(mission, { maxLength: 80, fallback: '' }).trim();
   if (!title) return null;
   return title;
@@ -87,12 +93,16 @@ export function hasMeaningfulExtraTokens(baseText: string, candidateText: string
 
 export function getMissionCardDescription(
   mission: Mission,
-  title?: string | null
+  cardTitle?: string | null
 ): string | null {
+  // When the backend title is used as display name, short_description is
+  // already surfaced as cardTitle — don't repeat it.
+  if (mission.title?.trim()) return null;
+
   const shortDescription = mission.short_description?.trim();
   if (!shortDescription) return null;
 
-  const normalizedTitle = (title ?? '').trim();
+  const normalizedTitle = (cardTitle ?? '').trim();
   if (normalizedTitle && !hasMeaningfulExtraTokens(normalizedTitle, shortDescription)) {
     return null;
   }
@@ -183,7 +193,12 @@ export function getMissionSearchText(mission: Mission): string {
   const status = mission.status ?? '';
   const textParts: string[] = [];
 
-  if (title) {
+  // Always include animal codename so it's searchable
+  textParts.push(getMissionShortName(mission.id));
+  if (mission.title?.trim()) {
+    textParts.push(mission.title.trim());
+  }
+  if (title && title !== mission.title?.trim()) {
     textParts.push(title);
   }
   if (shortDescription && (textParts.length === 0 || hasMeaningfulExtraTokens(title, shortDescription))) {
@@ -991,6 +1006,14 @@ export function MissionSwitcher({
                               ? getMissionDisplayName(mission, workspaceNameById)
                               : getMissionShortName(item.id)}
                           </span>
+                          {mission && (() => {
+                            const ws = getWorkspaceLabel(mission, workspaceNameById);
+                            return ws ? (
+                              <span className="inline-flex items-center rounded bg-white/[0.06] px-1.5 py-0.5 text-[10px] text-white/40 shrink-0 max-w-[80px] truncate">
+                                {ws}
+                              </span>
+                            ) : null;
+                          })()}
                           {isStalled && (
                             <span className="text-[10px] text-amber-400 tabular-nums shrink-0">
                               {Math.floor(stallInfo?.seconds_since_activity ?? 0)}s

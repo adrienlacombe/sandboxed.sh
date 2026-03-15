@@ -304,8 +304,8 @@ export async function autoGenerateMissionTitle(
       await updateMissionTitle(missionId, title);
       return title;
     }
-  } catch {
-    // Silent failure — title generation is best-effort
+  } catch (err) {
+    console.warn("[AutoTitle] Failed to generate mission title:", err);
   }
   return null;
 }

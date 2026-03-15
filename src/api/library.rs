@@ -2280,7 +2280,7 @@ async fn install_from_registry(
         ));
     }
 
-    copy_dir_recursive(&source_dir, &target_dir)
+    crate::util::copy_dir_recursive(&source_dir, &target_dir)
         .await
         .map_err(internal_error)?;
 
@@ -2312,28 +2312,7 @@ async fn install_from_registry(
     Ok(Json(skill))
 }
 
-/// Recursively copy a directory.
-#[async_recursion::async_recursion]
-async fn copy_dir_recursive(
-    src: &std::path::Path,
-    dst: &std::path::Path,
-) -> Result<(), std::io::Error> {
-    tokio::fs::create_dir_all(dst).await?;
-
-    let mut entries = tokio::fs::read_dir(src).await?;
-    while let Some(entry) = entries.next_entry().await? {
-        let src_path = entry.path();
-        let dst_path = dst.join(entry.file_name());
-
-        if src_path.is_dir() {
-            copy_dir_recursive(&src_path, &dst_path).await?;
-        } else {
-            tokio::fs::copy(&src_path, &dst_path).await?;
-        }
-    }
-
-    Ok(())
-}
+// Uses crate::util::copy_dir_recursive (shared implementation)
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Unit Tests

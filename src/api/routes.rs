@@ -425,6 +425,19 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         deferred_requests,
     });
 
+    // Initialize the metadata LLM client for AI-powered mission titles/descriptions
+    {
+        super::metadata_llm::init_metadata_llm(state.http_client.clone());
+        let ai_providers = Arc::clone(&state.ai_providers);
+        tokio::spawn(async move {
+            super::metadata_llm::refresh_metadata_llm_config(&ai_providers).await;
+            // Store the AI providers reference for self-refresh (picks up new OAuth tokens)
+            if let Some(client) = super::metadata_llm::metadata_llm() {
+                client.set_ai_providers(ai_providers).await;
+            }
+        });
+    }
+
     // Start background desktop session cleanup task
     {
         let state_clone = Arc::clone(&state);

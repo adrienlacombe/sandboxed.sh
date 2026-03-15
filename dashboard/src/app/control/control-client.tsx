@@ -2934,16 +2934,26 @@ export default function ControlClient() {
     return viewingRunningInfo.health;
   }, [viewingMissionId, viewingRunningInfo]);
 
-  const hasPendingQuestion = useMemo(
-    () =>
-      items.some(
-        (item) =>
-          item.kind === "tool" &&
-          (item.name === "question" || item.name === "AskUserQuestion") &&
-          item.result === undefined
-      ),
-    [items]
-  );
+  const hasPendingQuestion = useMemo(() => {
+    // Find the index of the last user message — any question before it is
+    // implicitly answered (the user continued the conversation).
+    let lastUserIdx = -1;
+    for (let i = items.length - 1; i >= 0; i--) {
+      if (items[i].kind === "user") {
+        lastUserIdx = i;
+        break;
+      }
+    }
+    // Only consider questions that appear AFTER the last user message
+    // and have no result — these are genuinely pending.
+    return items.some(
+      (item, idx) =>
+        item.kind === "tool" &&
+        (item.name === "question" || item.name === "AskUserQuestion") &&
+        item.result === undefined &&
+        idx > lastUserIdx
+    );
+  }, [items]);
 
   const viewingMissionStallSeconds = viewingMissionStallInfo?.seconds_since_activity ?? 0;
   const isViewingMissionStalled = Boolean(viewingMissionStallInfo);
@@ -6389,8 +6399,8 @@ export default function ControlClient() {
         missionLabel={
           activeMission
             ? activeWorkspaceLabel
-              ? `${activeWorkspaceLabel} · ${getMissionShortName(activeMission.id)}`
-              : getMissionShortName(activeMission.id)
+              ? `${activeWorkspaceLabel} · ${activeMission.title?.trim() || getMissionShortName(activeMission.id)}`
+              : activeMission.title?.trim() || getMissionShortName(activeMission.id)
             : null
         }
         onClose={() => setShowAutomationsDialog(false)}

@@ -1367,7 +1367,59 @@ async fn generate_mission_metadata_updates(
         return (None, None);
     }
 
-    let title_candidate = if (title_missing || should_refresh) && !title_user_managed {
+    // ── Try LLM-powered summarization first ────────────────────────────
+    let needs_title = (title_missing || should_refresh) && !title_user_managed;
+    let needs_description = short_description_missing
+        || should_refresh
+        || should_bootstrap_short_description_from_first_assistant;
+
+    if (needs_title || needs_description) && has_successful_assistant_reply {
+        if let Some((llm_title, llm_status)) =
+            try_llm_metadata_summarization(history, mission, should_refresh).await
+        {
+            let mut updated_title: Option<String> = None;
+            let mut updated_short_description: Option<String> = None;
+
+            if needs_title {
+                if let Some(candidate) = llm_title {
+                    let candidate = diversify_generated_title_with_recent_context(
+                        mission_store,
+                        mission_id,
+                        candidate,
+                        history,
+                        fallback_user_content,
+                    )
+                    .await;
+                    if should_accept_metadata_candidate(
+                        mission.title.as_deref(),
+                        &candidate,
+                        should_bootstrap_title_from_first_assistant,
+                    ) {
+                        updated_title = Some(candidate);
+                    }
+                }
+            }
+
+            if needs_description {
+                if let Some(candidate) = llm_status {
+                    if should_accept_metadata_candidate(
+                        mission.short_description.as_deref(),
+                        &candidate,
+                        should_bootstrap_short_description_from_first_assistant,
+                    ) {
+                        updated_short_description = Some(candidate);
+                    }
+                }
+            }
+
+            if updated_title.is_some() || updated_short_description.is_some() {
+                return (updated_title, updated_short_description);
+            }
+        }
+    }
+
+    // ── Fallback: heuristic extraction from conversation text ──────────
+    let title_candidate = if needs_title {
         let assistant_title_candidate = if should_bootstrap_title_from_first_assistant {
             history
                 .iter()
@@ -1412,10 +1464,7 @@ async fn generate_mission_metadata_updates(
         None => None,
     };
 
-    let short_description_candidate = if short_description_missing
-        || should_refresh
-        || should_bootstrap_short_description_from_first_assistant
-    {
+    let short_description_candidate = if needs_description {
         if should_bootstrap_short_description_from_first_assistant {
             extract_short_description_from_first_successful_assistant(history, 160)
                 .or_else(|| extract_short_description_from_history(history, 160))
@@ -1433,54 +1482,129 @@ async fn generate_mission_metadata_updates(
 
     let mut updated_title: Option<String> = None;
     if let Some(candidate_title) = title_candidate {
-        let should_update = mission
-            .title
-            .as_deref()
-            .map(|existing| has_significant_metadata_drift(existing, &candidate_title))
-            .unwrap_or(true);
-        if should_update {
-            let differs_from_existing = mission
-                .title
-                .as_deref()
-                .map(|existing| {
-                    normalize_metadata_text(existing) != normalize_metadata_text(&candidate_title)
-                })
-                .unwrap_or(true);
-            if differs_from_existing {
-                updated_title = Some(candidate_title);
-            }
+        if should_accept_metadata_candidate(
+            mission.title.as_deref(),
+            &candidate_title,
+            should_bootstrap_title_from_first_assistant,
+        ) {
+            updated_title = Some(candidate_title);
         }
     }
 
     let mut updated_short_description: Option<String> = None;
     if let Some(candidate_short_description) = short_description_candidate {
-        let should_update = if should_bootstrap_short_description_from_first_assistant {
-            true
-        } else {
-            mission
-                .short_description
-                .as_deref()
-                .map(|existing| {
-                    has_significant_metadata_drift(existing, &candidate_short_description)
-                })
-                .unwrap_or(true)
-        };
-        if should_update {
-            let differs_from_existing = mission
-                .short_description
-                .as_deref()
-                .map(|existing| {
-                    normalize_metadata_text(existing)
-                        != normalize_metadata_text(&candidate_short_description)
-                })
-                .unwrap_or(true);
-            if differs_from_existing {
-                updated_short_description = Some(candidate_short_description);
-            }
+        if should_accept_metadata_candidate(
+            mission.short_description.as_deref(),
+            &candidate_short_description,
+            should_bootstrap_short_description_from_first_assistant,
+        ) {
+            updated_short_description = Some(candidate_short_description);
         }
     }
 
     (updated_title, updated_short_description)
+}
+
+/// Check if a metadata candidate should replace the existing value.
+fn should_accept_metadata_candidate(
+    existing: Option<&str>,
+    candidate: &str,
+    is_bootstrap: bool,
+) -> bool {
+    let should_update = if is_bootstrap {
+        true
+    } else {
+        existing
+            .map(|e| has_significant_metadata_drift(e, candidate))
+            .unwrap_or(true)
+    };
+    if !should_update {
+        return false;
+    }
+    existing
+        .map(|e| normalize_metadata_text(e) != normalize_metadata_text(candidate))
+        .unwrap_or(true)
+}
+
+/// Try to generate metadata using the configured LLM provider.
+/// Returns `Some((title, status))` if the LLM was called successfully,
+/// `None` if no LLM is configured or the call failed.
+async fn try_llm_metadata_summarization(
+    history: &[(String, String)],
+    mission: &Mission,
+    is_refresh: bool,
+) -> Option<(Option<String>, Option<String>)> {
+    let llm = match super::metadata_llm::metadata_llm() {
+        Some(l) => l,
+        None => {
+            tracing::debug!("[MetadataLLM] No LLM client available");
+            return None;
+        }
+    };
+
+    // Gather the most relevant user message and assistant reply
+    let (user_msg, assistant_msg) = if is_refresh {
+        // On refresh, use the most recent exchange
+        let user = history
+            .iter()
+            .rev()
+            .find(|(role, _)| role == "user")
+            .map(|(_, c)| c.as_str())
+            .unwrap_or("");
+        let assistant = history
+            .iter()
+            .rev()
+            .find(|(role, content)| role == "assistant" && assistant_reply_is_successful(content))
+            .map(|(_, c)| c.as_str())
+            .unwrap_or("");
+        (user, assistant)
+    } else {
+        // On bootstrap, use the first exchange
+        let user = history
+            .iter()
+            .find(|(role, _)| role == "user")
+            .map(|(_, c)| c.as_str())
+            .unwrap_or("");
+        let assistant = history
+            .iter()
+            .find(|(role, content)| role == "assistant" && assistant_reply_is_successful(content))
+            .map(|(_, c)| c.as_str())
+            .unwrap_or("");
+        (user, assistant)
+    };
+
+    if user_msg.is_empty() && assistant_msg.is_empty() {
+        return None;
+    }
+
+    tracing::info!(
+        "[MetadataLLM] Calling summarize_mission (is_refresh={}, user_len={}, assistant_len={})",
+        is_refresh,
+        user_msg.len(),
+        assistant_msg.len()
+    );
+
+    let (title, status) = llm
+        .summarize_mission(
+            user_msg,
+            assistant_msg,
+            mission.title.as_deref(),
+            is_refresh,
+        )
+        .await;
+
+    tracing::info!(
+        "[MetadataLLM] Result: title={:?}, status={:?}",
+        title,
+        status
+    );
+
+    // Only return Some if we got at least one result
+    if title.is_some() || status.is_some() {
+        Some((title, status))
+    } else {
+        None
+    }
 }
 
 async fn apply_generated_mission_metadata_updates(
@@ -5645,57 +5769,68 @@ async fn control_actor_loop(
             }
         }
 
-        // Scan work directory for artifacts (shared workspace root)
+        // Scan work directory for a compact top-level overview (not full file listing)
         if workspace_root.exists() {
-            resume_parts.push("\n## Work Directory Contents".to_string());
+            resume_parts.push("\n## Workspace Layout".to_string());
 
-            let mut files_found = Vec::new();
+            let mut top_level_dirs = Vec::new();
+            let mut top_level_files = Vec::new();
+            const SKIP_DIRS: &[&str] = &[
+                "venv",
+                ".venv",
+                ".sandboxed_sh",
+                ".sandboxed-sh",
+                ".git",
+                ".claude",
+                ".cargo",
+                ".rustup",
+                "node_modules",
+                "target",
+                "__pycache__",
+                ".next",
+                ".cache",
+                "temp",
+                ".local",
+                ".config",
+            ];
+
             if let Ok(entries) = std::fs::read_dir(&workspace_root) {
                 for entry in entries.filter_map(|e| e.ok()) {
+                    let name = entry.file_name().to_string_lossy().to_string();
                     let path = entry.path();
                     if path.is_dir() {
-                        let dir_name = path.file_name().unwrap_or_default().to_string_lossy();
-                        // Skip common non-artifact directories
-                        if matches!(
-                            dir_name.as_ref(),
-                            "venv" | ".venv" | ".sandboxed_sh" | ".sandboxed-sh" | "temp"
-                        ) {
+                        if SKIP_DIRS.contains(&name.as_str()) {
                             continue;
                         }
-                        // List files in subdirectory
-                        if let Ok(subentries) = std::fs::read_dir(&path) {
-                            for subentry in subentries.filter_map(|e| e.ok()) {
-                                let subpath = subentry.path();
-                                if subpath.is_file() {
-                                    let rel_path = subpath
-                                        .strip_prefix(&workspace_root)
-                                        .map(|p| p.display().to_string())
-                                        .unwrap_or_else(|_| subpath.display().to_string());
-                                    files_found.push(rel_path);
-                                }
-                            }
-                        }
+                        top_level_dirs.push(format!("{}/ ", name));
                     } else if path.is_file() {
-                        let rel_path = path
-                            .strip_prefix(&workspace_root)
-                            .map(|p| p.display().to_string())
-                            .unwrap_or_else(|_| path.display().to_string());
-                        files_found.push(rel_path);
+                        top_level_files.push(name);
                     }
                 }
             }
 
-            if !files_found.is_empty() {
-                resume_parts.push(format!(
-                    "Files created:\n{}",
-                    files_found
-                        .iter()
-                        .map(|f| format!("- {}", f))
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                ));
+            top_level_dirs.sort();
+            top_level_files.sort();
+
+            if top_level_dirs.is_empty() && top_level_files.is_empty() {
+                resume_parts.push("Empty workspace.".to_string());
             } else {
-                resume_parts.push("No output files created yet.".to_string());
+                let mut listing = Vec::new();
+                for d in &top_level_dirs {
+                    listing.push(format!("- {}", d));
+                }
+                // Cap files at 20 to avoid token bloat
+                let file_cap = 20;
+                for f in top_level_files.iter().take(file_cap) {
+                    listing.push(format!("- {}", f));
+                }
+                if top_level_files.len() > file_cap {
+                    listing.push(format!(
+                        "- ... and {} more files",
+                        top_level_files.len() - file_cap
+                    ));
+                }
+                resume_parts.push(listing.join("\n"));
             }
         }
 

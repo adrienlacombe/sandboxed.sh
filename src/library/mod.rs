@@ -756,7 +756,7 @@ impl LibraryStore {
         }
 
         // Copy the skill directory to target
-        if let Err(e) = Self::copy_dir_recursive(&source_dir, &target_dir).await {
+        if let Err(e) = Self::copy_dir_recursive_skip_git(&source_dir, &target_dir).await {
             let _ = fs::remove_dir_all(&temp_dir).await;
             return Err(e);
         }
@@ -815,31 +815,9 @@ impl LibraryStore {
         Ok(())
     }
 
-    /// Recursively copy a directory.
-    #[async_recursion::async_recursion]
-    async fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
-        fs::create_dir_all(dst).await?;
-
-        let mut entries = fs::read_dir(src).await?;
-        while let Some(entry) = entries.next_entry().await? {
-            let entry_path = entry.path();
-            let file_name = entry.file_name();
-            let dst_path = dst.join(&file_name);
-
-            // Skip .git directory
-            if file_name == ".git" {
-                continue;
-            }
-
-            let metadata = fs::metadata(&entry_path).await?;
-            if metadata.is_dir() {
-                Self::copy_dir_recursive(&entry_path, &dst_path).await?;
-            } else {
-                fs::copy(&entry_path, &dst_path).await?;
-            }
-        }
-
-        Ok(())
+    /// Recursively copy a directory, skipping `.git` at all levels.
+    async fn copy_dir_recursive_skip_git(src: &Path, dst: &Path) -> Result<()> {
+        crate::util::copy_dir_recursive_skip(src, dst, &[".git"]).await
     }
 
     // ─────────────────────────────────────────────────────────────────────────

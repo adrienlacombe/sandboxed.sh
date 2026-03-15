@@ -310,7 +310,35 @@ impl MonitoringState {
             }
 
             let ws_id = ws.id.to_string();
-            let scope_name = format!("machine-{}.scope", ws.name);
+
+            // Derive the machine name from the workspace path (last path component),
+            // matching how systemd-nspawn auto-derives it when no --machine flag is used.
+            let machine_name = ws
+                .path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(&ws.name);
+
+            // Escape the machine name for systemd unit naming. Hyphens within the
+            // name part must be escaped as `\x2d` because `-` is a path separator
+            // in systemd unit hierarchies. Without this, `systemctl show` and
+            // `is-active` silently return empty/inactive results for containers
+            // whose names contain hyphens (e.g., `dgx-spark`).
+            let escaped_name = systemd_escape(machine_name);
+            let scope_name = format!("machine-{}.scope", escaped_name);
+
+            // Check if the scope is actually active before querying properties.
+            // `systemctl show` returns exit 0 even for non-existent units (with
+            // `[not set]` for all values), so we need an explicit liveness check.
+            let is_active = tokio::process::Command::new("systemctl")
+                .args(["is-active", "--quiet", &scope_name])
+                .status()
+                .await
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if !is_active {
+                continue;
+            }
 
             let output = match tokio::process::Command::new("systemctl")
                 .args(["show", &scope_name])
@@ -600,4 +628,26 @@ async fn handle_monitoring_stream(socket: WebSocket) {
             recv_task.abort();
         }
     }
+}
+
+/// Escape a string for use as a systemd unit name component.
+///
+/// Systemd uses `-` as a path separator in unit hierarchies, so hyphens
+/// within a name must be escaped as `\x2d`. Other non-alphanumeric chars
+/// (except `_` and `.`) are also hex-escaped.
+fn systemd_escape(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    for ch in name.chars() {
+        match ch {
+            '-' => out.push_str("\\x2d"),
+            c if c.is_ascii_alphanumeric() || c == '_' || c == '.' => out.push(c),
+            c => {
+                // Hex-escape other characters
+                for b in c.to_string().as_bytes() {
+                    out.push_str(&format!("\\x{:02x}", b));
+                }
+            }
+        }
+    }
+    out
 }
