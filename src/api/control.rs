@@ -6607,6 +6607,46 @@ async fn control_actor_loop(
                         }
                     }
                     ControlCommand::CancelMission { mission_id, respond } => {
+                        // Helper: cascade-cancel all child missions of the given parent.
+                        async fn cancel_child_missions(
+                            parent_id: Uuid,
+                            mission_store: &Arc<dyn MissionStore>,
+                            parallel_runners: &mut HashMap<Uuid, super::mission_runner::MissionRunner>,
+                            events_tx: &tokio::sync::broadcast::Sender<AgentEvent>,
+                            working_dir: &std::path::Path,
+                        ) {
+                            let children = match mission_store.get_child_missions(parent_id).await {
+                                Ok(c) => c,
+                                Err(e) => {
+                                    tracing::warn!("Failed to fetch child missions for cascade cancel: {}", e);
+                                    return;
+                                }
+                            };
+                            for child in children {
+                                if matches!(child.status, MissionStatus::Completed | MissionStatus::Failed | MissionStatus::Interrupted | MissionStatus::NotFeasible) {
+                                    continue;
+                                }
+                                // Cancel runner if running
+                                if let Some(runner) = parallel_runners.get_mut(&child.id) {
+                                    runner.cancel();
+                                    parallel_runners.remove(&child.id);
+                                }
+                                if let Err(e) = mission_store
+                                    .update_mission_status(child.id, MissionStatus::Interrupted)
+                                    .await
+                                {
+                                    tracing::warn!("Failed to cancel child mission {}: {}", child.id, e);
+                                } else {
+                                    let _ = events_tx.send(AgentEvent::MissionStatusChanged {
+                                        mission_id: child.id,
+                                        status: MissionStatus::Interrupted,
+                                        summary: None,
+                                    });
+                                }
+                                close_mission_desktop_sessions(mission_store, child.id, working_dir).await;
+                            }
+                        }
+
                         // First check parallel runners
                         if let Some(runner) = parallel_runners.get_mut(&mission_id) {
                             runner.cancel();
@@ -6645,6 +6685,8 @@ async fn control_actor_loop(
                                 &config.working_dir,
                             )
                             .await;
+                            // Cascade cancel child missions
+                            cancel_child_missions(mission_id, &mission_store, &mut parallel_runners, &events_tx, &config.working_dir).await;
                             let _ = respond.send(Ok(()));
                         } else {
                             // Check if this is the currently executing mission
@@ -6663,6 +6705,8 @@ async fn control_actor_loop(
                                     // Don't send Error event here - the task will complete and send
                                     // an AssistantMessage with resumable=true when it finishes.
                                     // Sending both causes duplicate UI messages.
+                                    // Cascade cancel child missions
+                                    cancel_child_missions(mission_id, &mission_store, &mut parallel_runners, &events_tx, &config.working_dir).await;
                                     let _ = respond.send(Ok(()));
                                 } else {
                                     let _ = respond.send(Err("Mission not currently executing".to_string()));
