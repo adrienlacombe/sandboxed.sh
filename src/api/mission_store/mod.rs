@@ -76,6 +76,12 @@ pub struct Mission {
     /// Why the mission terminated (for failed/completed missions)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub terminal_reason: Option<String>,
+    /// Parent mission ID (for orchestrated worker missions)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_mission_id: Option<Uuid>,
+    /// Working directory override (for git worktrees etc.)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub working_directory: Option<String>,
 }
 
 fn default_backend() -> String {
@@ -340,6 +346,33 @@ pub trait MissionStore: Send + Sync {
         model_effort: Option<&str>,
         backend: Option<&str>,
         config_profile: Option<&str>,
+    ) -> Result<Mission, String> {
+        self.create_mission_with_parent(
+            title,
+            workspace_id,
+            agent,
+            model_override,
+            model_effort,
+            backend,
+            config_profile,
+            None,
+            None,
+        )
+        .await
+    }
+
+    /// Create a new mission with optional parent and working directory.
+    async fn create_mission_with_parent(
+        &self,
+        title: Option<&str>,
+        workspace_id: Option<Uuid>,
+        agent: Option<&str>,
+        model_override: Option<&str>,
+        model_effort: Option<&str>,
+        backend: Option<&str>,
+        config_profile: Option<&str>,
+        parent_mission_id: Option<Uuid>,
+        working_directory: Option<&str>,
     ) -> Result<Mission, String>;
 
     /// Update mission status.
@@ -393,6 +426,12 @@ pub trait MissionStore: Send + Sync {
 
     /// Get mission agent tree.
     async fn get_mission_tree(&self, id: Uuid) -> Result<Option<AgentTreeNode>, String>;
+
+    /// Get all child missions of a parent mission.
+    async fn get_child_missions(&self, parent_mission_id: Uuid) -> Result<Vec<Mission>, String> {
+        let _ = parent_mission_id;
+        Ok(vec![])
+    }
 
     /// Delete a mission.
     async fn delete_mission(&self, id: Uuid) -> Result<bool, String>;

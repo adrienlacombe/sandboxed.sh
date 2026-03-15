@@ -98,7 +98,7 @@ impl MissionStore for FileMissionStore {
         Ok(self.missions.read().await.get(&id).cloned())
     }
 
-    async fn create_mission(
+    async fn create_mission_with_parent(
         &self,
         title: Option<&str>,
         workspace_id: Option<Uuid>,
@@ -107,6 +107,8 @@ impl MissionStore for FileMissionStore {
         model_effort: Option<&str>,
         backend: Option<&str>,
         config_profile: Option<&str>,
+        parent_mission_id: Option<Uuid>,
+        working_directory: Option<&str>,
     ) -> Result<Mission, String> {
         let now = now_string();
         let metadata_source = title.and_then(|value| {
@@ -142,6 +144,8 @@ impl MissionStore for FileMissionStore {
             desktop_sessions: Vec::new(),
             session_id: Some(Uuid::new_v4().to_string()),
             terminal_reason: None,
+            parent_mission_id,
+            working_directory: working_directory.map(|s| s.to_string()),
         };
         self.missions
             .write()
@@ -149,6 +153,15 @@ impl MissionStore for FileMissionStore {
             .insert(mission.id, mission.clone());
         self.persist().await?;
         Ok(mission)
+    }
+
+    async fn get_child_missions(&self, parent_id: Uuid) -> Result<Vec<Mission>, String> {
+        let missions = self.missions.read().await;
+        Ok(missions
+            .values()
+            .filter(|m| m.parent_mission_id == Some(parent_id))
+            .cloned()
+            .collect())
     }
 
     async fn update_mission_status(&self, id: Uuid, status: MissionStatus) -> Result<(), String> {

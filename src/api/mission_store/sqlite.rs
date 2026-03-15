@@ -607,6 +607,37 @@ impl SqliteMissionStore {
                 .map_err(|e| format!("Failed to add metadata_version column: {}", e))?;
         }
 
+        // Check if 'parent_mission_id' column exists in missions table
+        let has_parent_mission_id_column: bool = conn
+            .prepare("SELECT 1 FROM pragma_table_info('missions') WHERE name = 'parent_mission_id'")
+            .map_err(|e| format!("Failed to check for parent_mission_id column: {}", e))?
+            .exists([])
+            .map_err(|e| format!("Failed to query table info: {}", e))?;
+
+        if !has_parent_mission_id_column {
+            tracing::info!("Running migration: adding 'parent_mission_id' column to missions table");
+            conn.execute("ALTER TABLE missions ADD COLUMN parent_mission_id TEXT", [])
+                .map_err(|e| format!("Failed to add parent_mission_id column: {}", e))?;
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_missions_parent ON missions(parent_mission_id)",
+                [],
+            )
+            .map_err(|e| format!("Failed to create parent_mission_id index: {}", e))?;
+        }
+
+        // Check if 'working_directory' column exists in missions table
+        let has_working_directory_column: bool = conn
+            .prepare("SELECT 1 FROM pragma_table_info('missions') WHERE name = 'working_directory'")
+            .map_err(|e| format!("Failed to check for working_directory column: {}", e))?
+            .exists([])
+            .map_err(|e| format!("Failed to query table info: {}", e))?;
+
+        if !has_working_directory_column {
+            tracing::info!("Running migration: adding 'working_directory' column to missions table");
+            conn.execute("ALTER TABLE missions ADD COLUMN working_directory TEXT", [])
+                .map_err(|e| format!("Failed to add working_directory column: {}", e))?;
+        }
+
         // Migrate automations table to new schema
         Self::migrate_automations_table(conn)?;
         Self::ensure_automation_indexes(conn)?;
@@ -864,7 +895,7 @@ impl MissionStore for SqliteMissionStore {
                             model_effort,
                             created_at, updated_at, interrupted_at, resumable, desktop_sessions,
                             COALESCE(backend, 'opencode') as backend, session_id, terminal_reason,
-                            config_profile
+                            config_profile, parent_mission_id, working_directory
                      FROM missions
                      ORDER BY updated_at DESC
                      LIMIT ?1 OFFSET ?2",
@@ -909,6 +940,8 @@ impl MissionStore for SqliteMissionStore {
                             .unwrap_or_default(),
                         session_id,
                         terminal_reason,
+                        parent_mission_id: row.get::<_, Option<String>>(22)?.and_then(|s| Uuid::parse_str(&s).ok()),
+                        working_directory: row.get(23)?,
                     })
                 })
                 .map_err(|e| e.to_string())?
@@ -935,7 +968,7 @@ impl MissionStore for SqliteMissionStore {
                             model_effort,
                             created_at, updated_at, interrupted_at, resumable, desktop_sessions,
                             COALESCE(backend, 'opencode') as backend, session_id, terminal_reason,
-                            config_profile
+                            config_profile, parent_mission_id, working_directory
                      FROM missions WHERE id = ?1",
                 )
                 .map_err(|e| e.to_string())?;
@@ -978,6 +1011,8 @@ impl MissionStore for SqliteMissionStore {
                             .unwrap_or_default(),
                         session_id,
                         terminal_reason,
+                        parent_mission_id: row.get::<_, Option<String>>(22)?.and_then(|s| Uuid::parse_str(&s).ok()),
+                        working_directory: row.get(23)?,
                     })
                 })
                 .optional()
@@ -1028,7 +1063,7 @@ impl MissionStore for SqliteMissionStore {
         .map_err(|e| e.to_string())?
     }
 
-    async fn create_mission(
+    async fn create_mission_with_parent(
         &self,
         title: Option<&str>,
         workspace_id: Option<Uuid>,
@@ -1037,6 +1072,8 @@ impl MissionStore for SqliteMissionStore {
         model_effort: Option<&str>,
         backend: Option<&str>,
         config_profile: Option<&str>,
+        parent_mission_id: Option<Uuid>,
+        working_directory: Option<&str>,
     ) -> Result<Mission, String> {
         let conn = self.conn.clone();
         let now = now_string();
@@ -1079,14 +1116,16 @@ impl MissionStore for SqliteMissionStore {
             desktop_sessions: Vec::new(),
             session_id: Some(session_id.clone()),
             terminal_reason: None,
+            parent_mission_id,
+            working_directory: working_directory.map(|s| s.to_string()),
         };
 
         let m = mission.clone();
         tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
             conn.execute(
-                "INSERT INTO missions (id, status, title, short_description, metadata_updated_at, metadata_source, metadata_model, metadata_version, workspace_id, agent, model_override, model_effort, backend, config_profile, created_at, updated_at, resumable, session_id)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
+                "INSERT INTO missions (id, status, title, short_description, metadata_updated_at, metadata_source, metadata_model, metadata_version, workspace_id, agent, model_override, model_effort, backend, config_profile, created_at, updated_at, resumable, session_id, parent_mission_id, working_directory)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
                 params![
                     m.id.to_string(),
                     status_to_string(m.status),
@@ -1106,6 +1145,8 @@ impl MissionStore for SqliteMissionStore {
                     m.updated_at,
                     0,
                     m.session_id,
+                    m.parent_mission_id.map(|id| id.to_string()),
+                    m.working_directory,
                 ],
             )
             .map_err(|e| e.to_string())?;
@@ -1115,6 +1156,53 @@ impl MissionStore for SqliteMissionStore {
         .map_err(|e| e.to_string())??;
 
         Ok(mission)
+    }
+
+    async fn get_child_missions(&self, parent_id: Uuid) -> Result<Vec<Mission>, String> {
+        let conn = self.conn.clone();
+        let parent_id_str = parent_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let mut stmt = conn
+                .prepare("SELECT id, status, title, short_description, metadata_updated_at, metadata_source, metadata_model, metadata_version, workspace_id, agent, model_override, model_effort, backend, config_profile, created_at, updated_at, interrupted_at, resumable, session_id, terminal_reason, parent_mission_id, working_directory FROM missions WHERE parent_mission_id = ?1")
+                .map_err(|e| e.to_string())?;
+            let missions = stmt
+                .query_map(params![parent_id_str], |row| {
+                    Ok(Mission {
+                        id: Uuid::parse_str(&row.get::<_, String>(0)?).unwrap_or_default(),
+                        status: parse_status(&row.get::<_, String>(1)?),
+                        title: row.get(2)?,
+                        short_description: row.get(3)?,
+                        metadata_updated_at: row.get(4)?,
+                        metadata_source: row.get(5)?,
+                        metadata_model: row.get(6)?,
+                        metadata_version: row.get(7)?,
+                        workspace_id: Uuid::parse_str(&row.get::<_, String>(8)?).unwrap_or_default(),
+                        workspace_name: None,
+                        agent: row.get(9)?,
+                        model_override: row.get(10)?,
+                        model_effort: row.get(11)?,
+                        backend: row.get::<_, String>(12)?,
+                        config_profile: row.get(13)?,
+                        history: vec![],
+                        created_at: row.get(14)?,
+                        updated_at: row.get(15)?,
+                        interrupted_at: row.get(16)?,
+                        resumable: row.get::<_, i32>(17)? != 0,
+                        desktop_sessions: Vec::new(),
+                        session_id: row.get(18)?,
+                        terminal_reason: row.get(19)?,
+                        parent_mission_id: row.get::<_, Option<String>>(20)?.and_then(|s| Uuid::parse_str(&s).ok()),
+                        working_directory: row.get(21)?,
+                    })
+                })
+                .map_err(|e| e.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?;
+            Ok(missions)
+        })
+        .await
+        .map_err(|e| e.to_string())?
     }
 
     async fn update_mission_status(&self, id: Uuid, status: MissionStatus) -> Result<(), String> {
@@ -1479,6 +1567,8 @@ impl MissionStore for SqliteMissionStore {
                             .unwrap_or_default(),
                         session_id: None, // Not needed for stale mission checks
                         terminal_reason: None,
+                        parent_mission_id: None,
+                        working_directory: None,
                     })
                 })
                 .map_err(|e| e.to_string())?
@@ -1541,6 +1631,8 @@ impl MissionStore for SqliteMissionStore {
                             .unwrap_or_default(),
                         session_id: None,
                         terminal_reason: None,
+                        parent_mission_id: None,
+                        working_directory: None,
                     })
                 })
                 .map_err(|e| e.to_string())?
