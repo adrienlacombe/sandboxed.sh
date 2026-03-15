@@ -93,6 +93,10 @@ path = "src/bin/workspace_mcp.rs"
 name = "automation-manager-mcp"
 path = "src/bin/automation_manager_mcp.rs"
 
+[[bin]]
+name = "orchestrator-mcp"
+path = "src/bin/orchestrator_mcp.rs"
+
 [dev-dependencies]
 tokio-test = "0.4"
 tempfile = "3"
