@@ -29,6 +29,7 @@ mod desktop_stream;
 mod fs;
 pub mod library;
 pub mod mcp;
+pub mod metadata_llm;
 pub mod mission_runner;
 pub mod mission_store;
 mod model_routing;
