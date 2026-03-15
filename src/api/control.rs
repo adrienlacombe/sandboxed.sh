@@ -6003,6 +6003,7 @@ async fn control_actor_loop(
                                                 mission.model_override.clone(),
                                                 mission.model_effort.clone(),
                                             );
+                                            runner.working_directory = mission.working_directory.clone();
                                             // Load existing history
                                             for entry in &mission.history {
                                                 runner.history.push((entry.role.clone(), entry.content.clone()));
@@ -6568,6 +6569,7 @@ async fn control_actor_loop(
                                 mission.model_override.clone(),
                                 mission.model_effort.clone(),
                             );
+                            runner.working_directory = mission.working_directory.clone();
 
                             // Load existing history into runner to preserve conversation context
                             for entry in &mission.history {

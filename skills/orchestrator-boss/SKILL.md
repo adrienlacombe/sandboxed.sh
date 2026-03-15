@@ -18,23 +18,31 @@ You have access to the `orchestrator-mcp` tools:
 - **get_worker_status**: Check a specific worker's detailed status
 - **cancel_worker** / **cancel_all_workers**: Stop workers
 - **send_message_to_worker**: Send follow-up instructions to a running worker
+- **create_worktree**: Create a git worktree for file-level isolation
+- **remove_worktree**: Remove a git worktree when done
+- **wait_for_worker**: Block until a worker completes/fails (instead of polling)
 
 ## Workflow
 
 1. **Analyze the task**: Break the work into independent, parallelizable units
 2. **Plan workers**: Decide how many workers you need and what each will do
-3. **Create git worktrees** (if needed): For file-level isolation, create worktrees:
-   ```bash
-   git worktree add /path/to/worktree-name branch-name
+3. **Create git worktrees**: Use `create_worktree` to give each worker an isolated directory:
    ```
-4. **Spawn workers**: Use `create_worker_mission` with clear, self-contained prompts
-5. **Monitor progress**: Periodically `list_worker_missions` to check status
+   create_worktree(path: "/workspaces/xxx/worktree-1", branch: "worker/task-1", base: "main")
+   ```
+4. **Spawn workers**: Use `create_worker_mission` with `working_directory` set to the worktree:
+   ```
+   create_worker_mission(
+     title: "Prove Storage.get_slot lemma",
+     model_override: "claude-sonnet-4-5-20250929",
+     working_directory: "/workspaces/xxx/worktree-1",
+     prompt: "Your task: ..."
+   )
+   ```
+5. **Wait for workers**: Use `wait_for_worker` to block until each worker finishes — no need to poll
 6. **Handle failures**: If a worker fails, read its status and decide whether to retry or reassign
-7. **Collect results**: When workers complete, merge their work (e.g., merge branches)
-8. **Clean up**: Remove worktrees when done:
-   ```bash
-   git worktree remove /path/to/worktree-name
-   ```
+7. **Collect results**: When workers complete, merge their branches
+8. **Clean up**: Use `remove_worktree` for each finished worktree
 
 ## Worker Prompt Best Practices
 
@@ -42,17 +50,7 @@ When creating workers, give them **self-contained** prompts that include:
 - Exactly what file(s) to work on
 - What the expected outcome is
 - Any constraints or patterns to follow
-- The working directory they should use
-
-Example:
-```
-create_worker_mission(
-  title: "Prove Storage.get_slot lemma",
-  model_override: "claude-sonnet-4-5-20250929",
-  working_directory: "/workspace/worktree-storage",
-  prompt: "In the file Proofs/Storage/GetSlot.lean, replace all `sorry` with valid Lean 4 proofs. Run `lake build` to verify compilation. Do not modify any other files."
-)
-```
+- Build/test commands to verify their work
 
 ## State Management
 

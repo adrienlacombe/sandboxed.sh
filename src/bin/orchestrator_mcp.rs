@@ -4,6 +4,7 @@
 //! Communicates over stdio using JSON-RPC 2.0.
 
 use std::io::{BufRead, BufReader, Write};
+use std::process::Command;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
@@ -121,6 +122,46 @@ struct CancelWorkerParams {
 struct SendMessageParams {
     mission_id: String,
     content: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateWorktreeParams {
+    /// Path relative to the workspace root where the worktree will be created
+    path: String,
+    /// Branch name (will be created if it doesn't exist)
+    branch: String,
+    /// Optional: base branch to create from (defaults to HEAD)
+    #[serde(default)]
+    base: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RemoveWorktreeParams {
+    /// Path of the worktree to remove
+    path: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct WaitForWorkerParams {
+    /// UUID of the worker mission to wait for
+    mission_id: String,
+    /// Target statuses to wait for (default: completed, failed, interrupted)
+    #[serde(default)]
+    target_statuses: Vec<String>,
+    /// Maximum seconds to wait (default: 600 = 10 minutes)
+    #[serde(default = "default_timeout")]
+    timeout_seconds: u64,
+    /// Poll interval in seconds (default: 10)
+    #[serde(default = "default_poll_interval")]
+    poll_interval_seconds: u64,
+}
+
+fn default_timeout() -> u64 {
+    600
+}
+
+fn default_poll_interval() -> u64 {
+    10
 }
 
 // =============================================================================
@@ -248,6 +289,69 @@ impl OrchestratorMcp {
                         "content": {
                             "type": "string",
                             "description": "Message content to send to the worker"
+                        }
+                    }
+                }),
+            },
+            ToolDefinition {
+                name: "create_worktree".to_string(),
+                description: "Create a git worktree for a worker to use as an isolated working directory. The worktree will be on its own branch so workers don't conflict.".to_string(),
+                input_schema: json!({
+                    "type": "object",
+                    "required": ["path", "branch"],
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Absolute path where the worktree will be created (e.g. /workspaces/mission-xxx/verity-worker-1)"
+                        },
+                        "branch": {
+                            "type": "string",
+                            "description": "Branch name for the worktree (will be created if it doesn't exist)"
+                        },
+                        "base": {
+                            "type": "string",
+                            "description": "Base branch/commit to create from (defaults to HEAD)"
+                        }
+                    }
+                }),
+            },
+            ToolDefinition {
+                name: "remove_worktree".to_string(),
+                description: "Remove a git worktree that is no longer needed.".to_string(),
+                input_schema: json!({
+                    "type": "object",
+                    "required": ["path"],
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Path of the worktree to remove"
+                        }
+                    }
+                }),
+            },
+            ToolDefinition {
+                name: "wait_for_worker".to_string(),
+                description: "Block until a worker mission reaches a terminal status (completed, failed, or interrupted). Returns the worker's final status and details. Use this instead of polling list_worker_missions in a loop.".to_string(),
+                input_schema: json!({
+                    "type": "object",
+                    "required": ["mission_id"],
+                    "properties": {
+                        "mission_id": {
+                            "type": "string",
+                            "description": "UUID of the worker mission to wait for"
+                        },
+                        "target_statuses": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "Statuses to wait for (default: ['completed', 'failed', 'interrupted'])"
+                        },
+                        "timeout_seconds": {
+                            "type": "integer",
+                            "description": "Maximum seconds to wait (default: 600)"
+                        },
+                        "poll_interval_seconds": {
+                            "type": "integer",
+                            "description": "Seconds between status checks (default: 10)"
                         }
                     }
                 }),
@@ -440,6 +544,122 @@ impl OrchestratorMcp {
         Ok(result)
     }
 
+    fn create_worktree(&self, params: CreateWorktreeParams) -> Result<Value, String> {
+        let path = &params.path;
+        let branch = &params.branch;
+
+        // Check if branch exists
+        let branch_exists = Command::new("git")
+            .args(["rev-parse", "--verify", branch])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+
+        let output = if branch_exists {
+            // Branch exists, just create worktree on it
+            Command::new("git")
+                .args(["worktree", "add", path, branch])
+                .output()
+                .map_err(|e| format!("Failed to run git worktree add: {}", e))?
+        } else {
+            // Create new branch from base
+            let base = params.base.as_deref().unwrap_or("HEAD");
+            Command::new("git")
+                .args(["worktree", "add", "-b", branch, path, base])
+                .output()
+                .map_err(|e| format!("Failed to run git worktree add: {}", e))?
+        };
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(format!("git worktree add failed: {}", stderr));
+        }
+
+        Ok(json!({
+            "success": true,
+            "path": path,
+            "branch": branch,
+            "message": format!("Worktree created at {} on branch {}", path, branch),
+        }))
+    }
+
+    fn remove_worktree(&self, params: RemoveWorktreeParams) -> Result<Value, String> {
+        let output = Command::new("git")
+            .args(["worktree", "remove", "--force", &params.path])
+            .output()
+            .map_err(|e| format!("Failed to run git worktree remove: {}", e))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(format!("git worktree remove failed: {}", stderr));
+        }
+
+        Ok(json!({
+            "success": true,
+            "path": params.path,
+            "message": format!("Worktree removed at {}", params.path),
+        }))
+    }
+
+    async fn wait_for_worker(&self, params: WaitForWorkerParams) -> Result<Value, String> {
+        let id = Uuid::parse_str(&params.mission_id)
+            .map_err(|_| "Invalid mission ID format".to_string())?;
+
+        let target_statuses = if params.target_statuses.is_empty() {
+            vec![
+                "completed".to_string(),
+                "failed".to_string(),
+                "interrupted".to_string(),
+                "not_feasible".to_string(),
+            ]
+        } else {
+            params.target_statuses
+        };
+
+        let timeout = std::time::Duration::from_secs(params.timeout_seconds);
+        let interval = std::time::Duration::from_secs(params.poll_interval_seconds);
+        let start = std::time::Instant::now();
+
+        loop {
+            // Check status
+            let response = self
+                .api_get(&format!("/api/control/missions/{}", id))
+                .await?;
+
+            if !response.status().is_success() {
+                return Err(format!("Worker mission not found: {}", response.status()));
+            }
+
+            let mission: Value = response
+                .json()
+                .await
+                .map_err(|e| format!("Failed to parse response: {}", e))?;
+
+            let status = mission["status"].as_str().unwrap_or("");
+            if target_statuses.iter().any(|s| s == status) {
+                return Ok(json!({
+                    "reached_target": true,
+                    "status": status,
+                    "elapsed_seconds": start.elapsed().as_secs(),
+                    "mission": mission,
+                }));
+            }
+
+            // Check timeout
+            if start.elapsed() > timeout {
+                return Ok(json!({
+                    "reached_target": false,
+                    "status": status,
+                    "elapsed_seconds": start.elapsed().as_secs(),
+                    "timeout": true,
+                    "mission": mission,
+                }));
+            }
+
+            tokio::time::sleep(interval).await;
+        }
+    }
+
     async fn handle_call(&self, method: &str, params: Value) -> Result<Value, String> {
         match method {
             "create_worker_mission" => {
@@ -463,6 +683,21 @@ impl OrchestratorMcp {
                 let params: SendMessageParams =
                     serde_json::from_value(params).map_err(|e| format!("Invalid params: {}", e))?;
                 self.send_message(params).await
+            }
+            "create_worktree" => {
+                let params: CreateWorktreeParams =
+                    serde_json::from_value(params).map_err(|e| format!("Invalid params: {}", e))?;
+                self.create_worktree(params)
+            }
+            "remove_worktree" => {
+                let params: RemoveWorktreeParams =
+                    serde_json::from_value(params).map_err(|e| format!("Invalid params: {}", e))?;
+                self.remove_worktree(params)
+            }
+            "wait_for_worker" => {
+                let params: WaitForWorkerParams =
+                    serde_json::from_value(params).map_err(|e| format!("Invalid params: {}", e))?;
+                self.wait_for_worker(params).await
             }
             _ => Err(format!("Unknown method: {}", method)),
         }
