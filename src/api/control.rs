@@ -5657,7 +5657,19 @@ async fn control_actor_loop(
 
     // Helper to create a new mission
     async fn create_new_mission(mission_store: &Arc<dyn MissionStore>) -> Result<Mission, String> {
-        create_new_mission_with_title(mission_store, None, None, None, None, None, None, None, None, None).await
+        create_new_mission_with_title(
+            mission_store,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
     }
 
     // Helper to create a new mission with title

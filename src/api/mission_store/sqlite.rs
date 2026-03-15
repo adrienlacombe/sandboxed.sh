@@ -615,7 +615,9 @@ impl SqliteMissionStore {
             .map_err(|e| format!("Failed to query table info: {}", e))?;
 
         if !has_parent_mission_id_column {
-            tracing::info!("Running migration: adding 'parent_mission_id' column to missions table");
+            tracing::info!(
+                "Running migration: adding 'parent_mission_id' column to missions table"
+            );
             conn.execute("ALTER TABLE missions ADD COLUMN parent_mission_id TEXT", [])
                 .map_err(|e| format!("Failed to add parent_mission_id column: {}", e))?;
             conn.execute(
@@ -633,7 +635,9 @@ impl SqliteMissionStore {
             .map_err(|e| format!("Failed to query table info: {}", e))?;
 
         if !has_working_directory_column {
-            tracing::info!("Running migration: adding 'working_directory' column to missions table");
+            tracing::info!(
+                "Running migration: adding 'working_directory' column to missions table"
+            );
             conn.execute("ALTER TABLE missions ADD COLUMN working_directory TEXT", [])
                 .map_err(|e| format!("Failed to add working_directory column: {}", e))?;
         }

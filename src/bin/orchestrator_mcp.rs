@@ -424,9 +424,7 @@ impl OrchestratorMcp {
     async fn list_workers(&self) -> Result<Value, String> {
         // List all missions and filter for children of this boss mission
         let response = self
-            .api_get(&format!(
-                "/api/control/missions?limit=100&offset=0"
-            ))
+            .api_get("/api/control/missions?limit=100&offset=0")
             .await?;
 
         if !response.status().is_success() {
@@ -496,7 +494,11 @@ impl OrchestratorMcp {
 
         for worker in &workers {
             let status = worker["status"].as_str().unwrap_or("");
-            if status == "completed" || status == "failed" || status == "interrupted" || status == "not_feasible" {
+            if status == "completed"
+                || status == "failed"
+                || status == "interrupted"
+                || status == "not_feasible"
+            {
                 continue;
             }
             let id = worker["id"].as_str().unwrap_or("");
@@ -755,7 +757,7 @@ impl OrchestratorMcp {
             }
             "notifications/initialized" => {
                 // Notification, no response needed but we return empty for safety
-                return JsonRpcResponse::success(req.id, json!(null));
+                JsonRpcResponse::success(req.id, json!(null))
             }
             _ => JsonRpcResponse::error(req.id, -32601, format!("Unknown method: {}", req.method)),
         }
