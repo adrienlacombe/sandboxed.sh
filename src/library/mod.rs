@@ -1835,6 +1835,23 @@ impl LibraryStore {
             AmpCodeConfig::default()
         };
 
+        // Load Codex config (TOML-based)
+        let codex_config_path = profile_dir.join(".codex").join("config.toml");
+        let codex_config = if codex_config_path.exists() {
+            let content = fs::read_to_string(&codex_config_path)
+                .await
+                .context("Failed to read codex config")?;
+            files.push(ConfigProfileFile {
+                path: ".codex/config.toml".to_string(),
+                content: content.clone(),
+            });
+            CodexProfileConfig {
+                has_otel: content.contains("[otel]"),
+            }
+        } else {
+            CodexProfileConfig::default()
+        };
+
         Ok(ConfigProfile {
             name: name.to_string(),
             is_default: name == DEFAULT_PROFILE,
@@ -1844,6 +1861,7 @@ impl LibraryStore {
             sandboxed_config,
             claudecode_config,
             ampcode_config,
+            codex_config,
         })
     }
 
@@ -1888,6 +1906,19 @@ impl LibraryStore {
         fs::write(ampcode_dir.join("settings.json"), ampcode_content)
             .await
             .context("Failed to write ampcode config")?;
+
+        // Save Codex config (TOML) if present in files list
+        let codex_dir = profile_dir.join(".codex");
+        fs::create_dir_all(&codex_dir).await?;
+        if let Some(codex_file) = profile
+            .files
+            .iter()
+            .find(|f| f.path == ".codex/config.toml")
+        {
+            fs::write(codex_dir.join("config.toml"), &codex_file.content)
+                .await
+                .context("Failed to write codex config")?;
+        }
 
         Ok(())
     }
@@ -1940,6 +1971,7 @@ impl LibraryStore {
                 sandboxed_config: base.sandboxed_config,
                 claudecode_config: base.claudecode_config,
                 ampcode_config: base.ampcode_config,
+                codex_config: base.codex_config,
             };
             self.save_config_profile(name, &new_profile).await?;
             Ok(new_profile)
@@ -1955,6 +1987,7 @@ impl LibraryStore {
                 sandboxed_config: SandboxedConfig::default(),
                 claudecode_config: ClaudeCodeConfig::default(),
                 ampcode_config: AmpCodeConfig::default(),
+                codex_config: CodexProfileConfig::default(),
             })
         }
     }
@@ -2111,6 +2144,25 @@ impl LibraryStore {
             .await
             .context("Failed to read claudecode settings")?;
         serde_json::from_str(&content).context("Failed to parse claudecode settings")
+    }
+
+    /// Get Codex raw config.toml from a profile as a plain string.
+    /// Returns the TOML content unmodified — the caller (workspace.rs) handles merging
+    /// with generated MCP sections via `update_codex_mcp_config()`.
+    pub async fn get_codex_raw_config_for_profile(&self, profile: &str) -> Result<String> {
+        Self::validate_name(profile)?;
+        let path = self
+            .path
+            .join(CONFIGS_DIR)
+            .join(profile)
+            .join(".codex")
+            .join("config.toml");
+        if !path.exists() {
+            return Ok(String::new());
+        }
+        fs::read_to_string(&path)
+            .await
+            .context("Failed to read codex config.toml")
     }
 
     /// Save Claude Code config to a specific profile.
