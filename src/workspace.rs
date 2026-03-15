@@ -1716,6 +1716,7 @@ async fn write_amp_config(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn write_codex_config(
     workspace_dir: &Path,
     mcp_configs: Vec<McpServerConfig>,
