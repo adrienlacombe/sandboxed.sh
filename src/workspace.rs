@@ -875,6 +875,7 @@ fn claude_entry_from_mcp(
     match &config.transport {
         McpTransport::Http { endpoint, headers } => {
             let mut entry = serde_json::Map::new();
+            entry.insert("type".to_string(), json!("http"));
             entry.insert("url".to_string(), json!(endpoint));
             if !headers.is_empty() {
                 entry.insert("headers".to_string(), json!(headers));
