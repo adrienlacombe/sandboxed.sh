@@ -3590,7 +3590,10 @@ pub async fn write_runtime_workspace_state(
     }
     let context_link = working_dir.join(context_dir_name);
     if let Some(target) = mission_context.as_ref() {
-        if context_link.exists() && tokio::fs::remove_file(&context_link).await.is_err() {
+        // Use symlink_metadata to avoid following symlinks (prevents ELOOP errors)
+        if tokio::fs::symlink_metadata(&context_link).await.is_ok()
+            && tokio::fs::remove_file(&context_link).await.is_err()
+        {
             if let Err(e) = tokio::fs::remove_dir_all(&context_link).await {
                 tracing::warn!(
                     workspace = %workspace.name,

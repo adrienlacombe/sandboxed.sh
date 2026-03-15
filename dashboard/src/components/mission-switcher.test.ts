@@ -49,7 +49,10 @@ describe('mission switcher search helpers', () => {
     const title = getMissionCardTitle(mission);
     const description = getMissionCardDescription(mission, title);
 
-    expect(description).toBe('调查 OAuth 回调失败');
+    // When title exists, short_description is surfaced as cardTitle (via getMissionCardTitle)
+    // and getMissionCardDescription returns null to avoid duplication.
+    expect(title).toBe('调查 OAuth 回调失败');
+    expect(description).toBeNull();
     expect(missionMatchesSearchQuery(mission, '回调')).toBe(true);
     expect(missionSearchRelevanceScore(mission, '回调')).toBeGreaterThan(0);
   });
