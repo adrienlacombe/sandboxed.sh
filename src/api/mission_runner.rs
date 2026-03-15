@@ -1303,6 +1303,9 @@ pub struct MissionRunner {
 
     /// Tracked subtasks (from delegate_task/Task tool calls)
     pub subtasks: Vec<SubtaskInfo>,
+
+    /// Optional working directory override (e.g. git worktree path for orchestrated workers)
+    pub working_directory: Option<String>,
 }
 
 impl MissionRunner {
@@ -1339,6 +1342,7 @@ impl MissionRunner {
             explicitly_completed: false,
             current_activity: None,
             subtasks: Vec::new(),
+            working_directory: None,
         }
     }
 
@@ -1478,6 +1482,7 @@ impl MissionRunner {
         let backend_id = self.backend_id.clone();
         let session_id = self.session_id.clone();
         let config_profile = self.config_profile.clone();
+        let working_directory = self.working_directory.clone();
         let user_message = msg.content.clone();
         let msg_id = msg.id;
         tracing::info!(
@@ -1528,6 +1533,7 @@ impl MissionRunner {
                 secrets,
                 session_id,
                 config_profile,
+                working_directory,
             )
             .await;
             (msg_id, user_message, result)
@@ -1845,6 +1851,7 @@ async fn run_mission_turn(
     secrets: Option<Arc<SecretsStore>>,
     session_id: Option<String>,
     mission_config_profile: Option<String>,
+    mission_working_directory: Option<String>,
 ) -> AgentResult {
     let mut config = config;
     let effective_agent = agent_override.clone();
@@ -1990,6 +1997,28 @@ async fn run_mission_turn(
             tracing::warn!("Failed to prepare mission workspace, using default: {}", e);
             workspace_root
         }
+    };
+
+    // Override with mission-specific working_directory (e.g. git worktree for orchestrated workers)
+    let mission_work_dir = if let Some(ref wd) = mission_working_directory {
+        let wd_path = std::path::PathBuf::from(wd);
+        if wd_path.exists() {
+            tracing::info!(
+                "Mission {} using working_directory override: {}",
+                mission_id,
+                wd
+            );
+            wd_path
+        } else {
+            tracing::warn!(
+                "Mission {} working_directory does not exist: {}, using default",
+                mission_id,
+                wd
+            );
+            mission_work_dir
+        }
+    } else {
+        mission_work_dir
     };
 
     // Session rotation: Prevent OOM by resetting sessions every N turns

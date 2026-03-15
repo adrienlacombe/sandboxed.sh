@@ -2769,6 +2769,10 @@ pub enum ControlCommand {
         backend: Option<String>,
         /// Config profile to use for this mission
         config_profile: Option<String>,
+        /// Parent mission ID (for orchestrated worker missions)
+        parent_mission_id: Option<Uuid>,
+        /// Working directory override (for git worktrees etc.)
+        working_directory: Option<String>,
         respond: oneshot::Sender<Result<Mission, String>>,
     },
     /// Update mission status
@@ -3718,6 +3722,10 @@ pub struct CreateMissionRequest {
     pub config_profile: Option<String>,
     /// Backend to use for this mission ("opencode" or "claudecode")
     pub backend: Option<String>,
+    /// Parent mission ID (for orchestrated worker missions)
+    pub parent_mission_id: Option<Uuid>,
+    /// Working directory override (for git worktrees etc.)
+    pub working_directory: Option<String>,
 }
 
 fn normalize_model_effort(raw: &str) -> Option<String> {
@@ -3749,22 +3757,25 @@ pub async fn create_mission(
 ) -> Result<Json<Mission>, (StatusCode, String)> {
     let (tx, rx) = oneshot::channel();
 
-    let (title, workspace_id, agent, model_override, model_effort, config_profile, mut backend) =
-        body.map(|b| {
-            (
-                b.title.clone(),
-                b.workspace_id,
-                b.agent.clone(),
-                b.model_override.clone(),
-                b.model_effort.clone(),
-                b.config_profile.clone(),
-                b.backend.clone(),
-            )
-        })
-        .unwrap_or((None, None, None, None, None, None, None));
+    let req = body.map(|b| b.0).unwrap_or(CreateMissionRequest {
+        title: None,
+        workspace_id: None,
+        agent: None,
+        model_override: None,
+        model_effort: None,
+        config_profile: None,
+        backend: None,
+        parent_mission_id: None,
+        working_directory: None,
+    });
 
-    let mut model_override = model_override;
-    let mut model_effort = model_effort;
+    let title = req.title.clone();
+    let workspace_id = req.workspace_id;
+    let agent = req.agent.clone();
+    let config_profile = req.config_profile.clone();
+    let mut backend = req.backend.clone();
+    let mut model_override = req.model_override.clone();
+    let mut model_effort = req.model_effort.clone();
     if let Some(value) = backend.as_ref() {
         if value.trim().is_empty() {
             backend = None;
@@ -3879,6 +3890,8 @@ pub async fn create_mission(
             model_effort,
             backend,
             config_profile: effective_config_profile,
+            parent_mission_id: req.parent_mission_id,
+            working_directory: req.working_directory,
             respond: tx,
         })
         .await
@@ -5644,7 +5657,19 @@ async fn control_actor_loop(
 
     // Helper to create a new mission
     async fn create_new_mission(mission_store: &Arc<dyn MissionStore>) -> Result<Mission, String> {
-        create_new_mission_with_title(mission_store, None, None, None, None, None, None, None).await
+        create_new_mission_with_title(
+            mission_store,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
     }
 
     // Helper to create a new mission with title
@@ -5657,9 +5682,11 @@ async fn control_actor_loop(
         model_effort: Option<&str>,
         backend: Option<&str>,
         config_profile: Option<&str>,
+        parent_mission_id: Option<Uuid>,
+        working_directory: Option<&str>,
     ) -> Result<Mission, String> {
         mission_store
-            .create_mission(
+            .create_mission_with_parent(
                 title,
                 workspace_id,
                 agent,
@@ -5667,6 +5694,8 @@ async fn control_actor_loop(
                 model_effort,
                 backend,
                 config_profile,
+                parent_mission_id,
+                working_directory,
             )
             .await
     }
@@ -5986,6 +6015,7 @@ async fn control_actor_loop(
                                                 mission.model_override.clone(),
                                                 mission.model_effort.clone(),
                                             );
+                                            runner.working_directory = mission.working_directory.clone();
                                             // Load existing history
                                             for entry in &mission.history {
                                                 runner.history.push((entry.role.clone(), entry.content.clone()));
@@ -6405,7 +6435,7 @@ async fn control_actor_loop(
                             }
                         }
                     }
-                    ControlCommand::CreateMission { title, workspace_id, agent, model_override, model_effort, backend, config_profile, respond } => {
+                    ControlCommand::CreateMission { title, workspace_id, agent, model_override, model_effort, backend, config_profile, parent_mission_id, working_directory, respond } => {
                         // First persist current mission history
                         persist_mission_history(
                             &mission_store,
@@ -6425,6 +6455,8 @@ async fn control_actor_loop(
                             model_effort.as_deref(),
                             backend.as_deref(),
                             config_profile.as_deref(),
+                            parent_mission_id,
+                            working_directory.as_deref(),
                         )
                         .await {
                             Ok(mission) => {
@@ -6549,6 +6581,7 @@ async fn control_actor_loop(
                                 mission.model_override.clone(),
                                 mission.model_effort.clone(),
                             );
+                            runner.working_directory = mission.working_directory.clone();
 
                             // Load existing history into runner to preserve conversation context
                             for entry in &mission.history {
@@ -6588,6 +6621,46 @@ async fn control_actor_loop(
                         }
                     }
                     ControlCommand::CancelMission { mission_id, respond } => {
+                        // Helper: cascade-cancel all child missions of the given parent.
+                        async fn cancel_child_missions(
+                            parent_id: Uuid,
+                            mission_store: &Arc<dyn MissionStore>,
+                            parallel_runners: &mut HashMap<Uuid, super::mission_runner::MissionRunner>,
+                            events_tx: &tokio::sync::broadcast::Sender<AgentEvent>,
+                            working_dir: &std::path::Path,
+                        ) {
+                            let children = match mission_store.get_child_missions(parent_id).await {
+                                Ok(c) => c,
+                                Err(e) => {
+                                    tracing::warn!("Failed to fetch child missions for cascade cancel: {}", e);
+                                    return;
+                                }
+                            };
+                            for child in children {
+                                if matches!(child.status, MissionStatus::Completed | MissionStatus::Failed | MissionStatus::Interrupted | MissionStatus::NotFeasible) {
+                                    continue;
+                                }
+                                // Cancel runner if running
+                                if let Some(runner) = parallel_runners.get_mut(&child.id) {
+                                    runner.cancel();
+                                    parallel_runners.remove(&child.id);
+                                }
+                                if let Err(e) = mission_store
+                                    .update_mission_status(child.id, MissionStatus::Interrupted)
+                                    .await
+                                {
+                                    tracing::warn!("Failed to cancel child mission {}: {}", child.id, e);
+                                } else {
+                                    let _ = events_tx.send(AgentEvent::MissionStatusChanged {
+                                        mission_id: child.id,
+                                        status: MissionStatus::Interrupted,
+                                        summary: None,
+                                    });
+                                }
+                                close_mission_desktop_sessions(mission_store, child.id, working_dir).await;
+                            }
+                        }
+
                         // First check parallel runners
                         if let Some(runner) = parallel_runners.get_mut(&mission_id) {
                             runner.cancel();
@@ -6626,6 +6699,8 @@ async fn control_actor_loop(
                                 &config.working_dir,
                             )
                             .await;
+                            // Cascade cancel child missions
+                            cancel_child_missions(mission_id, &mission_store, &mut parallel_runners, &events_tx, &config.working_dir).await;
                             let _ = respond.send(Ok(()));
                         } else {
                             // Check if this is the currently executing mission
@@ -6644,6 +6719,8 @@ async fn control_actor_loop(
                                     // Don't send Error event here - the task will complete and send
                                     // an AssistantMessage with resumable=true when it finishes.
                                     // Sending both causes duplicate UI messages.
+                                    // Cascade cancel child missions
+                                    cancel_child_missions(mission_id, &mission_store, &mut parallel_runners, &events_tx, &config.working_dir).await;
                                     let _ = respond.send(Ok(()));
                                 } else {
                                     let _ = respond.send(Err("Mission not currently executing".to_string()));
@@ -11533,6 +11610,8 @@ And the report:
             desktop_sessions: Vec::new(),
             session_id: None,
             terminal_reason: None,
+            parent_mission_id: None,
+            working_directory: None,
         };
         let weak = Mission {
             id: Uuid::new_v4(),
@@ -11558,6 +11637,8 @@ And the report:
             desktop_sessions: Vec::new(),
             session_id: None,
             terminal_reason: None,
+            parent_mission_id: None,
+            working_directory: None,
         };
 
         let strong_score = mission_search_relevance_score(
@@ -11598,6 +11679,8 @@ And the report:
             desktop_sessions: Vec::new(),
             session_id: None,
             terminal_reason: None,
+            parent_mission_id: None,
+            working_directory: None,
         };
 
         let score = mission_search_relevance_score(
@@ -11635,6 +11718,8 @@ And the report:
             desktop_sessions: Vec::new(),
             session_id: None,
             terminal_reason: None,
+            parent_mission_id: None,
+            working_directory: None,
         };
 
         let score = mission_search_relevance_score(
@@ -11672,6 +11757,8 @@ And the report:
             desktop_sessions: Vec::new(),
             session_id: None,
             terminal_reason: None,
+            parent_mission_id: None,
+            working_directory: None,
         };
 
         let score = mission_search_relevance_score(
@@ -11709,6 +11796,8 @@ And the report:
             desktop_sessions: Vec::new(),
             session_id: None,
             terminal_reason: None,
+            parent_mission_id: None,
+            working_directory: None,
         };
 
         let score = mission_search_relevance_score(
@@ -11830,6 +11919,8 @@ And the report:
             desktop_sessions: Vec::new(),
             session_id: None,
             terminal_reason: None,
+            parent_mission_id: None,
+            working_directory: None,
         };
         let before = mission_search_freshness_key(
             &[MissionSearchCandidate {
