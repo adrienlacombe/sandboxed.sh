@@ -176,6 +176,9 @@ export function AddProviderModal({ open, onClose, onSuccess, providerTypes }: Ad
     // If provider has OAuth options, show method selection
     if (typeInfo?.uses_oauth && methods.length > 0) {
       setStep('select-method');
+    } else if (providerType === 'anthropic' || providerType === 'openai' || providerType === 'google') {
+      // Providers with backend targeting go to backend selection even without OAuth
+      setStep('select-backends');
     } else {
       // Otherwise go directly to API key entry
       setStep('enter-api-key');
@@ -223,7 +226,14 @@ export function AddProviderModal({ open, onClose, onSuccess, providerTypes }: Ad
       return;
     }
 
-    const method = authMethods[selectedMethodIndex!];
+    // If we got here without selecting an auth method (non-OAuth flow),
+    // go directly to API key entry.
+    if (selectedMethodIndex === null) {
+      setStep('enter-api-key');
+      return;
+    }
+
+    const method = authMethods[selectedMethodIndex];
     if (method.type === 'api') {
       setStep('enter-api-key');
     } else {
@@ -357,10 +367,15 @@ export function AddProviderModal({ open, onClose, onSuccess, providerTypes }: Ad
       setStep('select-provider');
       setSelectedProvider(null);
     } else if (step === 'select-backends') {
-      setStep('select-method');
+      if (selectedMethodIndex !== null || hasOAuth) {
+        setStep('select-method');
+      } else {
+        setStep('select-provider');
+        setSelectedProvider(null);
+      }
     } else if (step === 'enter-api-key') {
-      if ((selectedProvider === 'anthropic' || selectedProvider === 'openai' || selectedProvider === 'google') && selectedMethodIndex !== null) {
-        // We went through method selection and backend selection; go back to backends
+      if (selectedProvider === 'anthropic' || selectedProvider === 'openai' || selectedProvider === 'google') {
+        // These providers have a backend selection step; go back to it
         setStep('select-backends');
       } else if (hasOAuth) {
         setStep('select-method');
