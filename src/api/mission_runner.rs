@@ -11460,7 +11460,7 @@ pub async fn run_gemini_turn(
         )
         .await;
 
-    // Write settings.json if API key is available (so CLI uses env-var auth)
+    // Write settings.json so CLI uses API key / access token auth via GEMINI_API_KEY env var
     if api_key.is_some() {
         let _ = workspace_exec
             .output(
@@ -11468,7 +11468,7 @@ pub async fn run_gemini_turn(
                 "/bin/sh",
                 &[
                     "-c".to_string(),
-                    r#"test -f /root/.gemini/settings.json || echo '{"selectedAuthType":"api-key"}' > /root/.gemini/settings.json"#.to_string(),
+                    r#"test -f /root/.gemini/settings.json || echo '{"selectedAuthType":"gemini-api-key"}' > /root/.gemini/settings.json"#.to_string(),
                 ],
                 std::collections::HashMap::new(),
             )
@@ -11670,69 +11670,112 @@ pub async fn run_gemini_turn(
     result
 }
 
-/// Get Google API key for the Gemini CLI backend from the AI provider store.
+/// Get Google API key or OAuth access token for the Gemini CLI backend.
 ///
-/// Checks the AI provider store for a Google provider with an API key,
-/// then falls back to environment variables.
+/// Checks (in order):
+/// 1. AI provider store for a Google provider with an API key
+/// 2. Sandboxed-sh credentials store for a Google OAuth access token
+/// 3. OpenCode's auth.json for a Google API key or access token
+/// 4. Environment variables (GEMINI_API_KEY, GOOGLE_API_KEY, etc.)
 fn get_google_api_key_for_gemini(working_dir: &std::path::Path) -> Option<String> {
-    // Try to get API key from the AI provider store
+    // 1. Try to get API key from the AI provider store
     let store_path = working_dir.join(crate::util::AI_PROVIDERS_PATH);
-    let store = match std::fs::read_to_string(&store_path) {
-        Ok(contents) => contents,
-        Err(_) => {
-            tracing::debug!("No AI providers file found at {:?}", store_path);
-            return env_google_api_key();
-        }
-    };
-
-    let providers: serde_json::Value = match serde_json::from_str(&store) {
-        Ok(v) => v,
-        Err(_) => return env_google_api_key(),
-    };
-
-    if let Some(providers_arr) = providers.as_array() {
-        for provider in providers_arr {
-            let pt = match provider.get("provider_type").and_then(|v| v.as_str()) {
-                Some(t) => t,
-                None => continue,
-            };
-            if pt != "google" {
-                continue;
-            }
-
-            let enabled = provider
-                .get("enabled")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(true);
-            if !enabled {
-                continue;
-            }
-
-            // Try API key first
-            if let Some(key) = provider.get("api_key").and_then(|v| v.as_str()) {
-                if !key.is_empty() {
-                    return Some(key.to_string());
-                }
-            }
-
-            // If OAuth credentials exist, the key may be in OpenCode's auth.json
-            if provider.get("oauth").is_some() {
-                // Try to read the API key from OpenCode's auth.json where it's synced
-                if let Some(key) = read_google_key_from_opencode_auth() {
-                    return Some(key);
+    if let Ok(store) = std::fs::read_to_string(&store_path) {
+        if let Ok(providers) = serde_json::from_str::<serde_json::Value>(&store) {
+            if let Some(providers_arr) = providers.as_array() {
+                for provider in providers_arr {
+                    let pt = match provider.get("provider_type").and_then(|v| v.as_str()) {
+                        Some(t) => t,
+                        None => continue,
+                    };
+                    if pt != "google" {
+                        continue;
+                    }
+                    let enabled = provider
+                        .get("enabled")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(true);
+                    if !enabled {
+                        continue;
+                    }
+                    // Try API key first
+                    if let Some(key) = provider.get("api_key").and_then(|v| v.as_str()) {
+                        if !key.is_empty() {
+                            tracing::info!("Using Google API key from ai_providers.json");
+                            return Some(key.to_string());
+                        }
+                    }
                 }
             }
         }
+    } else {
+        tracing::debug!("No AI providers file found at {:?}", store_path);
     }
 
-    // Fall back to environment variables
+    // 2. Try sandboxed-sh credentials store (has Google OAuth access token)
+    if let Some(key) = read_google_access_token_from_credentials() {
+        return Some(key);
+    }
+
+    // 3. Try OpenCode's auth.json
+    if let Some(key) = read_google_key_from_opencode_auth() {
+        return Some(key);
+    }
+
+    // 4. Fall back to environment variables
     env_google_api_key()
 }
 
-/// Read Google API key from OpenCode's auth.json (synced during OAuth callback).
+/// Read Google OAuth access token from the sandboxed-sh credentials store.
+/// The credentials store at ~/.sandboxed-sh/credentials.json contains OAuth
+/// tokens in the format: {"google": {"type": "oauth", "access": "ya29...", "refresh": "...", "expires": ...}}
+fn read_google_access_token_from_credentials() -> Option<String> {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+    let candidates = [
+        std::path::PathBuf::from(&home)
+            .join(".sandboxed-sh")
+            .join("credentials.json"),
+        std::path::PathBuf::from("/var/lib/opencode")
+            .join(".sandboxed-sh")
+            .join("credentials.json"),
+    ];
+    let creds_path = candidates.iter().find(|p| p.exists())?;
+    let contents = std::fs::read_to_string(creds_path).ok()?;
+    let auth: serde_json::Value = serde_json::from_str(&contents).ok()?;
+
+    for key_name in ["google", "gemini"] {
+        let entry = match auth.get(key_name) {
+            Some(e) => e,
+            None => continue,
+        };
+        // Check if the token is expired
+        let expires_at = entry.get("expires").and_then(|v| v.as_i64()).unwrap_or(0);
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64;
+        if expires_at > 0 && expires_at < now_ms {
+            tracing::warn!(
+                "Google OAuth access token in credentials.json is expired (expires_at={}, now={})",
+                expires_at,
+                now_ms
+            );
+            continue;
+        }
+        if let Some(access) = entry.get("access").and_then(|v| v.as_str()) {
+            if !access.is_empty() {
+                tracing::info!(
+                    "Using Google OAuth access token from credentials.json for Gemini CLI"
+                );
+                return Some(access.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Read Google API key or access token from OpenCode's auth.json.
 fn read_google_key_from_opencode_auth() -> Option<String> {
-    // Use the same path resolution as get_opencode_auth_path():
-    // XDG_DATA_HOME → ~/.local/share/opencode/auth.json → /var/lib/opencode/...
     let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
     let mut candidates = Vec::new();
     if let Ok(data_home) = std::env::var("XDG_DATA_HOME") {
@@ -11763,15 +11806,26 @@ fn read_google_key_from_opencode_auth() -> Option<String> {
     // Look for google or gemini key in auth.json
     for key_name in ["google", "gemini"] {
         if let Some(entry) = auth.get(key_name) {
-            // Check for access token (OAuth) or api_key
+            // Check for API key first
             if let Some(key) = entry.get("key").and_then(|v| v.as_str()) {
                 if !key.is_empty() {
+                    tracing::info!("Using Google API key from OpenCode auth.json");
                     return Some(key.to_string());
                 }
             }
             if let Some(key) = entry.get("api_key").and_then(|v| v.as_str()) {
                 if !key.is_empty() {
+                    tracing::info!("Using Google API key from OpenCode auth.json");
                     return Some(key.to_string());
+                }
+            }
+            // Fall back to OAuth access token
+            if let Some(access) = entry.get("access").and_then(|v| v.as_str()) {
+                if !access.is_empty() {
+                    tracing::info!(
+                        "Using Google OAuth access token from OpenCode auth.json for Gemini CLI"
+                    );
+                    return Some(access.to_string());
                 }
             }
         }
