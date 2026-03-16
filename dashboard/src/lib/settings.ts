@@ -29,6 +29,14 @@ function normalizeBaseUrl(url: string): string {
   return trimmed.endsWith('/') ? trimmed.slice(0, -1) : trimmed;
 }
 
+const HOSTED_API_BASE_BY_HOSTNAME: Record<string, string> = {
+  'agent.thomas.md': 'https://agent-backend.thomas.md',
+};
+
+export function inferHostedApiBase(hostname: string): string | null {
+  return HOSTED_API_BASE_BY_HOSTNAME[hostname] ?? null;
+}
+
 export function getRuntimeApiBase(): string {
   const envBase = process.env.NEXT_PUBLIC_API_URL;
   if (typeof window === 'undefined') {
@@ -37,5 +45,7 @@ export function getRuntimeApiBase(): string {
   const saved = readSavedSettings().apiUrl;
   if (saved) return normalizeBaseUrl(saved);
   if (envBase) return normalizeBaseUrl(envBase);
+  const hostedBase = inferHostedApiBase(window.location.hostname);
+  if (hostedBase) return normalizeBaseUrl(hostedBase);
   return normalizeBaseUrl(window.location.origin);
 }
