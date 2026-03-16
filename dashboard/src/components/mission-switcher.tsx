@@ -58,9 +58,13 @@ function getMissionDisplayName(
 
 export function getMissionCardTitle(mission: Mission): string | null {
   // When a backend title exists, it's already shown as the display name,
-  // so show the short_description as subtitle instead.
+  // so only surface short_description when it adds distinct context.
   if (mission.title?.trim()) {
-    return mission.short_description?.trim() || null;
+    const shortDescription = mission.short_description?.trim();
+    if (!shortDescription) return null;
+    return hasMeaningfulExtraTokens(mission.title, shortDescription)
+      ? shortDescription
+      : null;
   }
   // No backend title: display name is the animal codename, so show the
   // first user message as subtitle.
@@ -189,6 +193,7 @@ export function getMissionQuickActions(mission: Mission, isRunning: boolean): Mi
 export function getMissionSearchText(mission: Mission): string {
   const title = getMissionCardTitle(mission) ?? '';
   const shortDescription = mission.short_description?.trim() ?? '';
+  const titleBase = mission.title?.trim() ?? title;
   const backend = getMissionBackendLabel(mission);
   const status = mission.status ?? '';
   const textParts: string[] = [];
@@ -201,7 +206,10 @@ export function getMissionSearchText(mission: Mission): string {
   if (title && title !== mission.title?.trim()) {
     textParts.push(title);
   }
-  if (shortDescription && (textParts.length === 0 || hasMeaningfulExtraTokens(title, shortDescription))) {
+  if (
+    shortDescription &&
+    (textParts.length === 0 || hasMeaningfulExtraTokens(titleBase, shortDescription))
+  ) {
     textParts.push(shortDescription);
   }
   if (backend) {

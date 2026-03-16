@@ -36,7 +36,7 @@ describe('mission switcher search helpers', () => {
     const title = getMissionCardTitle(mission);
     const description = getMissionCardDescription(mission, title);
 
-    expect(title).toBe('Fix login bug!');
+    expect(title).toBeNull();
     expect(description).toBeNull();
   });
 
@@ -49,7 +49,7 @@ describe('mission switcher search helpers', () => {
     const title = getMissionCardTitle(mission);
     const description = getMissionCardDescription(mission, title);
 
-    // When title exists, short_description is surfaced as cardTitle (via getMissionCardTitle)
+    // When title exists, a distinct short_description is surfaced as cardTitle
     // and getMissionCardDescription returns null to avoid duplication.
     expect(title).toBe('调查 OAuth 回调失败');
     expect(description).toBeNull();
