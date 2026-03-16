@@ -3379,6 +3379,18 @@ pub async fn prepare_mission_workspace_with_skills_backend(
         None
     };
 
+    // Inject MISSION_ID into MCP server env for MCPs that need it (e.g. orchestrator-mcp).
+    let mcp_configs: Vec<McpServerConfig> = mcp_configs
+        .into_iter()
+        .map(|mut cfg| {
+            if let McpTransport::Stdio { ref mut env, .. } = cfg.transport {
+                env.entry("MISSION_ID".to_string())
+                    .or_insert_with(|| mission_id.to_string());
+            }
+            cfg
+        })
+        .collect();
+
     write_backend_config(
         &dir,
         backend_id,

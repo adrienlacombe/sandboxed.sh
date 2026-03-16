@@ -771,12 +771,17 @@ impl OrchestratorMcp {
 #[tokio::main]
 async fn main() {
     let mission_id = std::env::var("MISSION_ID")
+        .or_else(|_| std::env::var("SANDBOXED_SH_MISSION_ID"))
         .ok()
         .and_then(|id| Uuid::parse_str(&id).ok())
-        .expect("MISSION_ID environment variable not set or invalid");
+        .expect("MISSION_ID (or SANDBOXED_SH_MISSION_ID) environment variable not set or invalid");
 
-    let api_url = std::env::var("API_URL").unwrap_or_else(|_| "http://localhost:3000".to_string());
-    let api_token = std::env::var("API_TOKEN").ok();
+    let api_url = std::env::var("API_URL")
+        .or_else(|_| std::env::var("SANDBOXED_SH_API_URL"))
+        .unwrap_or_else(|_| "http://localhost:3000".to_string());
+    let api_token = std::env::var("API_TOKEN")
+        .or_else(|_| std::env::var("SANDBOXED_SH_API_TOKEN"))
+        .ok();
 
     let server = Arc::new(OrchestratorMcp::new(mission_id, api_url, api_token));
 
