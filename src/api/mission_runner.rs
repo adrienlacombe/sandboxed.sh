@@ -8080,6 +8080,10 @@ pub async fn check_backend_prerequisites(
             let cli = cli_path.unwrap_or("amp");
             check_amp_prerequisites(&workspace_exec, cwd, cli).await
         }
+        "gemini" => {
+            let cli = cli_path.unwrap_or("gemini");
+            check_gemini_prerequisites(&workspace_exec, cwd, cli).await
+        }
         _ => BackendPreflightResult {
             backend_id: backend_id.to_string(),
             available: false,
@@ -8087,7 +8091,7 @@ pub async fn check_backend_prerequisites(
             auto_install_possible: false,
             missing_dependencies: vec![format!("unknown backend: {}", backend_id)],
             message: Some(format!(
-                "Unknown backend '{}'. Supported backends: claudecode, opencode, codex, amp",
+                "Unknown backend '{}'. Supported backends: claudecode, opencode, codex, amp, gemini",
                 backend_id
             )),
         },
@@ -8274,6 +8278,157 @@ async fn check_amp_prerequisites(
             Some("Amp CLI not found but can be auto-installed via npm/bun.".to_string())
         },
     }
+}
+
+async fn check_gemini_prerequisites(
+    workspace_exec: &WorkspaceExec,
+    cwd: &std::path::Path,
+    cli_path: &str,
+) -> BackendPreflightResult {
+    let program = cli_path.split_whitespace().next().unwrap_or(cli_path);
+
+    let cli_available = command_available(workspace_exec, cwd, program).await;
+
+    if cli_available {
+        return BackendPreflightResult {
+            backend_id: "gemini".to_string(),
+            available: true,
+            cli_available: true,
+            auto_install_possible: false,
+            missing_dependencies: vec![],
+            message: None,
+        };
+    }
+
+    let has_npm = command_available(workspace_exec, cwd, "npm").await;
+    let has_bun = command_available(workspace_exec, cwd, "bun").await
+        || command_available(workspace_exec, cwd, "/root/.bun/bin/bun").await;
+
+    let auto_install_possible = has_npm || has_bun;
+
+    BackendPreflightResult {
+        backend_id: "gemini".to_string(),
+        available: auto_install_possible,
+        cli_available: false,
+        auto_install_possible,
+        missing_dependencies: if !auto_install_possible {
+            vec!["npm or bun".to_string()]
+        } else {
+            vec![]
+        },
+        message: if !auto_install_possible {
+            Some("Gemini CLI not found and neither npm nor bun is available. Install Node.js/npm or Bun in the workspace template.".to_string())
+        } else {
+            Some("Gemini CLI not found but can be auto-installed via npm/bun.".to_string())
+        },
+    }
+}
+
+/// Returns the path to the Gemini CLI that should be used.
+/// Auto-installs via npm/bun if not found and auto-install is enabled.
+async fn ensure_gemini_cli_available(
+    workspace_exec: &WorkspaceExec,
+    cwd: &std::path::Path,
+    cli_path: &str,
+) -> Result<String, String> {
+    let program = cli_path.split(' ').next().unwrap_or(cli_path);
+
+    // Check if already available
+    if command_available(workspace_exec, cwd, program).await {
+        return Ok(cli_path.to_string());
+    }
+
+    // Check bun's global bin directories
+    const BUN_GLOBAL_GEMINI_PATHS: &[&str] =
+        &["/root/.cache/.bun/bin/gemini", "/root/.bun/bin/gemini"];
+    for gemini_path in BUN_GLOBAL_GEMINI_PATHS {
+        if command_available(workspace_exec, cwd, gemini_path).await {
+            tracing::info!(
+                path = %gemini_path,
+                "Found Gemini CLI in bun global bin"
+            );
+            return Ok(gemini_path.to_string());
+        }
+    }
+
+    // Auto-install Gemini CLI if enabled (defaults to true)
+    let auto_install = env_var_bool("SANDBOXED_SH_AUTO_INSTALL_GEMINI", true);
+    if !auto_install {
+        return Err(format!(
+            "Gemini CLI '{}' not found in workspace. Install it or set GEMINI_CLI_PATH.",
+            cli_path
+        ));
+    }
+
+    let has_bun = command_available(workspace_exec, cwd, "bun").await
+        || command_available(workspace_exec, cwd, "/root/.bun/bin/bun").await;
+    let has_npm = command_available(workspace_exec, cwd, "npm").await;
+
+    if !has_bun && !has_npm {
+        return Err(format!(
+            "Gemini CLI '{}' not found and neither npm nor bun is available in the workspace. Install Node.js/npm or Bun in the workspace template, or set GEMINI_CLI_PATH.",
+            cli_path
+        ));
+    }
+
+    let install_cmd = if has_bun {
+        r#"export PATH="/root/.bun/bin:/root/.cache/.bun/bin:$PATH" && bun install -g @google/gemini-cli@latest 2>&1"#
+    } else {
+        "npm install -g @google/gemini-cli@latest 2>&1"
+    };
+
+    tracing::info!(
+        installer = if has_bun { "bun" } else { "npm" },
+        "Auto-installing Gemini CLI"
+    );
+
+    let output = workspace_exec
+        .output(
+            cwd,
+            "/bin/sh",
+            &["-lc".to_string(), install_cmd.to_string()],
+            std::collections::HashMap::new(),
+        )
+        .await
+        .map_err(|e| format!("Failed to install Gemini CLI: {}", e))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let mut message = String::new();
+        if !stderr.trim().is_empty() {
+            message.push_str(stderr.trim());
+        }
+        if !stdout.trim().is_empty() {
+            if !message.is_empty() {
+                message.push_str(" | ");
+            }
+            message.push_str(stdout.trim());
+        }
+        if message.is_empty() {
+            message = "Gemini CLI install failed with no output".to_string();
+        }
+        return Err(format!("Gemini CLI install failed: {}", message));
+    }
+
+    // Re-check availability after install
+    if command_available(workspace_exec, cwd, cli_path).await {
+        return Ok(cli_path.to_string());
+    }
+    for gemini_path in BUN_GLOBAL_GEMINI_PATHS {
+        if command_available(workspace_exec, cwd, gemini_path).await {
+            tracing::info!(
+                path = %gemini_path,
+                "Gemini CLI available after auto-install"
+            );
+            return Ok(gemini_path.to_string());
+        }
+    }
+
+    Err(format!(
+        "Gemini CLI install completed but '{}' is still not available in workspace PATH.",
+        cli_path
+    ))
 }
 
 /// Execute a turn using OpenCode CLI backend.
@@ -11177,6 +11332,17 @@ pub async fn run_gemini_turn(
     let cli_path = get_backend_string_setting("gemini", "cli_path")
         .or_else(|| std::env::var("GEMINI_CLI_PATH").ok())
         .unwrap_or_else(|| "gemini".to_string());
+
+    // Ensure Gemini CLI is available, auto-install if needed
+    let cli_path =
+        match ensure_gemini_cli_available(&workspace_exec, mission_work_dir, &cli_path).await {
+            Ok(path) => path,
+            Err(e) => {
+                tracing::error!("Gemini CLI not available: {}", e);
+                return AgentResult::failure(format!("Gemini CLI not available: {}", e), 0)
+                    .with_terminal_reason(TerminalReason::LlmError);
+            }
+        };
 
     tracing::info!(
         mission_id = %mission_id,

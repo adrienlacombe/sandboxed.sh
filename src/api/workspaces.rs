@@ -1712,7 +1712,7 @@ async fn check_backend_preflight(
 ) -> Result<Json<super::mission_runner::BackendPreflightResult>, (StatusCode, String)> {
     let workspace = require_workspace(&state.workspaces, workspace_id).await?;
 
-    let cli_path = if backend_id == "claudecode" || backend_id == "codex" || backend_id == "amp" {
+    let cli_path = if backend_id == "claudecode" || backend_id == "codex" || backend_id == "amp" || backend_id == "gemini" {
         state
             .backend_configs
             .get(&backend_id)
