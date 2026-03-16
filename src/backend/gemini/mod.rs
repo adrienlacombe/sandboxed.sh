@@ -7,6 +7,8 @@ use tokio::sync::{mpsc, RwLock};
 use tokio::task::JoinHandle;
 use tracing::debug;
 
+use std::collections::HashMap;
+
 use crate::backend::events::ExecutionEvent;
 use crate::backend::{AgentInfo, Backend, Session, SessionConfig};
 
@@ -128,14 +130,22 @@ impl Backend for GeminiBackend {
 
         // Spawn event conversion task
         let handle = tokio::spawn(async move {
+            // Track tool_id -> tool_name so ToolResult can use the real name
+            let mut tool_names: HashMap<String, String> = HashMap::new();
+            let mut receiver_dropped = false;
+
             while let Some(event) = gemini_rx.recv().await {
-                let exec_events = convert_gemini_event(event);
+                let exec_events = convert_gemini_event(event, &mut tool_names);
 
                 for exec_event in exec_events {
                     if tx.send(exec_event).await.is_err() {
                         debug!("ExecutionEvent receiver dropped");
+                        receiver_dropped = true;
                         break;
                     }
+                }
+                if receiver_dropped {
+                    break;
                 }
             }
 
@@ -155,7 +165,14 @@ impl Backend for GeminiBackend {
 }
 
 /// Convert a Gemini CLI event to backend-agnostic ExecutionEvents.
-fn convert_gemini_event(event: GeminiEvent) -> Vec<ExecutionEvent> {
+///
+/// `tool_names` is a mutable map of tool_id -> tool_name, populated by ToolUse
+/// events and consumed by ToolResult events so the result carries the real tool
+/// name instead of the opaque tool ID.
+fn convert_gemini_event(
+    event: GeminiEvent,
+    tool_names: &mut HashMap<String, String>,
+) -> Vec<ExecutionEvent> {
     let mut results = vec![];
 
     match event {
@@ -188,8 +205,10 @@ fn convert_gemini_event(event: GeminiEvent) -> Vec<ExecutionEvent> {
         } => {
             if let Some(name) = tool_name {
                 let id = tool_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-                let args = parameters
-                    .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
+                let args =
+                    parameters.unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
+                // Remember tool_id -> tool_name for later ToolResult events
+                tool_names.insert(id.clone(), name.clone());
                 results.push(ExecutionEvent::ToolCall { id, name, args });
             }
         }
@@ -214,12 +233,10 @@ fn convert_gemini_event(event: GeminiEvent) -> Vec<ExecutionEvent> {
                     output.unwrap_or(serde_json::Value::Null)
                 };
 
-                // Use tool_id as name fallback since Gemini tool_result doesn't repeat the name
-                results.push(ExecutionEvent::ToolResult {
-                    id: id.clone(),
-                    name: id,
-                    result,
-                });
+                // Look up the real tool name from the preceding ToolUse event;
+                // fall back to the tool_id if we never saw a matching ToolUse.
+                let name = tool_names.get(&id).cloned().unwrap_or_else(|| id.clone());
+                results.push(ExecutionEvent::ToolResult { id, name, result });
             }
         }
 
@@ -232,7 +249,16 @@ fn convert_gemini_event(event: GeminiEvent) -> Vec<ExecutionEvent> {
             }
         }
 
-        GeminiEvent::Result { status: _, stats } => {
+        GeminiEvent::Result { status, stats } => {
+            // Check if the result status indicates an error
+            if let Some(ref s) = status {
+                if s != "success" && s != "ok" {
+                    results.push(ExecutionEvent::Error {
+                        message: format!("Gemini CLI finished with status: {}", s),
+                    });
+                }
+            }
+
             // Extract token usage from final stats
             if let Some(stats) = stats {
                 let input = stats.total_input_tokens.unwrap_or(0);
@@ -289,22 +315,24 @@ mod tests {
 
     #[test]
     fn convert_gemini_event_init_no_events() {
+        let mut tool_names = HashMap::new();
         let event = GeminiEvent::Init {
             session_id: Some("s1".to_string()),
             model: Some("gemini-2.5-flash".to_string()),
         };
-        let events = convert_gemini_event(event);
+        let events = convert_gemini_event(event, &mut tool_names);
         assert!(events.is_empty(), "Init should produce no execution events");
     }
 
     #[test]
     fn convert_gemini_event_assistant_message() {
+        let mut tool_names = HashMap::new();
         let event = GeminiEvent::Message {
             role: Some("assistant".to_string()),
             content: Some("Hello world".to_string()),
             delta: Some(true),
         };
-        let events = convert_gemini_event(event);
+        let events = convert_gemini_event(event, &mut tool_names);
         assert_eq!(events.len(), 1);
         match &events[0] {
             ExecutionEvent::TextDelta { content } => {
@@ -316,23 +344,25 @@ mod tests {
 
     #[test]
     fn convert_gemini_event_user_message_ignored() {
+        let mut tool_names = HashMap::new();
         let event = GeminiEvent::Message {
             role: Some("user".to_string()),
             content: Some("User message".to_string()),
             delta: Some(false),
         };
-        let events = convert_gemini_event(event);
+        let events = convert_gemini_event(event, &mut tool_names);
         assert!(events.is_empty(), "User messages should be ignored");
     }
 
     #[test]
     fn convert_gemini_event_tool_use() {
+        let mut tool_names = HashMap::new();
         let event = GeminiEvent::ToolUse {
             tool_name: Some("read_file".to_string()),
             tool_id: Some("tc1".to_string()),
             parameters: Some(serde_json::json!({"path": "/tmp/test.txt"})),
         };
-        let events = convert_gemini_event(event);
+        let events = convert_gemini_event(event, &mut tool_names);
         assert_eq!(events.len(), 1);
         match &events[0] {
             ExecutionEvent::ToolCall { id, name, args } => {
@@ -342,21 +372,49 @@ mod tests {
             }
             other => panic!("Expected ToolCall, got {:?}", other),
         }
+        // Verify tool name was stored
+        assert_eq!(tool_names.get("tc1").unwrap(), "read_file");
     }
 
     #[test]
-    fn convert_gemini_event_tool_result_success() {
+    fn convert_gemini_event_tool_result_uses_stored_name() {
+        let mut tool_names = HashMap::new();
+        // Simulate a preceding ToolUse that populated the map
+        tool_names.insert("tc1".to_string(), "read_file".to_string());
+
         let event = GeminiEvent::ToolResult {
             tool_id: Some("tc1".to_string()),
             status: Some("success".to_string()),
             output: Some(serde_json::json!("file contents")),
             error: None,
         };
-        let events = convert_gemini_event(event);
+        let events = convert_gemini_event(event, &mut tool_names);
         assert_eq!(events.len(), 1);
         match &events[0] {
-            ExecutionEvent::ToolResult { id, result, .. } => {
+            ExecutionEvent::ToolResult { id, name, result } => {
                 assert_eq!(id, "tc1");
+                assert_eq!(name, "read_file");
+                assert_eq!(result, "file contents");
+            }
+            other => panic!("Expected ToolResult, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn convert_gemini_event_tool_result_falls_back_to_id() {
+        let mut tool_names = HashMap::new();
+        let event = GeminiEvent::ToolResult {
+            tool_id: Some("tc1".to_string()),
+            status: Some("success".to_string()),
+            output: Some(serde_json::json!("file contents")),
+            error: None,
+        };
+        let events = convert_gemini_event(event, &mut tool_names);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            ExecutionEvent::ToolResult { id, name, result } => {
+                assert_eq!(id, "tc1");
+                assert_eq!(name, "tc1"); // Falls back to ID
                 assert_eq!(result, "file contents");
             }
             other => panic!("Expected ToolResult, got {:?}", other),
@@ -365,11 +423,12 @@ mod tests {
 
     #[test]
     fn convert_gemini_event_error() {
+        let mut tool_names = HashMap::new();
         let event = GeminiEvent::Error {
             severity: Some("error".to_string()),
             message: "Something failed".to_string(),
         };
-        let events = convert_gemini_event(event);
+        let events = convert_gemini_event(event, &mut tool_names);
         assert_eq!(events.len(), 1);
         match &events[0] {
             ExecutionEvent::Error { message } => {
@@ -381,16 +440,18 @@ mod tests {
 
     #[test]
     fn convert_gemini_event_warning_ignored() {
+        let mut tool_names = HashMap::new();
         let event = GeminiEvent::Error {
             severity: Some("warning".to_string()),
             message: "Just a warning".to_string(),
         };
-        let events = convert_gemini_event(event);
+        let events = convert_gemini_event(event, &mut tool_names);
         assert!(events.is_empty(), "Warnings should not produce events");
     }
 
     #[test]
     fn convert_gemini_event_result_with_usage() {
+        let mut tool_names = HashMap::new();
         let event = GeminiEvent::Result {
             status: Some("success".to_string()),
             stats: Some(client::GeminiStats {
@@ -399,7 +460,7 @@ mod tests {
                 models: None,
             }),
         };
-        let events = convert_gemini_event(event);
+        let events = convert_gemini_event(event, &mut tool_names);
         assert_eq!(events.len(), 1);
         match &events[0] {
             ExecutionEvent::Usage {
@@ -414,7 +475,25 @@ mod tests {
     }
 
     #[test]
+    fn convert_gemini_event_result_error_status() {
+        let mut tool_names = HashMap::new();
+        let event = GeminiEvent::Result {
+            status: Some("error".to_string()),
+            stats: None,
+        };
+        let events = convert_gemini_event(event, &mut tool_names);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            ExecutionEvent::Error { message } => {
+                assert!(message.contains("error"));
+            }
+            other => panic!("Expected Error, got {:?}", other),
+        }
+    }
+
+    #[test]
     fn convert_gemini_event_result_zero_usage() {
+        let mut tool_names = HashMap::new();
         let event = GeminiEvent::Result {
             status: Some("success".to_string()),
             stats: Some(client::GeminiStats {
@@ -423,14 +502,15 @@ mod tests {
                 models: None,
             }),
         };
-        let events = convert_gemini_event(event);
+        let events = convert_gemini_event(event, &mut tool_names);
         assert!(events.is_empty(), "Zero usage should not emit Usage event");
     }
 
     #[test]
     fn convert_gemini_event_unknown_no_events() {
+        let mut tool_names = HashMap::new();
         let event = GeminiEvent::Unknown;
-        let events = convert_gemini_event(event);
+        let events = convert_gemini_event(event, &mut tool_names);
         assert!(events.is_empty());
     }
 }

@@ -48,6 +48,8 @@ export interface Mission {
   updated_at: string;
   interrupted_at?: string;
   resumable?: boolean;
+  parent_mission_id?: string;
+  working_directory?: string;
 }
 
 export interface StoredEvent {

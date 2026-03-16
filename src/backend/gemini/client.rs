@@ -484,7 +484,8 @@ mod tests {
 
     #[test]
     fn test_parse_tool_result_event() {
-        let json = r#"{"type":"tool_result","tool_id":"tc1","status":"success","output":"file contents"}"#;
+        let json =
+            r#"{"type":"tool_result","tool_id":"tc1","status":"success","output":"file contents"}"#;
         let event: GeminiEvent = serde_json::from_str(json).unwrap();
         match event {
             GeminiEvent::ToolResult {

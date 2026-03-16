@@ -1022,6 +1022,11 @@ export function MissionSwitcher({
                               </span>
                             ) : null;
                           })()}
+                          {mission?.parent_mission_id && (
+                            <span className="inline-flex items-center rounded bg-cyan-500/10 border border-cyan-500/20 px-1 py-0.5 text-[8px] font-medium text-cyan-400 shrink-0">
+                              Worker
+                            </span>
+                          )}
                           {isStalled && (
                             <span className="text-[10px] text-amber-400 tabular-nums shrink-0">
                               {Math.floor(stallInfo?.seconds_since_activity ?? 0)}s

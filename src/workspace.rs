@@ -3395,6 +3395,29 @@ pub async fn prepare_mission_workspace_with_skills_backend(
         None
     };
 
+    // Inject MISSION_ID, API_URL, and API_TOKEN into stdio MCP server env vars
+    // so that MCPs like orchestrator-mcp can communicate with the backend API.
+    let mcp_configs: Vec<McpServerConfig> = mcp_configs
+        .into_iter()
+        .map(|mut cfg| {
+            if let McpTransport::Stdio { ref mut env, .. } = cfg.transport {
+                env.entry("MISSION_ID".to_string())
+                    .or_insert_with(|| mission_id.to_string());
+                // Use the server's own address so MCPs can reach the API
+                // (including from inside containers where localhost differs).
+                if let Ok(port) = std::env::var("PORT") {
+                    env.entry("API_URL".to_string())
+                        .or_insert_with(|| format!("http://127.0.0.1:{}", port));
+                }
+                // Forward JWT_SECRET so the MCP can mint its own service token.
+                if let Ok(secret) = std::env::var("JWT_SECRET") {
+                    env.entry("JWT_SECRET".to_string()).or_insert(secret);
+                }
+            }
+            cfg
+        })
+        .collect();
+
     write_backend_config(
         &dir,
         backend_id,

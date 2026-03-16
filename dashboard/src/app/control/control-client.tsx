@@ -6428,6 +6428,12 @@ export default function ControlClient() {
     return null;
   }, [items]);
 
+  // Derive child (worker) missions for the active mission
+  const childMissions = useMemo(() => {
+    if (!activeMission) return [];
+    return recentMissions.filter((m) => m.parent_mission_id === activeMission.id);
+  }, [activeMission, recentMissions]);
+
   // Determine if we should show the resume UI for interrupted/blocked/failed missions
   // Don't show resume UI if:
   // - Mission is running
@@ -6892,6 +6898,69 @@ export default function ControlClient() {
                           <span className="text-white/40">Resolved model</span>
                           <span className="font-mono text-[11px] text-emerald-400 truncate max-w-[160px]" title={lastResolvedModel}>
                             {lastResolvedModel}
+                          </span>
+                        </div>
+                      )}
+                    </div>
+                  )}
+
+                  {/* Orchestrator: Boss with workers */}
+                  {childMissions.length > 0 && (
+                    <div className="mt-2 pt-2 border-t border-white/[0.06] space-y-1 text-xs">
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="text-white/40">Role</span>
+                        <span className="font-mono text-[11px] text-violet-400">Boss</span>
+                      </div>
+                      <div className="flex items-center justify-between gap-2 mb-1">
+                        <span className="text-white/40">Workers</span>
+                        <span className="font-mono text-[11px] text-white/60">{childMissions.length}</span>
+                      </div>
+                      <div className="space-y-0.5 max-h-[120px] overflow-y-auto">
+                        {childMissions.map((w) => (
+                          <a
+                            key={w.id}
+                            href={`/control?mission=${w.id}`}
+                            className="flex items-center gap-1.5 rounded px-1 py-0.5 hover:bg-white/[0.04] transition-colors"
+                          >
+                            <span className={cn(
+                              "h-1.5 w-1.5 rounded-full shrink-0",
+                              w.status === "active" && "bg-indigo-400",
+                              w.status === "completed" && "bg-emerald-400",
+                              w.status === "failed" && "bg-red-400",
+                              w.status === "interrupted" && "bg-amber-400",
+                              w.status === "not_feasible" && "bg-rose-400",
+                              !["active", "completed", "failed", "interrupted", "not_feasible"].includes(w.status) && "bg-white/30"
+                            )} />
+                            <span className="font-mono text-[11px] text-white/70 truncate">
+                              {w.title || w.id.slice(0, 8)}
+                            </span>
+                          </a>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Orchestrator: Worker info */}
+                  {activeMission?.parent_mission_id && (
+                    <div className="mt-2 pt-2 border-t border-white/[0.06] space-y-0.5 text-xs">
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="text-white/40">Role</span>
+                        <span className="font-mono text-[11px] text-cyan-400">Worker</span>
+                      </div>
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="text-white/40">Boss</span>
+                        <a
+                          href={`/control?mission=${activeMission.parent_mission_id}`}
+                          className="font-mono text-[11px] text-cyan-400 hover:text-cyan-300 transition-colors select-all"
+                        >
+                          {activeMission.parent_mission_id.slice(0, 8)}
+                        </a>
+                      </div>
+                      {activeMission.working_directory && (
+                        <div className="flex items-center justify-between gap-2">
+                          <span className="text-white/40">Worktree</span>
+                          <span className="font-mono text-[11px] text-white/60 truncate max-w-[160px]" title={activeMission.working_directory}>
+                            {activeMission.working_directory.split('/').pop()}
                           </span>
                         </div>
                       )}

@@ -359,7 +359,8 @@ export function AddProviderModal({ open, onClose, onSuccess, providerTypes }: Ad
     } else if (step === 'select-backends') {
       setStep('select-method');
     } else if (step === 'enter-api-key') {
-      if (selectedProvider === 'anthropic' || selectedProvider === 'openai' || selectedProvider === 'google') {
+      if ((selectedProvider === 'anthropic' || selectedProvider === 'openai' || selectedProvider === 'google') && selectedMethodIndex !== null) {
+        // We went through method selection and backend selection; go back to backends
         setStep('select-backends');
       } else if (hasOAuth) {
         setStep('select-method');

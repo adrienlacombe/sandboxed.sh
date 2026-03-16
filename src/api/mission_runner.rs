@@ -8466,10 +8466,7 @@ async fn gemini_bun_fallback_if_needed(
         .output(
             cwd,
             "/bin/sh",
-            &[
-                "-lc".to_string(),
-                "node --version 2>/dev/null".to_string(),
-            ],
+            &["-lc".to_string(), "node --version 2>/dev/null".to_string()],
             std::collections::HashMap::new(),
         )
         .await
@@ -11402,6 +11399,7 @@ Update it to the latest version (`npm install -g @openai/codex@latest`) and retr
 }
 
 /// Run a single Gemini CLI turn for a mission.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_gemini_turn(
     workspace: &Workspace,
     mission_work_dir: &std::path::Path,
@@ -11433,13 +11431,18 @@ pub async fn run_gemini_turn(
     let gemini_creds = get_google_credentials_for_gemini(app_working_dir);
     match &gemini_creds {
         GeminiCredentials::ApiKey(k) => {
-            tracing::info!("Using Gemini API key (prefix: {}...)", &k[..k.len().min(8)]);
+            tracing::info!(
+                "Using Gemini API key (prefix: {}...)",
+                k.chars().take(8).collect::<String>()
+            );
         }
         GeminiCredentials::OAuth { .. } => {
             tracing::info!("Using Google OAuth credentials for Gemini CLI");
         }
         GeminiCredentials::None => {
-            tracing::warn!("No Google credentials found for Gemini CLI; will rely on CLI's own auth");
+            tracing::warn!(
+                "No Google credentials found for Gemini CLI; will rely on CLI's own auth"
+            );
         }
     }
 
@@ -11464,10 +11467,7 @@ pub async fn run_gemini_turn(
         .output(
             mission_work_dir,
             "/bin/sh",
-            &[
-                "-c".to_string(),
-                "mkdir -p /root/.gemini".to_string(),
-            ],
+            &["-c".to_string(), "mkdir -p /root/.gemini".to_string()],
             std::collections::HashMap::new(),
         )
         .await;
@@ -11571,15 +11571,15 @@ pub async fn run_gemini_turn(
     };
 
     // Send message streaming
-    let (mut event_rx, _handle) =
-        match backend.send_message_streaming(&session, user_message).await {
-            Ok(result) => result,
-            Err(e) => {
-                tracing::error!("Failed to send message to Gemini CLI: {}", e);
-                return AgentResult::failure(format!("Gemini CLI execution failed: {}", e), 0)
-                    .with_terminal_reason(TerminalReason::LlmError);
-            }
-        };
+    let (mut event_rx, _handle) = match backend.send_message_streaming(&session, user_message).await
+    {
+        Ok(result) => result,
+        Err(e) => {
+            tracing::error!("Failed to send message to Gemini CLI: {}", e);
+            return AgentResult::failure(format!("Gemini CLI execution failed: {}", e), 0)
+                .with_terminal_reason(TerminalReason::LlmError);
+        }
+    };
 
     // Process events until completion or cancellation
     let mut assistant_message = String::new();
@@ -11840,9 +11840,7 @@ fn read_google_oauth_from_credentials() -> Option<GeminiCredentials> {
             continue;
         }
 
-        tracing::info!(
-            "Using Google OAuth credentials from credentials.json for Gemini CLI"
-        );
+        tracing::info!("Using Google OAuth credentials from credentials.json for Gemini CLI");
         return Some(GeminiCredentials::OAuth {
             access_token: access_token.to_string(),
             refresh_token: refresh_token.to_string(),
@@ -11916,7 +11914,11 @@ fn read_google_credentials_from_opencode_auth() -> Option<GeminiCredentials> {
 
 /// Get Google API key from environment variables.
 fn env_google_api_key() -> Option<String> {
-    for var in ["GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_GENERATIVE_AI_API_KEY"] {
+    for var in [
+        "GEMINI_API_KEY",
+        "GOOGLE_API_KEY",
+        "GOOGLE_GENERATIVE_AI_API_KEY",
+    ] {
         if let Ok(key) = std::env::var(var) {
             let key = key.trim().to_string();
             if !key.is_empty() {

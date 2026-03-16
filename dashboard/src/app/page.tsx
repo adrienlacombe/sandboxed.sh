@@ -57,6 +57,7 @@ const columns: Column[] = [
 
 function CompactMissionCard({
   mission,
+  isBoss,
   isRunningForDisplay,
   isActuallyRunning,
   onCancel,
@@ -64,6 +65,7 @@ function CompactMissionCard({
   onDelete,
 }: {
   mission: Mission;
+  isBoss: boolean;
   isRunningForDisplay: boolean;
   isActuallyRunning: boolean;
   onCancel: (id: string) => void;
@@ -87,6 +89,16 @@ function CompactMissionCard({
             {title}
           </p>
         </Link>
+        {isBoss && (
+          <span className="shrink-0 rounded bg-violet-500/10 border border-violet-500/20 px-1 py-0.5 text-[8px] font-medium text-violet-400">
+            B
+          </span>
+        )}
+        {mission.parent_mission_id && (
+          <span className="shrink-0 rounded bg-cyan-500/10 border border-cyan-500/20 px-1 py-0.5 text-[8px] font-medium text-cyan-400">
+            W
+          </span>
+        )}
       </div>
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-1.5">
@@ -224,6 +236,15 @@ function OverviewPageContent() {
     () => categorizeMissions(missions, runningLikeMissionIds),
     [missions, runningLikeMissionIds]
   );
+
+  // Set of mission IDs that have at least one child (boss missions)
+  const bossMissionIds = useMemo(() => {
+    const ids = new Set<string>();
+    for (const m of missions) {
+      if (m.parent_mission_id) ids.add(m.parent_mission_id);
+    }
+    return ids;
+  }, [missions]);
 
   // Build column data for display
   const columnData = useMemo(() => {
@@ -373,6 +394,7 @@ function OverviewPageContent() {
                       <CompactMissionCard
                         key={mission.id}
                         mission={mission}
+                        isBoss={bossMissionIds.has(mission.id)}
                         isRunningForDisplay={
                           runningMissionIds.has(mission.id) ||
                           automationMissionIds.has(mission.id)
