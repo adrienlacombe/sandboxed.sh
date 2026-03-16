@@ -104,13 +104,9 @@ impl GeminiClient {
         );
 
         let (program, full_args) = if self.config.cli_path.contains(' ') {
-            let parts: Vec<&str> = self.config.cli_path.splitn(2, ' ').collect();
+            let parts: Vec<&str> = self.config.cli_path.split_whitespace().collect();
             let program = parts[0].to_string();
-            let mut full_args = if parts.len() > 1 {
-                vec![parts[1].to_string()]
-            } else {
-                vec![]
-            };
+            let mut full_args: Vec<String> = parts[1..].iter().map(|s| s.to_string()).collect();
             full_args.extend(args.clone());
             (program, full_args)
         } else {

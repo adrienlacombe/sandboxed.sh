@@ -8324,8 +8324,10 @@ async fn check_gemini_prerequisites(
     }
 }
 
-/// Returns the path to the Gemini CLI that should be used.
+/// Returns the path/command to the Gemini CLI that should be used.
 /// Auto-installs via npm/bun if not found and auto-install is enabled.
+/// If the installed CLI requires Node 20+ but only Node 18 is available,
+/// returns a `bun run <entry_point>` command instead.
 async fn ensure_gemini_cli_available(
     workspace_exec: &WorkspaceExec,
     cwd: &std::path::Path,
@@ -8335,6 +8337,10 @@ async fn ensure_gemini_cli_available(
 
     // Check if already available
     if command_available(workspace_exec, cwd, program).await {
+        // Verify Node.js version is sufficient (gemini CLI requires Node 20+)
+        if let Some(bun_cmd) = gemini_bun_fallback_if_needed(workspace_exec, cwd, cli_path).await {
+            return Ok(bun_cmd);
+        }
         return Ok(cli_path.to_string());
     }
 
@@ -8347,6 +8353,11 @@ async fn ensure_gemini_cli_available(
                 path = %gemini_path,
                 "Found Gemini CLI in bun global bin"
             );
+            if let Some(bun_cmd) =
+                gemini_bun_fallback_if_needed(workspace_exec, cwd, gemini_path).await
+            {
+                return Ok(bun_cmd);
+            }
             return Ok(gemini_path.to_string());
         }
     }
@@ -8413,6 +8424,9 @@ async fn ensure_gemini_cli_available(
 
     // Re-check availability after install
     if command_available(workspace_exec, cwd, cli_path).await {
+        if let Some(bun_cmd) = gemini_bun_fallback_if_needed(workspace_exec, cwd, cli_path).await {
+            return Ok(bun_cmd);
+        }
         return Ok(cli_path.to_string());
     }
     for gemini_path in BUN_GLOBAL_GEMINI_PATHS {
@@ -8421,6 +8435,11 @@ async fn ensure_gemini_cli_available(
                 path = %gemini_path,
                 "Gemini CLI available after auto-install"
             );
+            if let Some(bun_cmd) =
+                gemini_bun_fallback_if_needed(workspace_exec, cwd, gemini_path).await
+            {
+                return Ok(bun_cmd);
+            }
             return Ok(gemini_path.to_string());
         }
     }
@@ -8429,6 +8448,90 @@ async fn ensure_gemini_cli_available(
         "Gemini CLI install completed but '{}' is still not available in workspace PATH.",
         cli_path
     ))
+}
+
+/// Check if Node.js version is too old for Gemini CLI (requires 20+).
+/// If so, return a `bun run <entry_point>` command as fallback.
+async fn gemini_bun_fallback_if_needed(
+    workspace_exec: &WorkspaceExec,
+    cwd: &std::path::Path,
+    _cli_path: &str,
+) -> Option<String> {
+    // Check Node.js major version
+    let node_version = workspace_exec
+        .output(
+            cwd,
+            "/bin/sh",
+            &[
+                "-lc".to_string(),
+                "node --version 2>/dev/null".to_string(),
+            ],
+            std::collections::HashMap::new(),
+        )
+        .await
+        .ok()?;
+
+    let version_str = String::from_utf8_lossy(&node_version.stdout);
+    let version_str = version_str.trim().trim_start_matches('v');
+    let major: u32 = version_str.split('.').next()?.parse().ok()?;
+
+    if major >= 20 {
+        return None; // Node.js version is sufficient
+    }
+
+    tracing::info!(
+        node_version = %version_str,
+        "Node.js version too old for Gemini CLI (requires 20+), falling back to bun"
+    );
+
+    // Find the gemini CLI entry point and run via bun
+    const GEMINI_ENTRY_POINTS: &[&str] = &[
+        "/root/.cache/.bun/install/global/node_modules/@google/gemini-cli/dist/index.js",
+        "/usr/local/lib/node_modules/@google/gemini-cli/dist/index.js",
+        "/usr/lib/node_modules/@google/gemini-cli/dist/index.js",
+    ];
+
+    // Determine which bun path to use
+    let bun_path = if command_available(workspace_exec, cwd, "bun").await {
+        "bun".to_string()
+    } else if command_available(workspace_exec, cwd, "/root/.bun/bin/bun").await {
+        "/root/.bun/bin/bun".to_string()
+    } else if command_available(workspace_exec, cwd, "/root/.cache/.bun/bin/bun").await {
+        "/root/.cache/.bun/bin/bun".to_string()
+    } else {
+        tracing::warn!("Node.js too old and bun not available; gemini CLI may fail");
+        return None;
+    };
+
+    for entry_point in GEMINI_ENTRY_POINTS {
+        let check = workspace_exec
+            .output(
+                cwd,
+                "/bin/sh",
+                &[
+                    "-lc".to_string(),
+                    format!("test -f {} && echo found", entry_point),
+                ],
+                std::collections::HashMap::new(),
+            )
+            .await;
+
+        if let Ok(output) = check {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            if stdout.trim() == "found" {
+                let cmd = format!("{} run {}", bun_path, entry_point);
+                tracing::info!(
+                    bun = %bun_path,
+                    entry_point = %entry_point,
+                    "Using bun to run Gemini CLI (Node.js < 20)"
+                );
+                return Some(cmd);
+            }
+        }
+    }
+
+    tracing::warn!("Could not find Gemini CLI entry point for bun fallback");
+    None
 }
 
 /// Execute a turn using OpenCode CLI backend.
