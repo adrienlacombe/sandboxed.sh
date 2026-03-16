@@ -8464,6 +8464,25 @@ async fn run_single_control_turn(
 
             result
         }
+        Some("gemini") => {
+            let mid = match require_mission_id(mission_id, "Gemini CLI", &events_tx) {
+                Ok(id) => id,
+                Err(r) => return r,
+            };
+            Box::pin(super::mission_runner::run_gemini_turn(
+                exec_workspace,
+                &ctx.working_dir,
+                &convo,
+                config.default_model.as_deref(),
+                config.opencode_agent.as_deref(),
+                mid,
+                events_tx.clone(),
+                cancel,
+                &config.working_dir,
+                session_id.as_deref(),
+            ))
+            .await
+        }
         Some(backend) if backend != "opencode" => {
             let _ = events_tx.send(AgentEvent::Error {
                 message: format!("Unsupported backend: {}", backend),

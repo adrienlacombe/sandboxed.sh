@@ -2262,6 +2262,22 @@ pub async fn write_backend_config(
             )
             .await
         }
+        "gemini" => {
+            // Gemini CLI doesn't need its own config format; use OpenCode config
+            // for workspace setup (skills, commands, etc.)
+            write_opencode_config(
+                workspace_dir,
+                mcp_configs,
+                workspace_root,
+                workspace_type,
+                workspace_env,
+                skill_allowlist,
+                command_contents,
+                shared_network,
+                custom_providers,
+            )
+            .await
+        }
         _ => {
             // Unknown backend - write OpenCode config as fallback
             tracing::warn!(
