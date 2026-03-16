@@ -11447,6 +11447,34 @@ pub async fn run_gemini_turn(
             }
         };
 
+    // Ensure ~/.gemini directory exists (gemini CLI needs it for projects.json and settings)
+    let _ = workspace_exec
+        .output(
+            mission_work_dir,
+            "/bin/sh",
+            &[
+                "-c".to_string(),
+                "mkdir -p /root/.gemini".to_string(),
+            ],
+            std::collections::HashMap::new(),
+        )
+        .await;
+
+    // Write settings.json if API key is available (so CLI uses env-var auth)
+    if api_key.is_some() {
+        let _ = workspace_exec
+            .output(
+                mission_work_dir,
+                "/bin/sh",
+                &[
+                    "-c".to_string(),
+                    r#"test -f /root/.gemini/settings.json || echo '{"selectedAuthType":"api-key"}' > /root/.gemini/settings.json"#.to_string(),
+                ],
+                std::collections::HashMap::new(),
+            )
+            .await;
+    }
+
     tracing::info!(
         mission_id = %mission_id,
         workspace_type = ?workspace.workspace_type,
