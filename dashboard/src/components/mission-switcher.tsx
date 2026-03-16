@@ -57,9 +57,10 @@ function getMissionDisplayName(
 }
 
 export function getMissionCardTitle(mission: Mission): string | null {
-  // When a backend title exists, show it as the card title
+  // When a backend title exists, it's already shown as the display name,
+  // so show the short_description as subtitle instead.
   if (mission.title?.trim()) {
-    return mission.title.trim();
+    return mission.short_description?.trim() || null;
   }
   // No backend title: display name is the animal codename, so show the
   // first user message as subtitle.
@@ -94,6 +95,10 @@ export function getMissionCardDescription(
   mission: Mission,
   cardTitle?: string | null
 ): string | null {
+  // When the backend title is used as display name, short_description is
+  // already surfaced as cardTitle — don't repeat it.
+  if (mission.title?.trim()) return null;
+
   const shortDescription = mission.short_description?.trim();
   if (!shortDescription) return null;
 
