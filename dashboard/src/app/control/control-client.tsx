@@ -2676,24 +2676,41 @@ export default function ControlClient() {
             if (!Array.isArray(p) || p.length === 0) break;
             lo = hi;
             hi *= 2;
-            if (hi > 500000) { hi = 500000; break; }
           }
-          // Narrow down
-          for (let i = 0; i < 12; i++) {
-            if (hi - lo <= PAGE_LIMIT) break;
-            const mid = Math.floor((lo + hi) / 2);
+          // Verify hi is actually an upper bound (no events at this offset).
+          // The doubling loop may have exited due to iteration limit.
+          {
             const p = await getMissionEvents(id, {
               types: HISTORY_EVENT_TYPES,
               limit: 1,
-              offset: mid,
+              offset: hi,
             });
             if (Array.isArray(p) && p.length > 0) {
-              lo = mid;
-            } else {
-              hi = mid;
+              // hi is not a true upper bound — can't determine total precisely.
+              // Fall back: just load the last MAX_EVENTS from hi as best-effort.
+              startOffset = Math.max(0, hi - MAX_EVENTS);
             }
           }
-          startOffset = Math.max(0, hi - MAX_EVENTS);
+          // Narrow down to find the precise total
+          if (startOffset === 0) {
+            for (let i = 0; i < 20; i++) {
+              if (hi - lo <= 1) break;
+              const mid = Math.floor((lo + hi) / 2);
+              const p = await getMissionEvents(id, {
+                types: HISTORY_EVENT_TYPES,
+                limit: 1,
+                offset: mid,
+              });
+              if (Array.isArray(p) && p.length > 0) {
+                lo = mid;
+              } else {
+                hi = mid;
+              }
+            }
+            // lo is the last offset with an event, hi is the first without.
+            // Total event count ≈ hi. Load the most recent MAX_EVENTS.
+            startOffset = Math.max(0, hi - MAX_EVENTS);
+          }
         }
       }
 
