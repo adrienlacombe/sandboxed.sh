@@ -107,12 +107,17 @@ impl Backend for GeminiBackend {
         let client = GeminiClient::with_config(config);
         let workspace_exec = self.workspace_exec.as_ref();
 
+        // Don't pass session_id for --resume: each invocation is a fresh CLI
+        // process with the full conversation provided inline.  Gemini's --resume
+        // requires a session that actually exists on disk (unlike Claude's
+        // --session-id which creates-or-continues), so passing our generated
+        // UUID would cause a "session not found" error.
         let (mut gemini_rx, gemini_handle) = client
             .execute_message(
                 &session.directory,
                 message,
                 session.model.as_deref(),
-                Some(&session.id),
+                None,
                 session.agent.as_deref(),
                 workspace_exec,
             )

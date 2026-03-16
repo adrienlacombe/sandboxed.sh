@@ -11434,10 +11434,33 @@ fn get_google_api_key_for_gemini(working_dir: &std::path::Path) -> Option<String
 
 /// Read Google API key from OpenCode's auth.json (synced during OAuth callback).
 fn read_google_key_from_opencode_auth() -> Option<String> {
-    let home = std::env::var("HOME").ok()?;
-    let auth_path = std::path::Path::new(&home)
-        .join(".config/opencode/auth.json");
-    let contents = std::fs::read_to_string(&auth_path).ok()?;
+    // Use the same path resolution as get_opencode_auth_path():
+    // XDG_DATA_HOME → ~/.local/share/opencode/auth.json → /var/lib/opencode/...
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+    let mut candidates = Vec::new();
+    if let Ok(data_home) = std::env::var("XDG_DATA_HOME") {
+        candidates.push(
+            std::path::PathBuf::from(data_home)
+                .join("opencode")
+                .join("auth.json"),
+        );
+    }
+    candidates.push(
+        std::path::PathBuf::from(&home)
+            .join(".local")
+            .join("share")
+            .join("opencode")
+            .join("auth.json"),
+    );
+    candidates.push(
+        std::path::PathBuf::from("/var/lib/opencode")
+            .join(".local")
+            .join("share")
+            .join("opencode")
+            .join("auth.json"),
+    );
+    let auth_path = candidates.iter().find(|p| p.exists())?;
+    let contents = std::fs::read_to_string(auth_path).ok()?;
     let auth: serde_json::Value = serde_json::from_str(&contents).ok()?;
 
     // Look for google or gemini key in auth.json

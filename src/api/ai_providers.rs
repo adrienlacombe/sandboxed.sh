@@ -6065,7 +6065,23 @@ async fn oauth_callback_inner(
             }
 
             // Save backend targeting if provided in the callback request
+            let config_path = get_opencode_config_path(&state.config.working_dir);
+            let mut opencode_config =
+                read_opencode_config(&config_path).map_err(internal_error)?;
+
             if let Some(ref backends_list) = req.use_for_backends {
+                set_provider_config_entry(
+                    &mut opencode_config,
+                    provider_type,
+                    None,
+                    None,
+                    None,
+                    req.use_for_backends.clone(),
+                    None,
+                );
+                if let Err(e) = write_opencode_config(&config_path, &opencode_config) {
+                    tracing::error!("Failed to write OpenCode config: {}", e);
+                }
                 if let Err(e) = update_provider_backends(
                     &state.config.working_dir,
                     provider_type.id(),
@@ -6074,9 +6090,6 @@ async fn oauth_callback_inner(
                     tracing::error!("Failed to save provider backends: {}", e);
                 }
             }
-
-            let config_path = get_opencode_config_path(&state.config.working_dir);
-            let opencode_config = read_opencode_config(&config_path).map_err(internal_error)?;
             let backends_state = read_provider_backends_state(&state.config.working_dir);
             let default_provider = get_default_provider(&opencode_config);
             let config_entry = get_provider_config_entry(&opencode_config, provider_type);
