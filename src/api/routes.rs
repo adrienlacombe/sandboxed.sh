@@ -449,8 +449,9 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
     // Start background OAuth token refresher task
     {
         let ai_providers = Arc::clone(&state.ai_providers);
+        let working_dir = config.working_dir.clone();
         tokio::spawn(async move {
-            oauth_token_refresher_loop(ai_providers).await;
+            oauth_token_refresher_loop(ai_providers, working_dir).await;
         });
     }
 
@@ -1364,7 +1365,10 @@ async fn search_memory(Query(params): Query<SearchMemoryQuery>) -> Json<serde_js
 /// The refresher checks credential files directly rather than relying on the
 /// AIProviderStore, because OAuth tokens from the callback are stored in
 /// credentials.json but may not have a corresponding AIProvider entry.
-async fn oauth_token_refresher_loop(_ai_providers: Arc<crate::ai_providers::AIProviderStore>) {
+async fn oauth_token_refresher_loop(
+    _ai_providers: Arc<crate::ai_providers::AIProviderStore>,
+    working_dir: std::path::PathBuf,
+) {
     use crate::ai_providers::ProviderType;
 
     // Check every 15 minutes
@@ -1385,6 +1389,40 @@ async fn oauth_token_refresher_loop(_ai_providers: Arc<crate::ai_providers::AIPr
 
     // Run an initial check after a short delay (let the server finish booting).
     tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+
+    // Populate missing account emails on startup (e.g. Anthropic tokens loaded
+    // from credential files don't include email — fetch via userinfo endpoint).
+    {
+        let accounts = ai_providers_api::read_provider_accounts_state(&working_dir);
+        for &provider_type in &oauth_capable_types {
+            let provider_id = provider_type.id();
+            if accounts.contains_key(provider_id) {
+                continue; // already have email
+            }
+            let entry = match ai_providers_api::read_oauth_token_entry(provider_type) {
+                Some(e) => e,
+                None => continue,
+            };
+            if entry.access_token.is_empty() {
+                continue;
+            }
+            // Anthropic needs a dedicated userinfo call; others use JWT id_token
+            // which only arrives during the OAuth callback (not from credential files).
+            if matches!(provider_type, ProviderType::Anthropic) {
+                if let Some(email) =
+                    ai_providers_api::fetch_anthropic_account_email(&entry.access_token).await
+                {
+                    tracing::info!(
+                        provider_type = ?provider_type,
+                        email = %email,
+                        "Fetched Anthropic account email via userinfo endpoint"
+                    );
+                    let _ =
+                        ai_providers_api::update_provider_account(&working_dir, provider_id, email);
+                }
+            }
+        }
+    }
 
     loop {
         // Check credential files directly for each OAuth-capable provider type.

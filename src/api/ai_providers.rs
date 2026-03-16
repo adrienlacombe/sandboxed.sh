@@ -3730,7 +3730,7 @@ fn provider_accounts_state_path(working_dir: &Path) -> PathBuf {
 
 /// Read provider account info state from the state file.
 /// Returns a map of provider_id -> account email (e.g., "anthropic" -> "user@example.com")
-fn read_provider_accounts_state(working_dir: &Path) -> HashMap<String, String> {
+pub fn read_provider_accounts_state(working_dir: &Path) -> HashMap<String, String> {
     let path = provider_accounts_state_path(working_dir);
     let contents = match std::fs::read_to_string(&path) {
         Ok(c) => c,
@@ -3757,7 +3757,7 @@ fn write_provider_accounts_state(
 }
 
 /// Update account email for a specific provider in the state file.
-fn update_provider_account(
+pub fn update_provider_account(
     working_dir: &Path,
     provider_id: &str,
     email: String,
@@ -3792,7 +3792,7 @@ fn extract_email_from_jwt(token: &str) -> Option<String> {
 ///
 /// Calls `GET /v1/oauth/userinfo` on the Anthropic console. This is needed because
 /// Anthropic's OAuth token response doesn't include an `id_token` or email claim.
-async fn fetch_anthropic_account_email(access_token: &str) -> Option<String> {
+pub async fn fetch_anthropic_account_email(access_token: &str) -> Option<String> {
     let client = reqwest::Client::new();
     let resp = client
         .get("https://console.anthropic.com/v1/oauth/userinfo")
