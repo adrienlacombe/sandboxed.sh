@@ -2640,12 +2640,96 @@ export default function ControlClient() {
   const loadHistoryEvents = useCallback(
     async (id: string) => {
       const PAGE_LIMIT = 1000;
-      const MAX_EVENTS = 20000;
-      const MAX_PAGES = 200;
+      const MAX_EVENTS = 5000;
+      const MAX_PAGES = 20;
+
+      // For very long missions (25k+ events), loading everything crashes the
+      // browser (Chrome Error code 11 / out-of-memory). We probe the total
+      // event count first and only load the most recent MAX_EVENTS events.
+      let startOffset = 0;
+      const firstPage = await getMissionEvents(id, {
+        types: HISTORY_EVENT_TYPES,
+        limit: PAGE_LIMIT,
+        offset: 0,
+      });
+      if (!Array.isArray(firstPage) || firstPage.length === 0) return [];
+
+      if (firstPage.length === PAGE_LIMIT) {
+        // There may be more than one page — check if total exceeds MAX_EVENTS
+        const probe = await getMissionEvents(id, {
+          types: HISTORY_EVENT_TYPES,
+          limit: 1,
+          offset: MAX_EVENTS,
+        });
+        if (Array.isArray(probe) && probe.length > 0) {
+          // Total exceeds MAX_EVENTS. Binary-search for the end to compute
+          // a starting offset so we load only the tail.
+          let lo = MAX_EVENTS;
+          let hi = MAX_EVENTS * 4;
+          // Find upper bound where no events exist
+          for (let i = 0; i < 10; i++) {
+            const p = await getMissionEvents(id, {
+              types: HISTORY_EVENT_TYPES,
+              limit: 1,
+              offset: hi,
+            });
+            if (!Array.isArray(p) || p.length === 0) break;
+            lo = hi;
+            hi *= 2;
+          }
+          // Verify hi is actually an upper bound (no events at this offset).
+          // The doubling loop may have exited due to iteration limit.
+          {
+            const p = await getMissionEvents(id, {
+              types: HISTORY_EVENT_TYPES,
+              limit: 1,
+              offset: hi,
+            });
+            if (Array.isArray(p) && p.length > 0) {
+              // hi is not a true upper bound — can't determine total precisely.
+              // Fall back: just load the last MAX_EVENTS from hi as best-effort.
+              startOffset = Math.max(0, hi - MAX_EVENTS);
+            }
+          }
+          // Narrow down to find the precise total
+          if (startOffset === 0) {
+            for (let i = 0; i < 20; i++) {
+              if (hi - lo <= 1) break;
+              const mid = Math.floor((lo + hi) / 2);
+              const p = await getMissionEvents(id, {
+                types: HISTORY_EVENT_TYPES,
+                limit: 1,
+                offset: mid,
+              });
+              if (Array.isArray(p) && p.length > 0) {
+                lo = mid;
+              } else {
+                hi = mid;
+              }
+            }
+            // lo is the last offset with an event, hi is the first without.
+            // Total event count ≈ hi. Load the most recent MAX_EVENTS.
+            startOffset = Math.max(0, hi - MAX_EVENTS);
+          }
+        }
+      }
+
       const all: StoredEvent[] = [];
       const seenIds = new Set<number>();
-      let offset = 0;
-      for (let page = 0; page < MAX_PAGES; page += 1) {
+
+      // If startOffset is 0, reuse the first page we already fetched
+      if (startOffset === 0) {
+        for (const event of firstPage) {
+          if (!seenIds.has(event.id)) {
+            seenIds.add(event.id);
+            all.push(event);
+          }
+        }
+      }
+
+      let offset = startOffset === 0 ? firstPage.length : startOffset;
+      const pageStart = startOffset === 0 ? 1 : 0; // skip page 0 if reused
+      for (let page = pageStart; page < MAX_PAGES; page += 1) {
         const batch = await getMissionEvents(id, {
           types: HISTORY_EVENT_TYPES,
           limit: PAGE_LIMIT,
@@ -2662,7 +2746,7 @@ export default function ControlClient() {
         }
 
         if (batch.length < PAGE_LIMIT) break;
-        if (newCount === 0) break; // avoid infinite loops if offset is ignored server-side
+        if (newCount === 0) break;
         if (all.length >= MAX_EVENTS) break;
         offset += batch.length;
       }
