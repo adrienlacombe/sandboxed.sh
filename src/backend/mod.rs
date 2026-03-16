@@ -2,6 +2,7 @@ pub mod amp;
 pub mod claudecode;
 pub mod codex;
 pub mod events;
+pub mod gemini;
 pub mod opencode;
 pub mod registry;
 pub mod shared;

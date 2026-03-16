@@ -2538,6 +2538,21 @@ async fn run_mission_turn(
                 }
             }
         }
+        "gemini" => {
+            run_gemini_turn(
+                &workspace,
+                &mission_work_dir,
+                &convo,
+                config.default_model.as_deref(),
+                effective_agent.as_deref(),
+                mission_id,
+                events_tx.clone(),
+                cancel.clone(),
+                &config.working_dir,
+                session_id.as_deref(),
+            )
+            .await
+        }
         _ => {
             // Don't send Error event - the failure will be emitted as an AssistantMessage
             // with success=false by the caller (control.rs), avoiding duplicate messages.
@@ -11122,6 +11137,339 @@ Update it to the latest version (`npm install -g @openai/codex@latest`) and retr
     }
 
     result
+}
+
+/// Run a single Gemini CLI turn for a mission.
+pub async fn run_gemini_turn(
+    workspace: &Workspace,
+    mission_work_dir: &std::path::Path,
+    user_message: &str,
+    model: Option<&str>,
+    agent: Option<&str>,
+    mission_id: Uuid,
+    events_tx: broadcast::Sender<AgentEvent>,
+    cancel: CancellationToken,
+    app_working_dir: &std::path::Path,
+    _session_id: Option<&str>,
+) -> AgentResult {
+    use crate::backend::events::ExecutionEvent;
+    use crate::backend::gemini::GeminiBackend;
+    use crate::backend::{Backend, SessionConfig};
+
+    let model = model.map(str::trim).filter(|m| !m.is_empty());
+    let resolved_model: Option<String> = model.map(|m| m.to_string());
+
+    tracing::info!(
+        mission_id = %mission_id,
+        requested_model = ?model,
+        resolved_model = ?resolved_model,
+        agent = ?agent,
+        "Starting Gemini CLI turn"
+    );
+
+    // Get Google API key from AI provider store
+    let api_key = get_google_api_key_for_gemini(app_working_dir);
+    if api_key.is_none() {
+        tracing::warn!("No Google API key found for Gemini CLI; will rely on CLI's own auth");
+    }
+
+    let workspace_exec = WorkspaceExec::new(workspace.clone());
+    let cli_path = get_backend_string_setting("gemini", "cli_path")
+        .or_else(|| std::env::var("GEMINI_CLI_PATH").ok())
+        .unwrap_or_else(|| "gemini".to_string());
+
+    tracing::info!(
+        mission_id = %mission_id,
+        workspace_type = ?workspace.workspace_type,
+        cli_path = %cli_path,
+        model = ?model,
+        has_api_key = api_key.is_some(),
+        "Starting Gemini CLI execution via WorkspaceExec"
+    );
+
+    let gemini_config = crate::backend::gemini::client::GeminiConfig {
+        cli_path,
+        api_key,
+        default_model: resolved_model.clone(),
+    };
+
+    let backend = GeminiBackend::with_config_and_workspace(gemini_config, workspace_exec);
+
+    // Create session
+    let session = match backend
+        .create_session(SessionConfig {
+            directory: mission_work_dir.to_string_lossy().to_string(),
+            title: Some(format!("Mission {}", mission_id)),
+            model: resolved_model.clone(),
+            agent: agent.map(|s| s.to_string()),
+        })
+        .await
+    {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!("Failed to create Gemini session: {}", e);
+            return AgentResult::failure(format!("Failed to start Gemini CLI: {}", e), 0)
+                .with_terminal_reason(TerminalReason::LlmError);
+        }
+    };
+
+    // Send message streaming
+    let (mut event_rx, _handle) =
+        match backend.send_message_streaming(&session, user_message).await {
+            Ok(result) => result,
+            Err(e) => {
+                tracing::error!("Failed to send message to Gemini CLI: {}", e);
+                return AgentResult::failure(format!("Gemini CLI execution failed: {}", e), 0)
+                    .with_terminal_reason(TerminalReason::LlmError);
+            }
+        };
+
+    // Process events until completion or cancellation
+    let mut assistant_message = String::new();
+    let mut success = false;
+    let mut error_message: Option<String> = None;
+    let mut pending_tools: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    let mut thinking_emitted = false;
+    let mut thinking_done_emitted = false;
+    let mut total_input_tokens: u64 = 0;
+    let mut total_output_tokens: u64 = 0;
+
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => {
+                tracing::info!("Gemini turn cancelled for mission {}", mission_id);
+                return AgentResult::failure("Mission cancelled".to_string(), 0)
+                    .with_terminal_reason(TerminalReason::Cancelled);
+            }
+            Some(event) = event_rx.recv() => {
+                match event {
+                    ExecutionEvent::TextDelta { content } => {
+                        assistant_message.push_str(&content);
+                        let _ = events_tx.send(AgentEvent::TextDelta {
+                            content,
+                            mission_id: Some(mission_id),
+                        });
+                    }
+                    ExecutionEvent::Thinking { content } => {
+                        let _ = events_tx.send(AgentEvent::Thinking {
+                            content,
+                            done: false,
+                            mission_id: Some(mission_id),
+                        });
+                        thinking_emitted = true;
+                    }
+                    ExecutionEvent::ToolCall { id, name, args } => {
+                        pending_tools.insert(id.clone(), name.clone());
+                        let _ = events_tx.send(AgentEvent::ToolCall {
+                            tool_call_id: id,
+                            name,
+                            args,
+                            mission_id: Some(mission_id),
+                        });
+                    }
+                    ExecutionEvent::ToolResult { id, name, result } => {
+                        pending_tools.remove(&id);
+                        let _ = events_tx.send(AgentEvent::ToolResult {
+                            tool_call_id: id,
+                            name,
+                            result,
+                            mission_id: Some(mission_id),
+                        });
+                    }
+                    ExecutionEvent::TurnSummary { content } => {
+                        if !content.trim().is_empty() {
+                            tracing::debug!("Gemini turn summary: {}", content);
+                        }
+                    }
+                    ExecutionEvent::Usage { input_tokens, output_tokens } => {
+                        total_input_tokens = total_input_tokens.saturating_add(input_tokens);
+                        total_output_tokens = total_output_tokens.saturating_add(output_tokens);
+                    }
+                    ExecutionEvent::Error { message } => {
+                        error_message = Some(message.clone());
+                        tracing::error!("Gemini CLI error: {}", message);
+                    }
+                    ExecutionEvent::MessageComplete { session_id: _ } => {
+                        success = error_message.is_none();
+                        break;
+                    }
+                }
+            }
+            else => {
+                break;
+            }
+        }
+    }
+
+    if !thinking_emitted {
+        if let Some((thought, cleaned)) = extract_thought_line(&assistant_message) {
+            let _ = events_tx.send(AgentEvent::Thinking {
+                content: thought,
+                done: true,
+                mission_id: Some(mission_id),
+            });
+            thinking_emitted = true;
+            thinking_done_emitted = true;
+            assistant_message = cleaned;
+        }
+    }
+
+    if thinking_emitted && !thinking_done_emitted {
+        let _ = events_tx.send(AgentEvent::Thinking {
+            content: String::new(),
+            done: true,
+            mission_id: Some(mission_id),
+        });
+    }
+
+    let no_output = assistant_message.trim().is_empty();
+    if no_output && error_message.is_none() {
+        success = false;
+        error_message = Some(
+            "Gemini CLI produced no output. Check that the Gemini CLI is installed and configured with valid credentials (GEMINI_API_KEY or Google OAuth)."
+                .to_string(),
+        );
+    }
+
+    let final_message = if let Some(err) = error_message {
+        err
+    } else if !assistant_message.is_empty() {
+        assistant_message
+    } else {
+        "No response from Gemini CLI".to_string()
+    };
+
+    let usage = crate::cost::TokenUsage {
+        input_tokens: total_input_tokens,
+        output_tokens: total_output_tokens,
+        cache_creation_input_tokens: None,
+        cache_read_input_tokens: None,
+    };
+
+    let model_for_cost = resolved_model.as_deref();
+    let (cost_cents, cost_source) = resolve_cost_cents_and_source(None, model_for_cost, &usage);
+
+    let mut result = if success {
+        AgentResult::success(final_message, cost_cents)
+            .with_terminal_reason(TerminalReason::TurnComplete)
+    } else {
+        let reason = if is_rate_limited_error(&final_message) {
+            TerminalReason::RateLimited
+        } else {
+            TerminalReason::LlmError
+        };
+        AgentResult::failure(final_message, cost_cents).with_terminal_reason(reason)
+    };
+
+    result = result.with_cost_source(cost_source);
+    if usage.has_usage() {
+        result = result.with_usage(usage);
+    }
+    if let Some(m) = resolved_model.as_deref() {
+        result = result.with_model(m.to_string());
+    }
+
+    result
+}
+
+/// Get Google API key for the Gemini CLI backend from the AI provider store.
+///
+/// Checks the AI provider store for a Google provider with an API key,
+/// then falls back to environment variables.
+fn get_google_api_key_for_gemini(working_dir: &std::path::Path) -> Option<String> {
+    // Try to get API key from the AI provider store
+    let store_path = working_dir.join(crate::util::AI_PROVIDERS_PATH);
+    let store = match std::fs::read_to_string(&store_path) {
+        Ok(contents) => contents,
+        Err(_) => {
+            tracing::debug!("No AI providers file found at {:?}", store_path);
+            return env_google_api_key();
+        }
+    };
+
+    let providers: serde_json::Value = match serde_json::from_str(&store) {
+        Ok(v) => v,
+        Err(_) => return env_google_api_key(),
+    };
+
+    if let Some(providers_arr) = providers.as_array() {
+        for provider in providers_arr {
+            let pt = match provider.get("provider_type").and_then(|v| v.as_str()) {
+                Some(t) => t,
+                None => continue,
+            };
+            if pt != "google" {
+                continue;
+            }
+
+            let enabled = provider
+                .get("enabled")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+            if !enabled {
+                continue;
+            }
+
+            // Try API key first
+            if let Some(key) = provider.get("api_key").and_then(|v| v.as_str()) {
+                if !key.is_empty() {
+                    return Some(key.to_string());
+                }
+            }
+
+            // If OAuth credentials exist, the key may be in OpenCode's auth.json
+            if provider.get("oauth").is_some() {
+                // Try to read the API key from OpenCode's auth.json where it's synced
+                if let Some(key) = read_google_key_from_opencode_auth() {
+                    return Some(key);
+                }
+            }
+        }
+    }
+
+    // Fall back to environment variables
+    env_google_api_key()
+}
+
+/// Read Google API key from OpenCode's auth.json (synced during OAuth callback).
+fn read_google_key_from_opencode_auth() -> Option<String> {
+    let home = std::env::var("HOME").ok()?;
+    let auth_path = std::path::Path::new(&home)
+        .join(".config/opencode/auth.json");
+    let contents = std::fs::read_to_string(&auth_path).ok()?;
+    let auth: serde_json::Value = serde_json::from_str(&contents).ok()?;
+
+    // Look for google or gemini key in auth.json
+    for key_name in ["google", "gemini"] {
+        if let Some(entry) = auth.get(key_name) {
+            // Check for access token (OAuth) or api_key
+            if let Some(key) = entry.get("key").and_then(|v| v.as_str()) {
+                if !key.is_empty() {
+                    return Some(key.to_string());
+                }
+            }
+            if let Some(key) = entry.get("api_key").and_then(|v| v.as_str()) {
+                if !key.is_empty() {
+                    return Some(key.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Get Google API key from environment variables.
+fn env_google_api_key() -> Option<String> {
+    for var in ["GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_GENERATIVE_AI_API_KEY"] {
+        if let Ok(key) = std::env::var(var) {
+            let key = key.trim().to_string();
+            if !key.is_empty() {
+                return Some(key);
+            }
+        }
+    }
+    None
 }
 
 /// Generate a concise summary of recent conversation turns for session rotation.

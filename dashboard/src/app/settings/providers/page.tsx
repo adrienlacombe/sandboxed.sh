@@ -211,7 +211,7 @@ export default function ProvidersPage() {
               <div>
                 <h2 className="text-sm font-medium text-white">Configured Providers</h2>
                 <p className="text-xs text-white/40">
-                  Configure inference providers for OpenCode, Claude Code, and Codex
+                  Configure inference providers for OpenCode, Claude Code, Gemini, and Codex
                 </p>
               </div>
             </div>
@@ -367,6 +367,8 @@ export default function ProvidersPage() {
                                   ? 'OC'
                                   : backend === 'codex'
                                   ? 'Codex'
+                                  : backend === 'gemini'
+                                  ? 'Gemini'
                                   : backend}
                               </span>
                             ))}

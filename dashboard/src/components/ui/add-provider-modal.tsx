@@ -165,6 +165,8 @@ export function AddProviderModal({ open, onClose, onSuccess, providerTypes }: Ad
       setSelectedBackends(['opencode']);
     } else if (providerType === 'openai') {
       setSelectedBackends(['opencode', 'codex']);
+    } else if (providerType === 'google') {
+      setSelectedBackends(['opencode', 'gemini']);
     } else if (providerType === 'amp') {
       setSelectedBackends(['amp']);
     } else {
@@ -185,10 +187,13 @@ export function AddProviderModal({ open, onClose, onSuccess, providerTypes }: Ad
     setSelectedMethodIndex(methodIndex);
 
     // Providers that support multiple backends should select targeting first.
-    if (selectedProvider === 'anthropic' || selectedProvider === 'openai') {
+    if (selectedProvider === 'anthropic' || selectedProvider === 'openai' || selectedProvider === 'google') {
       // For OpenAI, default backends depend on auth method.
       if (selectedProvider === 'openai') {
         setSelectedBackends(['opencode', 'codex']);
+      }
+      if (selectedProvider === 'google') {
+        setSelectedBackends(['opencode', 'gemini']);
       }
       setStep('select-backends');
       return;
@@ -278,7 +283,7 @@ export function AddProviderModal({ open, onClose, onSuccess, providerTypes }: Ad
         selectedMethodIndex,
         oauthCode,
         // Include backend targeting for supported providers
-        selectedProvider === 'anthropic' || selectedProvider === 'openai'
+        selectedProvider === 'anthropic' || selectedProvider === 'openai' || selectedProvider === 'google'
           ? selectedBackends
           : undefined
       );
@@ -354,7 +359,7 @@ export function AddProviderModal({ open, onClose, onSuccess, providerTypes }: Ad
     } else if (step === 'select-backends') {
       setStep('select-method');
     } else if (step === 'enter-api-key') {
-      if (selectedProvider === 'anthropic' || selectedProvider === 'openai') {
+      if (selectedProvider === 'anthropic' || selectedProvider === 'openai' || selectedProvider === 'google') {
         setStep('select-backends');
       } else if (hasOAuth) {
         setStep('select-method');
@@ -580,6 +585,35 @@ export function AddProviderModal({ open, onClose, onSuccess, providerTypes }: Ad
                         </label>
                       );
                     })()}
+                  </>
+                )}
+
+                {selectedProvider === 'google' && (
+                  <>
+                    <label className="flex items-center gap-3 p-3 rounded-xl border border-white/[0.06] hover:bg-white/[0.02] transition-colors cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={selectedBackends.includes('opencode')}
+                        onChange={() => toggleBackend('opencode')}
+                        className="rounded border-white/20 bg-white/[0.02] text-indigo-500 focus:ring-indigo-500/30 cursor-pointer"
+                      />
+                      <div className="flex-1">
+                        <div className="text-sm text-white">OpenCode</div>
+                        <div className="text-xs text-white/40">Use for OpenCode agents and missions</div>
+                      </div>
+                    </label>
+                    <label className="flex items-center gap-3 p-3 rounded-xl border border-white/[0.06] hover:bg-white/[0.02] transition-colors cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={selectedBackends.includes('gemini')}
+                        onChange={() => toggleBackend('gemini')}
+                        className="rounded border-white/20 bg-white/[0.02] text-indigo-500 focus:ring-indigo-500/30 cursor-pointer"
+                      />
+                      <div className="flex-1">
+                        <div className="text-sm text-white">Gemini CLI</div>
+                        <div className="text-xs text-white/40">Use for Gemini CLI-based missions</div>
+                      </div>
+                    </label>
                   </>
                 )}
               </div>
