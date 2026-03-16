@@ -94,8 +94,8 @@ impl GeminiClient {
             args.push(sid.to_string());
         }
 
-        // Add the message as a positional arg (guard prompts starting with '-')
-        args.push("--".to_string());
+        // Use --prompt for non-interactive (headless) mode
+        args.push("--prompt".to_string());
         args.push(message.to_string());
 
         info!(
