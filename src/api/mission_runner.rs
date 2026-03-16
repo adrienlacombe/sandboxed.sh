@@ -11468,7 +11468,10 @@ pub async fn run_gemini_turn(
         .output(
             mission_work_dir,
             "/bin/sh",
-            &["-c".to_string(), r#"mkdir -p "${HOME:-/root}/.gemini""#.to_string()],
+            &[
+                "-c".to_string(),
+                r#"mkdir -p "${HOME:-/root}/.gemini""#.to_string(),
+            ],
             std::collections::HashMap::new(),
         )
         .await;
@@ -11532,7 +11535,10 @@ pub async fn run_gemini_turn(
                     "/bin/sh",
                     &[
                         "-c".to_string(),
-                        format!(r#"echo '{}' > "${{HOME:-/root}}/.gemini/oauth_creds.json""#, escaped),
+                        format!(
+                            r#"echo '{}' > "${{HOME:-/root}}/.gemini/oauth_creds.json""#,
+                            escaped
+                        ),
                     ],
                     std::collections::HashMap::new(),
                 )
@@ -11793,9 +11799,7 @@ fn get_google_credentials_for_gemini(working_dir: &std::path::Path) -> GeminiCre
     let google_targets_gemini = if let Ok(data) = std::fs::read_to_string(&backends_path) {
         if let Ok(map) = serde_json::from_str::<serde_json::Value>(&data) {
             match map.get("google").and_then(|v| v.as_array()) {
-                Some(backends) => {
-                    backends.iter().any(|b| b.as_str() == Some("gemini"))
-                }
+                Some(backends) => backends.iter().any(|b| b.as_str() == Some("gemini")),
                 // No entry for google means no explicit targeting; allow by default
                 None => true,
             }
