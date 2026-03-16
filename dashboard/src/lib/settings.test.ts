@@ -3,6 +3,7 @@ import {
   readSavedSettings,
   writeSavedSettings,
   getRuntimeApiBase,
+  inferHostedApiBase,
 } from "./settings";
 
 describe("readSavedSettings", () => {
@@ -85,5 +86,15 @@ describe("getRuntimeApiBase", () => {
       JSON.stringify({ apiUrl: "http://host:3000/" })
     );
     expect(getRuntimeApiBase()).toBe("http://host:3000");
+  });
+});
+
+describe("inferHostedApiBase", () => {
+  it("maps the production dashboard host to the production backend", () => {
+    expect(inferHostedApiBase("agent.thomas.md")).toBe("https://agent-backend.thomas.md");
+  });
+
+  it("returns null for unknown hosts", () => {
+    expect(inferHostedApiBase("example.com")).toBeNull();
   });
 });
