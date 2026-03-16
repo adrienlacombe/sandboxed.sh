@@ -11609,9 +11609,9 @@ pub async fn run_gemini_turn(
         tokio::select! {
             _ = cancel.cancelled() => {
                 tracing::info!("Gemini turn cancelled for mission {}", mission_id);
-                // Kill the Gemini CLI process so it doesn't keep running
-                // and mutating the workspace after cancellation.
-                handle.kill().await;
+                // Abort the event-conversion task; dropping it also drops the
+                // inner ProcessHandle which owns the child process.
+                handle.abort();
                 return AgentResult::failure("Mission cancelled".to_string(), 0)
                     .with_terminal_reason(TerminalReason::Cancelled);
             }
@@ -11793,9 +11793,9 @@ fn get_google_credentials_for_gemini(working_dir: &std::path::Path) -> GeminiCre
     let google_targets_gemini = if let Ok(data) = std::fs::read_to_string(&backends_path) {
         if let Ok(map) = serde_json::from_str::<serde_json::Value>(&data) {
             match map.get("google").and_then(|v| v.as_array()) {
-                Some(backends) => backends
-                    .iter()
-                    .any(|b| b.as_str() == Some("gemini")),
+                Some(backends) => {
+                    backends.iter().any(|b| b.as_str() == Some("gemini"))
+                }
                 // No entry for google means no explicit targeting; allow by default
                 None => true,
             }
