@@ -7,6 +7,8 @@ use std::io::{BufRead, BufReader, Write};
 use std::process::Command;
 use std::sync::Arc;
 
+use chrono::Utc;
+use jsonwebtoken::{EncodingKey, Header};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use uuid::Uuid;
@@ -162,6 +164,36 @@ fn default_timeout() -> u64 {
 
 fn default_poll_interval() -> u64 {
     10
+}
+
+// =============================================================================
+// JWT helpers (lightweight – mirrors auth.rs Claims)
+// =============================================================================
+
+#[derive(Debug, Serialize)]
+struct JwtClaims {
+    sub: String,
+    usr: String,
+    iat: i64,
+    exp: i64,
+}
+
+/// Mint a short-lived service JWT using the shared secret.
+fn mint_service_jwt(secret: &str) -> Option<String> {
+    let now = Utc::now();
+    let exp = now + chrono::Duration::hours(24);
+    let claims = JwtClaims {
+        sub: "orchestrator-mcp".to_string(),
+        usr: "orchestrator-mcp".to_string(),
+        iat: now.timestamp(),
+        exp: exp.timestamp(),
+    };
+    jsonwebtoken::encode(
+        &Header::default(),
+        &claims,
+        &EncodingKey::from_secret(secret.as_bytes()),
+    )
+    .ok()
 }
 
 // =============================================================================
@@ -771,12 +803,23 @@ impl OrchestratorMcp {
 #[tokio::main]
 async fn main() {
     let mission_id = std::env::var("MISSION_ID")
+        .or_else(|_| std::env::var("SANDBOXED_SH_MISSION_ID"))
         .ok()
         .and_then(|id| Uuid::parse_str(&id).ok())
         .expect("MISSION_ID environment variable not set or invalid");
 
-    let api_url = std::env::var("API_URL").unwrap_or_else(|_| "http://localhost:3000".to_string());
-    let api_token = std::env::var("API_TOKEN").ok();
+    let api_url = std::env::var("API_URL")
+        .or_else(|_| std::env::var("SANDBOXED_SH_API_URL"))
+        .unwrap_or_else(|_| "http://localhost:3000".to_string());
+    let api_token = std::env::var("API_TOKEN")
+        .or_else(|_| std::env::var("SANDBOXED_SH_API_TOKEN"))
+        .ok()
+        .or_else(|| {
+            // Mint a service JWT from the shared secret when no explicit token is set.
+            std::env::var("JWT_SECRET")
+                .ok()
+                .and_then(|s| mint_service_jwt(&s))
+        });
 
     let server = Arc::new(OrchestratorMcp::new(mission_id, api_url, api_token));
 

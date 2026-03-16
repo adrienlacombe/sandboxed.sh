@@ -1082,7 +1082,17 @@ impl MissionStore for SqliteMissionStore {
         let conn = self.conn.clone();
         let now = now_string();
         let id = Uuid::new_v4();
-        let workspace_id = workspace_id.unwrap_or(crate::workspace::DEFAULT_WORKSPACE_ID);
+        // Inherit workspace from parent mission when not explicitly provided.
+        let workspace_id = if let Some(ws) = workspace_id {
+            ws
+        } else if let Some(parent_id) = parent_mission_id {
+            match self.get_mission(parent_id).await {
+                Ok(Some(parent)) => parent.workspace_id,
+                _ => crate::workspace::DEFAULT_WORKSPACE_ID,
+            }
+        } else {
+            crate::workspace::DEFAULT_WORKSPACE_ID
+        };
         let backend = backend.unwrap_or("claudecode").to_string();
         let metadata_source = title.and_then(|value| {
             let trimmed = value.trim();

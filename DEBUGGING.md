@@ -104,6 +104,7 @@ ssh -i ~/.ssh/cursor root@95.216.112.253 "systemctl stop sandboxed-sh-dev && \
   cp /opt/sandboxed-sh-dev/target/debug/sandboxed-sh /usr/local/bin/sandboxed-sh-dev && \
   cp /opt/sandboxed-sh-dev/target/debug/workspace-mcp /usr/local/bin/ && \
   cp /opt/sandboxed-sh-dev/target/debug/desktop-mcp /usr/local/bin/ && \
+  cp /opt/sandboxed-sh-dev/target/debug/orchestrator-mcp /usr/local/bin/ && \
   systemctl start sandboxed-sh-dev"
 
 # Verify health
@@ -203,10 +204,11 @@ should show `model_effort: high`.
 
 **Service won't start (exit code 203/EXEC):** Usually means wrong binary architecture (e.g., macOS ARM binary on Linux). Build on server instead.
 
-**MCPs show "Failed to spawn process" error:** The MCP binaries (`workspace-mcp`, `desktop-mcp`) need to be installed to `/usr/local/bin/`. After building, copy them:
+**MCPs show "Failed to spawn process" error:** The MCP binaries (`workspace-mcp`, `desktop-mcp`, `orchestrator-mcp`) need to be installed to `/usr/local/bin/`. After building, copy them:
 ```bash
 ssh -i ~/.ssh/cursor root@95.216.112.253 "cp /opt/sandboxed-sh-dev/target/debug/workspace-mcp /usr/local/bin/ && \
-  cp /opt/sandboxed-sh-dev/target/debug/desktop-mcp /usr/local/bin/"
+  cp /opt/sandboxed-sh-dev/target/debug/desktop-mcp /usr/local/bin/ && \
+  cp /opt/sandboxed-sh-dev/target/debug/orchestrator-mcp /usr/local/bin/"
 ```
 Then restart the backend. Workspace-scoped MCPs must be in PATH for both host workspace missions and the Extensions page to work.
 

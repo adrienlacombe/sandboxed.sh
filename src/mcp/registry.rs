@@ -204,7 +204,33 @@ impl McpRegistry {
         playwright.scope = McpScope::Workspace;
         playwright.default_enabled = true;
 
-        vec![workspace, desktop, playwright]
+        let orchestrator_command = {
+            let release = working_dir
+                .join("target")
+                .join("release")
+                .join("orchestrator-mcp");
+            let debug = working_dir
+                .join("target")
+                .join("debug")
+                .join("orchestrator-mcp");
+            if release.exists() {
+                release.to_string_lossy().to_string()
+            } else if debug.exists() {
+                debug.to_string_lossy().to_string()
+            } else {
+                "orchestrator-mcp".to_string()
+            }
+        };
+        let mut orchestrator = McpServerConfig::new_stdio(
+            "orchestrator".to_string(),
+            orchestrator_command,
+            Vec::new(),
+            HashMap::new(),
+        );
+        orchestrator.scope = McpScope::Workspace;
+        orchestrator.default_enabled = true;
+
+        vec![workspace, desktop, playwright, orchestrator]
     }
 
     async fn ensure_defaults(

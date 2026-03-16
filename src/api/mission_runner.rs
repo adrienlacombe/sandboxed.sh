@@ -1892,6 +1892,10 @@ async fn run_mission_turn(
         // The global DEFAULT_MODEL (e.g. claude-opus-4-6) is not valid for
         // Codex.  Clear it so Codex uses its own CLI default.
         config.default_model = None;
+    } else if backend_id == "gemini" && model_override.is_none() {
+        // The global DEFAULT_MODEL (e.g. claude-opus-4-6) is not valid for
+        // Gemini CLI.  Clear it so Gemini uses its own CLI default.
+        config.default_model = None;
     }
     tracing::info!(
         mission_id = %mission_id,
@@ -2537,6 +2541,21 @@ async fn run_mission_turn(
                     }
                 }
             }
+        }
+        "gemini" => {
+            run_gemini_turn(
+                &workspace,
+                &mission_work_dir,
+                &convo,
+                config.default_model.as_deref(),
+                effective_agent.as_deref(),
+                mission_id,
+                events_tx.clone(),
+                cancel.clone(),
+                &config.working_dir,
+                session_id.as_deref(),
+            )
+            .await
         }
         _ => {
             // Don't send Error event - the failure will be emitted as an AssistantMessage
@@ -8065,6 +8084,10 @@ pub async fn check_backend_prerequisites(
             let cli = cli_path.unwrap_or("amp");
             check_amp_prerequisites(&workspace_exec, cwd, cli).await
         }
+        "gemini" => {
+            let cli = cli_path.unwrap_or("gemini");
+            check_gemini_prerequisites(&workspace_exec, cwd, cli).await
+        }
         _ => BackendPreflightResult {
             backend_id: backend_id.to_string(),
             available: false,
@@ -8072,7 +8095,7 @@ pub async fn check_backend_prerequisites(
             auto_install_possible: false,
             missing_dependencies: vec![format!("unknown backend: {}", backend_id)],
             message: Some(format!(
-                "Unknown backend '{}'. Supported backends: claudecode, opencode, codex, amp",
+                "Unknown backend '{}'. Supported backends: claudecode, opencode, codex, amp, gemini",
                 backend_id
             )),
         },
@@ -8259,6 +8282,257 @@ async fn check_amp_prerequisites(
             Some("Amp CLI not found but can be auto-installed via npm/bun.".to_string())
         },
     }
+}
+
+async fn check_gemini_prerequisites(
+    workspace_exec: &WorkspaceExec,
+    cwd: &std::path::Path,
+    cli_path: &str,
+) -> BackendPreflightResult {
+    let program = cli_path.split_whitespace().next().unwrap_or(cli_path);
+
+    let cli_available = command_available(workspace_exec, cwd, program).await;
+
+    if cli_available {
+        return BackendPreflightResult {
+            backend_id: "gemini".to_string(),
+            available: true,
+            cli_available: true,
+            auto_install_possible: false,
+            missing_dependencies: vec![],
+            message: None,
+        };
+    }
+
+    let has_npm = command_available(workspace_exec, cwd, "npm").await;
+    let has_bun = command_available(workspace_exec, cwd, "bun").await
+        || command_available(workspace_exec, cwd, "/root/.bun/bin/bun").await;
+
+    let auto_install_possible = has_npm || has_bun;
+
+    BackendPreflightResult {
+        backend_id: "gemini".to_string(),
+        available: auto_install_possible,
+        cli_available: false,
+        auto_install_possible,
+        missing_dependencies: if !auto_install_possible {
+            vec!["npm or bun".to_string()]
+        } else {
+            vec![]
+        },
+        message: if !auto_install_possible {
+            Some("Gemini CLI not found and neither npm nor bun is available. Install Node.js/npm or Bun in the workspace template.".to_string())
+        } else {
+            Some("Gemini CLI not found but can be auto-installed via npm/bun.".to_string())
+        },
+    }
+}
+
+/// Returns the path/command to the Gemini CLI that should be used.
+/// Auto-installs via npm/bun if not found and auto-install is enabled.
+/// If the installed CLI requires Node 20+ but only Node 18 is available,
+/// returns a `bun run <entry_point>` command instead.
+async fn ensure_gemini_cli_available(
+    workspace_exec: &WorkspaceExec,
+    cwd: &std::path::Path,
+    cli_path: &str,
+) -> Result<String, String> {
+    let program = cli_path.split(' ').next().unwrap_or(cli_path);
+
+    // Check if already available
+    if command_available(workspace_exec, cwd, program).await {
+        // Verify Node.js version is sufficient (gemini CLI requires Node 20+)
+        if let Some(bun_cmd) = gemini_bun_fallback_if_needed(workspace_exec, cwd, cli_path).await {
+            return Ok(bun_cmd);
+        }
+        return Ok(cli_path.to_string());
+    }
+
+    // Check bun's global bin directories
+    const BUN_GLOBAL_GEMINI_PATHS: &[&str] =
+        &["/root/.cache/.bun/bin/gemini", "/root/.bun/bin/gemini"];
+    for gemini_path in BUN_GLOBAL_GEMINI_PATHS {
+        if command_available(workspace_exec, cwd, gemini_path).await {
+            tracing::info!(
+                path = %gemini_path,
+                "Found Gemini CLI in bun global bin"
+            );
+            if let Some(bun_cmd) =
+                gemini_bun_fallback_if_needed(workspace_exec, cwd, gemini_path).await
+            {
+                return Ok(bun_cmd);
+            }
+            return Ok(gemini_path.to_string());
+        }
+    }
+
+    // Auto-install Gemini CLI if enabled (defaults to true)
+    let auto_install = env_var_bool("SANDBOXED_SH_AUTO_INSTALL_GEMINI", true);
+    if !auto_install {
+        return Err(format!(
+            "Gemini CLI '{}' not found in workspace. Install it or set GEMINI_CLI_PATH.",
+            cli_path
+        ));
+    }
+
+    let has_bun = command_available(workspace_exec, cwd, "bun").await
+        || command_available(workspace_exec, cwd, "/root/.bun/bin/bun").await;
+    let has_npm = command_available(workspace_exec, cwd, "npm").await;
+
+    if !has_bun && !has_npm {
+        return Err(format!(
+            "Gemini CLI '{}' not found and neither npm nor bun is available in the workspace. Install Node.js/npm or Bun in the workspace template, or set GEMINI_CLI_PATH.",
+            cli_path
+        ));
+    }
+
+    let install_cmd = if has_bun {
+        r#"export PATH="/root/.bun/bin:/root/.cache/.bun/bin:$PATH" && bun install -g @google/gemini-cli@latest 2>&1"#
+    } else {
+        "npm install -g @google/gemini-cli@latest 2>&1"
+    };
+
+    tracing::info!(
+        installer = if has_bun { "bun" } else { "npm" },
+        "Auto-installing Gemini CLI"
+    );
+
+    let output = workspace_exec
+        .output(
+            cwd,
+            "/bin/sh",
+            &["-lc".to_string(), install_cmd.to_string()],
+            std::collections::HashMap::new(),
+        )
+        .await
+        .map_err(|e| format!("Failed to install Gemini CLI: {}", e))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let mut message = String::new();
+        if !stderr.trim().is_empty() {
+            message.push_str(stderr.trim());
+        }
+        if !stdout.trim().is_empty() {
+            if !message.is_empty() {
+                message.push_str(" | ");
+            }
+            message.push_str(stdout.trim());
+        }
+        if message.is_empty() {
+            message = "Gemini CLI install failed with no output".to_string();
+        }
+        return Err(format!("Gemini CLI install failed: {}", message));
+    }
+
+    // Re-check availability after install
+    if command_available(workspace_exec, cwd, cli_path).await {
+        if let Some(bun_cmd) = gemini_bun_fallback_if_needed(workspace_exec, cwd, cli_path).await {
+            return Ok(bun_cmd);
+        }
+        return Ok(cli_path.to_string());
+    }
+    for gemini_path in BUN_GLOBAL_GEMINI_PATHS {
+        if command_available(workspace_exec, cwd, gemini_path).await {
+            tracing::info!(
+                path = %gemini_path,
+                "Gemini CLI available after auto-install"
+            );
+            if let Some(bun_cmd) =
+                gemini_bun_fallback_if_needed(workspace_exec, cwd, gemini_path).await
+            {
+                return Ok(bun_cmd);
+            }
+            return Ok(gemini_path.to_string());
+        }
+    }
+
+    Err(format!(
+        "Gemini CLI install completed but '{}' is still not available in workspace PATH.",
+        cli_path
+    ))
+}
+
+/// Check if Node.js version is too old for Gemini CLI (requires 20+).
+/// If so, return a `bun run <entry_point>` command as fallback.
+async fn gemini_bun_fallback_if_needed(
+    workspace_exec: &WorkspaceExec,
+    cwd: &std::path::Path,
+    _cli_path: &str,
+) -> Option<String> {
+    // Check Node.js major version
+    let node_version = workspace_exec
+        .output(
+            cwd,
+            "/bin/sh",
+            &["-lc".to_string(), "node --version 2>/dev/null".to_string()],
+            std::collections::HashMap::new(),
+        )
+        .await
+        .ok()?;
+
+    let version_str = String::from_utf8_lossy(&node_version.stdout);
+    let version_str = version_str.trim().trim_start_matches('v');
+    let major: u32 = version_str.split('.').next()?.parse().ok()?;
+
+    if major >= 20 {
+        return None; // Node.js version is sufficient
+    }
+
+    tracing::info!(
+        node_version = %version_str,
+        "Node.js version too old for Gemini CLI (requires 20+), falling back to bun"
+    );
+
+    // Find the gemini CLI entry point and run via bun
+    const GEMINI_ENTRY_POINTS: &[&str] = &[
+        "/root/.cache/.bun/install/global/node_modules/@google/gemini-cli/dist/index.js",
+        "/usr/local/lib/node_modules/@google/gemini-cli/dist/index.js",
+        "/usr/lib/node_modules/@google/gemini-cli/dist/index.js",
+    ];
+
+    // Determine which bun path to use
+    let bun_path = if command_available(workspace_exec, cwd, "bun").await {
+        "bun".to_string()
+    } else if command_available(workspace_exec, cwd, "/root/.bun/bin/bun").await {
+        "/root/.bun/bin/bun".to_string()
+    } else if command_available(workspace_exec, cwd, "/root/.cache/.bun/bin/bun").await {
+        "/root/.cache/.bun/bin/bun".to_string()
+    } else {
+        tracing::warn!("Node.js too old and bun not available; gemini CLI may fail");
+        return None;
+    };
+
+    for entry_point in GEMINI_ENTRY_POINTS {
+        let check = workspace_exec
+            .output(
+                cwd,
+                "/bin/sh",
+                &[
+                    "-lc".to_string(),
+                    format!("test -f {} && echo found", entry_point),
+                ],
+                std::collections::HashMap::new(),
+            )
+            .await;
+
+        if let Ok(output) = check {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            if stdout.trim() == "found" {
+                let cmd = format!("{} run {}", bun_path, entry_point);
+                tracing::info!(
+                    bun = %bun_path,
+                    entry_point = %entry_point,
+                    "Using bun to run Gemini CLI (Node.js < 20)"
+                );
+                return Some(cmd);
+            }
+        }
+    }
+
+    tracing::warn!("Could not find Gemini CLI entry point for bun fallback");
+    None
 }
 
 /// Execute a turn using OpenCode CLI backend.
@@ -11122,6 +11396,587 @@ Update it to the latest version (`npm install -g @openai/codex@latest`) and retr
     }
 
     result
+}
+
+/// Run a single Gemini CLI turn for a mission.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_gemini_turn(
+    workspace: &Workspace,
+    mission_work_dir: &std::path::Path,
+    user_message: &str,
+    model: Option<&str>,
+    agent: Option<&str>,
+    mission_id: Uuid,
+    events_tx: broadcast::Sender<AgentEvent>,
+    cancel: CancellationToken,
+    app_working_dir: &std::path::Path,
+    _session_id: Option<&str>,
+) -> AgentResult {
+    use crate::backend::events::ExecutionEvent;
+    use crate::backend::gemini::GeminiBackend;
+    use crate::backend::{Backend, SessionConfig};
+
+    let model = model.map(str::trim).filter(|m| !m.is_empty());
+    let resolved_model: Option<String> = model.map(|m| m.to_string());
+
+    tracing::info!(
+        mission_id = %mission_id,
+        requested_model = ?model,
+        resolved_model = ?resolved_model,
+        agent = ?agent,
+        "Starting Gemini CLI turn"
+    );
+
+    // Get Google credentials for Gemini CLI
+    let gemini_creds = get_google_credentials_for_gemini(app_working_dir);
+    match &gemini_creds {
+        GeminiCredentials::ApiKey(k) => {
+            tracing::info!(
+                "Using Gemini API key (prefix: {}...)",
+                k.chars().take(8).collect::<String>()
+            );
+        }
+        GeminiCredentials::OAuth { .. } => {
+            tracing::info!("Using Google OAuth credentials for Gemini CLI");
+        }
+        GeminiCredentials::None => {
+            tracing::warn!(
+                "No Google credentials found for Gemini CLI; will rely on CLI's own auth"
+            );
+        }
+    }
+
+    let workspace_exec = WorkspaceExec::new(workspace.clone());
+    let cli_path = get_backend_string_setting("gemini", "cli_path")
+        .or_else(|| std::env::var("GEMINI_CLI_PATH").ok())
+        .unwrap_or_else(|| "gemini".to_string());
+
+    // Ensure Gemini CLI is available, auto-install if needed
+    let cli_path =
+        match ensure_gemini_cli_available(&workspace_exec, mission_work_dir, &cli_path).await {
+            Ok(path) => path,
+            Err(e) => {
+                tracing::error!("Gemini CLI not available: {}", e);
+                return AgentResult::failure(format!("Gemini CLI not available: {}", e), 0)
+                    .with_terminal_reason(TerminalReason::LlmError);
+            }
+        };
+
+    // Ensure ~/.gemini directory exists (gemini CLI needs it for projects.json and settings).
+    // Use $HOME so this works for non-root users in host workspaces.
+    let gemini_dir_result = workspace_exec
+        .output(
+            mission_work_dir,
+            "/bin/sh",
+            &[
+                "-c".to_string(),
+                r#"mkdir -p "${HOME:-/root}/.gemini""#.to_string(),
+            ],
+            std::collections::HashMap::new(),
+        )
+        .await;
+    if let Err(e) = &gemini_dir_result {
+        tracing::warn!("Failed to create ~/.gemini directory: {}", e);
+    }
+
+    // Configure auth in the container based on credential type
+    let api_key = match &gemini_creds {
+        GeminiCredentials::ApiKey(key) => {
+            // Write settings.json for API key auth
+            if let Err(e) = workspace_exec
+                .output(
+                    mission_work_dir,
+                    "/bin/sh",
+                    &[
+                        "-c".to_string(),
+                        r#"echo '{"security":{"auth":{"selectedType":"gemini-api-key"}}}' > "${HOME:-/root}/.gemini/settings.json""#.to_string(),
+                    ],
+                    std::collections::HashMap::new(),
+                )
+                .await
+            {
+                tracing::warn!("Failed to write Gemini settings.json: {}", e);
+            }
+            Some(key.clone())
+        }
+        GeminiCredentials::OAuth {
+            access_token,
+            refresh_token,
+            expires_at,
+        } => {
+            // Write settings.json for OAuth auth
+            if let Err(e) = workspace_exec
+                .output(
+                    mission_work_dir,
+                    "/bin/sh",
+                    &[
+                        "-c".to_string(),
+                        r#"echo '{"security":{"auth":{"selectedType":"oauth-personal"}}}' > "${HOME:-/root}/.gemini/settings.json""#.to_string(),
+                    ],
+                    std::collections::HashMap::new(),
+                )
+                .await
+            {
+                tracing::warn!("Failed to write Gemini settings.json for OAuth: {}", e);
+            }
+            // Write OAuth credentials file for the CLI to pick up
+            let oauth_creds = serde_json::json!({
+                "access_token": access_token,
+                "refresh_token": refresh_token,
+                "token_type": "Bearer",
+                "expiry_date": expires_at
+            });
+            let creds_json = serde_json::to_string(&oauth_creds).unwrap_or_default();
+            // Escape single quotes in the JSON for shell
+            let escaped = creds_json.replace('\'', "'\\''");
+            if let Err(e) = workspace_exec
+                .output(
+                    mission_work_dir,
+                    "/bin/sh",
+                    &[
+                        "-c".to_string(),
+                        format!(
+                            r#"echo '{}' > "${{HOME:-/root}}/.gemini/oauth_creds.json""#,
+                            escaped
+                        ),
+                    ],
+                    std::collections::HashMap::new(),
+                )
+                .await
+            {
+                tracing::warn!("Failed to write Gemini OAuth credentials: {}", e);
+            }
+            // Don't set GEMINI_API_KEY for OAuth - the CLI uses its own credential store
+            None
+        }
+        GeminiCredentials::None => None,
+    };
+
+    tracing::info!(
+        mission_id = %mission_id,
+        workspace_type = ?workspace.workspace_type,
+        cli_path = %cli_path,
+        model = ?model,
+        has_api_key = api_key.is_some(),
+        auth_type = ?gemini_creds.auth_type_str(),
+        "Starting Gemini CLI execution via WorkspaceExec"
+    );
+
+    let gemini_config = crate::backend::gemini::client::GeminiConfig {
+        cli_path,
+        api_key,
+        default_model: resolved_model.clone(),
+        force_file_storage: matches!(gemini_creds, GeminiCredentials::OAuth { .. }),
+    };
+
+    let backend = GeminiBackend::with_config_and_workspace(gemini_config, workspace_exec);
+
+    // Create session
+    let session = match backend
+        .create_session(SessionConfig {
+            directory: mission_work_dir.to_string_lossy().to_string(),
+            title: Some(format!("Mission {}", mission_id)),
+            model: resolved_model.clone(),
+            agent: agent.map(|s| s.to_string()),
+        })
+        .await
+    {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!("Failed to create Gemini session: {}", e);
+            return AgentResult::failure(format!("Failed to start Gemini CLI: {}", e), 0)
+                .with_terminal_reason(TerminalReason::LlmError);
+        }
+    };
+
+    // Send message streaming
+    let (mut event_rx, handle) = match backend.send_message_streaming(&session, user_message).await
+    {
+        Ok(result) => result,
+        Err(e) => {
+            tracing::error!("Failed to send message to Gemini CLI: {}", e);
+            return AgentResult::failure(format!("Gemini CLI execution failed: {}", e), 0)
+                .with_terminal_reason(TerminalReason::LlmError);
+        }
+    };
+
+    // Process events until completion or cancellation
+    let mut assistant_message = String::new();
+    let mut success = false;
+    let mut error_message: Option<String> = None;
+    let mut pending_tools: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    let mut thinking_emitted = false;
+    let mut thinking_done_emitted = false;
+    let mut total_input_tokens: u64 = 0;
+    let mut total_output_tokens: u64 = 0;
+
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => {
+                tracing::info!("Gemini turn cancelled for mission {}", mission_id);
+                // Abort the event-conversion task; dropping it also drops the
+                // inner ProcessHandle which owns the child process.
+                handle.abort();
+                return AgentResult::failure("Mission cancelled".to_string(), 0)
+                    .with_terminal_reason(TerminalReason::Cancelled);
+            }
+            Some(event) = event_rx.recv() => {
+                match event {
+                    ExecutionEvent::TextDelta { content } => {
+                        assistant_message.push_str(&content);
+                        let _ = events_tx.send(AgentEvent::TextDelta {
+                            content,
+                            mission_id: Some(mission_id),
+                        });
+                    }
+                    ExecutionEvent::Thinking { content } => {
+                        let _ = events_tx.send(AgentEvent::Thinking {
+                            content,
+                            done: false,
+                            mission_id: Some(mission_id),
+                        });
+                        thinking_emitted = true;
+                    }
+                    ExecutionEvent::ToolCall { id, name, args } => {
+                        pending_tools.insert(id.clone(), name.clone());
+                        let _ = events_tx.send(AgentEvent::ToolCall {
+                            tool_call_id: id,
+                            name,
+                            args,
+                            mission_id: Some(mission_id),
+                        });
+                    }
+                    ExecutionEvent::ToolResult { id, name, result } => {
+                        pending_tools.remove(&id);
+                        let _ = events_tx.send(AgentEvent::ToolResult {
+                            tool_call_id: id,
+                            name,
+                            result,
+                            mission_id: Some(mission_id),
+                        });
+                    }
+                    ExecutionEvent::TurnSummary { content } => {
+                        if !content.trim().is_empty() {
+                            tracing::debug!("Gemini turn summary: {}", content);
+                        }
+                    }
+                    ExecutionEvent::Usage { input_tokens, output_tokens } => {
+                        total_input_tokens = total_input_tokens.saturating_add(input_tokens);
+                        total_output_tokens = total_output_tokens.saturating_add(output_tokens);
+                    }
+                    ExecutionEvent::Error { message } => {
+                        error_message = Some(message.clone());
+                        tracing::error!("Gemini CLI error: {}", message);
+                    }
+                    ExecutionEvent::MessageComplete { session_id: _ } => {
+                        success = error_message.is_none();
+                        break;
+                    }
+                }
+            }
+            else => {
+                break;
+            }
+        }
+    }
+
+    if !thinking_emitted {
+        if let Some((thought, cleaned)) = extract_thought_line(&assistant_message) {
+            let _ = events_tx.send(AgentEvent::Thinking {
+                content: thought,
+                done: true,
+                mission_id: Some(mission_id),
+            });
+            thinking_emitted = true;
+            thinking_done_emitted = true;
+            assistant_message = cleaned;
+        }
+    }
+
+    if thinking_emitted && !thinking_done_emitted {
+        let _ = events_tx.send(AgentEvent::Thinking {
+            content: String::new(),
+            done: true,
+            mission_id: Some(mission_id),
+        });
+    }
+
+    let no_output = assistant_message.trim().is_empty();
+    if no_output && error_message.is_none() {
+        success = false;
+        error_message = Some(
+            "Gemini CLI produced no output. Check that the Gemini CLI is installed and configured with valid credentials (GEMINI_API_KEY or Google OAuth)."
+                .to_string(),
+        );
+    }
+
+    let final_message = if let Some(err) = error_message {
+        err
+    } else if !assistant_message.is_empty() {
+        assistant_message
+    } else {
+        "No response from Gemini CLI".to_string()
+    };
+
+    let usage = crate::cost::TokenUsage {
+        input_tokens: total_input_tokens,
+        output_tokens: total_output_tokens,
+        cache_creation_input_tokens: None,
+        cache_read_input_tokens: None,
+    };
+
+    let model_for_cost = resolved_model.as_deref();
+    let (cost_cents, cost_source) = resolve_cost_cents_and_source(None, model_for_cost, &usage);
+
+    let mut result = if success {
+        AgentResult::success(final_message, cost_cents)
+            .with_terminal_reason(TerminalReason::TurnComplete)
+    } else {
+        let reason = if is_rate_limited_error(&final_message) {
+            TerminalReason::RateLimited
+        } else {
+            TerminalReason::LlmError
+        };
+        AgentResult::failure(final_message, cost_cents).with_terminal_reason(reason)
+    };
+
+    result = result.with_cost_source(cost_source);
+    if usage.has_usage() {
+        result = result.with_usage(usage);
+    }
+    if let Some(m) = resolved_model.as_deref() {
+        result = result.with_model(m.to_string());
+    }
+
+    result
+}
+
+/// Credentials for the Gemini CLI backend.
+#[derive(Debug)]
+enum GeminiCredentials {
+    /// A Gemini API key (from ai_providers.json or GEMINI_API_KEY env var)
+    ApiKey(String),
+    /// Google OAuth credentials (access token + refresh token from credentials store)
+    OAuth {
+        access_token: String,
+        refresh_token: String,
+        expires_at: i64,
+    },
+    /// No credentials found
+    None,
+}
+
+impl GeminiCredentials {
+    fn auth_type_str(&self) -> &'static str {
+        match self {
+            GeminiCredentials::ApiKey(_) => "api-key",
+            GeminiCredentials::OAuth { .. } => "oauth",
+            GeminiCredentials::None => "none",
+        }
+    }
+}
+
+/// Get Google credentials for the Gemini CLI backend.
+///
+/// Checks (in order):
+/// 1. Environment variables (GEMINI_API_KEY, GOOGLE_API_KEY, etc.)
+/// 2. AI provider store for a Google provider with an API key
+/// 3. Sandboxed-sh credentials store for Google OAuth credentials
+/// 4. OpenCode's auth.json for Google API key or OAuth credentials
+fn get_google_credentials_for_gemini(working_dir: &std::path::Path) -> GeminiCredentials {
+    // 1. Check environment variables first (most explicit)
+    if let Some(key) = env_google_api_key() {
+        return GeminiCredentials::ApiKey(key);
+    }
+
+    // Read provider_backends.json to check backend targeting.
+    // If the Google provider has use_for_backends configured but "gemini" is
+    // not included, skip using credentials from that provider.
+    let backends_path = working_dir
+        .join(".sandboxed-sh")
+        .join("provider_backends.json");
+    let google_targets_gemini = if let Ok(data) = std::fs::read_to_string(&backends_path) {
+        if let Ok(map) = serde_json::from_str::<serde_json::Value>(&data) {
+            match map.get("google").and_then(|v| v.as_array()) {
+                Some(backends) => backends.iter().any(|b| b.as_str() == Some("gemini")),
+                // No entry for google means no explicit targeting; allow by default
+                None => true,
+            }
+        } else {
+            true
+        }
+    } else {
+        // No backends state file; allow by default
+        true
+    };
+
+    if !google_targets_gemini {
+        tracing::info!(
+            "Google provider does not target 'gemini' backend; skipping provider credentials"
+        );
+        return GeminiCredentials::None;
+    }
+
+    // 2. Try to get API key from the AI provider store
+    let store_path = working_dir.join(crate::util::AI_PROVIDERS_PATH);
+    if let Ok(store) = std::fs::read_to_string(&store_path) {
+        if let Ok(providers) = serde_json::from_str::<serde_json::Value>(&store) {
+            if let Some(providers_arr) = providers.as_array() {
+                for provider in providers_arr {
+                    let pt = match provider.get("provider_type").and_then(|v| v.as_str()) {
+                        Some(t) => t,
+                        None => continue,
+                    };
+                    if pt != "google" {
+                        continue;
+                    }
+                    let enabled = provider
+                        .get("enabled")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(true);
+                    if !enabled {
+                        continue;
+                    }
+                    if let Some(key) = provider.get("api_key").and_then(|v| v.as_str()) {
+                        if !key.is_empty() {
+                            tracing::info!("Using Google API key from ai_providers.json");
+                            return GeminiCredentials::ApiKey(key.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. Try sandboxed-sh credentials store for OAuth
+    if let Some(creds) = read_google_oauth_from_credentials() {
+        return creds;
+    }
+
+    // 4. Try OpenCode's auth.json
+    if let Some(creds) = read_google_credentials_from_opencode_auth() {
+        return creds;
+    }
+
+    GeminiCredentials::None
+}
+
+/// Read Google OAuth credentials from the sandboxed-sh credentials store.
+fn read_google_oauth_from_credentials() -> Option<GeminiCredentials> {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+    let candidates = [
+        std::path::PathBuf::from(&home)
+            .join(".sandboxed-sh")
+            .join("credentials.json"),
+        std::path::PathBuf::from("/var/lib/opencode")
+            .join(".sandboxed-sh")
+            .join("credentials.json"),
+    ];
+    let creds_path = candidates.iter().find(|p| p.exists())?;
+    let contents = std::fs::read_to_string(creds_path).ok()?;
+    let auth: serde_json::Value = serde_json::from_str(&contents).ok()?;
+
+    for key_name in ["google", "gemini"] {
+        let entry = match auth.get(key_name) {
+            Some(e) => e,
+            None => continue,
+        };
+        let access_token = entry.get("access").and_then(|v| v.as_str()).unwrap_or("");
+        let refresh_token = entry.get("refresh").and_then(|v| v.as_str()).unwrap_or("");
+        let expires_at = entry.get("expires").and_then(|v| v.as_i64()).unwrap_or(0);
+
+        if access_token.is_empty() || refresh_token.is_empty() {
+            continue;
+        }
+
+        tracing::info!("Using Google OAuth credentials from credentials.json for Gemini CLI");
+        return Some(GeminiCredentials::OAuth {
+            access_token: access_token.to_string(),
+            refresh_token: refresh_token.to_string(),
+            expires_at,
+        });
+    }
+    None
+}
+
+/// Read Google API key or OAuth credentials from OpenCode's auth.json.
+fn read_google_credentials_from_opencode_auth() -> Option<GeminiCredentials> {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+    let mut candidates = Vec::new();
+    if let Ok(data_home) = std::env::var("XDG_DATA_HOME") {
+        candidates.push(
+            std::path::PathBuf::from(data_home)
+                .join("opencode")
+                .join("auth.json"),
+        );
+    }
+    candidates.push(
+        std::path::PathBuf::from(&home)
+            .join(".local")
+            .join("share")
+            .join("opencode")
+            .join("auth.json"),
+    );
+    candidates.push(
+        std::path::PathBuf::from("/var/lib/opencode")
+            .join(".local")
+            .join("share")
+            .join("opencode")
+            .join("auth.json"),
+    );
+    let auth_path = candidates.iter().find(|p| p.exists())?;
+    let contents = std::fs::read_to_string(auth_path).ok()?;
+    let auth: serde_json::Value = serde_json::from_str(&contents).ok()?;
+
+    for key_name in ["google", "gemini"] {
+        if let Some(entry) = auth.get(key_name) {
+            // Check for API key first
+            for field in ["key", "api_key"] {
+                if let Some(key) = entry.get(field).and_then(|v| v.as_str()) {
+                    if !key.is_empty() {
+                        let entry_type = entry.get("type").and_then(|v| v.as_str());
+                        if entry_type != Some("oauth") {
+                            tracing::info!("Using Google API key from OpenCode auth.json");
+                            return Some(GeminiCredentials::ApiKey(key.to_string()));
+                        }
+                    }
+                }
+            }
+            // Check for OAuth credentials
+            let access = entry.get("access").and_then(|v| v.as_str()).unwrap_or("");
+            let refresh = entry.get("refresh").and_then(|v| v.as_str()).unwrap_or("");
+            let expires = entry.get("expires").and_then(|v| v.as_i64()).unwrap_or(0);
+            if !access.is_empty() && !refresh.is_empty() {
+                tracing::info!(
+                    "Using Google OAuth credentials from OpenCode auth.json for Gemini CLI"
+                );
+                return Some(GeminiCredentials::OAuth {
+                    access_token: access.to_string(),
+                    refresh_token: refresh.to_string(),
+                    expires_at: expires,
+                });
+            }
+        }
+    }
+    None
+}
+
+/// Get Google API key from environment variables.
+fn env_google_api_key() -> Option<String> {
+    for var in [
+        "GEMINI_API_KEY",
+        "GOOGLE_API_KEY",
+        "GOOGLE_GENERATIVE_AI_API_KEY",
+    ] {
+        if let Ok(key) = std::env::var(var) {
+            let key = key.trim().to_string();
+            if !key.is_empty() {
+                return Some(key);
+            }
+        }
+    }
+    None
 }
 
 /// Generate a concise summary of recent conversation turns for session rotation.

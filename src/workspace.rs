@@ -2262,6 +2262,22 @@ pub async fn write_backend_config(
             )
             .await
         }
+        "gemini" => {
+            // Gemini CLI doesn't need its own config format; use OpenCode config
+            // for workspace setup (skills, commands, etc.)
+            write_opencode_config(
+                workspace_dir,
+                mcp_configs,
+                workspace_root,
+                workspace_type,
+                workspace_env,
+                skill_allowlist,
+                command_contents,
+                shared_network,
+                custom_providers,
+            )
+            .await
+        }
         _ => {
             // Unknown backend - write OpenCode config as fallback
             tracing::warn!(
@@ -3378,6 +3394,33 @@ pub async fn prepare_mission_workspace_with_skills_backend(
     } else {
         None
     };
+
+    // Inject MISSION_ID and API_URL into stdio MCP server env vars,
+    // and JWT_SECRET only into the orchestrator MCP (not third-party MCPs).
+    let mcp_configs: Vec<McpServerConfig> = mcp_configs
+        .into_iter()
+        .map(|mut cfg| {
+            if let McpTransport::Stdio { ref mut env, .. } = cfg.transport {
+                env.entry("MISSION_ID".to_string())
+                    .or_insert_with(|| mission_id.to_string());
+                // Use the server's own address so MCPs can reach the API
+                // (including from inside containers where localhost differs).
+                if let Ok(port) = std::env::var("PORT") {
+                    env.entry("API_URL".to_string())
+                        .or_insert_with(|| format!("http://127.0.0.1:{}", port));
+                }
+                // Only forward JWT_SECRET to the orchestrator MCP so it can
+                // mint service tokens.  Other MCPs (including third-party ones)
+                // must not receive this secret.
+                if cfg.name == "orchestrator" {
+                    if let Ok(secret) = std::env::var("JWT_SECRET") {
+                        env.entry("JWT_SECRET".to_string()).or_insert(secret);
+                    }
+                }
+            }
+            cfg
+        })
+        .collect();
 
     write_backend_config(
         &dir,

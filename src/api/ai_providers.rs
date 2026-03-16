@@ -3819,6 +3819,33 @@ pub async fn fetch_anthropic_account_email(access_token: &str) -> Option<String>
         })
 }
 
+/// Fetch account email from Google's userinfo endpoint using an access token.
+///
+/// Calls `GET https://www.googleapis.com/oauth2/v2/userinfo` with the access token.
+/// This is used as a fallback when the Google OAuth id_token doesn't contain an email claim.
+pub async fn fetch_google_account_email(access_token: &str) -> Option<String> {
+    let client = reqwest::Client::new();
+    let resp = client
+        .get("https://www.googleapis.com/oauth2/v2/userinfo")
+        .header("Authorization", format!("Bearer {}", access_token))
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        tracing::debug!(
+            status = %resp.status(),
+            "Google userinfo endpoint returned non-success"
+        );
+        return None;
+    }
+    let data: serde_json::Value = resp.json().await.ok()?;
+    // Only return the email field; do not fall back to "name" which is a
+    // display name, not an email address.
+    data.get("email")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+}
+
 /// Extract account email from an OAuth token response and persist it.
 ///
 /// Tries `id_token` JWT first, then `access_token` JWT, then a plain `email` field.
@@ -6015,15 +6042,50 @@ async fn oauth_callback_inner(
                 tracing::error!("Failed to sync Google credentials to OpenCode: {}", e);
             }
 
-            let account_email = extract_and_save_account_email(
+            let mut account_email = extract_and_save_account_email(
                 &token_data,
                 &state.config.working_dir,
                 provider_type.id(),
                 "Google",
             );
 
+            // Google id_tokens usually contain email, but fall back to userinfo endpoint
+            if account_email.is_none() {
+                if let Some(email) = fetch_google_account_email(access_token).await {
+                    let _ = update_provider_account(
+                        &state.config.working_dir,
+                        provider_type.id(),
+                        email.clone(),
+                    );
+                    account_email = Some(email);
+                }
+            }
+
+            // Save backend targeting if provided in the callback request
             let config_path = get_opencode_config_path(&state.config.working_dir);
-            let opencode_config = read_opencode_config(&config_path).map_err(internal_error)?;
+            let mut opencode_config = read_opencode_config(&config_path).map_err(internal_error)?;
+
+            if let Some(ref backends_list) = req.use_for_backends {
+                set_provider_config_entry(
+                    &mut opencode_config,
+                    provider_type,
+                    None,
+                    None,
+                    None,
+                    req.use_for_backends.clone(),
+                    None,
+                );
+                if let Err(e) = write_opencode_config(&config_path, &opencode_config) {
+                    tracing::error!("Failed to write OpenCode config: {}", e);
+                }
+                if let Err(e) = update_provider_backends(
+                    &state.config.working_dir,
+                    provider_type.id(),
+                    backends_list.clone(),
+                ) {
+                    tracing::error!("Failed to save provider backends: {}", e);
+                }
+            }
             let backends_state = read_provider_backends_state(&state.config.working_dir);
             let default_provider = get_default_provider(&opencode_config);
             let config_entry = get_provider_config_entry(&opencode_config, provider_type);
