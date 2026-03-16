@@ -1892,6 +1892,10 @@ async fn run_mission_turn(
         // The global DEFAULT_MODEL (e.g. claude-opus-4-6) is not valid for
         // Codex.  Clear it so Codex uses its own CLI default.
         config.default_model = None;
+    } else if backend_id == "gemini" && model_override.is_none() {
+        // The global DEFAULT_MODEL (e.g. claude-opus-4-6) is not valid for
+        // Gemini CLI.  Clear it so Gemini uses its own CLI default.
+        config.default_model = None;
     }
     tracing::info!(
         mission_id = %mission_id,
@@ -11478,7 +11482,7 @@ pub async fn run_gemini_turn(
                     "/bin/sh",
                     &[
                         "-c".to_string(),
-                        r#"echo '{"selectedAuthType":"gemini-api-key"}' > /root/.gemini/settings.json"#.to_string(),
+                        r#"echo '{"security":{"auth":{"selectedType":"gemini-api-key"}}}' > /root/.gemini/settings.json"#.to_string(),
                     ],
                     std::collections::HashMap::new(),
                 )
@@ -11497,7 +11501,7 @@ pub async fn run_gemini_turn(
                     "/bin/sh",
                     &[
                         "-c".to_string(),
-                        r#"echo '{"selectedAuthType":"oauth-personal"}' > /root/.gemini/settings.json"#.to_string(),
+                        r#"echo '{"security":{"auth":{"selectedType":"oauth-personal"}}}' > /root/.gemini/settings.json"#.to_string(),
                     ],
                     std::collections::HashMap::new(),
                 )
