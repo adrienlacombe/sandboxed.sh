@@ -17,6 +17,7 @@ import { oneDark } from "react-syntax-highlighter/dist/esm/styles/prism";
 import { LazyJsonHighlighter } from "@/components/lazy-json-highlighter";
 import { cn } from "@/lib/utils";
 import { getMissionShortName } from "@/lib/mission-display";
+import { inferMissionRole } from "@/lib/mission-role";
 import { getRuntimeApiBase } from "@/lib/settings";
 import { authHeader } from "@/lib/auth";
 import {
@@ -6433,6 +6434,7 @@ export default function ControlClient() {
     if (!activeMission) return [];
     return recentMissions.filter((m) => m.parent_mission_id === activeMission.id);
   }, [activeMission, recentMissions]);
+  const activeMissionRole = activeMission ? inferMissionRole(activeMission) : null;
 
   // Determine if we should show the resume UI for interrupted/blocked/failed missions
   // Don't show resume UI if:
@@ -6905,7 +6907,7 @@ export default function ControlClient() {
                   )}
 
                   {/* Orchestrator: Boss with workers */}
-                  {childMissions.length > 0 && (
+                  {(childMissions.length > 0 || activeMissionRole === "boss") && (
                     <div className="mt-2 pt-2 border-t border-white/[0.06] space-y-1 text-xs">
                       <div className="flex items-center justify-between gap-2">
                         <span className="text-white/40">Role</span>
@@ -6915,28 +6917,30 @@ export default function ControlClient() {
                         <span className="text-white/40">Workers</span>
                         <span className="font-mono text-[11px] text-white/60">{childMissions.length}</span>
                       </div>
-                      <div className="space-y-0.5 max-h-[120px] overflow-y-auto">
-                        {childMissions.map((w) => (
-                          <a
-                            key={w.id}
-                            href={`/control?mission=${w.id}`}
-                            className="flex items-center gap-1.5 rounded px-1 py-0.5 hover:bg-white/[0.04] transition-colors"
-                          >
-                            <span className={cn(
-                              "h-1.5 w-1.5 rounded-full shrink-0",
-                              w.status === "active" && "bg-indigo-400",
-                              w.status === "completed" && "bg-emerald-400",
-                              w.status === "failed" && "bg-red-400",
-                              w.status === "interrupted" && "bg-amber-400",
-                              w.status === "not_feasible" && "bg-rose-400",
-                              !["active", "completed", "failed", "interrupted", "not_feasible"].includes(w.status) && "bg-white/30"
-                            )} />
-                            <span className="font-mono text-[11px] text-white/70 truncate">
-                              {w.title || w.id.slice(0, 8)}
-                            </span>
-                          </a>
-                        ))}
-                      </div>
+                      {childMissions.length > 0 && (
+                        <div className="space-y-0.5 max-h-[120px] overflow-y-auto">
+                          {childMissions.map((w) => (
+                            <a
+                              key={w.id}
+                              href={`/control?mission=${w.id}`}
+                              className="flex items-center gap-1.5 rounded px-1 py-0.5 hover:bg-white/[0.04] transition-colors"
+                            >
+                              <span className={cn(
+                                "h-1.5 w-1.5 rounded-full shrink-0",
+                                w.status === "active" && "bg-indigo-400",
+                                w.status === "completed" && "bg-emerald-400",
+                                w.status === "failed" && "bg-red-400",
+                                w.status === "interrupted" && "bg-amber-400",
+                                w.status === "not_feasible" && "bg-rose-400",
+                                !["active", "completed", "failed", "interrupted", "not_feasible"].includes(w.status) && "bg-white/30"
+                              )} />
+                              <span className="font-mono text-[11px] text-white/70 truncate">
+                                {w.title || w.id.slice(0, 8)}
+                              </span>
+                            </a>
+                          ))}
+                        </div>
+                      )}
                     </div>
                   )}
 

@@ -11462,31 +11462,41 @@ pub async fn run_gemini_turn(
             }
         };
 
-    // Ensure ~/.gemini directory exists (gemini CLI needs it for projects.json and settings)
-    let _ = workspace_exec
+    // Ensure ~/.gemini directory exists (gemini CLI needs it for projects.json and settings).
+    // Use $HOME so this works for non-root users in host workspaces.
+    let gemini_dir_result = workspace_exec
         .output(
             mission_work_dir,
             "/bin/sh",
-            &["-c".to_string(), "mkdir -p /root/.gemini".to_string()],
+            &[
+                "-c".to_string(),
+                r#"mkdir -p "${HOME:-/root}/.gemini""#.to_string(),
+            ],
             std::collections::HashMap::new(),
         )
         .await;
+    if let Err(e) = &gemini_dir_result {
+        tracing::warn!("Failed to create ~/.gemini directory: {}", e);
+    }
 
     // Configure auth in the container based on credential type
     let api_key = match &gemini_creds {
         GeminiCredentials::ApiKey(key) => {
             // Write settings.json for API key auth
-            let _ = workspace_exec
+            if let Err(e) = workspace_exec
                 .output(
                     mission_work_dir,
                     "/bin/sh",
                     &[
                         "-c".to_string(),
-                        r#"echo '{"security":{"auth":{"selectedType":"gemini-api-key"}}}' > /root/.gemini/settings.json"#.to_string(),
+                        r#"echo '{"security":{"auth":{"selectedType":"gemini-api-key"}}}' > "${HOME:-/root}/.gemini/settings.json""#.to_string(),
                     ],
                     std::collections::HashMap::new(),
                 )
-                .await;
+                .await
+            {
+                tracing::warn!("Failed to write Gemini settings.json: {}", e);
+            }
             Some(key.clone())
         }
         GeminiCredentials::OAuth {
@@ -11495,17 +11505,20 @@ pub async fn run_gemini_turn(
             expires_at,
         } => {
             // Write settings.json for OAuth auth
-            let _ = workspace_exec
+            if let Err(e) = workspace_exec
                 .output(
                     mission_work_dir,
                     "/bin/sh",
                     &[
                         "-c".to_string(),
-                        r#"echo '{"security":{"auth":{"selectedType":"oauth-personal"}}}' > /root/.gemini/settings.json"#.to_string(),
+                        r#"echo '{"security":{"auth":{"selectedType":"oauth-personal"}}}' > "${HOME:-/root}/.gemini/settings.json""#.to_string(),
                     ],
                     std::collections::HashMap::new(),
                 )
-                .await;
+                .await
+            {
+                tracing::warn!("Failed to write Gemini settings.json for OAuth: {}", e);
+            }
             // Write OAuth credentials file for the CLI to pick up
             let oauth_creds = serde_json::json!({
                 "access_token": access_token,
@@ -11516,17 +11529,23 @@ pub async fn run_gemini_turn(
             let creds_json = serde_json::to_string(&oauth_creds).unwrap_or_default();
             // Escape single quotes in the JSON for shell
             let escaped = creds_json.replace('\'', "'\\''");
-            let _ = workspace_exec
+            if let Err(e) = workspace_exec
                 .output(
                     mission_work_dir,
                     "/bin/sh",
                     &[
                         "-c".to_string(),
-                        format!("echo '{}' > /root/.gemini/oauth_creds.json", escaped),
+                        format!(
+                            r#"echo '{}' > "${{HOME:-/root}}/.gemini/oauth_creds.json""#,
+                            escaped
+                        ),
                     ],
                     std::collections::HashMap::new(),
                 )
-                .await;
+                .await
+            {
+                tracing::warn!("Failed to write Gemini OAuth credentials: {}", e);
+            }
             // Don't set GEMINI_API_KEY for OAuth - the CLI uses its own credential store
             None
         }
@@ -11571,7 +11590,7 @@ pub async fn run_gemini_turn(
     };
 
     // Send message streaming
-    let (mut event_rx, _handle) = match backend.send_message_streaming(&session, user_message).await
+    let (mut event_rx, handle) = match backend.send_message_streaming(&session, user_message).await
     {
         Ok(result) => result,
         Err(e) => {
@@ -11596,6 +11615,9 @@ pub async fn run_gemini_turn(
         tokio::select! {
             _ = cancel.cancelled() => {
                 tracing::info!("Gemini turn cancelled for mission {}", mission_id);
+                // Abort the event-conversion task; dropping it also drops the
+                // inner ProcessHandle which owns the child process.
+                handle.abort();
                 return AgentResult::failure("Mission cancelled".to_string(), 0)
                     .with_terminal_reason(TerminalReason::Cancelled);
             }
@@ -11768,6 +11790,33 @@ fn get_google_credentials_for_gemini(working_dir: &std::path::Path) -> GeminiCre
         return GeminiCredentials::ApiKey(key);
     }
 
+    // Read provider_backends.json to check backend targeting.
+    // If the Google provider has use_for_backends configured but "gemini" is
+    // not included, skip using credentials from that provider.
+    let backends_path = working_dir
+        .join(".sandboxed-sh")
+        .join("provider_backends.json");
+    let google_targets_gemini = if let Ok(data) = std::fs::read_to_string(&backends_path) {
+        if let Ok(map) = serde_json::from_str::<serde_json::Value>(&data) {
+            match map.get("google").and_then(|v| v.as_array()) {
+                Some(backends) => backends.iter().any(|b| b.as_str() == Some("gemini")),
+                // No entry for google means no explicit targeting; allow by default
+                None => true,
+            }
+        } else {
+            true
+        }
+    } else {
+        // No backends state file; allow by default
+        true
+    };
+
+    if !google_targets_gemini {
+        tracing::info!(
+            "Google provider does not target 'gemini' backend; skipping provider credentials"
+        );
+        return GeminiCredentials::None;
+    }
     // 2. Try to get API key from the AI provider store
     let store_path = working_dir.join(crate::util::AI_PROVIDERS_PATH);
     if let Ok(store) = std::fs::read_to_string(&store_path) {

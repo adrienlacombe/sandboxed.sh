@@ -41,6 +41,7 @@ import {
   getMissionTitle,
   type MissionCategory,
 } from '@/lib/mission-status';
+import { inferMissionRole } from '@/lib/mission-role';
 import { getStatusIcon } from '@/components/ui/status-icons';
 
 interface Column {
@@ -242,6 +243,7 @@ function OverviewPageContent() {
     const ids = new Set<string>();
     for (const m of missions) {
       if (m.parent_mission_id) ids.add(m.parent_mission_id);
+      if (inferMissionRole(m) === 'boss') ids.add(m.id);
     }
     return ids;
   }, [missions]);
