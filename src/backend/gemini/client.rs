@@ -20,6 +20,10 @@ pub struct GeminiConfig {
     pub cli_path: String,
     pub api_key: Option<String>,
     pub default_model: Option<String>,
+    /// When true, set GEMINI_FORCE_FILE_STORAGE=true so the CLI uses
+    /// file-based token storage (for OAuth credentials written to
+    /// ~/.gemini/oauth_creds.json) instead of the system keychain.
+    pub force_file_storage: bool,
 }
 
 impl Default for GeminiConfig {
@@ -28,6 +32,7 @@ impl Default for GeminiConfig {
             cli_path: std::env::var("GEMINI_CLI_PATH").unwrap_or_else(|_| "gemini".to_string()),
             api_key: std::env::var("GEMINI_API_KEY").ok(),
             default_model: None,
+            force_file_storage: false,
         }
     }
 }
@@ -79,6 +84,12 @@ impl GeminiClient {
         if let Some(ref key) = self.config.api_key {
             env.insert("GEMINI_API_KEY".to_string(), key.clone());
             debug!("Using API key for Gemini CLI authentication");
+        }
+
+        // Force file-based token storage for OAuth credentials
+        if self.config.force_file_storage {
+            env.insert("GEMINI_FORCE_FILE_STORAGE".to_string(), "true".to_string());
+            debug!("Forcing file-based token storage for Gemini CLI OAuth");
         }
 
         // Model selection

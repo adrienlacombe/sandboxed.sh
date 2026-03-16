@@ -11425,10 +11425,18 @@ pub async fn run_gemini_turn(
         "Starting Gemini CLI turn"
     );
 
-    // Get Google API key from AI provider store
-    let api_key = get_google_api_key_for_gemini(app_working_dir);
-    if api_key.is_none() {
-        tracing::warn!("No Google API key found for Gemini CLI; will rely on CLI's own auth");
+    // Get Google credentials for Gemini CLI
+    let gemini_creds = get_google_credentials_for_gemini(app_working_dir);
+    match &gemini_creds {
+        GeminiCredentials::ApiKey(k) => {
+            tracing::info!("Using Gemini API key (prefix: {}...)", &k[..k.len().min(8)]);
+        }
+        GeminiCredentials::OAuth { .. } => {
+            tracing::info!("Using Google OAuth credentials for Gemini CLI");
+        }
+        GeminiCredentials::None => {
+            tracing::warn!("No Google credentials found for Gemini CLI; will rely on CLI's own auth");
+        }
     }
 
     let workspace_exec = WorkspaceExec::new(workspace.clone());
@@ -11460,20 +11468,66 @@ pub async fn run_gemini_turn(
         )
         .await;
 
-    // Write settings.json so CLI uses API key / access token auth via GEMINI_API_KEY env var
-    if api_key.is_some() {
-        let _ = workspace_exec
-            .output(
-                mission_work_dir,
-                "/bin/sh",
-                &[
-                    "-c".to_string(),
-                    r#"test -f /root/.gemini/settings.json || echo '{"selectedAuthType":"gemini-api-key"}' > /root/.gemini/settings.json"#.to_string(),
-                ],
-                std::collections::HashMap::new(),
-            )
-            .await;
-    }
+    // Configure auth in the container based on credential type
+    let api_key = match &gemini_creds {
+        GeminiCredentials::ApiKey(key) => {
+            // Write settings.json for API key auth
+            let _ = workspace_exec
+                .output(
+                    mission_work_dir,
+                    "/bin/sh",
+                    &[
+                        "-c".to_string(),
+                        r#"echo '{"selectedAuthType":"gemini-api-key"}' > /root/.gemini/settings.json"#.to_string(),
+                    ],
+                    std::collections::HashMap::new(),
+                )
+                .await;
+            Some(key.clone())
+        }
+        GeminiCredentials::OAuth {
+            access_token,
+            refresh_token,
+            expires_at,
+        } => {
+            // Write settings.json for OAuth auth
+            let _ = workspace_exec
+                .output(
+                    mission_work_dir,
+                    "/bin/sh",
+                    &[
+                        "-c".to_string(),
+                        r#"echo '{"selectedAuthType":"oauth-personal"}' > /root/.gemini/settings.json"#.to_string(),
+                    ],
+                    std::collections::HashMap::new(),
+                )
+                .await;
+            // Write OAuth credentials file for the CLI to pick up
+            let oauth_creds = serde_json::json!({
+                "access_token": access_token,
+                "refresh_token": refresh_token,
+                "token_type": "Bearer",
+                "expiry_date": expires_at
+            });
+            let creds_json = serde_json::to_string(&oauth_creds).unwrap_or_default();
+            // Escape single quotes in the JSON for shell
+            let escaped = creds_json.replace('\'', "'\\''");
+            let _ = workspace_exec
+                .output(
+                    mission_work_dir,
+                    "/bin/sh",
+                    &[
+                        "-c".to_string(),
+                        format!("echo '{}' > /root/.gemini/oauth_creds.json", escaped),
+                    ],
+                    std::collections::HashMap::new(),
+                )
+                .await;
+            // Don't set GEMINI_API_KEY for OAuth - the CLI uses its own credential store
+            None
+        }
+        GeminiCredentials::None => None,
+    };
 
     tracing::info!(
         mission_id = %mission_id,
@@ -11481,6 +11535,7 @@ pub async fn run_gemini_turn(
         cli_path = %cli_path,
         model = ?model,
         has_api_key = api_key.is_some(),
+        auth_type = ?gemini_creds.auth_type_str(),
         "Starting Gemini CLI execution via WorkspaceExec"
     );
 
@@ -11488,6 +11543,7 @@ pub async fn run_gemini_turn(
         cli_path,
         api_key,
         default_model: resolved_model.clone(),
+        force_file_storage: matches!(gemini_creds, GeminiCredentials::OAuth { .. }),
     };
 
     let backend = GeminiBackend::with_config_and_workspace(gemini_config, workspace_exec);
@@ -11670,15 +11726,45 @@ pub async fn run_gemini_turn(
     result
 }
 
-/// Get Google API key or OAuth access token for the Gemini CLI backend.
+/// Credentials for the Gemini CLI backend.
+#[derive(Debug)]
+enum GeminiCredentials {
+    /// A Gemini API key (from ai_providers.json or GEMINI_API_KEY env var)
+    ApiKey(String),
+    /// Google OAuth credentials (access token + refresh token from credentials store)
+    OAuth {
+        access_token: String,
+        refresh_token: String,
+        expires_at: i64,
+    },
+    /// No credentials found
+    None,
+}
+
+impl GeminiCredentials {
+    fn auth_type_str(&self) -> &'static str {
+        match self {
+            GeminiCredentials::ApiKey(_) => "api-key",
+            GeminiCredentials::OAuth { .. } => "oauth",
+            GeminiCredentials::None => "none",
+        }
+    }
+}
+
+/// Get Google credentials for the Gemini CLI backend.
 ///
 /// Checks (in order):
-/// 1. AI provider store for a Google provider with an API key
-/// 2. Sandboxed-sh credentials store for a Google OAuth access token
-/// 3. OpenCode's auth.json for a Google API key or access token
-/// 4. Environment variables (GEMINI_API_KEY, GOOGLE_API_KEY, etc.)
-fn get_google_api_key_for_gemini(working_dir: &std::path::Path) -> Option<String> {
-    // 1. Try to get API key from the AI provider store
+/// 1. Environment variables (GEMINI_API_KEY, GOOGLE_API_KEY, etc.)
+/// 2. AI provider store for a Google provider with an API key
+/// 3. Sandboxed-sh credentials store for Google OAuth credentials
+/// 4. OpenCode's auth.json for Google API key or OAuth credentials
+fn get_google_credentials_for_gemini(working_dir: &std::path::Path) -> GeminiCredentials {
+    // 1. Check environment variables first (most explicit)
+    if let Some(key) = env_google_api_key() {
+        return GeminiCredentials::ApiKey(key);
+    }
+
+    // 2. Try to get API key from the AI provider store
     let store_path = working_dir.join(crate::util::AI_PROVIDERS_PATH);
     if let Ok(store) = std::fs::read_to_string(&store_path) {
         if let Ok(providers) = serde_json::from_str::<serde_json::Value>(&store) {
@@ -11698,38 +11784,32 @@ fn get_google_api_key_for_gemini(working_dir: &std::path::Path) -> Option<String
                     if !enabled {
                         continue;
                     }
-                    // Try API key first
                     if let Some(key) = provider.get("api_key").and_then(|v| v.as_str()) {
                         if !key.is_empty() {
                             tracing::info!("Using Google API key from ai_providers.json");
-                            return Some(key.to_string());
+                            return GeminiCredentials::ApiKey(key.to_string());
                         }
                     }
                 }
             }
         }
-    } else {
-        tracing::debug!("No AI providers file found at {:?}", store_path);
     }
 
-    // 2. Try sandboxed-sh credentials store (has Google OAuth access token)
-    if let Some(key) = read_google_access_token_from_credentials() {
-        return Some(key);
+    // 3. Try sandboxed-sh credentials store for OAuth
+    if let Some(creds) = read_google_oauth_from_credentials() {
+        return creds;
     }
 
-    // 3. Try OpenCode's auth.json
-    if let Some(key) = read_google_key_from_opencode_auth() {
-        return Some(key);
+    // 4. Try OpenCode's auth.json
+    if let Some(creds) = read_google_credentials_from_opencode_auth() {
+        return creds;
     }
 
-    // 4. Fall back to environment variables
-    env_google_api_key()
+    GeminiCredentials::None
 }
 
-/// Read Google OAuth access token from the sandboxed-sh credentials store.
-/// The credentials store at ~/.sandboxed-sh/credentials.json contains OAuth
-/// tokens in the format: {"google": {"type": "oauth", "access": "ya29...", "refresh": "...", "expires": ...}}
-fn read_google_access_token_from_credentials() -> Option<String> {
+/// Read Google OAuth credentials from the sandboxed-sh credentials store.
+fn read_google_oauth_from_credentials() -> Option<GeminiCredentials> {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
     let candidates = [
         std::path::PathBuf::from(&home)
@@ -11748,34 +11828,28 @@ fn read_google_access_token_from_credentials() -> Option<String> {
             Some(e) => e,
             None => continue,
         };
-        // Check if the token is expired
+        let access_token = entry.get("access").and_then(|v| v.as_str()).unwrap_or("");
+        let refresh_token = entry.get("refresh").and_then(|v| v.as_str()).unwrap_or("");
         let expires_at = entry.get("expires").and_then(|v| v.as_i64()).unwrap_or(0);
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as i64;
-        if expires_at > 0 && expires_at < now_ms {
-            tracing::warn!(
-                "Google OAuth access token in credentials.json is expired (expires_at={}, now={})",
-                expires_at,
-                now_ms
-            );
+
+        if access_token.is_empty() || refresh_token.is_empty() {
             continue;
         }
-        if let Some(access) = entry.get("access").and_then(|v| v.as_str()) {
-            if !access.is_empty() {
-                tracing::info!(
-                    "Using Google OAuth access token from credentials.json for Gemini CLI"
-                );
-                return Some(access.to_string());
-            }
-        }
+
+        tracing::info!(
+            "Using Google OAuth credentials from credentials.json for Gemini CLI"
+        );
+        return Some(GeminiCredentials::OAuth {
+            access_token: access_token.to_string(),
+            refresh_token: refresh_token.to_string(),
+            expires_at,
+        });
     }
     None
 }
 
-/// Read Google API key or access token from OpenCode's auth.json.
-fn read_google_key_from_opencode_auth() -> Option<String> {
+/// Read Google API key or OAuth credentials from OpenCode's auth.json.
+fn read_google_credentials_from_opencode_auth() -> Option<GeminiCredentials> {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
     let mut candidates = Vec::new();
     if let Ok(data_home) = std::env::var("XDG_DATA_HOME") {
@@ -11803,30 +11877,33 @@ fn read_google_key_from_opencode_auth() -> Option<String> {
     let contents = std::fs::read_to_string(auth_path).ok()?;
     let auth: serde_json::Value = serde_json::from_str(&contents).ok()?;
 
-    // Look for google or gemini key in auth.json
     for key_name in ["google", "gemini"] {
         if let Some(entry) = auth.get(key_name) {
             // Check for API key first
-            if let Some(key) = entry.get("key").and_then(|v| v.as_str()) {
-                if !key.is_empty() {
-                    tracing::info!("Using Google API key from OpenCode auth.json");
-                    return Some(key.to_string());
+            for field in ["key", "api_key"] {
+                if let Some(key) = entry.get(field).and_then(|v| v.as_str()) {
+                    if !key.is_empty() {
+                        let entry_type = entry.get("type").and_then(|v| v.as_str());
+                        if entry_type != Some("oauth") {
+                            tracing::info!("Using Google API key from OpenCode auth.json");
+                            return Some(GeminiCredentials::ApiKey(key.to_string()));
+                        }
+                    }
                 }
             }
-            if let Some(key) = entry.get("api_key").and_then(|v| v.as_str()) {
-                if !key.is_empty() {
-                    tracing::info!("Using Google API key from OpenCode auth.json");
-                    return Some(key.to_string());
-                }
-            }
-            // Fall back to OAuth access token
-            if let Some(access) = entry.get("access").and_then(|v| v.as_str()) {
-                if !access.is_empty() {
-                    tracing::info!(
-                        "Using Google OAuth access token from OpenCode auth.json for Gemini CLI"
-                    );
-                    return Some(access.to_string());
-                }
+            // Check for OAuth credentials
+            let access = entry.get("access").and_then(|v| v.as_str()).unwrap_or("");
+            let refresh = entry.get("refresh").and_then(|v| v.as_str()).unwrap_or("");
+            let expires = entry.get("expires").and_then(|v| v.as_i64()).unwrap_or(0);
+            if !access.is_empty() && !refresh.is_empty() {
+                tracing::info!(
+                    "Using Google OAuth credentials from OpenCode auth.json for Gemini CLI"
+                );
+                return Some(GeminiCredentials::OAuth {
+                    access_token: access.to_string(),
+                    refresh_token: refresh.to_string(),
+                    expires_at: expires,
+                });
             }
         }
     }
