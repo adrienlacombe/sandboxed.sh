@@ -286,6 +286,15 @@ fn should_persist_synthetic_thought(candidate: &str, assistant_content: &str) ->
     assistant_content != candidate && !assistant_content.starts_with(candidate)
 }
 
+fn merge_pending_text_delta(existing: &mut String, content: &str) {
+    if content.starts_with(existing.as_str()) {
+        existing.clear();
+        existing.push_str(content);
+    } else {
+        existing.push_str(content);
+    }
+}
+
 fn synthetic_thought_from_text_delta(
     pending_text_deltas: &mut HashMap<Uuid, String>,
     mission_id: Uuid,
@@ -296,7 +305,10 @@ fn synthetic_thought_from_text_delta(
             if content.trim().is_empty() {
                 pending_text_deltas.remove(&mission_id);
             } else {
-                pending_text_deltas.insert(mission_id, content.clone());
+                pending_text_deltas
+                    .entry(mission_id)
+                    .and_modify(|existing| merge_pending_text_delta(existing, content))
+                    .or_insert_with(|| content.clone());
             }
             None
         }
@@ -9408,6 +9420,62 @@ mod tests {
             Some("Now let me run the build to see how many errors remain.".to_string())
         );
         assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn synthetic_thought_from_text_delta_accumulates_incremental_fragments() {
+        let mission_id = Uuid::new_v4();
+        let mut pending = HashMap::new();
+
+        let first = AgentEvent::TextDelta {
+            content: "Now let me run ".to_string(),
+            mission_id: Some(mission_id),
+        };
+        let second = AgentEvent::TextDelta {
+            content: "the build.".to_string(),
+            mission_id: Some(mission_id),
+        };
+        let tool_call = AgentEvent::ToolCall {
+            tool_call_id: "tool-1".to_string(),
+            name: "Bash".to_string(),
+            args: serde_json::json!({ "command": "cargo test" }),
+            mission_id: Some(mission_id),
+        };
+
+        let _ = synthetic_thought_from_text_delta(&mut pending, mission_id, &first);
+        let _ = synthetic_thought_from_text_delta(&mut pending, mission_id, &second);
+        assert_eq!(
+            synthetic_thought_from_text_delta(&mut pending, mission_id, &tool_call),
+            Some("Now let me run the build.".to_string())
+        );
+    }
+
+    #[test]
+    fn synthetic_thought_from_text_delta_replaces_accumulated_fragments() {
+        let mission_id = Uuid::new_v4();
+        let mut pending = HashMap::new();
+
+        let first = AgentEvent::TextDelta {
+            content: "Now let me run".to_string(),
+            mission_id: Some(mission_id),
+        };
+        let second = AgentEvent::TextDelta {
+            content: "Now let me run the build".to_string(),
+            mission_id: Some(mission_id),
+        };
+        let tool_call = AgentEvent::ToolCall {
+            tool_call_id: "tool-1".to_string(),
+            name: "Bash".to_string(),
+            args: serde_json::json!({ "command": "cargo test" }),
+            mission_id: Some(mission_id),
+        };
+
+        let _ = synthetic_thought_from_text_delta(&mut pending, mission_id, &first);
+        let _ = synthetic_thought_from_text_delta(&mut pending, mission_id, &second);
+        assert_eq!(
+            synthetic_thought_from_text_delta(&mut pending, mission_id, &tool_call),
+            Some("Now let me run the build".to_string())
+        );
     }
 
     #[test]

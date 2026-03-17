@@ -1888,10 +1888,16 @@ struct ControlView: View {
         }) {
             let existing = messages[index]
             let startTime = existing.thinkingStartTime ?? existing.timestamp
+            let mergedContent: String
+            if content.hasPrefix(existing.content) {
+                mergedContent = content
+            } else {
+                mergedContent = existing.content + content
+            }
             messages[index] = ChatMessage(
                 id: existing.id,
                 type: .thinking(done: done, startTime: startTime),
-                content: content,
+                content: mergedContent,
                 toolUI: existing.toolUI,
                 toolData: existing.toolData,
                 timestamp: existing.timestamp
@@ -2046,7 +2052,7 @@ struct ControlView: View {
             }
 
         case "text_delta":
-            if let content = data["content"] as? String {
+            if !isHistoricalReplay, let content = data["content"] as? String {
                 upsertStreamingFallbackThought(content: content, done: false)
             }
             
