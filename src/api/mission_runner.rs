@@ -8875,10 +8875,19 @@ pub async fn run_opencode_turn(
         escaped
     };
 
+    let use_plain_opencode = workspace
+        .config
+        .get("disable_oh_my_opencode")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
     let mut shell_cmd = String::new();
     if runner_is_direct {
         shell_cmd.push_str(&shell_escape(&cli_runner));
         shell_cmd.push_str(" run");
+    } else if use_plain_opencode {
+        shell_cmd.push_str(&shell_escape(&cli_runner));
+        shell_cmd.push_str(" opencode run");
     } else {
         shell_cmd.push_str(&shell_escape(&cli_runner));
         shell_cmd.push_str(" oh-my-opencode run");

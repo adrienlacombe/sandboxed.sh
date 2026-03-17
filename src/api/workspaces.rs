@@ -115,6 +115,8 @@ pub struct UpdateWorkspaceRequest {
     pub mcps: Option<Vec<String>>,
     /// Optional config profile to apply to this workspace.
     pub config_profile: Option<String>,
+    /// Freeform workspace configuration (merged with existing config).
+    pub config: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -137,6 +139,7 @@ pub struct WorkspaceResponse {
     pub tailscale_mode: Option<TailscaleMode>,
     pub mcps: Vec<String>,
     pub config_profile: Option<String>,
+    pub config: serde_json::Value,
 }
 
 impl From<Workspace> for WorkspaceResponse {
@@ -160,6 +163,7 @@ impl From<Workspace> for WorkspaceResponse {
             tailscale_mode: w.tailscale_mode,
             mcps: w.mcps,
             config_profile: w.config_profile,
+            config: w.config,
         }
     }
 }
@@ -635,6 +639,19 @@ async fn update_workspace(
             workspace.config_profile = None;
         } else {
             workspace.config_profile = Some(trimmed.to_string());
+        }
+    }
+
+    // Merge freeform config (shallow merge of top-level keys)
+    if let Some(config) = req.config {
+        if let Some(new_obj) = config.as_object() {
+            let mut existing = workspace.config.as_object().cloned().unwrap_or_default();
+            for (k, v) in new_obj {
+                existing.insert(k.clone(), v.clone());
+            }
+            workspace.config = serde_json::Value::Object(existing);
+        } else {
+            workspace.config = config;
         }
     }
 
