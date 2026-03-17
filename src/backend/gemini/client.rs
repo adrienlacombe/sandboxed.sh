@@ -394,6 +394,13 @@ pub enum GeminiEvent {
         stats: Option<GeminiStats>,
     },
 
+    /// Model thinking/reasoning content.
+    #[serde(rename = "thought")]
+    Thought {
+        #[serde(default)]
+        content: Option<String>,
+    },
+
     /// Catch-all for unknown event types.
     #[serde(other)]
     Unknown,

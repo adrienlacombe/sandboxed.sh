@@ -20,6 +20,10 @@ pub struct GeminiBackend {
     name: String,
     config: Arc<RwLock<GeminiConfig>>,
     workspace_exec: Option<crate::workspace_exec::WorkspaceExec>,
+    /// Handle to the most recently spawned child process, used for kill-on-cancel.
+    #[allow(clippy::type_complexity)]
+    last_child:
+        Arc<tokio::sync::Mutex<Option<Arc<tokio::sync::Mutex<Option<tokio::process::Child>>>>>>,
 }
 
 impl GeminiBackend {
@@ -29,6 +33,7 @@ impl GeminiBackend {
             name: "Gemini CLI".to_string(),
             config: Arc::new(RwLock::new(GeminiConfig::default())),
             workspace_exec: None,
+            last_child: Arc::new(tokio::sync::Mutex::new(None)),
         }
     }
 
@@ -38,6 +43,7 @@ impl GeminiBackend {
             name: "Gemini CLI".to_string(),
             config: Arc::new(RwLock::new(config)),
             workspace_exec: None,
+            last_child: Arc::new(tokio::sync::Mutex::new(None)),
         }
     }
 
@@ -50,6 +56,7 @@ impl GeminiBackend {
             name: "Gemini CLI".to_string(),
             config: Arc::new(RwLock::new(config)),
             workspace_exec: Some(workspace_exec),
+            last_child: Arc::new(tokio::sync::Mutex::new(None)),
         }
     }
 
@@ -62,6 +69,19 @@ impl GeminiBackend {
     /// Get the current configuration.
     pub async fn get_config(&self) -> GeminiConfig {
         self.config.read().await.clone()
+    }
+
+    /// Kill the most recently spawned Gemini CLI process.
+    pub async fn kill(&self) {
+        if let Some(child_arc) = self.last_child.lock().await.take() {
+            if let Some(mut child) = child_arc.lock().await.take() {
+                if let Err(e) = child.kill().await {
+                    tracing::warn!("Failed to kill Gemini CLI process: {}", e);
+                } else {
+                    tracing::info!("Gemini CLI process killed");
+                }
+            }
+        }
     }
 }
 
@@ -124,6 +144,12 @@ impl Backend for GeminiBackend {
                 workspace_exec,
             )
             .await?;
+
+        // Store child handle for kill-on-cancel
+        {
+            let mut last = self.last_child.lock().await;
+            *last = Some(gemini_handle.child_arc());
+        }
 
         let (tx, rx) = mpsc::channel(256);
         let session_id = session.id.clone();
@@ -268,6 +294,14 @@ fn convert_gemini_event(
                         input_tokens: input,
                         output_tokens: output,
                     });
+                }
+            }
+        }
+
+        GeminiEvent::Thought { content } => {
+            if let Some(text) = content {
+                if !text.is_empty() {
+                    results.push(ExecutionEvent::Thinking { content: text });
                 }
             }
         }

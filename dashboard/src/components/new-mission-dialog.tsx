@@ -119,7 +119,7 @@ export function NewMissionDialog({
   const { data: backends } = useSWR<Backend[]>('backends', listBackends, {
     revalidateOnFocus: false,
     dedupingInterval: 30000,
-    fallbackData: [{ id: 'opencode', name: 'OpenCode' }, { id: 'claudecode', name: 'Claude Code' }, { id: 'amp', name: 'Amp' }],
+    fallbackData: [{ id: 'opencode', name: 'OpenCode' }, { id: 'claudecode', name: 'Claude Code' }, { id: 'amp', name: 'Amp' }, { id: 'gemini', name: 'Gemini CLI' }],
   });
 
   // SWR: fetch backend configs to check enabled status
@@ -136,6 +136,10 @@ export function NewMissionDialog({
     dedupingInterval: 30000,
   });
   const { data: codexConfig } = useSWR('backend-codex-config', () => getBackendConfig('codex'), {
+    revalidateOnFocus: false,
+    dedupingInterval: 30000,
+  });
+  const { data: geminiConfig } = useSWR('backend-gemini-config', () => getBackendConfig('gemini'), {
     revalidateOnFocus: false,
     dedupingInterval: 30000,
   });
@@ -166,9 +170,12 @@ export function NewMissionDialog({
       if (b.id === 'codex') {
         return codexConfig?.enabled !== false && codexConfig?.cli_available !== false;
       }
+      if (b.id === 'gemini') {
+        return geminiConfig?.enabled !== false && geminiConfig?.cli_available !== false;
+      }
       return true;
     }) || [];
-  }, [backends, opencodeConfig, claudecodeConfig, ampConfig, codexConfig]);
+  }, [backends, opencodeConfig, claudecodeConfig, ampConfig, codexConfig, geminiConfig]);
 
   // SWR: fetch agents for each enabled backend
   const { data: opencodeAgents, mutate: mutateOpencodeAgents } = useSWR<BackendAgent[]>(
@@ -189,6 +196,11 @@ export function NewMissionDialog({
   const { data: codexAgents, mutate: mutateCodexAgents } = useSWR<BackendAgent[]>(
     enabledBackends.some(b => b.id === 'codex') ? 'backend-codex-agents' : null,
     () => listBackendAgents('codex'),
+    { revalidateOnFocus: true, dedupingInterval: 5000 }
+  );
+  const { data: geminiAgents, mutate: mutateGeminiAgents } = useSWR<BackendAgent[]>(
+    enabledBackends.some(b => b.id === 'gemini') ? 'backend-gemini-agents' : null,
+    () => listBackendAgents('gemini'),
     { revalidateOnFocus: true, dedupingInterval: 5000 }
   );
 
@@ -273,6 +285,11 @@ export function NewMissionDialog({
         agents = codexAgents || [
           { id: 'default', name: 'Codex Agent' },
         ];
+      } else if (backend.id === 'gemini') {
+        // Gemini agents
+        agents = geminiAgents || [
+          { id: 'default', name: 'Gemini Agent' },
+        ];
       }
 
       // Use agent.id for CLI value, agent.name for display (consistent across all backends)
@@ -288,7 +305,7 @@ export function NewMissionDialog({
     }
 
     return result;
-  }, [enabledBackends, opencodeAgents, opencodeProfileAgentNames, claudecodeAgents, ampAgents, codexAgents, agentsPayload, config, claudeCodeLibConfig]);
+  }, [enabledBackends, opencodeAgents, opencodeProfileAgentNames, claudecodeAgents, ampAgents, codexAgents, geminiAgents, agentsPayload, config, claudeCodeLibConfig]);
 
   // Group agents by backend for display
   const agentsByBackend = useMemo(() => {
@@ -501,6 +518,7 @@ export function NewMissionDialog({
       mutateClaudecodeAgents?.(),
       mutateAmpAgents?.(),
       mutateCodexAgents?.(),
+      mutateGeminiAgents?.(),
       mutateAgentsPayload?.(),
       mutateConfig?.(),
     ]);

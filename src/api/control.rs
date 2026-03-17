@@ -2164,6 +2164,11 @@ pub(crate) async fn resolve_claudecode_default_model(
     }
 }
 
+/// Return the default model for Gemini CLI when no override is specified.
+pub(crate) fn resolve_gemini_default_model() -> String {
+    "gemini-3.1-pro-preview".to_string()
+}
+
 async fn close_mission_desktop_sessions(
     mission_store: &Arc<dyn MissionStore>,
     mission_id: Uuid,
@@ -8141,9 +8146,10 @@ async fn run_single_control_turn(
         && effective_config_profile.is_some()
         && requested_model.is_none())
         || (backend_id.as_deref() == Some("codex") && requested_model.is_none())
-        || (backend_id.as_deref() == Some("gemini") && requested_model.is_none())
     {
         config.default_model = None;
+    } else if backend_id.as_deref() == Some("gemini") && requested_model.is_none() {
+        config.default_model = Some(resolve_gemini_default_model());
     }
     if let Some(ref agent) = agent_override {
         config.opencode_agent = Some(agent.clone());
