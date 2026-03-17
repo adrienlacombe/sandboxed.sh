@@ -262,8 +262,8 @@ impl OrchestratorMcp {
                         },
                         "backend": {
                             "type": "string",
-                            "enum": ["claudecode", "codex", "gemini", "opencode"],
-                            "description": "Backend/harness to use. MUST match the model: claudecode for Claude models, codex for OpenAI/GPT models, gemini for Gemini models, opencode for any model via provider routing."
+                            "enum": ["claudecode", "codex", "gemini", "opencode", "amp"],
+                            "description": "Backend/harness to use. MUST match the model: claudecode for Claude models, codex for OpenAI/GPT models, gemini for Gemini models, opencode for any model via provider routing, amp for Amp."
                         },
                         "model_override": {
                             "type": "string",
@@ -308,7 +308,7 @@ impl OrchestratorMcp {
                                 "required": ["title", "prompt"],
                                 "properties": {
                                     "title": { "type": "string" },
-                                    "backend": { "type": "string", "enum": ["claudecode", "codex", "gemini", "opencode"] },
+                                    "backend": { "type": "string", "enum": ["claudecode", "codex", "gemini", "opencode", "amp"] },
                                     "model_override": { "type": "string" },
                                     "model_effort": { "type": "string", "enum": ["low", "medium", "high"] },
                                     "agent": { "type": "string" },
@@ -789,16 +789,18 @@ impl OrchestratorMcp {
         let timeout = std::time::Duration::from_secs(params.timeout_seconds);
         let interval = std::time::Duration::from_secs(params.poll_interval_seconds);
         let start = std::time::Instant::now();
-        let mut consecutive_errors: u32 = 0;
+        let mut error_counts: std::collections::HashMap<Uuid, u32> =
+            ids.iter().map(|id| (*id, 0u32)).collect();
 
         loop {
             for id in &ids {
                 let response = self.api_get(&format!("/api/control/missions/{}", id)).await;
+                let errors = error_counts.get_mut(id).unwrap();
 
                 match response {
-                    Ok(resp) if resp.status().is_success() => {
-                        consecutive_errors = 0;
-                        if let Ok(mission) = resp.json::<Value>().await {
+                    Ok(resp) if resp.status().is_success() => match resp.json::<Value>().await {
+                        Ok(mission) => {
+                            *errors = 0;
                             let status = mission["status"].as_str().unwrap_or("");
                             if target_statuses.iter().any(|s| s == status) {
                                 return Ok(json!({
@@ -810,24 +812,33 @@ impl OrchestratorMcp {
                                 }));
                             }
                         }
-                    }
+                        Err(e) => {
+                            *errors += 1;
+                            if *errors >= 3 {
+                                return Err(format!(
+                                    "Mission {} returned invalid JSON: {} ({} consecutive errors)",
+                                    id, e, errors
+                                ));
+                            }
+                        }
+                    },
                     Ok(resp) => {
-                        consecutive_errors += 1;
-                        if consecutive_errors >= 3 {
+                        *errors += 1;
+                        if *errors >= 3 {
                             return Err(format!(
-                                "Mission {} returned HTTP {} after {} consecutive errors",
+                                "Mission {} returned HTTP {} ({} consecutive errors)",
                                 id,
                                 resp.status(),
-                                consecutive_errors
+                                errors
                             ));
                         }
                     }
                     Err(e) => {
-                        consecutive_errors += 1;
-                        if consecutive_errors >= 3 {
+                        *errors += 1;
+                        if *errors >= 3 {
                             return Err(format!(
                                 "API request failed for mission {}: {} ({} consecutive errors)",
-                                id, e, consecutive_errors
+                                id, e, errors
                             ));
                         }
                     }
