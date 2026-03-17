@@ -4760,7 +4760,7 @@ export default function ControlClient() {
       return { id: mission.id };
     } catch (err) {
       console.error("Failed to create mission:", err);
-      toast.error("Failed to create new mission");
+      toast.error(err instanceof Error ? err.message : "Failed to create new mission");
       throw err; // Re-throw so dialog knows creation failed
     } finally {
       setMissionLoading(false);

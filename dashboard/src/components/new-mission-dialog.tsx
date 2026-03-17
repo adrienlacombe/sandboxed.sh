@@ -527,6 +527,10 @@ export function NewMissionDialog({
 
   const getCreateOptions = (): NewMissionDialogOptions => {
     const parsed = parseSelectedValue(selectedAgentValue);
+    const agentValue =
+      selectedBackend === 'gemini' && parsed?.agent === 'default'
+        ? undefined
+        : parsed?.agent || undefined;
     const trimmedModel = modelOverride.trim();
     const normalizedModel =
       selectedBackend === 'opencode'
@@ -540,7 +544,7 @@ export function NewMissionDialog({
       (selectedBackend === 'codex' || selectedBackend === 'claudecode') && modelEffort ? modelEffort : undefined;
     return {
       workspaceId: newMissionWorkspace || undefined,
-      agent: parsed?.agent || undefined,
+      agent: agentValue,
       backend: parsed?.backend || 'claudecode',
       modelOverride: modelOverrideValue,
       modelEffort: modelEffortValue,
