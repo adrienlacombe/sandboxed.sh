@@ -83,6 +83,9 @@ export interface RunningMissionInfo {
   seconds_since_activity: number;
   health: MissionHealth;
   expected_deliverables: number;
+  current_activity?: string;
+  subtask_total: number;
+  subtask_completed: number;
 }
 
 export type MissionStallSeverity = "warning" | "severe";

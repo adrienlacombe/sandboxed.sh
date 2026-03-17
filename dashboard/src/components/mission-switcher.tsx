@@ -650,41 +650,118 @@ export function MissionSwitcher({
     );
   }, [missions, currentMissionId, runningMissionIds]);
 
-  // Build flat list of all selectable items
+  // Build a map from boss mission id to its worker missions
+  const bossMissionWorkerIds = useMemo(() => {
+    const map = new Map<string, Set<string>>();
+    for (const m of missions) {
+      if (m.parent_mission_id) {
+        let set = map.get(m.parent_mission_id);
+        if (!set) {
+          set = new Set();
+          map.set(m.parent_mission_id, set);
+        }
+        set.add(m.id);
+      }
+    }
+    return map;
+  }, [missions]);
+
+  // Build flat list of all selectable items, grouping workers under their boss
   const allItems = useMemo(() => {
     const items: Array<{
       type: 'running' | 'current' | 'recent';
       mission?: Mission;
       runningInfo?: RunningMissionInfo;
       id: string;
+      isWorkerOf?: string; // parent boss mission id
+      isBoss?: boolean;
     }> = [];
+
+    const addedIds = new Set<string>();
+
+    // Helper to add a running mission + its workers
+    const addRunningWithWorkers = (rm: RunningMissionInfo) => {
+      if (addedIds.has(rm.mission_id)) return;
+      addedIds.add(rm.mission_id);
+      const mission = missions.find((m) => m.id === rm.mission_id);
+      const workerIds = bossMissionWorkerIds.get(rm.mission_id);
+      const isBoss = Boolean(workerIds && workerIds.size > 0);
+      items.push({
+        type: 'running',
+        mission,
+        runningInfo: rm,
+        id: rm.mission_id,
+        isBoss,
+      });
+      // Add workers grouped under this boss
+      if (workerIds) {
+        for (const workerId of workerIds) {
+          if (addedIds.has(workerId)) continue;
+          addedIds.add(workerId);
+          const workerMission = missions.find((m) => m.id === workerId);
+          const workerRunningInfo = runningMissions.find((r) => r.mission_id === workerId);
+          items.push({
+            type: workerRunningInfo ? 'running' : 'recent',
+            mission: workerMission,
+            runningInfo: workerRunningInfo,
+            id: workerId,
+            isWorkerOf: rm.mission_id,
+          });
+        }
+      }
+    };
 
     // Current mission first if not running
     if (currentMissionId) {
       const currentMission = missions.find((m) => m.id === currentMissionId);
       if (currentMission && !runningMissionIds.has(currentMissionId)) {
-        items.push({ type: 'current', mission: currentMission, id: currentMissionId });
+        addedIds.add(currentMissionId);
+        const workerIds = bossMissionWorkerIds.get(currentMissionId);
+        items.push({
+          type: 'current',
+          mission: currentMission,
+          id: currentMissionId,
+          isBoss: Boolean(workerIds && workerIds.size > 0),
+        });
       }
     }
 
-    // Running missions
-    runningMissions.forEach((rm) => {
+    // Running missions (boss missions first, then standalone)
+    const bosses = runningMissions.filter((rm) => bossMissionWorkerIds.has(rm.mission_id));
+    const standalone = runningMissions.filter(
+      (rm) => !bossMissionWorkerIds.has(rm.mission_id) && !missions.find((m) => m.id === rm.mission_id)?.parent_mission_id
+    );
+    const workerOnlyRunning = runningMissions.filter((rm) => {
+      const m = missions.find((mi) => mi.id === rm.mission_id);
+      return m?.parent_mission_id && !bossMissionWorkerIds.has(rm.mission_id);
+    });
+
+    // Add bosses first (with their workers grouped)
+    for (const rm of bosses) addRunningWithWorkers(rm);
+    // Add standalone running missions
+    for (const rm of standalone) addRunningWithWorkers(rm);
+    // Add orphan worker running missions (boss not running)
+    for (const rm of workerOnlyRunning) {
+      if (addedIds.has(rm.mission_id)) continue;
+      addedIds.add(rm.mission_id);
       const mission = missions.find((m) => m.id === rm.mission_id);
       items.push({
         type: 'running',
         mission,
         runningInfo: rm,
         id: rm.mission_id,
+        isWorkerOf: mission?.parent_mission_id ?? undefined,
       });
-    });
+    }
 
     // Recent missions
     recentMissions.forEach((m) => {
+      if (addedIds.has(m.id)) return;
       items.push({ type: 'recent', mission: m, id: m.id });
     });
 
     return items;
-  }, [missions, currentMissionId, runningMissions, runningMissionIds, recentMissions]);
+  }, [missions, currentMissionId, runningMissions, runningMissionIds, recentMissions, bossMissionWorkerIds]);
 
   useEffect(() => {
     if (!open) return;
@@ -921,21 +998,24 @@ export function MissionSwitcher({
               )}
               {filteredItems.map((item, index) => {
                 // Show section headers only when not searching
+                const isWorkerItem = Boolean(item.isWorkerOf);
                 const showRunningHeader =
                   !normalizedSearchQuery &&
                   item.type === 'running' &&
+                  !isWorkerItem &&
                   (index === 0 ||
                     (index === 1 && hasCurrent) ||
                     filteredItems[index - 1]?.type !== 'running');
                 const showRecentHeader =
                   !normalizedSearchQuery &&
                   item.type === 'recent' &&
+                  !isWorkerItem &&
                   filteredItems[index - 1]?.type !== 'recent';
 
                 const mission = item.mission;
                 const isSelected = index === selectedIndex;
                 const isViewing = item.id === viewingMissionId;
-                const isRunning = item.type === 'running';
+                const isRunning = item.type === 'running' || Boolean(item.runningInfo);
                 const runningInfo = item.runningInfo;
                 const missionQuickActions = mission
                   ? getMissionQuickActions(mission, isRunning)
@@ -954,6 +1034,7 @@ export function MissionSwitcher({
                 const cardDescription = mission
                   ? getMissionCardDescription(mission, cardTitle)
                   : null;
+                const hasProgress = runningInfo && runningInfo.subtask_total > 0;
 
                 return (
                   <div key={item.id}>
@@ -979,7 +1060,8 @@ export function MissionSwitcher({
                         handleSelect(item.id);
                       }}
                       className={cn(
-                        'group flex items-center gap-3 px-3 py-2 mx-2 rounded-lg cursor-pointer transition-colors no-underline',
+                        'group flex items-center gap-3 py-2 mx-2 rounded-lg cursor-pointer transition-colors no-underline',
+                        isWorkerItem ? 'px-3 ml-6 border-l-2 border-white/[0.06]' : 'px-3',
                         isSelected
                           ? 'bg-indigo-500/15 text-white'
                           : 'text-white/70 hover:bg-white/[0.04]',
@@ -1009,7 +1091,7 @@ export function MissionSwitcher({
                       {/* Mission info */}
                       <div className="flex-1 min-w-0">
                         <div className="flex items-center gap-2">
-                          <span className="font-medium text-sm truncate">
+                          <span className={cn("font-medium truncate", isWorkerItem ? "text-[13px]" : "text-sm")}>
                             {mission
                               ? getMissionDisplayName(mission, workspaceNameById)
                               : getMissionShortName(item.id)}
@@ -1022,7 +1104,17 @@ export function MissionSwitcher({
                               </span>
                             ) : null;
                           })()}
-                          {mission?.parent_mission_id && (
+                          {item.isBoss && (
+                            <span className="inline-flex items-center rounded bg-violet-500/10 border border-violet-500/20 px-1 py-0.5 text-[8px] font-medium text-violet-400 shrink-0">
+                              Boss
+                            </span>
+                          )}
+                          {isWorkerItem && (
+                            <span className="inline-flex items-center rounded bg-cyan-500/10 border border-cyan-500/20 px-1 py-0.5 text-[8px] font-medium text-cyan-400 shrink-0">
+                              W
+                            </span>
+                          )}
+                          {!item.isBoss && !isWorkerItem && mission?.parent_mission_id && (
                             <span className="inline-flex items-center rounded bg-cyan-500/10 border border-cyan-500/20 px-1 py-0.5 text-[8px] font-medium text-cyan-400 shrink-0">
                               Worker
                             </span>
@@ -1046,6 +1138,21 @@ export function MissionSwitcher({
                               </p>
                             )}
                           </>
+                        )}
+                        {/* Activity + progress for running missions */}
+                        {isRunning && runningInfo && (
+                          <div className="flex items-center gap-2 mt-0.5">
+                            {runningInfo.current_activity && (
+                              <span className="text-[11px] text-white/40 truncate italic">
+                                {runningInfo.current_activity}
+                              </span>
+                            )}
+                            {hasProgress && (
+                              <span className="text-[10px] font-mono text-white/30 tabular-nums shrink-0">
+                                {runningInfo.subtask_completed}/{runningInfo.subtask_total}
+                              </span>
+                            )}
+                          </div>
                         )}
                       </div>
 
