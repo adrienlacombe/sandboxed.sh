@@ -434,6 +434,7 @@ pub fn routes() -> Router<Arc<super::routes::AppState>> {
         .route("/:id/oauth/callback", post(oauth_callback))
         .route("/:id/default", post(set_default))
         .route("/:id/health", post(check_provider_health))
+        .route("/:id/usage", get(get_provider_usage))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -453,6 +454,30 @@ pub struct ClaudeCodeAuthWithExpiry {
     pub auth: ClaudeCodeAuth,
     /// Expiry timestamp in milliseconds. None for API keys (never expire).
     pub expires_at: Option<i64>,
+}
+
+pub fn default_backends_for_provider(provider_type: ProviderType) -> Vec<String> {
+    match provider_type {
+        ProviderType::Anthropic => vec!["opencode".to_string(), "claudecode".to_string()],
+        ProviderType::OpenAI => vec!["opencode".to_string(), "codex".to_string()],
+        ProviderType::Google => vec!["opencode".to_string(), "gemini".to_string()],
+        ProviderType::Amp => vec!["amp".to_string()],
+        _ => vec!["opencode".to_string()],
+    }
+}
+
+pub fn provider_targets_backend(
+    working_dir: &Path,
+    provider_type: ProviderType,
+    backend: &str,
+) -> bool {
+    let backends_state = read_provider_backends_state(working_dir);
+    let configured = backends_state
+        .get(provider_type.id())
+        .cloned()
+        .unwrap_or_else(|| default_backends_for_provider(provider_type));
+
+    configured.iter().any(|candidate| candidate == backend)
 }
 
 /// Get the Anthropic API key or OAuth access token for the Claude Code backend.
@@ -479,9 +504,8 @@ pub fn get_anthropic_auth_for_claudecode(working_dir: &Path) -> Option<ClaudeCod
 
     // Check if Anthropic provider has claudecode in use_for_backends
     let anthropic_backends = backends_state.get(ProviderType::Anthropic.id());
-    let use_for_claudecode = anthropic_backends
-        .map(|backends| backends.iter().any(|b| b == "claudecode"))
-        .unwrap_or(false);
+    let use_for_claudecode =
+        provider_targets_backend(working_dir, ProviderType::Anthropic, "claudecode");
     tracing::debug!(
         anthropic_backends = ?anthropic_backends,
         use_for_claudecode = use_for_claudecode,
@@ -1207,11 +1231,7 @@ fn get_anthropic_auth_from_claude_cli_credentials() -> Option<ClaudeCodeAuth> {
 
 /// Check if the Anthropic provider is configured for the Claude Code backend.
 pub fn is_anthropic_configured_for_claudecode(working_dir: &Path) -> bool {
-    let backends_state = read_provider_backends_state(working_dir);
-    backends_state
-        .get(ProviderType::Anthropic.id())
-        .map(|backends| backends.iter().any(|b| b == "claudecode"))
-        .unwrap_or(false)
+    provider_targets_backend(working_dir, ProviderType::Anthropic, "claudecode")
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1839,7 +1859,7 @@ fn build_provider_response(
     // Most providers are only usable via OpenCode, but we still store and render
     // `use_for_backends` generically so the UI can express intent and we can grow
     // support without special-casing a single provider forever.
-    let use_for_backends = backends.unwrap_or_else(|| vec!["opencode".to_string()]);
+    let use_for_backends = backends.unwrap_or_else(|| default_backends_for_provider(provider_type));
 
     ProviderResponse {
         id: provider_type.id().to_string(),
@@ -4213,11 +4233,6 @@ async fn list_providers(
         let pt = provider.provider_type;
         if pt == ProviderType::Custom || pt == ProviderType::Amp {
             let now = chrono::Utc::now();
-            let default_backend = if pt == ProviderType::Amp {
-                "amp".to_string()
-            } else {
-                "opencode".to_string()
-            };
             providers.push(ProviderResponse {
                 id: provider.id.to_string(),
                 provider_type: pt,
@@ -4241,7 +4256,7 @@ async fn list_providers(
                 } else {
                     ProviderStatusResponse::NeedsAuth { auth_url: None }
                 },
-                use_for_backends: vec![default_backend],
+                use_for_backends: default_backends_for_provider(pt),
                 account_email: provider.account_email.clone(),
                 created_at: now,
                 updated_at: now,
@@ -4273,13 +4288,11 @@ async fn get_provider_for_backend(
     }
 
     // Read the provider backends state to find provider with claudecode in use_for_backends
-    let backends_state = read_provider_backends_state(&state.config.working_dir);
-
-    // Check if Anthropic provider has claudecode in use_for_backends
-    let use_for_claudecode = backends_state
-        .get(ProviderType::Anthropic.id())
-        .map(|backends| backends.iter().any(|b| b == "claudecode"))
-        .unwrap_or(false);
+    let use_for_claudecode = provider_targets_backend(
+        &state.config.working_dir,
+        ProviderType::Anthropic,
+        "claudecode",
+    );
 
     if !use_for_claudecode {
         return Ok(Json(BackendProviderResponse {
@@ -4520,7 +4533,7 @@ async fn check_provider_health(
             (
                 "https://open.bigmodel.cn/api/paas/v4/chat/completions",
                 serde_json::json!({
-                    "model": "glm-4-flash",
+                    "model": "glm-4.7-flash",
                     "messages": [{"role": "user", "content": "test"}],
                     "max_tokens": 1
                 }),
@@ -4612,6 +4625,583 @@ async fn check_provider_health(
     }
 }
 
+/// GET /api/ai/providers/:id/usage - Fetch live usage/rate-limit info from the provider API.
+///
+/// Makes a minimal API call to the provider and captures rate-limit headers
+/// from the response. Also returns any account info we have stored.
+async fn get_provider_usage(
+    State(state): State<Arc<super::routes::AppState>>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    // Resolve provider credentials: check AIProviderStore first, then OpenCode auth
+    let (provider_type, api_key_opt, oauth, account_email, provider_name) = if let Ok(uuid) =
+        uuid::Uuid::parse_str(&id)
+    {
+        // UUID lookup for custom providers
+        let provider = state
+            .ai_providers
+            .get(uuid)
+            .await
+            .ok_or((StatusCode::NOT_FOUND, format!("Provider {} not found", id)))?;
+        (
+            provider.provider_type,
+            provider.api_key.clone(),
+            provider.oauth.clone(),
+            provider.account_email.clone(),
+            provider.name.clone(),
+        )
+    } else if let Some(pt) = ProviderType::from_id(&id) {
+        // Try AIProviderStore first
+        if let Some(provider) = state.ai_providers.get_by_type(pt).await {
+            (
+                provider.provider_type,
+                provider.api_key.clone(),
+                provider.oauth.clone(),
+                provider.account_email.clone(),
+                provider.name.clone(),
+            )
+        } else {
+            // Fall back to OpenCode auth: check both central auth.json
+            // and per-provider auth files (~/.opencode/auth/{provider}.json)
+            let auth = read_opencode_auth().map_err(internal_error)?;
+            let accounts_state = read_provider_accounts_state(&state.config.working_dir);
+            let account_email = accounts_state.get(pt.id()).cloned();
+
+            // Collect all auth entries: central + per-provider file
+            let mut auth_entries: Vec<&serde_json::Value> = opencode_auth_keys(pt)
+                .into_iter()
+                .filter_map(|key| auth.get(key))
+                .collect();
+            // Also read per-provider auth file
+            let provider_auth_path = get_opencode_provider_auth_path(pt);
+            let provider_auth_value: Option<serde_json::Value> = if provider_auth_path.exists() {
+                std::fs::read_to_string(&provider_auth_path)
+                    .ok()
+                    .and_then(|c| serde_json::from_str(&c).ok())
+            } else {
+                None
+            };
+            if let Some(ref pav) = provider_auth_value {
+                auth_entries.push(pav);
+            }
+
+            let api_key = auth_entries.iter().find_map(|v| {
+                v.get("key")
+                    .or_else(|| v.get("api_key"))
+                    .or_else(|| v.get("apiKey"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+            });
+
+            let oauth_creds = auth_entries.iter().find_map(|entry| {
+                let access = entry
+                    .get("access")
+                    .or_else(|| entry.get("access_token"))
+                    .and_then(|v| v.as_str())?;
+                let refresh = entry
+                    .get("refresh")
+                    .or_else(|| entry.get("refresh_token"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let expires_at = entry
+                    .get("expires")
+                    .or_else(|| entry.get("expires_at"))
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0);
+                Some(crate::ai_providers::OAuthCredentials {
+                    access_token: access.to_string(),
+                    refresh_token: refresh,
+                    expires_at,
+                })
+            });
+
+            if api_key.is_none() && oauth_creds.is_none() {
+                return Ok(Json(serde_json::json!({
+                    "provider_type": pt.id(),
+                    "provider_name": pt.display_name(),
+                    "error": "No credentials found"
+                })));
+            }
+
+            (
+                pt,
+                api_key,
+                oauth_creds,
+                account_email,
+                pt.display_name().to_string(),
+            )
+        }
+    } else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            format!("Invalid provider ID: {}", id),
+        ));
+    };
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(internal_error)?;
+
+    // Determine how to call each provider for rate-limit info
+    let usage_result = match provider_type {
+        ProviderType::Anthropic => {
+            // Use API key or OAuth access token
+            let auth = if let Some(ref key) = api_key_opt {
+                format!("{}", key)
+            } else if let Some(ref o) = oauth {
+                format!("{}", o.access_token)
+            } else {
+                return Ok(Json(serde_json::json!({
+                    "provider_type": provider_type.id(),
+                    "provider_name": provider_name,
+                    "account_email": account_email,
+                    "error": "No credentials configured"
+                })));
+            };
+
+            // Minimal messages API call to get rate limit headers
+            let resp = client
+                .post("https://api.anthropic.com/v1/messages")
+                .header("x-api-key", &auth)
+                .header("anthropic-version", "2023-06-01")
+                .header("Content-Type", "application/json")
+                .json(&serde_json::json!({
+                    "model": "claude-haiku-4-5-20251001",
+                    "max_tokens": 1,
+                    "messages": [{"role": "user", "content": "hi"}]
+                }))
+                .send()
+                .await;
+
+            match resp {
+                Ok(r) => {
+                    let headers = r.headers().clone();
+                    let mut info = serde_json::json!({
+                        "provider_type": "anthropic",
+                        "provider_name": provider_name,
+                        "account_email": account_email,
+                    });
+
+                    let map = info.as_object_mut().unwrap();
+
+                    // Extract organization ID
+                    if let Some(org) = headers
+                        .get("anthropic-organization-id")
+                        .and_then(|v| v.to_str().ok())
+                    {
+                        map.insert("organization_id".to_string(), serde_json::json!(org));
+                    }
+
+                    // Try new unified rate limit headers (Anthropic 2025+)
+                    let has_unified = headers.get("anthropic-ratelimit-unified-status").is_some();
+                    if has_unified {
+                        for (hdr, key) in [
+                            ("anthropic-ratelimit-unified-status", "unified_status"),
+                            ("anthropic-ratelimit-unified-reset", "unified_reset"),
+                            ("anthropic-ratelimit-unified-5h-status", "unified_5h_status"),
+                            ("anthropic-ratelimit-unified-5h-reset", "unified_5h_reset"),
+                            (
+                                "anthropic-ratelimit-unified-5h-utilization",
+                                "unified_5h_utilization",
+                            ),
+                            ("anthropic-ratelimit-unified-7d-status", "unified_7d_status"),
+                            ("anthropic-ratelimit-unified-7d-reset", "unified_7d_reset"),
+                            (
+                                "anthropic-ratelimit-unified-7d-utilization",
+                                "unified_7d_utilization",
+                            ),
+                            (
+                                "anthropic-ratelimit-unified-representative-claim",
+                                "unified_representative_claim",
+                            ),
+                            (
+                                "anthropic-ratelimit-unified-fallback-percentage",
+                                "unified_fallback_pct",
+                            ),
+                            (
+                                "anthropic-ratelimit-unified-overage-status",
+                                "unified_overage_status",
+                            ),
+                            (
+                                "anthropic-ratelimit-unified-overage-disabled-reason",
+                                "unified_overage_disabled_reason",
+                            ),
+                        ] {
+                            if let Some(v) = headers.get(hdr).and_then(|v| v.to_str().ok()) {
+                                if let Ok(n) = v.parse::<f64>() {
+                                    map.insert(key.to_string(), serde_json::json!(n));
+                                } else {
+                                    map.insert(key.to_string(), serde_json::json!(v));
+                                }
+                            }
+                        }
+                    } else {
+                        // Legacy per-resource rate limit headers
+                        for (hdr, key) in [
+                            ("anthropic-ratelimit-requests-limit", "requests_limit"),
+                            (
+                                "anthropic-ratelimit-requests-remaining",
+                                "requests_remaining",
+                            ),
+                            ("anthropic-ratelimit-requests-reset", "requests_reset"),
+                            ("anthropic-ratelimit-tokens-limit", "tokens_limit"),
+                            ("anthropic-ratelimit-tokens-remaining", "tokens_remaining"),
+                            ("anthropic-ratelimit-tokens-reset", "tokens_reset"),
+                            (
+                                "anthropic-ratelimit-input-tokens-limit",
+                                "input_tokens_limit",
+                            ),
+                            (
+                                "anthropic-ratelimit-input-tokens-remaining",
+                                "input_tokens_remaining",
+                            ),
+                            (
+                                "anthropic-ratelimit-output-tokens-limit",
+                                "output_tokens_limit",
+                            ),
+                            (
+                                "anthropic-ratelimit-output-tokens-remaining",
+                                "output_tokens_remaining",
+                            ),
+                        ] {
+                            if let Some(v) = headers.get(hdr).and_then(|v| v.to_str().ok()) {
+                                if let Ok(n) = v.parse::<u64>() {
+                                    map.insert(key.to_string(), serde_json::json!(n));
+                                } else {
+                                    map.insert(key.to_string(), serde_json::json!(v));
+                                }
+                            }
+                        }
+                    }
+                    info
+                }
+                Err(e) => serde_json::json!({
+                    "provider_type": "anthropic",
+                    "provider_name": provider_name,
+                    "account_email": account_email,
+                    "error": format!("Failed to reach API: {}", e)
+                }),
+            }
+        }
+        ProviderType::OpenAI => {
+            let auth = if let Some(ref key) = api_key_opt {
+                key.clone()
+            } else if let Some(ref o) = oauth {
+                o.access_token.clone()
+            } else {
+                return Ok(Json(serde_json::json!({
+                    "provider_type": "openai",
+                    "provider_name": provider_name,
+                    "account_email": account_email,
+                    "error": "No credentials configured"
+                })));
+            };
+
+            let resp = client
+                .post("https://api.openai.com/v1/chat/completions")
+                .header("Authorization", format!("Bearer {}", auth))
+                .header("Content-Type", "application/json")
+                .json(&serde_json::json!({
+                    "model": "gpt-4.1-nano",
+                    "max_tokens": 1,
+                    "messages": [{"role": "user", "content": "hi"}]
+                }))
+                .send()
+                .await;
+
+            match resp {
+                Ok(r) => {
+                    let headers = r.headers().clone();
+                    let mut info = serde_json::json!({
+                        "provider_type": "openai",
+                        "provider_name": provider_name,
+                        "account_email": account_email,
+                    });
+
+                    let map = info.as_object_mut().unwrap();
+                    for (hdr, key) in [
+                        ("x-ratelimit-limit-requests", "requests_limit"),
+                        ("x-ratelimit-remaining-requests", "requests_remaining"),
+                        ("x-ratelimit-reset-requests", "requests_reset"),
+                        ("x-ratelimit-limit-tokens", "tokens_limit"),
+                        ("x-ratelimit-remaining-tokens", "tokens_remaining"),
+                        ("x-ratelimit-reset-tokens", "tokens_reset"),
+                    ] {
+                        if let Some(v) = headers.get(hdr).and_then(|v| v.to_str().ok()) {
+                            if let Ok(n) = v.parse::<u64>() {
+                                map.insert(key.to_string(), serde_json::json!(n));
+                            } else {
+                                map.insert(key.to_string(), serde_json::json!(v));
+                            }
+                        }
+                    }
+                    // Also extract organization header if present
+                    if let Some(org) = headers
+                        .get("openai-organization")
+                        .and_then(|v| v.to_str().ok())
+                    {
+                        map.insert("organization".to_string(), serde_json::json!(org));
+                    }
+                    info
+                }
+                Err(e) => serde_json::json!({
+                    "provider_type": "openai",
+                    "provider_name": provider_name,
+                    "account_email": account_email,
+                    "error": format!("Failed to reach API: {}", e)
+                }),
+            }
+        }
+        ProviderType::Cerebras => {
+            let key = match api_key_opt.as_ref() {
+                Some(k) => k,
+                None => {
+                    return Ok(Json(serde_json::json!({
+                        "provider_type": "cerebras",
+                        "provider_name": provider_name,
+                        "error": "No API key configured"
+                    })));
+                }
+            };
+
+            let resp = client
+                .post("https://api.cerebras.ai/v1/chat/completions")
+                .header("Authorization", format!("Bearer {}", key))
+                .header("Content-Type", "application/json")
+                .json(&serde_json::json!({
+                    "model": "llama-3.1-8b",
+                    "max_tokens": 1,
+                    "messages": [{"role": "user", "content": "hi"}]
+                }))
+                .send()
+                .await;
+
+            match resp {
+                Ok(r) => {
+                    let headers = r.headers().clone();
+                    let mut info = serde_json::json!({
+                        "provider_type": "cerebras",
+                        "provider_name": provider_name,
+                    });
+
+                    let map = info.as_object_mut().unwrap();
+                    for (hdr, key) in [
+                        ("x-ratelimit-limit-requests-day", "requests_limit_day"),
+                        (
+                            "x-ratelimit-remaining-requests-day",
+                            "requests_remaining_day",
+                        ),
+                        ("x-ratelimit-reset-requests-day", "requests_reset_day"),
+                        ("x-ratelimit-limit-tokens-minute", "tokens_limit_minute"),
+                        (
+                            "x-ratelimit-remaining-tokens-minute",
+                            "tokens_remaining_minute",
+                        ),
+                        ("x-ratelimit-reset-tokens-minute", "tokens_reset_minute"),
+                    ] {
+                        if let Some(v) = headers.get(hdr).and_then(|v| v.to_str().ok()) {
+                            if let Ok(n) = v.parse::<u64>() {
+                                map.insert(key.to_string(), serde_json::json!(n));
+                            } else {
+                                map.insert(key.to_string(), serde_json::json!(v));
+                            }
+                        }
+                    }
+                    info
+                }
+                Err(e) => serde_json::json!({
+                    "provider_type": "cerebras",
+                    "provider_name": provider_name,
+                    "error": format!("Failed to reach API: {}", e)
+                }),
+            }
+        }
+        ProviderType::Minimax => {
+            let key = match api_key_opt.as_ref() {
+                Some(k) => k,
+                None => {
+                    return Ok(Json(serde_json::json!({
+                        "provider_type": "minimax",
+                        "provider_name": provider_name,
+                        "error": "No API key configured"
+                    })));
+                }
+            };
+
+            // Minimax doesn't return rate-limit headers; try coding plan remains
+            let coding_resp = client
+                .get("https://api.minimax.io/v1/api/openplatform/coding_plan/remains")
+                .header("Authorization", format!("Bearer {}", key))
+                .send()
+                .await;
+
+            let mut info = serde_json::json!({
+                "provider_type": "minimax",
+                "provider_name": provider_name,
+            });
+
+            if let Ok(r) = coding_resp {
+                if r.status().is_success() {
+                    if let Ok(data) = r.json::<serde_json::Value>().await {
+                        info.as_object_mut()
+                            .unwrap()
+                            .insert("coding_plan".to_string(), data);
+                    }
+                } else {
+                    // Fall back to a test completion to verify the key works
+                    let test_resp = client
+                        .post("https://api.minimax.io/v1/chat/completions")
+                        .header("Authorization", format!("Bearer {}", key))
+                        .header("Content-Type", "application/json")
+                        .json(&serde_json::json!({
+                            "model": "MiniMax-M2",
+                            "max_tokens": 1,
+                            "messages": [{"role": "user", "content": "hi"}]
+                        }))
+                        .send()
+                        .await;
+
+                    match test_resp {
+                        Ok(r) if r.status().is_success() => {
+                            info.as_object_mut()
+                                .unwrap()
+                                .insert("status".to_string(), serde_json::json!("connected"));
+                        }
+                        Ok(r) => {
+                            let status = r.status().as_u16();
+                            let body = r.text().await.unwrap_or_default();
+                            info.as_object_mut().unwrap().insert(
+                                "error".to_string(),
+                                serde_json::json!(format!("API returned {}: {}", status, body)),
+                            );
+                        }
+                        Err(e) => {
+                            info.as_object_mut().unwrap().insert(
+                                "error".to_string(),
+                                serde_json::json!(format!("Failed to reach API: {}", e)),
+                            );
+                        }
+                    }
+                }
+            }
+            info
+        }
+        ProviderType::Zai => {
+            let key = match api_key_opt.as_ref() {
+                Some(k) => k,
+                None => {
+                    return Ok(Json(serde_json::json!({
+                        "provider_type": "zai",
+                        "provider_name": provider_name,
+                        "error": "No API key configured"
+                    })));
+                }
+            };
+
+            // Z.AI doesn't expose rate-limit headers; do a health-check style call
+            let resp = client
+                .post("https://open.bigmodel.cn/api/paas/v4/chat/completions")
+                .header("Authorization", format!("Bearer {}", key))
+                .header("Content-Type", "application/json")
+                .json(&serde_json::json!({
+                    "model": "glm-4.7-flash",
+                    "max_tokens": 1,
+                    "messages": [{"role": "user", "content": "hi"}]
+                }))
+                .send()
+                .await;
+
+            match resp {
+                Ok(r) => {
+                    let status_code = r.status().as_u16();
+                    let body = r.json::<serde_json::Value>().await.unwrap_or_default();
+                    let mut info = serde_json::json!({
+                        "provider_type": "zai",
+                        "provider_name": provider_name,
+                        "status": if status_code < 400 { "connected" } else { "error" },
+                    });
+                    // Z.AI returns usage in response body for completed requests
+                    if let Some(usage) = body.get("usage") {
+                        info.as_object_mut()
+                            .unwrap()
+                            .insert("last_call_usage".to_string(), usage.clone());
+                    }
+                    if status_code >= 400 {
+                        info.as_object_mut().unwrap().insert(
+                            "error".to_string(),
+                            serde_json::json!(format!("API returned {}", status_code)),
+                        );
+                    }
+                    info
+                }
+                Err(e) => serde_json::json!({
+                    "provider_type": "zai",
+                    "provider_name": provider_name,
+                    "error": format!("Failed to reach API: {}", e)
+                }),
+            }
+        }
+        ProviderType::Google => {
+            // Google doesn't expose rate-limit headers via the standard Gemini API
+            // Check if we have OAuth credentials and try userinfo
+            let mut info = serde_json::json!({
+                "provider_type": "google",
+                "provider_name": provider_name,
+                "account_email": account_email,
+            });
+
+            if let Some(ref o) = oauth {
+                // Try to get additional account info from Google userinfo
+                if let Ok(r) = client
+                    .get("https://www.googleapis.com/oauth2/v2/userinfo")
+                    .header("Authorization", format!("Bearer {}", o.access_token))
+                    .send()
+                    .await
+                {
+                    if r.status().is_success() {
+                        if let Ok(data) = r.json::<serde_json::Value>().await {
+                            let map = info.as_object_mut().unwrap();
+                            if let Some(name) = data.get("name").and_then(|v| v.as_str()) {
+                                map.insert("account_name".to_string(), serde_json::json!(name));
+                            }
+                            if let Some(email) = data.get("email").and_then(|v| v.as_str()) {
+                                map.insert("account_email".to_string(), serde_json::json!(email));
+                            }
+                            if let Some(pic) = data.get("picture").and_then(|v| v.as_str()) {
+                                map.insert("account_picture".to_string(), serde_json::json!(pic));
+                            }
+                            map.insert("status".to_string(), serde_json::json!("connected"));
+                        }
+                    }
+                }
+            } else if api_key_opt.is_some() {
+                info.as_object_mut()
+                    .unwrap()
+                    .insert("status".to_string(), serde_json::json!("connected"));
+            } else {
+                info.as_object_mut().unwrap().insert(
+                    "error".to_string(),
+                    serde_json::json!("No credentials configured"),
+                );
+            }
+            info
+        }
+        _ => {
+            // Generic: just return what we know
+            serde_json::json!({
+                "provider_type": provider_type.id(),
+                "provider_name": provider_name,
+                "account_email": account_email,
+                "status": if api_key_opt.is_some() || oauth.is_some() { "connected" } else { "no_credentials" },
+            })
+        }
+    };
+
+    Ok(Json(usage_result))
+}
+
 /// POST /api/ai/providers - Create a new provider.
 async fn create_provider(
     State(state): State<Arc<super::routes::AppState>>,
@@ -4673,11 +5263,6 @@ async fn create_provider(
         );
 
         let now = chrono::Utc::now();
-        let default_backend = if provider_type == ProviderType::Amp {
-            "amp".to_string()
-        } else {
-            "opencode".to_string()
-        };
         return Ok(Json(ProviderResponse {
             id: provider.id.to_string(),
             provider_type,
@@ -4703,7 +5288,7 @@ async fn create_provider(
             },
             use_for_backends: req
                 .use_for_backends
-                .unwrap_or_else(|| vec![default_backend]),
+                .unwrap_or_else(|| default_backends_for_provider(provider_type)),
             account_email: provider.account_email.clone(),
             created_at: now,
             updated_at: now,
@@ -4716,7 +5301,7 @@ async fn create_provider(
     // Default use_for_backends to ["opencode"] if not specified.
     let use_for_backends = req
         .use_for_backends
-        .or_else(|| Some(vec!["opencode".to_string()]));
+        .or_else(|| Some(default_backends_for_provider(provider_type)));
 
     set_provider_config_entry(
         &mut opencode_config,
@@ -4956,11 +5541,6 @@ async fn update_store_provider(
         })?;
 
     let pt = result.provider_type;
-    let default_backend = if pt == ProviderType::Amp {
-        "amp".to_string()
-    } else {
-        "opencode".to_string()
-    };
     let now = chrono::Utc::now();
     let has_credentials = result.api_key.is_some() || result.base_url.is_some();
     let response = ProviderResponse {
@@ -4986,7 +5566,7 @@ async fn update_store_provider(
         } else {
             ProviderStatusResponse::NeedsAuth { auth_url: None }
         },
-        use_for_backends: vec![default_backend],
+        use_for_backends: default_backends_for_provider(pt),
         account_email: result.account_email.clone(),
         created_at: now,
         updated_at: result.updated_at,
@@ -5146,11 +5726,6 @@ async fn set_default(
         state.ai_providers.set_default(uuid).await;
 
         let pt = provider.provider_type;
-        let default_backend = if pt == ProviderType::Amp {
-            "amp".to_string()
-        } else {
-            "opencode".to_string()
-        };
         let now = chrono::Utc::now();
         let has_credentials = provider.api_key.is_some() || provider.base_url.is_some();
         let response = ProviderResponse {
@@ -5176,7 +5751,7 @@ async fn set_default(
             } else {
                 ProviderStatusResponse::NeedsAuth { auth_url: None }
             },
-            use_for_backends: vec![default_backend],
+            use_for_backends: default_backends_for_provider(pt),
             account_email: provider.account_email.clone(),
             created_at: now,
             updated_at: provider.updated_at,
@@ -5884,11 +6459,11 @@ async fn oauth_callback_inner(
                 tracing::error!("Failed to sync credentials to OpenCode: {}", e);
             }
 
-            // Persist backend targeting for OpenAI (defaults to ["opencode"]).
+            // Persist backend targeting for OpenAI.
             let backends = req
                 .use_for_backends
                 .clone()
-                .unwrap_or_else(|| vec!["opencode".to_string()]);
+                .unwrap_or_else(|| default_backends_for_provider(provider_type));
             if let Err(e) = update_provider_backends(
                 &state.config.working_dir,
                 provider_type.id(),
@@ -6061,30 +6636,32 @@ async fn oauth_callback_inner(
                 }
             }
 
-            // Save backend targeting if provided in the callback request
+            // Persist backend targeting for Google even if the callback omitted it.
             let config_path = get_opencode_config_path(&state.config.working_dir);
             let mut opencode_config = read_opencode_config(&config_path).map_err(internal_error)?;
 
-            if let Some(ref backends_list) = req.use_for_backends {
-                set_provider_config_entry(
-                    &mut opencode_config,
-                    provider_type,
-                    None,
-                    None,
-                    None,
-                    req.use_for_backends.clone(),
-                    None,
-                );
-                if let Err(e) = write_opencode_config(&config_path, &opencode_config) {
-                    tracing::error!("Failed to write OpenCode config: {}", e);
-                }
-                if let Err(e) = update_provider_backends(
-                    &state.config.working_dir,
-                    provider_type.id(),
-                    backends_list.clone(),
-                ) {
-                    tracing::error!("Failed to save provider backends: {}", e);
-                }
+            let backends_list = req
+                .use_for_backends
+                .clone()
+                .unwrap_or_else(|| default_backends_for_provider(provider_type));
+            set_provider_config_entry(
+                &mut opencode_config,
+                provider_type,
+                None,
+                None,
+                None,
+                Some(backends_list.clone()),
+                None,
+            );
+            if let Err(e) = write_opencode_config(&config_path, &opencode_config) {
+                tracing::error!("Failed to write OpenCode config: {}", e);
+            }
+            if let Err(e) = update_provider_backends(
+                &state.config.working_dir,
+                provider_type.id(),
+                backends_list,
+            ) {
+                tracing::error!("Failed to save provider backends: {}", e);
             }
             let backends_state = read_provider_backends_state(&state.config.working_dir);
             let default_provider = get_default_provider(&opencode_config);

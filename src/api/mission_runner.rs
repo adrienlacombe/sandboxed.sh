@@ -11800,26 +11800,11 @@ fn get_google_credentials_for_gemini(working_dir: &std::path::Path) -> GeminiCre
         return GeminiCredentials::ApiKey(key);
     }
 
-    // Read provider_backends.json to check backend targeting.
-    // If the Google provider has use_for_backends configured but "gemini" is
-    // not included, skip using credentials from that provider.
-    let backends_path = working_dir
-        .join(".sandboxed-sh")
-        .join("provider_backends.json");
-    let google_targets_gemini = if let Ok(data) = std::fs::read_to_string(&backends_path) {
-        if let Ok(map) = serde_json::from_str::<serde_json::Value>(&data) {
-            match map.get("google").and_then(|v| v.as_array()) {
-                Some(backends) => backends.iter().any(|b| b.as_str() == Some("gemini")),
-                // No entry for google means no explicit targeting; allow by default
-                None => true,
-            }
-        } else {
-            true
-        }
-    } else {
-        // No backends state file; allow by default
-        true
-    };
+    let google_targets_gemini = crate::api::ai_providers::provider_targets_backend(
+        working_dir,
+        crate::ai_providers::ProviderType::Google,
+        "gemini",
+    );
 
     if !google_targets_gemini {
         tracing::info!(

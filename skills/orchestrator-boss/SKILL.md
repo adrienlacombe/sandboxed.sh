@@ -35,6 +35,7 @@ Always match `backend` to `model_override`.
 ## Tools
 
 - `get_workspace_layout`
+- `get_backend_auth_status`
 - `batch_create_workers`, `create_worker_mission`
 - `wait_for_any_worker`, `get_worker_status`, `list_worker_missions`
 - `resume_worker`, `retask_worker`, `send_message_to_worker`
@@ -44,14 +45,15 @@ Always match `backend` to `model_override`.
 ## Required Loop
 
 1. Call `get_workspace_layout` once. Use its paths in worker prompts and worktree setup.
-2. Build a task graph with `ready`, `blocked`, and `depends_on`.
-3. Spawn every ready task now.
-4. Wait with `wait_for_any_worker`.
-5. React immediately:
+2. If backend choice matters, call `get_backend_auth_status` once before spawning. Do not infer auth from shell env vars, CLI login status, or missing `*_API_KEY` in Bash.
+3. Build a task graph with `ready`, `blocked`, and `depends_on`.
+4. Spawn every ready task now.
+5. Wait with `wait_for_any_worker`.
+6. React immediately:
    - `completed`: verify the actual result, then integrate or reject and spawn newly-ready work
    - `failed` or `interrupted`: recover with `resume_worker` or replace the worker
    - `stalled`: cancel and replace
-6. Update `orchestrator-state.json` after every state change.
+7. Update `orchestrator-state.json` after every state change.
 
 ## Worker Prompt Checklist
 

@@ -108,6 +108,8 @@ export {
   oauthCallback,
   listProviders,
   listBackendModelOptions,
+  type ProviderUsage,
+  getProviderUsage,
 } from "./providers";
 
 // Model Routing

@@ -256,6 +256,63 @@ export async function oauthCallback(
   return res.json();
 }
 
+// ---------------------------------------------------------------------------
+// Usage / Rate Limits
+// ---------------------------------------------------------------------------
+
+export interface ProviderUsage {
+  provider_type: string;
+  provider_name: string;
+  account_email?: string | null;
+  account_name?: string | null;
+  account_picture?: string | null;
+  organization?: string | null;
+  organization_id?: string | null;
+  status?: string;
+  error?: string;
+  // Anthropic unified rate limits (2025+)
+  unified_status?: string;
+  unified_reset?: string;
+  unified_5h_status?: string;
+  unified_5h_reset?: string;
+  unified_5h_utilization?: number;
+  unified_7d_status?: string;
+  unified_7d_reset?: string;
+  unified_7d_utilization?: number;
+  unified_representative_claim?: string;
+  unified_fallback_pct?: number;
+  unified_overage_status?: string;
+  unified_overage_disabled_reason?: string;
+  // Anthropic legacy / OpenAI style
+  requests_limit?: number;
+  requests_remaining?: number;
+  requests_reset?: string;
+  tokens_limit?: number;
+  tokens_remaining?: number;
+  tokens_reset?: string;
+  input_tokens_limit?: number;
+  input_tokens_remaining?: number;
+  output_tokens_limit?: number;
+  output_tokens_remaining?: number;
+  // Cerebras style
+  requests_limit_day?: number;
+  requests_remaining_day?: number;
+  requests_reset_day?: string;
+  tokens_limit_minute?: number;
+  tokens_remaining_minute?: number;
+  tokens_reset_minute?: string;
+  // Minimax coding plan
+  coding_plan?: Record<string, unknown>;
+  // Z.AI last call usage
+  last_call_usage?: Record<string, unknown>;
+  // Any additional fields
+  [key: string]: unknown;
+}
+
+export async function getProviderUsage(id: string): Promise<ProviderUsage> {
+  return apiGet(`/api/ai/providers/${id}/usage`, "Failed to get provider usage");
+}
+
 export async function listProviders(options?: { includeAll?: boolean }): Promise<ProvidersResponse> {
   const params = new URLSearchParams();
   if (options?.includeAll) {

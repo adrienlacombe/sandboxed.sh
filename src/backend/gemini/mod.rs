@@ -275,12 +275,27 @@ fn convert_gemini_event(
             }
         }
 
-        GeminiEvent::Result { status, stats } => {
+        GeminiEvent::Result {
+            status,
+            error,
+            stats,
+        } => {
             // Check if the result status indicates an error
             if let Some(ref s) = status {
                 if s != "success" && s != "ok" {
+                    let detail = error
+                        .as_ref()
+                        .and_then(|e| e.message.as_deref())
+                        .unwrap_or("no details provided");
+                    let error_type = error
+                        .as_ref()
+                        .and_then(|e| e.error_type.as_deref())
+                        .unwrap_or("unknown");
                     results.push(ExecutionEvent::Error {
-                        message: format!("Gemini CLI finished with status: {}", s),
+                        message: format!(
+                            "Gemini CLI finished with status: {} (type: {}, detail: {})",
+                            s, error_type, detail
+                        ),
                     });
                 }
             }
@@ -488,6 +503,7 @@ mod tests {
         let mut tool_names = HashMap::new();
         let event = GeminiEvent::Result {
             status: Some("success".to_string()),
+            error: None,
             stats: Some(client::GeminiStats {
                 total_input_tokens: Some(1500),
                 total_output_tokens: Some(300),
@@ -513,6 +529,7 @@ mod tests {
         let mut tool_names = HashMap::new();
         let event = GeminiEvent::Result {
             status: Some("error".to_string()),
+            error: None,
             stats: None,
         };
         let events = convert_gemini_event(event, &mut tool_names);
@@ -526,10 +543,33 @@ mod tests {
     }
 
     #[test]
+    fn convert_gemini_event_result_error_with_detail() {
+        let mut tool_names = HashMap::new();
+        let event = GeminiEvent::Result {
+            status: Some("error".to_string()),
+            error: Some(client::GeminiErrorDetail {
+                error_type: Some("api_error".to_string()),
+                message: Some("Rate limit exceeded".to_string()),
+            }),
+            stats: None,
+        };
+        let events = convert_gemini_event(event, &mut tool_names);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            ExecutionEvent::Error { message } => {
+                assert!(message.contains("api_error"));
+                assert!(message.contains("Rate limit exceeded"));
+            }
+            other => panic!("Expected Error, got {:?}", other),
+        }
+    }
+
+    #[test]
     fn convert_gemini_event_result_zero_usage() {
         let mut tool_names = HashMap::new();
         let event = GeminiEvent::Result {
             status: Some("success".to_string()),
+            error: None,
             stats: Some(client::GeminiStats {
                 total_input_tokens: Some(0),
                 total_output_tokens: Some(0),
