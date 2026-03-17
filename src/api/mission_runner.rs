@@ -35,8 +35,8 @@ use crate::workspace_exec::WorkspaceExec;
 
 use super::automation_variables::substitute_custom_variables;
 use super::control::{
-    resolve_claudecode_default_model, safe_truncate_index, AgentEvent, AgentTreeNode,
-    ControlRunState, ControlStatus, ExecutionProgress, FrontendToolHub,
+    resolve_claudecode_default_model, resolve_gemini_default_model, safe_truncate_index,
+    AgentEvent, AgentTreeNode, ControlRunState, ControlStatus, ExecutionProgress, FrontendToolHub,
 };
 use super::library::SharedLibrary;
 
@@ -1893,9 +1893,9 @@ async fn run_mission_turn(
         // Codex.  Clear it so Codex uses its own CLI default.
         config.default_model = None;
     } else if backend_id == "gemini" && model_override.is_none() {
-        // The global DEFAULT_MODEL (e.g. claude-opus-4-6) is not valid for
-        // Gemini CLI.  Clear it so Gemini uses its own CLI default.
-        config.default_model = None;
+        // Pin Gemini to a stable backend default instead of inheriting the
+        // global model or relying on the CLI's own default.
+        config.default_model = Some(resolve_gemini_default_model());
     }
     tracing::info!(
         mission_id = %mission_id,
@@ -8462,7 +8462,7 @@ async fn gemini_bun_fallback_if_needed(
     _cli_path: &str,
 ) -> Option<String> {
     // Check Node.js major version
-    let node_version = workspace_exec
+    let node_available = workspace_exec
         .output(
             cwd,
             "/bin/sh",
@@ -8470,20 +8470,29 @@ async fn gemini_bun_fallback_if_needed(
             std::collections::HashMap::new(),
         )
         .await
-        .ok()?;
+        .ok();
 
-    let version_str = String::from_utf8_lossy(&node_version.stdout);
-    let version_str = version_str.trim().trim_start_matches('v');
-    let major: u32 = version_str.split('.').next()?.parse().ok()?;
-
-    if major >= 20 {
-        return None; // Node.js version is sufficient
+    if let Some(ref node_version) = node_available {
+        let version_str = String::from_utf8_lossy(&node_version.stdout);
+        let version_str = version_str.trim().trim_start_matches('v');
+        if let Some(major) = version_str
+            .split('.')
+            .next()
+            .and_then(|s| s.parse::<u32>().ok())
+        {
+            if major >= 20 {
+                return None; // Node.js version is sufficient
+            }
+            tracing::info!(
+                node_version = %version_str,
+                "Node.js version too old for Gemini CLI (requires 20+), falling back to bun"
+            );
+        } else {
+            tracing::info!("Could not parse Node.js version, falling back to bun");
+        }
+    } else {
+        tracing::info!("Node.js not available, falling back to bun");
     }
-
-    tracing::info!(
-        node_version = %version_str,
-        "Node.js version too old for Gemini CLI (requires 20+), falling back to bun"
-    );
 
     // Find the gemini CLI entry point and run via bun
     const GEMINI_ENTRY_POINTS: &[&str] = &[
@@ -11615,8 +11624,9 @@ pub async fn run_gemini_turn(
         tokio::select! {
             _ = cancel.cancelled() => {
                 tracing::info!("Gemini turn cancelled for mission {}", mission_id);
-                // Abort the event-conversion task; dropping it also drops the
-                // inner ProcessHandle which owns the child process.
+                // Kill the Gemini CLI child process to stop consuming API resources
+                backend.kill().await;
+                // Abort the event-conversion task
                 handle.abort();
                 return AgentResult::failure("Mission cancelled".to_string(), 0)
                     .with_terminal_reason(TerminalReason::Cancelled);

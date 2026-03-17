@@ -48,6 +48,11 @@ impl ProcessHandle {
         }
     }
 
+    /// Get a clone of the child process Arc for external kill handling.
+    pub fn child_arc(&self) -> Arc<Mutex<Option<Child>>> {
+        Arc::clone(&self.child)
+    }
+
     /// Kill the underlying CLI process.
     pub async fn kill(&self) {
         if let Some(mut child) = self.child.lock().await.take() {
