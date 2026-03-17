@@ -24,11 +24,13 @@ When creating workers, you MUST set the correct `backend` to match your chosen m
 | Backend | Models | Best for | Cost |
 |---------|--------|----------|------|
 | `codex` | `gpt-5.4` (effort: high) | Software engineering, code edits, debugging | Medium |
-| `gemini` | `gemini-2.5-pro` | Long-context reasoning, proofs, analysis | Low |
-| `claudecode` | `claude-sonnet-4-5-20250929` | General coding, careful edits | Medium |
+| `gemini` | `gemini-3.1-pro-preview` (default), `gemini-2.5-pro` | Long-context reasoning, proofs, analysis | Low-Medium |
+| `claudecode` | `claude-sonnet-4-5-20250929`, `claude-opus-4-6` | General coding, careful edits | Medium-High |
 | `opencode` | `builtin/smart` | Cheap general tasks, redundancy | Low |
 
 **Backend diversity:** For important tasks, race 2-3 workers on the same task using different backends. Keep the first correct result, cancel losers.
+
+**Model override:** Pass `model_override` and optionally `model_effort` (for codex: "high"/"medium"/"low") when creating workers. If omitted, the default model for the backend is used.
 
 ## Tools
 
