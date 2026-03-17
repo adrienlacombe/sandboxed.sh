@@ -754,18 +754,25 @@ impl OrchestratorMcp {
         }))
     }
 
-    async fn wait_for_any_worker(
-        &self,
-        params: WaitForAnyWorkerParams,
-    ) -> Result<Value, String> {
-        let ids: Vec<Uuid> = params
-            .mission_ids
-            .iter()
-            .filter_map(|s| Uuid::parse_str(s).ok())
-            .collect();
+    async fn wait_for_any_worker(&self, params: WaitForAnyWorkerParams) -> Result<Value, String> {
+        let mut ids = Vec::new();
+        let mut invalid_ids = Vec::new();
+        for s in &params.mission_ids {
+            match Uuid::parse_str(s) {
+                Ok(id) => ids.push(id),
+                Err(_) => invalid_ids.push(s.clone()),
+            }
+        }
+
+        if !invalid_ids.is_empty() {
+            return Err(format!(
+                "Invalid mission ID format: {}",
+                invalid_ids.join(", ")
+            ));
+        }
 
         if ids.is_empty() {
-            return Err("No valid mission IDs provided".to_string());
+            return Err("No mission IDs provided".to_string());
         }
 
         let target_statuses = if params.target_statuses.is_empty() {
@@ -782,16 +789,15 @@ impl OrchestratorMcp {
         let timeout = std::time::Duration::from_secs(params.timeout_seconds);
         let interval = std::time::Duration::from_secs(params.poll_interval_seconds);
         let start = std::time::Instant::now();
+        let mut consecutive_errors: u32 = 0;
 
         loop {
-            // Check all workers in each iteration
             for id in &ids {
-                let response = self
-                    .api_get(&format!("/api/control/missions/{}", id))
-                    .await;
+                let response = self.api_get(&format!("/api/control/missions/{}", id)).await;
 
-                if let Ok(resp) = response {
-                    if resp.status().is_success() {
+                match response {
+                    Ok(resp) if resp.status().is_success() => {
+                        consecutive_errors = 0;
                         if let Ok(mission) = resp.json::<Value>().await {
                             let status = mission["status"].as_str().unwrap_or("");
                             if target_statuses.iter().any(|s| s == status) {
@@ -805,10 +811,29 @@ impl OrchestratorMcp {
                             }
                         }
                     }
+                    Ok(resp) => {
+                        consecutive_errors += 1;
+                        if consecutive_errors >= 3 {
+                            return Err(format!(
+                                "Mission {} returned HTTP {} after {} consecutive errors",
+                                id,
+                                resp.status(),
+                                consecutive_errors
+                            ));
+                        }
+                    }
+                    Err(e) => {
+                        consecutive_errors += 1;
+                        if consecutive_errors >= 3 {
+                            return Err(format!(
+                                "API request failed for mission {}: {} ({} consecutive errors)",
+                                id, e, consecutive_errors
+                            ));
+                        }
+                    }
                 }
             }
 
-            // Check timeout
             if start.elapsed() > timeout {
                 return Ok(json!({
                     "reached_target": false,

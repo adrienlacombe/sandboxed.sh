@@ -332,7 +332,10 @@ impl McpRegistry {
         // Ensure workspace/desktop/orchestrator MCPs have correct scope (migrate old configs).
         // This must run even if the binary doesn't exist locally.
         for config in configs.iter_mut() {
-            if !matches!(config.name.as_str(), "workspace" | "desktop" | "orchestrator") {
+            if !matches!(
+                config.name.as_str(),
+                "workspace" | "desktop" | "orchestrator"
+            ) {
                 continue;
             }
 
