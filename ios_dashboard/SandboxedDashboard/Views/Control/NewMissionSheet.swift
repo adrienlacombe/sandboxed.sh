@@ -266,8 +266,8 @@ struct NewMissionSheet: View {
     private func agentRow(agent: BackendAgent, backend: Backend, value: String) -> some View {
         Button {
             selectedAgentValue = value
-            // Reset model override if switching to Claude Code or Amp
-            if backend.id == "claudecode" || backend.id == "amp" {
+            // Reset model override if switching away from OpenCode (which uses provider/model format)
+            if backend.id != "opencode" {
                 if selectedModelOverride.contains("/") {
                     selectedModelOverride = ""
                 }
@@ -351,10 +351,10 @@ struct NewMissionSheet: View {
                 .padding(.top, 8)
             
             ForEach(provider.models) { model in
-                // Claude Code and Amp use raw model IDs (no provider prefix)
-                let value = (selectedBackend == "claudecode" || selectedBackend == "amp")
-                    ? model.id
-                    : "\(provider.id)/\(model.id)"
+                // Only OpenCode uses provider/model format; all other backends use raw model IDs
+                let value = selectedBackend == "opencode"
+                    ? "\(provider.id)/\(model.id)"
+                    : model.id
                 modelRow(id: value, name: model.name, provider: provider)
             }
         }
@@ -426,6 +426,14 @@ struct NewMissionSheet: View {
         if backend == "claudecode" || backend == "amp" {
             // Only show Anthropic models for Claude Code and Amp
             return providers.filter { $0.id == "anthropic" }
+        }
+        if backend == "codex" {
+            // Only show OpenAI models for Codex
+            return providers.filter { $0.id == "openai" }
+        }
+        if backend == "gemini" {
+            // Only show Google models for Gemini
+            return providers.filter { $0.id == "google" }
         }
         return providers
     }

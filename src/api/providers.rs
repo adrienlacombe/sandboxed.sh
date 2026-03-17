@@ -1177,6 +1177,7 @@ pub async fn list_backend_model_options(
     // Source of truth: https://raw.githubusercontent.com/openai/codex/main/codex-rs/core/models.json
     let codex_filter: &dyn Fn(&str) -> bool = &|id: &str| id.contains("codex") || id == "gpt-5.4";
     push_options("codex", Some(&["openai"]), false, Some(codex_filter));
+    push_options("gemini", Some(&["google"]), false, None);
     push_options("opencode", None, true, None);
     backends.entry("amp".to_string()).or_default();
 
@@ -1366,6 +1367,42 @@ pub async fn validate_model_override(
                 } else {
                     Err(format!(
                         "OpenAI provider not configured. Expected an OpenAI model ID (e.g., 'gpt-4', 'o1-*', or 'codex-*'), got '{}'",
+                        model_override
+                    ))
+                }
+            }
+        }
+        "gemini" => {
+            // Gemini expects raw model IDs from Google
+            let google = providers.iter().find(|p| p.id == "google");
+            if let Some(provider) = google {
+                if !provider.models.iter().any(|m| m.id == model_override) {
+                    // Allow unknown Gemini models (escape hatch for new models)
+                    if model_override.starts_with("gemini-") {
+                        Ok(())
+                    } else {
+                        Err(format!(
+                            "Model '{}' not found in Google catalog. Available models: {}. For custom Gemini models, use format 'gemini-*'",
+                            model_override,
+                            provider
+                                .models
+                                .iter()
+                                .map(|m| &m.id)
+                                .cloned()
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ))
+                    }
+                } else {
+                    Ok(())
+                }
+            } else {
+                // Google not configured, but allow if it looks like a Gemini model
+                if model_override.starts_with("gemini-") {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "Google provider not configured. Expected a Gemini model ID (e.g., 'gemini-3.1-pro-preview'), got '{}'",
                         model_override
                     ))
                 }

@@ -97,6 +97,9 @@ struct CreateWorkerParams {
     title: String,
     #[serde(default)]
     agent: Option<String>,
+    /// Backend to use: "claudecode", "codex", "gemini", "opencode", "amp"
+    #[serde(default)]
+    backend: Option<String>,
     #[serde(default)]
     model_override: Option<String>,
     #[serde(default)]
@@ -108,6 +111,27 @@ struct CreateWorkerParams {
     /// Initial prompt to send to the worker after creation.
     #[serde(default)]
     prompt: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BatchCreateWorkersParams {
+    /// Array of worker definitions
+    workers: Vec<CreateWorkerParams>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WaitForAnyWorkerParams {
+    /// UUIDs of the worker missions to wait for
+    mission_ids: Vec<String>,
+    /// Target statuses to wait for (default: completed, failed, interrupted)
+    #[serde(default)]
+    target_statuses: Vec<String>,
+    /// Maximum seconds to wait (default: 600 = 10 minutes)
+    #[serde(default = "default_timeout")]
+    timeout_seconds: u64,
+    /// Poll interval in seconds (default: 10)
+    #[serde(default = "default_poll_interval")]
+    poll_interval_seconds: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -227,26 +251,32 @@ impl OrchestratorMcp {
         vec![
             ToolDefinition {
                 name: "create_worker_mission".to_string(),
-                description: "Create a new worker mission (child of the current boss mission). The worker will start executing immediately.".to_string(),
+                description: "Create a new worker mission (child of the current boss mission). The worker will start executing immediately. IMPORTANT: You must set the 'backend' field to match the harness you want (claudecode, codex, gemini, opencode). If omitted, defaults to the workspace default (usually claudecode).".to_string(),
                 input_schema: json!({
                     "type": "object",
-                    "required": ["title"],
+                    "required": ["title", "prompt"],
                     "properties": {
                         "title": {
                             "type": "string",
                             "description": "Descriptive title for the worker mission"
                         },
-                        "agent": {
+                        "backend": {
                             "type": "string",
-                            "description": "Agent type to use (e.g. 'claudecode'). Defaults to workspace default."
+                            "enum": ["claudecode", "codex", "gemini", "opencode", "amp"],
+                            "description": "Backend/harness to use. MUST match the model: claudecode for Claude models, codex for OpenAI/GPT models, gemini for Gemini models, opencode for any model via provider routing, amp for Amp."
                         },
                         "model_override": {
                             "type": "string",
-                            "description": "Model to use (e.g. 'claude-sonnet-4-5-20250929')"
+                            "description": "Model to use. Must match the backend: Claude models (e.g. 'claude-sonnet-4-5-20250929') for claudecode, GPT models (e.g. 'gpt-5.4') for codex, Gemini models for gemini, 'provider/model' format for opencode."
                         },
                         "model_effort": {
                             "type": "string",
-                            "description": "Effort level (e.g. 'high', 'low')"
+                            "enum": ["low", "medium", "high"],
+                            "description": "Effort level. Supported by codex and claudecode backends."
+                        },
+                        "agent": {
+                            "type": "string",
+                            "description": "Agent name from library (optional, for opencode backend)."
                         },
                         "config_profile": {
                             "type": "string",
@@ -254,11 +284,39 @@ impl OrchestratorMcp {
                         },
                         "working_directory": {
                             "type": "string",
-                            "description": "Working directory for the worker (e.g. a git worktree path)"
+                            "description": "Working directory for the worker (e.g. a git worktree path). If omitted, uses the boss mission's repo directory."
                         },
                         "prompt": {
                             "type": "string",
-                            "description": "Initial prompt/instructions to send to the worker after creation"
+                            "description": "Initial prompt/instructions to send to the worker after creation. Must be self-contained."
+                        }
+                    }
+                }),
+            },
+            ToolDefinition {
+                name: "batch_create_workers".to_string(),
+                description: "Create multiple worker missions at once. Each worker is created independently — if one fails, others still succeed. Use this to spawn many workers in parallel.".to_string(),
+                input_schema: json!({
+                    "type": "object",
+                    "required": ["workers"],
+                    "properties": {
+                        "workers": {
+                            "type": "array",
+                            "description": "Array of worker definitions. Each has the same schema as create_worker_mission.",
+                            "items": {
+                                "type": "object",
+                                "required": ["title", "prompt"],
+                                "properties": {
+                                    "title": { "type": "string" },
+                                    "backend": { "type": "string", "enum": ["claudecode", "codex", "gemini", "opencode", "amp"] },
+                                    "model_override": { "type": "string" },
+                                    "model_effort": { "type": "string", "enum": ["low", "medium", "high"] },
+                                    "agent": { "type": "string" },
+                                    "config_profile": { "type": "string" },
+                                    "working_directory": { "type": "string" },
+                                    "prompt": { "type": "string" }
+                                }
+                            }
                         }
                     }
                 }),
@@ -363,7 +421,7 @@ impl OrchestratorMcp {
             },
             ToolDefinition {
                 name: "wait_for_worker".to_string(),
-                description: "Block until a worker mission reaches a terminal status (completed, failed, or interrupted). Returns the worker's final status and details. Use this instead of polling list_worker_missions in a loop.".to_string(),
+                description: "Block until a single worker mission reaches a terminal status. Use wait_for_any_worker to monitor multiple workers simultaneously.".to_string(),
                 input_schema: json!({
                     "type": "object",
                     "required": ["mission_id"],
@@ -371,6 +429,34 @@ impl OrchestratorMcp {
                         "mission_id": {
                             "type": "string",
                             "description": "UUID of the worker mission to wait for"
+                        },
+                        "target_statuses": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "Statuses to wait for (default: ['completed', 'failed', 'interrupted'])"
+                        },
+                        "timeout_seconds": {
+                            "type": "integer",
+                            "description": "Maximum seconds to wait (default: 600)"
+                        },
+                        "poll_interval_seconds": {
+                            "type": "integer",
+                            "description": "Seconds between status checks (default: 10)"
+                        }
+                    }
+                }),
+            },
+            ToolDefinition {
+                name: "wait_for_any_worker".to_string(),
+                description: "Block until ANY of the specified worker missions reaches a terminal status. Returns the first worker that finishes. Use this to monitor a pool of workers and react as each completes.".to_string(),
+                input_schema: json!({
+                    "type": "object",
+                    "required": ["mission_ids"],
+                    "properties": {
+                        "mission_ids": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "UUIDs of worker missions to monitor"
                         },
                         "target_statuses": {
                             "type": "array",
@@ -417,6 +503,7 @@ impl OrchestratorMcp {
         let body = json!({
             "title": params.title,
             "agent": params.agent,
+            "backend": params.backend,
             "model_override": params.model_override,
             "model_effort": params.model_effort,
             "config_profile": params.config_profile,
@@ -635,6 +722,141 @@ impl OrchestratorMcp {
         }))
     }
 
+    async fn batch_create_workers(
+        &self,
+        params: BatchCreateWorkersParams,
+    ) -> Result<Value, String> {
+        let mut results = Vec::new();
+        let mut errors = Vec::new();
+
+        for (i, worker_params) in params.workers.into_iter().enumerate() {
+            match self.create_worker(worker_params).await {
+                Ok(mission) => results.push(json!({
+                    "index": i,
+                    "success": true,
+                    "mission": mission,
+                })),
+                Err(e) => {
+                    errors.push(json!({
+                        "index": i,
+                        "success": false,
+                        "error": e,
+                    }));
+                }
+            }
+        }
+
+        Ok(json!({
+            "created": results.len(),
+            "failed": errors.len(),
+            "results": results,
+            "errors": errors,
+        }))
+    }
+
+    async fn wait_for_any_worker(&self, params: WaitForAnyWorkerParams) -> Result<Value, String> {
+        let mut ids = Vec::new();
+        let mut invalid_ids = Vec::new();
+        for s in &params.mission_ids {
+            match Uuid::parse_str(s) {
+                Ok(id) => ids.push(id),
+                Err(_) => invalid_ids.push(s.clone()),
+            }
+        }
+
+        if !invalid_ids.is_empty() {
+            return Err(format!(
+                "Invalid mission ID format: {}",
+                invalid_ids.join(", ")
+            ));
+        }
+
+        if ids.is_empty() {
+            return Err("No mission IDs provided".to_string());
+        }
+
+        let target_statuses = if params.target_statuses.is_empty() {
+            vec![
+                "completed".to_string(),
+                "failed".to_string(),
+                "interrupted".to_string(),
+                "not_feasible".to_string(),
+            ]
+        } else {
+            params.target_statuses
+        };
+
+        let timeout = std::time::Duration::from_secs(params.timeout_seconds);
+        let interval = std::time::Duration::from_secs(params.poll_interval_seconds);
+        let start = std::time::Instant::now();
+        let mut error_counts: std::collections::HashMap<Uuid, u32> =
+            ids.iter().map(|id| (*id, 0u32)).collect();
+
+        loop {
+            for id in &ids {
+                let response = self.api_get(&format!("/api/control/missions/{}", id)).await;
+                let errors = error_counts.get_mut(id).unwrap();
+
+                match response {
+                    Ok(resp) if resp.status().is_success() => match resp.json::<Value>().await {
+                        Ok(mission) => {
+                            *errors = 0;
+                            let status = mission["status"].as_str().unwrap_or("");
+                            if target_statuses.iter().any(|s| s == status) {
+                                return Ok(json!({
+                                    "reached_target": true,
+                                    "mission_id": id.to_string(),
+                                    "status": status,
+                                    "elapsed_seconds": start.elapsed().as_secs(),
+                                    "mission": mission,
+                                }));
+                            }
+                        }
+                        Err(e) => {
+                            *errors += 1;
+                            if *errors >= 3 {
+                                return Err(format!(
+                                    "Mission {} returned invalid JSON: {} ({} consecutive errors)",
+                                    id, e, errors
+                                ));
+                            }
+                        }
+                    },
+                    Ok(resp) => {
+                        *errors += 1;
+                        if *errors >= 3 {
+                            return Err(format!(
+                                "Mission {} returned HTTP {} ({} consecutive errors)",
+                                id,
+                                resp.status(),
+                                errors
+                            ));
+                        }
+                    }
+                    Err(e) => {
+                        *errors += 1;
+                        if *errors >= 3 {
+                            return Err(format!(
+                                "API request failed for mission {}: {} ({} consecutive errors)",
+                                id, e, errors
+                            ));
+                        }
+                    }
+                }
+            }
+
+            if start.elapsed() > timeout {
+                return Ok(json!({
+                    "reached_target": false,
+                    "elapsed_seconds": start.elapsed().as_secs(),
+                    "timeout": true,
+                }));
+            }
+
+            tokio::time::sleep(interval).await;
+        }
+    }
+
     async fn wait_for_worker(&self, params: WaitForWorkerParams) -> Result<Value, String> {
         let id = Uuid::parse_str(&params.mission_id)
             .map_err(|_| "Invalid mission ID format".to_string())?;
@@ -701,6 +923,11 @@ impl OrchestratorMcp {
                     serde_json::from_value(params).map_err(|e| format!("Invalid params: {}", e))?;
                 self.create_worker(params).await
             }
+            "batch_create_workers" => {
+                let params: BatchCreateWorkersParams =
+                    serde_json::from_value(params).map_err(|e| format!("Invalid params: {}", e))?;
+                self.batch_create_workers(params).await
+            }
             "list_worker_missions" => self.list_workers().await,
             "get_worker_status" => {
                 let params: GetWorkerStatusParams =
@@ -732,6 +959,11 @@ impl OrchestratorMcp {
                 let params: WaitForWorkerParams =
                     serde_json::from_value(params).map_err(|e| format!("Invalid params: {}", e))?;
                 self.wait_for_worker(params).await
+            }
+            "wait_for_any_worker" => {
+                let params: WaitForAnyWorkerParams =
+                    serde_json::from_value(params).map_err(|e| format!("Invalid params: {}", e))?;
+                self.wait_for_any_worker(params).await
             }
             _ => Err(format!("Unknown method: {}", method)),
         }

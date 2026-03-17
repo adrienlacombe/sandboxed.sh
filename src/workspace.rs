@@ -3286,7 +3286,7 @@ pub async fn prepare_mission_workspace_with_skills_backend(
         }
 
         // Collect skills (for backends that use skill contents directly)
-        if matches!(backend_id, "claudecode" | "amp" | "codex") {
+        if matches!(backend_id, "claudecode" | "amp" | "codex" | "gemini") {
             let skill_names = match resolve_workspace_skill_names(workspace, lib).await {
                 Ok(names) => {
                     tracing::debug!(
@@ -3901,7 +3901,7 @@ async fn sync_workspace_mcp_binaries(
     container_root: &Path,
 ) -> anyhow::Result<()> {
     // Copy MCP binaries into the container so workspace-local MCP configs can run them directly.
-    for binary in ["workspace-mcp", "desktop-mcp"] {
+    for binary in ["workspace-mcp", "desktop-mcp", "orchestrator-mcp"] {
         if find_host_binary(binary, working_dir).is_none() {
             tracing::warn!(binary, "MCP binary not found on host; skipping copy");
             continue;

@@ -3840,10 +3840,10 @@ pub async fn create_mission(
     };
 
     // Validate agent exists before creating mission (fail fast with clear error)
-    // Skip validation for Claude Code, Amp, and Codex - they have their own built-in agents
+    // Skip validation for Claude Code, Amp, Codex, and Gemini - they have their own built-in agents
     if let Some(ref agent_name) = agent {
         let backend_id = backend.as_deref();
-        let skip_validation = matches!(backend_id, Some("claudecode" | "amp" | "codex"));
+        let skip_validation = matches!(backend_id, Some("claudecode" | "amp" | "codex" | "gemini"));
         if !skip_validation {
             super::library::validate_agent_exists(
                 &state,

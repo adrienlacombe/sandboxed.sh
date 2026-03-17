@@ -329,10 +329,13 @@ impl McpRegistry {
                 .await;
         }
 
-        // Ensure workspace/desktop MCPs have correct scope (migrate old configs).
+        // Ensure workspace/desktop/orchestrator MCPs have correct scope (migrate old configs).
         // This must run even if the binary doesn't exist locally.
         for config in configs.iter_mut() {
-            if !matches!(config.name.as_str(), "workspace" | "desktop") {
+            if !matches!(
+                config.name.as_str(),
+                "workspace" | "desktop" | "orchestrator"
+            ) {
                 continue;
             }
 
@@ -349,7 +352,10 @@ impl McpRegistry {
 
         // Ensure built-in MCPs have default_enabled = true (migrate old configs).
         for config in configs.iter_mut() {
-            if !matches!(config.name.as_str(), "workspace" | "desktop" | "playwright") {
+            if !matches!(
+                config.name.as_str(),
+                "workspace" | "desktop" | "playwright" | "orchestrator"
+            ) {
                 continue;
             }
 
@@ -370,6 +376,7 @@ impl McpRegistry {
             let binary_name = match config.name.as_str() {
                 "workspace" => Some("workspace-mcp"),
                 "desktop" => Some("desktop-mcp"),
+                "orchestrator" => Some("orchestrator-mcp"),
                 _ => None,
             };
 
