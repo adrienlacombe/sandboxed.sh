@@ -334,6 +334,7 @@ export function NewMissionDialog({
   const providerAllowlist = useMemo(() => {
     if (selectedBackend === 'claudecode') return new Set(['anthropic']);
     if (selectedBackend === 'codex') return new Set(['openai']);
+    if (selectedBackend === 'gemini') return new Set(['google']);
     return null;
   }, [selectedBackend]);
 
