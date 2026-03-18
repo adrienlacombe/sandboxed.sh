@@ -8875,10 +8875,19 @@ pub async fn run_opencode_turn(
         escaped
     };
 
+    let use_plain_opencode = workspace
+        .config
+        .get("disable_oh_my_opencode")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
     let mut shell_cmd = String::new();
     if runner_is_direct {
         shell_cmd.push_str(&shell_escape(&cli_runner));
         shell_cmd.push_str(" run");
+    } else if use_plain_opencode {
+        shell_cmd.push_str(&shell_escape(&cli_runner));
+        shell_cmd.push_str(" opencode run");
     } else {
         shell_cmd.push_str(&shell_escape(&cli_runner));
         shell_cmd.push_str(" oh-my-opencode run");
@@ -11242,6 +11251,7 @@ pub async fn run_codex_turn(
         std::collections::HashMap::new();
     let mut thinking_emitted = false;
     let mut thinking_done_emitted = false;
+    let mut thinking_accumulated = String::new();
     let mut last_summary: Option<String> = None;
     let mut total_input_tokens: u64 = 0;
     let mut total_output_tokens: u64 = 0;
@@ -11267,14 +11277,31 @@ pub async fn run_codex_turn(
                         });
                     }
                     ExecutionEvent::Thinking { content } => {
+                        // Stream incrementally for real-time UI
                         let _ = events_tx.send(AgentEvent::Thinking {
-                            content,
+                            content: content.clone(),
                             done: false,
                             mission_id: Some(mission_id),
                         });
+                        // Accumulate for persistence: Codex sends snapshot-style
+                        // thinking updates (each one replaces the previous), so
+                        // keep the latest (longest) content.
+                        if content.len() >= thinking_accumulated.len() {
+                            thinking_accumulated = content;
+                        }
                         thinking_emitted = true;
                     }
                     ExecutionEvent::ToolCall { id, name, args } => {
+                        // Flush accumulated thinking as done before tool call,
+                        // so the event logger persists the full thought block.
+                        if !thinking_accumulated.is_empty() {
+                            let _ = events_tx.send(AgentEvent::Thinking {
+                                content: std::mem::take(&mut thinking_accumulated),
+                                done: true,
+                                mission_id: Some(mission_id),
+                            });
+                            thinking_done_emitted = true;
+                        }
                         pending_tools.insert(id.clone(), name.clone());
                         let _ = events_tx.send(AgentEvent::ToolCall {
                             tool_call_id: id,
@@ -11302,8 +11329,20 @@ pub async fn run_codex_turn(
                         total_output_tokens = total_output_tokens.saturating_add(output_tokens);
                     }
                     ExecutionEvent::Error { message } => {
-                        error_message = Some(message.clone());
-                        tracing::error!("Codex error: {}", message);
+                        // Codex CLI sometimes emits non-fatal internal errors (e.g.
+                        // "Failed to shutdown rollout recorder") after the agent has
+                        // already produced a valid response. Ignore these if we
+                        // already have assistant output.
+                        if assistant_message.trim().is_empty() {
+                            error_message = Some(message.clone());
+                            tracing::error!("Codex error: {}", message);
+                        } else {
+                            tracing::warn!(
+                                "Ignoring post-response Codex error (have {}B assistant output): {}",
+                                assistant_message.len(),
+                                message
+                            );
+                        }
                     }
                     ExecutionEvent::MessageComplete { session_id: _ } => {
                         success = error_message.is_none();
@@ -11331,9 +11370,11 @@ pub async fn run_codex_turn(
         }
     }
 
+    // Flush any remaining accumulated thinking with full content so
+    // the event logger persists it for replay/history.
     if thinking_emitted && !thinking_done_emitted {
         let _ = events_tx.send(AgentEvent::Thinking {
-            content: String::new(),
+            content: thinking_accumulated,
             done: true,
             mission_id: Some(mission_id),
         });
@@ -11617,6 +11658,7 @@ pub async fn run_gemini_turn(
         std::collections::HashMap::new();
     let mut thinking_emitted = false;
     let mut thinking_done_emitted = false;
+    let mut thinking_accumulated = String::new();
     let mut total_input_tokens: u64 = 0;
     let mut total_output_tokens: u64 = 0;
 
@@ -11641,14 +11683,28 @@ pub async fn run_gemini_turn(
                         });
                     }
                     ExecutionEvent::Thinking { content } => {
+                        // Stream incrementally for real-time UI
                         let _ = events_tx.send(AgentEvent::Thinking {
-                            content,
+                            content: content.clone(),
                             done: false,
                             mission_id: Some(mission_id),
                         });
+                        // Accumulate for persistence (keep longest snapshot)
+                        if content.len() >= thinking_accumulated.len() {
+                            thinking_accumulated = content;
+                        }
                         thinking_emitted = true;
                     }
                     ExecutionEvent::ToolCall { id, name, args } => {
+                        // Flush accumulated thinking before tool call
+                        if !thinking_accumulated.is_empty() {
+                            let _ = events_tx.send(AgentEvent::Thinking {
+                                content: std::mem::take(&mut thinking_accumulated),
+                                done: true,
+                                mission_id: Some(mission_id),
+                            });
+                            thinking_done_emitted = true;
+                        }
                         pending_tools.insert(id.clone(), name.clone());
                         let _ = events_tx.send(AgentEvent::ToolCall {
                             tool_call_id: id,
@@ -11704,9 +11760,10 @@ pub async fn run_gemini_turn(
         }
     }
 
+    // Flush any remaining accumulated thinking with full content
     if thinking_emitted && !thinking_done_emitted {
         let _ = events_tx.send(AgentEvent::Thinking {
-            content: String::new(),
+            content: thinking_accumulated,
             done: true,
             mission_id: Some(mission_id),
         });
@@ -11800,26 +11857,11 @@ fn get_google_credentials_for_gemini(working_dir: &std::path::Path) -> GeminiCre
         return GeminiCredentials::ApiKey(key);
     }
 
-    // Read provider_backends.json to check backend targeting.
-    // If the Google provider has use_for_backends configured but "gemini" is
-    // not included, skip using credentials from that provider.
-    let backends_path = working_dir
-        .join(".sandboxed-sh")
-        .join("provider_backends.json");
-    let google_targets_gemini = if let Ok(data) = std::fs::read_to_string(&backends_path) {
-        if let Ok(map) = serde_json::from_str::<serde_json::Value>(&data) {
-            match map.get("google").and_then(|v| v.as_array()) {
-                Some(backends) => backends.iter().any(|b| b.as_str() == Some("gemini")),
-                // No entry for google means no explicit targeting; allow by default
-                None => true,
-            }
-        } else {
-            true
-        }
-    } else {
-        // No backends state file; allow by default
-        true
-    };
+    let google_targets_gemini = crate::api::ai_providers::provider_targets_backend(
+        working_dir,
+        crate::ai_providers::ProviderType::Google,
+        "gemini",
+    );
 
     if !google_targets_gemini {
         tracing::info!(

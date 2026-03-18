@@ -561,6 +561,11 @@ fn default_providers_config() -> ProvidersConfig {
                 description: "GLM models via Z.AI API key".to_string(),
                 models: vec![
                     ProviderModel {
+                        id: "glm-5-turbo".to_string(),
+                        name: "GLM-5 Turbo".to_string(),
+                        description: Some("Fast reasoning model with deep thinking".to_string()),
+                    },
+                    ProviderModel {
                         id: "glm-4.7".to_string(),
                         name: "GLM-4.7".to_string(),
                         description: Some("Most capable GLM model".to_string()),

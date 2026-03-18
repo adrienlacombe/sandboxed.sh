@@ -205,12 +205,14 @@ describe('mission switcher search helpers', () => {
   it('keeps running missions searchable even without hydrated mission metadata', () => {
     const runningInfo = {
       mission_id: 'mission-running-123',
-      state: 'running',
+      state: 'running' as const,
       queue_len: 0,
       history_len: 12,
       seconds_since_activity: 3,
       health: { status: 'healthy' as const },
       expected_deliverables: 0,
+      subtask_total: 0,
+      subtask_completed: 0,
     };
 
     expect(getRunningMissionSearchText(runningInfo)).toContain('mission-running-123');
@@ -222,14 +224,17 @@ describe('mission switcher search helpers', () => {
   it('supports synonym and stopword matching for running missions', () => {
     const runningInfo = {
       mission_id: 'mission-running-123',
-      state: 'blocked',
+      state: 'waiting_for_tool' as const,
       queue_len: 0,
       history_len: 12,
       seconds_since_activity: 3,
       health: { status: 'healthy' as const },
       expected_deliverables: 0,
+      subtask_total: 0,
+      subtask_completed: 0,
     };
 
+    // 'waiting_for_tool' contains 'waiting', which is a synonym for 'blocked' and 'stalled'
     expect(runningMissionMatchesSearchQuery(runningInfo, 'stalled mission')).toBe(true);
     expect(runningMissionMatchesSearchQuery(runningInfo, 'where is my blocked mission')).toBe(true);
   });
@@ -237,12 +242,14 @@ describe('mission switcher search helpers', () => {
   it('supports abbreviation phrase expansion for running mission fallback relevance', () => {
     const runningInfo = {
       mission_id: 'mission-login-pipeline-123',
-      state: 'running',
+      state: 'running' as const,
       queue_len: 0,
       history_len: 12,
       seconds_since_activity: 3,
       health: { status: 'healthy' as const },
       expected_deliverables: 0,
+      subtask_total: 0,
+      subtask_completed: 0,
     };
 
     expect(runningMissionMatchesSearchQuery(runningInfo, 'sso')).toBe(true);

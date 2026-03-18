@@ -114,6 +114,7 @@ import {
   File,
   ExternalLink,
   MessageSquare,
+  Users,
 } from "lucide-react";
 import { IMAGE_PATH_PATTERN } from "@/lib/file-extensions";
 import { insertTextAtSelection, type TextSelection } from "@/lib/text-selection";
@@ -194,6 +195,7 @@ import { useCopyToClipboard } from "@/hooks/use-copy-to-clipboard";
 import { DesktopStream } from "@/components/desktop-stream";
 import { NewMissionDialog } from "@/components/new-mission-dialog";
 import { MissionSwitcher, normalizeMetadataText } from "@/components/mission-switcher";
+import { WorkerPanel } from "@/components/worker-panel";
 
 import type { SharedFile } from "@/lib/api";
 
@@ -2529,6 +2531,7 @@ export default function ControlClient() {
     []
   );
   const [showMissionSwitcher, setShowMissionSwitcher] = useState(false);
+  const [showWorkerPanel, setShowWorkerPanel] = useState(false);
   const [highlightedItemId, setHighlightedItemId] = useState<string | null>(null);
   const deepLinkFocusKeyRef = useRef<string | null>(null);
   const [showAutomationsDialog, setShowAutomationsDialog] = useState(false);
@@ -4289,7 +4292,7 @@ export default function ControlClient() {
   // Global keyboard shortcut for mission switcher (Cmd+K / Ctrl+K)
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
-      if ((e.metaKey || e.ctrlKey) && e.key === 'k') {
+      if ((e.metaKey || e.ctrlKey) && e.key === 'k' && !e.shiftKey) {
         e.preventDefault();
         setShowMissionSwitcher(true);
       }
@@ -4760,7 +4763,7 @@ export default function ControlClient() {
       return { id: mission.id };
     } catch (err) {
       console.error("Failed to create mission:", err);
-      toast.error("Failed to create new mission");
+      toast.error(err instanceof Error ? err.message : "Failed to create new mission");
       throw err; // Re-throw so dialog knows creation failed
     } finally {
       setMissionLoading(false);
@@ -6435,6 +6438,14 @@ export default function ControlClient() {
     return recentMissions.filter((m) => m.parent_mission_id === activeMission.id);
   }, [activeMission, recentMissions]);
   const activeMissionRole = activeMission ? inferMissionRole(activeMission) : null;
+  const isBossMission = childMissions.length > 0 || activeMissionRole === "boss";
+
+  // Auto-show worker panel when viewing a boss mission with workers
+  useEffect(() => {
+    if (childMissions.length > 0) {
+      setShowWorkerPanel(true);
+    }
+  }, [activeMission?.id, childMissions.length]);
 
   // Determine if we should show the resume UI for interrupted/blocked/failed missions
   // Don't show resume UI if:
@@ -6590,6 +6601,26 @@ export default function ControlClient() {
               <span className="text-xs opacity-60">({thinkingItemsCount})</span>
             )}
           </button>
+
+          {/* Worker panel toggle - only shown for boss missions */}
+          {isBossMission && (
+            <button
+              onClick={() => setShowWorkerPanel((prev) => !prev)}
+              className={cn(
+                "flex items-center gap-2 rounded-lg border px-3 py-2 text-sm transition-colors",
+                showWorkerPanel
+                  ? "border-violet-500/30 bg-violet-500/10 text-violet-400"
+                  : "border-white/[0.06] bg-white/[0.02] text-white/70 hover:bg-white/[0.04]"
+              )}
+              title={showWorkerPanel ? "Hide worker panel" : "Show worker panel"}
+            >
+              <Users className="h-4 w-4" />
+              <span className="hidden sm:inline">Workers</span>
+              {childMissions.length > 0 && (
+                <span className="text-xs opacity-60">({childMissions.length})</span>
+              )}
+            </button>
+          )}
 
           {/* Desktop stream toggle with display selector - only shown when a desktop session is active */}
           {hasDesktopSession && (
@@ -7935,12 +7966,29 @@ export default function ControlClient() {
         </div>
       </div>
 
-        {/* Right column: Thinking Panel and Desktop Stream stacked */}
-        {(showThinkingPanel || showDesktopStream) && (
+        {/* Right column: Worker Panel, Thinking Panel, and Desktop Stream stacked */}
+        {(showThinkingPanel || showDesktopStream || (showWorkerPanel && isBossMission)) && (
           <div className={cn(
             "min-h-0 flex flex-col gap-4 transition-all duration-300 animate-fade-in shrink-0",
             showDesktopStream ? "flex-1 max-w-md" : "w-80"
           )}>
+            {/* Worker Panel */}
+            {showWorkerPanel && isBossMission && (
+              <WorkerPanel
+                childMissions={childMissions}
+                runningMissions={runningMissions}
+                bossMissionId={activeMission?.id ?? ''}
+                viewingMissionId={viewingMissionId}
+                onSelectWorker={(missionId) => handleViewMission(missionId)}
+                onClose={() => setShowWorkerPanel(false)}
+                className={cn(
+                  showThinkingPanel || showDesktopStream
+                    ? "flex-shrink-0 max-h-[50%]"
+                    : "flex-1"
+                )}
+              />
+            )}
+
             {/* Thinking Panel */}
             {showThinkingPanel && (
               <ThinkingPanel

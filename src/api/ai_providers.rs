@@ -10,7 +10,7 @@
 //! - Set default provider
 //! - Get provider credentials for specific backend (Claude Code)
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use axum::{
@@ -434,6 +434,7 @@ pub fn routes() -> Router<Arc<super::routes::AppState>> {
         .route("/:id/oauth/callback", post(oauth_callback))
         .route("/:id/default", post(set_default))
         .route("/:id/health", post(check_provider_health))
+        .route("/:id/usage", get(get_provider_usage))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -453,6 +454,30 @@ pub struct ClaudeCodeAuthWithExpiry {
     pub auth: ClaudeCodeAuth,
     /// Expiry timestamp in milliseconds. None for API keys (never expire).
     pub expires_at: Option<i64>,
+}
+
+pub fn default_backends_for_provider(provider_type: ProviderType) -> Vec<String> {
+    match provider_type {
+        ProviderType::Anthropic => vec!["opencode".to_string(), "claudecode".to_string()],
+        ProviderType::OpenAI => vec!["opencode".to_string(), "codex".to_string()],
+        ProviderType::Google => vec!["opencode".to_string(), "gemini".to_string()],
+        ProviderType::Amp => vec!["amp".to_string()],
+        _ => vec!["opencode".to_string()],
+    }
+}
+
+pub fn provider_targets_backend(
+    working_dir: &Path,
+    provider_type: ProviderType,
+    backend: &str,
+) -> bool {
+    let backends_state = read_provider_backends_state(working_dir);
+    let configured = backends_state
+        .get(provider_type.id())
+        .cloned()
+        .unwrap_or_else(|| default_backends_for_provider(provider_type));
+
+    configured.iter().any(|candidate| candidate == backend)
 }
 
 /// Get the Anthropic API key or OAuth access token for the Claude Code backend.
@@ -479,9 +504,8 @@ pub fn get_anthropic_auth_for_claudecode(working_dir: &Path) -> Option<ClaudeCod
 
     // Check if Anthropic provider has claudecode in use_for_backends
     let anthropic_backends = backends_state.get(ProviderType::Anthropic.id());
-    let use_for_claudecode = anthropic_backends
-        .map(|backends| backends.iter().any(|b| b == "claudecode"))
-        .unwrap_or(false);
+    let use_for_claudecode =
+        provider_targets_backend(working_dir, ProviderType::Anthropic, "claudecode");
     tracing::debug!(
         anthropic_backends = ?anthropic_backends,
         use_for_claudecode = use_for_claudecode,
@@ -1207,11 +1231,7 @@ fn get_anthropic_auth_from_claude_cli_credentials() -> Option<ClaudeCodeAuth> {
 
 /// Check if the Anthropic provider is configured for the Claude Code backend.
 pub fn is_anthropic_configured_for_claudecode(working_dir: &Path) -> bool {
-    let backends_state = read_provider_backends_state(working_dir);
-    backends_state
-        .get(ProviderType::Anthropic.id())
-        .map(|backends| backends.iter().any(|b| b == "claudecode"))
-        .unwrap_or(false)
+    provider_targets_backend(working_dir, ProviderType::Anthropic, "claudecode")
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1839,7 +1859,7 @@ fn build_provider_response(
     // Most providers are only usable via OpenCode, but we still store and render
     // `use_for_backends` generically so the UI can express intent and we can grow
     // support without special-casing a single provider forever.
-    let use_for_backends = backends.unwrap_or_else(|| vec!["opencode".to_string()]);
+    let use_for_backends = backends.unwrap_or_else(|| default_backends_for_provider(provider_type));
 
     ProviderResponse {
         id: provider_type.id().to_string(),
@@ -1864,6 +1884,230 @@ fn build_provider_response(
         account_email,
         created_at: now,
         updated_at: now,
+    }
+}
+
+/// Build a ProviderResponse from an AIProvider store entry.
+/// Used for all provider types now that everything is stored in AIProviderStore.
+fn build_response_from_store(provider: &crate::ai_providers::AIProvider) -> ProviderResponse {
+    let pt = provider.provider_type;
+    let has_api_key = provider.api_key.is_some();
+    let has_oauth = provider.oauth.is_some();
+    let status = if has_api_key || has_oauth || provider.base_url.is_some() {
+        ProviderStatusResponse::Connected
+    } else {
+        ProviderStatusResponse::NeedsAuth { auth_url: None }
+    };
+    let use_for_backends = provider
+        .use_for_backends
+        .clone()
+        .unwrap_or_else(|| default_backends_for_provider(pt));
+
+    ProviderResponse {
+        id: provider.id.to_string(),
+        provider_type: pt,
+        provider_type_name: pt.display_name().to_string(),
+        name: provider.name.clone(),
+        label: provider.label.clone(),
+        priority: provider.priority,
+        google_project_id: provider.google_project_id.clone(),
+        has_api_key,
+        has_oauth,
+        base_url: provider.base_url.clone(),
+        custom_models: provider.custom_models.clone(),
+        custom_env_var: provider.custom_env_var.clone(),
+        npm_package: provider.npm_package.clone(),
+        enabled: provider.enabled,
+        is_default: provider.is_default,
+        uses_oauth: pt.uses_oauth(),
+        auth_methods: pt.auth_methods(),
+        status,
+        use_for_backends,
+        account_email: provider.account_email.clone(),
+        created_at: provider.created_at,
+        updated_at: provider.updated_at,
+    }
+}
+
+/// Sync the highest-priority enabled provider of a given type from the store
+/// to opencode.json and auth.json for runtime consumption by OpenCode.
+async fn sync_store_to_opencode(
+    store: &crate::ai_providers::AIProviderStore,
+    working_dir: &Path,
+    provider_type: ProviderType,
+) {
+    let providers = store.get_all_by_type(provider_type).await;
+    let active = providers.first(); // already sorted by priority
+
+    let config_path = get_opencode_config_path(working_dir);
+    let mut opencode_config = match read_opencode_config(&config_path) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!("Failed to read opencode config for sync: {}", e);
+            return;
+        }
+    };
+
+    if let Some(provider) = active {
+        // Sync provider config entry to opencode.json
+        set_provider_config_entry(
+            &mut opencode_config,
+            provider_type,
+            Some(provider.name.clone()),
+            Some(provider.base_url.clone()),
+            Some(provider.enabled),
+            provider.use_for_backends.clone(),
+            provider.google_project_id.clone().map(Some),
+        );
+        if let Err(e) = write_opencode_config(&config_path, &opencode_config) {
+            tracing::error!("Failed to write opencode config during sync: {}", e);
+        }
+
+        // Sync credentials to auth.json
+        if let Some(ref key) = provider.api_key {
+            if let Err(e) = sync_api_key_to_opencode_auth(provider_type, key) {
+                tracing::error!("Failed to sync API key to OpenCode during sync: {}", e);
+            }
+        }
+        if let Some(ref oauth) = provider.oauth {
+            if let Err(e) = sync_to_opencode_auth(
+                provider_type,
+                &oauth.refresh_token,
+                &oauth.access_token,
+                oauth.expires_at,
+            ) {
+                tracing::error!("Failed to sync OAuth to OpenCode during sync: {}", e);
+            }
+        }
+
+        // Sync backends
+        let backends = provider
+            .use_for_backends
+            .clone()
+            .unwrap_or_else(|| default_backends_for_provider(provider_type));
+        if let Err(e) = update_provider_backends(working_dir, provider_type.id(), backends) {
+            tracing::error!("Failed to sync provider backends during sync: {}", e);
+        }
+
+        // Sync account email
+        if let Some(ref email) = provider.account_email {
+            if let Err(e) = update_provider_account(working_dir, provider_type.id(), email.clone())
+            {
+                tracing::error!("Failed to sync provider account during sync: {}", e);
+            }
+        }
+    } else {
+        // No providers of this type - remove from opencode.json
+        remove_provider_config_entry(&mut opencode_config, provider_type);
+        if let Err(e) = write_opencode_config(&config_path, &opencode_config) {
+            tracing::error!("Failed to write opencode config during sync removal: {}", e);
+        }
+        if let Err(e) = remove_opencode_auth_entry(provider_type) {
+            tracing::error!("Failed to remove OpenCode auth entry during sync: {}", e);
+        }
+        let _ = remove_provider_backends(working_dir, provider_type.id());
+        let _ = remove_provider_account(working_dir, provider_type.id());
+    }
+}
+
+/// Migrate standard providers from opencode.json + auth.json into the AIProviderStore.
+/// Called on first list to ensure existing setups continue working.
+async fn migrate_opencode_providers_to_store(
+    store: &crate::ai_providers::AIProviderStore,
+    working_dir: &Path,
+) {
+    let config_path = get_opencode_config_path(working_dir);
+    let opencode_config = match read_opencode_config(&config_path) {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    let auth_map = read_opencode_auth_map().unwrap_or_default();
+    let backends_state = read_provider_backends_state(working_dir);
+    let accounts_state = read_provider_accounts_state(working_dir);
+
+    let provider_map = match opencode_config.get("provider").and_then(|v| v.as_object()) {
+        Some(m) => m.clone(),
+        None => return,
+    };
+
+    for (key, _entry) in &provider_map {
+        let Some(provider_type) = ProviderType::from_id(key) else {
+            continue;
+        };
+        // Skip Custom/Amp (already in store) and skip if already in store
+        if provider_type == ProviderType::Custom || provider_type == ProviderType::Amp {
+            continue;
+        }
+        let existing = store.get_all_by_type(provider_type).await;
+        if !existing.is_empty() {
+            continue;
+        }
+
+        // Create store entry from opencode.json + auth.json
+        let config_entry = get_provider_config_entry(&opencode_config, provider_type);
+        let name = config_entry
+            .as_ref()
+            .and_then(|c| c.name.clone())
+            .unwrap_or_else(|| provider_type.display_name().to_string());
+
+        let mut provider = crate::ai_providers::AIProvider::new(provider_type, name);
+        provider.base_url = config_entry.as_ref().and_then(|c| c.base_url.clone());
+        provider.google_project_id = config_entry
+            .as_ref()
+            .and_then(|c| c.google_project_id.clone());
+        provider.use_for_backends = backends_state.get(provider_type.id()).cloned();
+        provider.account_email = accounts_state.get(provider_type.id()).cloned();
+
+        // Check auth.json for credentials
+        if let Some(auth_kind) = auth_map.get(&provider_type) {
+            match auth_kind {
+                AuthKind::ApiKey => {
+                    // Read the actual key from auth.json
+                    if let Ok(auth) = read_opencode_auth() {
+                        if let Some(auth_entry) = auth.get(provider_type.id()) {
+                            let key = auth_entry
+                                .get("key")
+                                .or_else(|| auth_entry.get("api_key"))
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string());
+                            provider.api_key = key;
+                        }
+                    }
+                }
+                AuthKind::OAuth => {
+                    // Read OAuth credentials from auth.json
+                    if let Ok(auth) = read_opencode_auth() {
+                        if let Some(auth_entry) = auth.get(provider_type.id()) {
+                            let refresh = auth_entry
+                                .get("refresh")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or_default()
+                                .to_string();
+                            let access = auth_entry
+                                .get("access")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or_default()
+                                .to_string();
+                            let expires = auth_entry
+                                .get("expires")
+                                .and_then(|v| v.as_i64())
+                                .unwrap_or(0);
+                            provider.oauth = Some(crate::ai_providers::OAuthCredentials {
+                                refresh_token: refresh,
+                                access_token: access,
+                                expires_at: expires,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        tracing::info!(
+            "Migrating provider {} from opencode.json to AIProviderStore",
+            provider_type.id()
+        );
+        store.add(provider).await;
     }
 }
 
@@ -4167,87 +4411,15 @@ async fn list_provider_types() -> Json<Vec<ProviderTypeInfo>> {
 async fn list_providers(
     State(state): State<Arc<super::routes::AppState>>,
 ) -> Result<Json<Vec<ProviderResponse>>, (StatusCode, String)> {
-    let config_path = get_opencode_config_path(&state.config.working_dir);
-    let opencode_config = read_opencode_config(&config_path).map_err(internal_error)?;
-    let auth_map = read_opencode_auth_map().map_err(internal_error)?;
-    let default_provider = read_default_provider_state(&state.config.working_dir)
-        .or_else(|| get_default_provider(&opencode_config));
-    let backends_state = read_provider_backends_state(&state.config.working_dir);
-    let accounts_state = read_provider_accounts_state(&state.config.working_dir);
+    // Migrate any standard providers from opencode.json to the store on first call
+    migrate_opencode_providers_to_store(&state.ai_providers, &state.config.working_dir).await;
 
-    let mut provider_ids: BTreeSet<String> = BTreeSet::new();
-    for provider in auth_map.keys() {
-        provider_ids.insert(provider.id().to_string());
-    }
-    if let Some(provider_map) = opencode_config.get("provider").and_then(|v| v.as_object()) {
-        for key in provider_map.keys() {
-            provider_ids.insert(key.to_string());
-        }
-    }
-    if let Some(provider) = default_provider {
-        provider_ids.insert(provider.id().to_string());
-    }
-
-    let mut providers: Vec<ProviderResponse> = provider_ids
-        .into_iter()
-        .filter_map(|provider_id| {
-            let provider_type = ProviderType::from_id(&provider_id)?;
-            let config_entry = get_provider_config_entry(&opencode_config, provider_type);
-            let auth_kind = auth_map.get(&provider_type).copied();
-            let backends = backends_state.get(provider_type.id()).cloned();
-            let account_email = accounts_state.get(provider_type.id()).cloned();
-            Some(build_provider_response(
-                provider_type,
-                config_entry,
-                auth_kind,
-                default_provider,
-                backends,
-                account_email,
-            ))
-        })
-        .collect();
-
-    // Also include providers from AIProviderStore (Custom and Amp)
+    // All providers live in AIProviderStore now
     let store_providers = state.ai_providers.list().await;
-    for provider in store_providers {
-        let pt = provider.provider_type;
-        if pt == ProviderType::Custom || pt == ProviderType::Amp {
-            let now = chrono::Utc::now();
-            let default_backend = if pt == ProviderType::Amp {
-                "amp".to_string()
-            } else {
-                "opencode".to_string()
-            };
-            providers.push(ProviderResponse {
-                id: provider.id.to_string(),
-                provider_type: pt,
-                provider_type_name: pt.display_name().to_string(),
-                name: provider.name.clone(),
-                label: provider.label.clone(),
-                priority: provider.priority,
-                google_project_id: None,
-                has_api_key: provider.api_key.is_some(),
-                has_oauth: false,
-                base_url: provider.base_url.clone(),
-                custom_models: provider.custom_models.clone(),
-                custom_env_var: provider.custom_env_var.clone(),
-                npm_package: provider.npm_package.clone(),
-                enabled: provider.enabled,
-                is_default: provider.is_default,
-                uses_oauth: false,
-                auth_methods: vec![],
-                status: if provider.api_key.is_some() || provider.base_url.is_some() {
-                    ProviderStatusResponse::Connected
-                } else {
-                    ProviderStatusResponse::NeedsAuth { auth_url: None }
-                },
-                use_for_backends: vec![default_backend],
-                account_email: provider.account_email.clone(),
-                created_at: now,
-                updated_at: now,
-            });
-        }
-    }
+    let mut providers: Vec<ProviderResponse> = store_providers
+        .iter()
+        .map(|p| build_response_from_store(p))
+        .collect();
 
     providers.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(Json(providers))
@@ -4273,13 +4445,11 @@ async fn get_provider_for_backend(
     }
 
     // Read the provider backends state to find provider with claudecode in use_for_backends
-    let backends_state = read_provider_backends_state(&state.config.working_dir);
-
-    // Check if Anthropic provider has claudecode in use_for_backends
-    let use_for_claudecode = backends_state
-        .get(ProviderType::Anthropic.id())
-        .map(|backends| backends.iter().any(|b| b == "claudecode"))
-        .unwrap_or(false);
+    let use_for_claudecode = provider_targets_backend(
+        &state.config.working_dir,
+        ProviderType::Anthropic,
+        "claudecode",
+    );
 
     if !use_for_claudecode {
         return Ok(Json(BackendProviderResponse {
@@ -4520,7 +4690,7 @@ async fn check_provider_health(
             (
                 "https://open.bigmodel.cn/api/paas/v4/chat/completions",
                 serde_json::json!({
-                    "model": "glm-4-flash",
+                    "model": "glm-4.7-flash",
                     "messages": [{"role": "user", "content": "test"}],
                     "max_tokens": 1
                 }),
@@ -4612,6 +4782,622 @@ async fn check_provider_health(
     }
 }
 
+/// GET /api/ai/providers/:id/usage - Fetch live usage/rate-limit info from the provider API.
+///
+/// Makes a minimal API call to the provider and captures rate-limit headers
+/// from the response. Also returns any account info we have stored.
+async fn get_provider_usage(
+    State(state): State<Arc<super::routes::AppState>>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    // Resolve provider credentials: check AIProviderStore first, then OpenCode auth
+    let (provider_type, api_key_opt, oauth, account_email, provider_name) = if let Ok(uuid) =
+        uuid::Uuid::parse_str(&id)
+    {
+        // UUID lookup for custom providers
+        let provider = state
+            .ai_providers
+            .get(uuid)
+            .await
+            .ok_or((StatusCode::NOT_FOUND, format!("Provider {} not found", id)))?;
+        (
+            provider.provider_type,
+            provider.api_key.clone(),
+            provider.oauth.clone(),
+            provider.account_email.clone(),
+            provider.name.clone(),
+        )
+    } else if let Some(pt) = ProviderType::from_id(&id) {
+        // Try AIProviderStore first
+        if let Some(provider) = state.ai_providers.get_by_type(pt).await {
+            (
+                provider.provider_type,
+                provider.api_key.clone(),
+                provider.oauth.clone(),
+                provider.account_email.clone(),
+                provider.name.clone(),
+            )
+        } else {
+            // Fall back to OpenCode auth: check both central auth.json
+            // and per-provider auth files (~/.opencode/auth/{provider}.json)
+            let auth = read_opencode_auth().map_err(internal_error)?;
+            let accounts_state = read_provider_accounts_state(&state.config.working_dir);
+            let account_email = accounts_state.get(pt.id()).cloned();
+
+            // Collect all auth entries: central + per-provider file
+            let mut auth_entries: Vec<&serde_json::Value> = opencode_auth_keys(pt)
+                .into_iter()
+                .filter_map(|key| auth.get(key))
+                .collect();
+            // Also read per-provider auth file
+            let provider_auth_path = get_opencode_provider_auth_path(pt);
+            let provider_auth_value: Option<serde_json::Value> = if provider_auth_path.exists() {
+                std::fs::read_to_string(&provider_auth_path)
+                    .ok()
+                    .and_then(|c| serde_json::from_str(&c).ok())
+            } else {
+                None
+            };
+            if let Some(ref pav) = provider_auth_value {
+                auth_entries.push(pav);
+            }
+
+            let api_key = auth_entries.iter().find_map(|v| {
+                v.get("key")
+                    .or_else(|| v.get("api_key"))
+                    .or_else(|| v.get("apiKey"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+            });
+
+            let oauth_creds = auth_entries.iter().find_map(|entry| {
+                let access = entry
+                    .get("access")
+                    .or_else(|| entry.get("access_token"))
+                    .and_then(|v| v.as_str())?;
+                let refresh = entry
+                    .get("refresh")
+                    .or_else(|| entry.get("refresh_token"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let expires_at = entry
+                    .get("expires")
+                    .or_else(|| entry.get("expires_at"))
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0);
+                Some(crate::ai_providers::OAuthCredentials {
+                    access_token: access.to_string(),
+                    refresh_token: refresh,
+                    expires_at,
+                })
+            });
+
+            if api_key.is_none() && oauth_creds.is_none() {
+                return Ok(Json(serde_json::json!({
+                    "provider_type": pt.id(),
+                    "provider_name": pt.display_name(),
+                    "error": "No credentials found"
+                })));
+            }
+
+            (
+                pt,
+                api_key,
+                oauth_creds,
+                account_email,
+                pt.display_name().to_string(),
+            )
+        }
+    } else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            format!("Invalid provider ID: {}", id),
+        ));
+    };
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(internal_error)?;
+
+    // Determine how to call each provider for rate-limit info
+    let usage_result = match provider_type {
+        ProviderType::Anthropic => {
+            // Use API key or OAuth access token
+            let auth = if let Some(ref key) = api_key_opt {
+                format!("{}", key)
+            } else if let Some(ref o) = oauth {
+                format!("{}", o.access_token)
+            } else {
+                return Ok(Json(serde_json::json!({
+                    "provider_type": provider_type.id(),
+                    "provider_name": provider_name,
+                    "account_email": account_email,
+                    "error": "No credentials configured"
+                })));
+            };
+
+            // Minimal messages API call to get rate limit headers
+            let resp = client
+                .post("https://api.anthropic.com/v1/messages")
+                .header("x-api-key", &auth)
+                .header("anthropic-version", "2023-06-01")
+                .header("Content-Type", "application/json")
+                .json(&serde_json::json!({
+                    "model": "claude-haiku-4-5-20251001",
+                    "max_tokens": 1,
+                    "messages": [{"role": "user", "content": "hi"}]
+                }))
+                .send()
+                .await;
+
+            match resp {
+                Ok(r) => {
+                    let status_code = r.status().as_u16();
+                    let headers = r.headers().clone();
+                    let mut info = serde_json::json!({
+                        "provider_type": "anthropic",
+                        "provider_name": provider_name,
+                        "account_email": account_email,
+                        "status_code": status_code,
+                    });
+                    if status_code == 401 || status_code == 403 {
+                        info["error"] = serde_json::json!(format!(
+                            "Authentication failed (HTTP {})",
+                            status_code
+                        ));
+                    }
+
+                    let map = info.as_object_mut().unwrap();
+
+                    // Extract organization ID
+                    if let Some(org) = headers
+                        .get("anthropic-organization-id")
+                        .and_then(|v| v.to_str().ok())
+                    {
+                        map.insert("organization_id".to_string(), serde_json::json!(org));
+                    }
+
+                    // Try new unified rate limit headers (Anthropic 2025+)
+                    let has_unified = headers.get("anthropic-ratelimit-unified-status").is_some();
+                    if has_unified {
+                        for (hdr, key) in [
+                            ("anthropic-ratelimit-unified-status", "unified_status"),
+                            ("anthropic-ratelimit-unified-reset", "unified_reset"),
+                            ("anthropic-ratelimit-unified-5h-status", "unified_5h_status"),
+                            ("anthropic-ratelimit-unified-5h-reset", "unified_5h_reset"),
+                            (
+                                "anthropic-ratelimit-unified-5h-utilization",
+                                "unified_5h_utilization",
+                            ),
+                            ("anthropic-ratelimit-unified-7d-status", "unified_7d_status"),
+                            ("anthropic-ratelimit-unified-7d-reset", "unified_7d_reset"),
+                            (
+                                "anthropic-ratelimit-unified-7d-utilization",
+                                "unified_7d_utilization",
+                            ),
+                            (
+                                "anthropic-ratelimit-unified-representative-claim",
+                                "unified_representative_claim",
+                            ),
+                            (
+                                "anthropic-ratelimit-unified-fallback-percentage",
+                                "unified_fallback_pct",
+                            ),
+                            (
+                                "anthropic-ratelimit-unified-overage-status",
+                                "unified_overage_status",
+                            ),
+                            (
+                                "anthropic-ratelimit-unified-overage-disabled-reason",
+                                "unified_overage_disabled_reason",
+                            ),
+                        ] {
+                            if let Some(v) = headers.get(hdr).and_then(|v| v.to_str().ok()) {
+                                if let Ok(n) = v.parse::<f64>() {
+                                    map.insert(key.to_string(), serde_json::json!(n));
+                                } else {
+                                    map.insert(key.to_string(), serde_json::json!(v));
+                                }
+                            }
+                        }
+                    } else {
+                        // Legacy per-resource rate limit headers
+                        for (hdr, key) in [
+                            ("anthropic-ratelimit-requests-limit", "requests_limit"),
+                            (
+                                "anthropic-ratelimit-requests-remaining",
+                                "requests_remaining",
+                            ),
+                            ("anthropic-ratelimit-requests-reset", "requests_reset"),
+                            ("anthropic-ratelimit-tokens-limit", "tokens_limit"),
+                            ("anthropic-ratelimit-tokens-remaining", "tokens_remaining"),
+                            ("anthropic-ratelimit-tokens-reset", "tokens_reset"),
+                            (
+                                "anthropic-ratelimit-input-tokens-limit",
+                                "input_tokens_limit",
+                            ),
+                            (
+                                "anthropic-ratelimit-input-tokens-remaining",
+                                "input_tokens_remaining",
+                            ),
+                            (
+                                "anthropic-ratelimit-output-tokens-limit",
+                                "output_tokens_limit",
+                            ),
+                            (
+                                "anthropic-ratelimit-output-tokens-remaining",
+                                "output_tokens_remaining",
+                            ),
+                        ] {
+                            if let Some(v) = headers.get(hdr).and_then(|v| v.to_str().ok()) {
+                                if let Ok(n) = v.parse::<u64>() {
+                                    map.insert(key.to_string(), serde_json::json!(n));
+                                } else {
+                                    map.insert(key.to_string(), serde_json::json!(v));
+                                }
+                            }
+                        }
+                    }
+                    info
+                }
+                Err(e) => serde_json::json!({
+                    "provider_type": "anthropic",
+                    "provider_name": provider_name,
+                    "account_email": account_email,
+                    "error": format!("Failed to reach API: {}", e)
+                }),
+            }
+        }
+        ProviderType::OpenAI => {
+            let auth = if let Some(ref key) = api_key_opt {
+                key.clone()
+            } else if let Some(ref o) = oauth {
+                o.access_token.clone()
+            } else {
+                return Ok(Json(serde_json::json!({
+                    "provider_type": "openai",
+                    "provider_name": provider_name,
+                    "account_email": account_email,
+                    "error": "No credentials configured"
+                })));
+            };
+
+            let resp = client
+                .post("https://api.openai.com/v1/chat/completions")
+                .header("Authorization", format!("Bearer {}", auth))
+                .header("Content-Type", "application/json")
+                .json(&serde_json::json!({
+                    "model": "gpt-4.1-nano",
+                    "max_tokens": 1,
+                    "messages": [{"role": "user", "content": "hi"}]
+                }))
+                .send()
+                .await;
+
+            match resp {
+                Ok(r) => {
+                    let status_code = r.status().as_u16();
+                    let headers = r.headers().clone();
+                    let mut info = serde_json::json!({
+                        "provider_type": "openai",
+                        "provider_name": provider_name,
+                        "account_email": account_email,
+                        "status_code": status_code,
+                    });
+                    if status_code == 401 || status_code == 403 {
+                        info["error"] = serde_json::json!(format!(
+                            "Authentication failed (HTTP {})",
+                            status_code
+                        ));
+                    }
+
+                    let map = info.as_object_mut().unwrap();
+                    for (hdr, key) in [
+                        ("x-ratelimit-limit-requests", "requests_limit"),
+                        ("x-ratelimit-remaining-requests", "requests_remaining"),
+                        ("x-ratelimit-reset-requests", "requests_reset"),
+                        ("x-ratelimit-limit-tokens", "tokens_limit"),
+                        ("x-ratelimit-remaining-tokens", "tokens_remaining"),
+                        ("x-ratelimit-reset-tokens", "tokens_reset"),
+                    ] {
+                        if let Some(v) = headers.get(hdr).and_then(|v| v.to_str().ok()) {
+                            if let Ok(n) = v.parse::<u64>() {
+                                map.insert(key.to_string(), serde_json::json!(n));
+                            } else {
+                                map.insert(key.to_string(), serde_json::json!(v));
+                            }
+                        }
+                    }
+                    // Also extract organization header if present
+                    if let Some(org) = headers
+                        .get("openai-organization")
+                        .and_then(|v| v.to_str().ok())
+                    {
+                        map.insert("organization".to_string(), serde_json::json!(org));
+                    }
+                    info
+                }
+                Err(e) => serde_json::json!({
+                    "provider_type": "openai",
+                    "provider_name": provider_name,
+                    "account_email": account_email,
+                    "error": format!("Failed to reach API: {}", e)
+                }),
+            }
+        }
+        ProviderType::Cerebras => {
+            let key = match api_key_opt.as_ref() {
+                Some(k) => k,
+                None => {
+                    return Ok(Json(serde_json::json!({
+                        "provider_type": "cerebras",
+                        "provider_name": provider_name,
+                        "error": "No API key configured"
+                    })));
+                }
+            };
+
+            let resp = client
+                .post("https://api.cerebras.ai/v1/chat/completions")
+                .header("Authorization", format!("Bearer {}", key))
+                .header("Content-Type", "application/json")
+                .json(&serde_json::json!({
+                    "model": "llama-3.1-8b",
+                    "max_tokens": 1,
+                    "messages": [{"role": "user", "content": "hi"}]
+                }))
+                .send()
+                .await;
+
+            match resp {
+                Ok(r) => {
+                    let status_code = r.status().as_u16();
+                    let headers = r.headers().clone();
+                    let mut info = serde_json::json!({
+                        "provider_type": "cerebras",
+                        "provider_name": provider_name,
+                        "status_code": status_code,
+                    });
+                    if status_code == 401 || status_code == 403 || status_code == 429 {
+                        info["error"] =
+                            serde_json::json!(format!("API returned HTTP {}", status_code));
+                    }
+
+                    let map = info.as_object_mut().unwrap();
+                    for (hdr, key) in [
+                        ("x-ratelimit-limit-requests-day", "requests_limit_day"),
+                        (
+                            "x-ratelimit-remaining-requests-day",
+                            "requests_remaining_day",
+                        ),
+                        ("x-ratelimit-reset-requests-day", "requests_reset_day"),
+                        ("x-ratelimit-limit-tokens-minute", "tokens_limit_minute"),
+                        (
+                            "x-ratelimit-remaining-tokens-minute",
+                            "tokens_remaining_minute",
+                        ),
+                        ("x-ratelimit-reset-tokens-minute", "tokens_reset_minute"),
+                    ] {
+                        if let Some(v) = headers.get(hdr).and_then(|v| v.to_str().ok()) {
+                            if let Ok(n) = v.parse::<u64>() {
+                                map.insert(key.to_string(), serde_json::json!(n));
+                            } else {
+                                map.insert(key.to_string(), serde_json::json!(v));
+                            }
+                        }
+                    }
+                    info
+                }
+                Err(e) => serde_json::json!({
+                    "provider_type": "cerebras",
+                    "provider_name": provider_name,
+                    "error": format!("Failed to reach API: {}", e)
+                }),
+            }
+        }
+        ProviderType::Minimax => {
+            let key = match api_key_opt.as_ref() {
+                Some(k) => k,
+                None => {
+                    return Ok(Json(serde_json::json!({
+                        "provider_type": "minimax",
+                        "provider_name": provider_name,
+                        "error": "No API key configured"
+                    })));
+                }
+            };
+
+            // Minimax doesn't return rate-limit headers; try coding plan remains
+            let coding_resp = client
+                .get("https://api.minimax.io/v1/api/openplatform/coding_plan/remains")
+                .header("Authorization", format!("Bearer {}", key))
+                .send()
+                .await;
+
+            let mut info = serde_json::json!({
+                "provider_type": "minimax",
+                "provider_name": provider_name,
+            });
+
+            match coding_resp {
+                Ok(r) if r.status().is_success() => {
+                    if let Ok(data) = r.json::<serde_json::Value>().await {
+                        info.as_object_mut()
+                            .unwrap()
+                            .insert("coding_plan".to_string(), data);
+                    }
+                }
+                Ok(_) => {
+                    // Coding plan endpoint failed; fall back to a test completion
+                    let test_resp = client
+                        .post("https://api.minimax.io/v1/chat/completions")
+                        .header("Authorization", format!("Bearer {}", key))
+                        .header("Content-Type", "application/json")
+                        .json(&serde_json::json!({
+                            "model": "MiniMax-M2",
+                            "max_tokens": 1,
+                            "messages": [{"role": "user", "content": "hi"}]
+                        }))
+                        .send()
+                        .await;
+
+                    match test_resp {
+                        Ok(r) if r.status().is_success() => {
+                            info.as_object_mut()
+                                .unwrap()
+                                .insert("status".to_string(), serde_json::json!("connected"));
+                        }
+                        Ok(r) => {
+                            let status = r.status().as_u16();
+                            let body = r.text().await.unwrap_or_default();
+                            info.as_object_mut().unwrap().insert(
+                                "error".to_string(),
+                                serde_json::json!(format!("API returned {}: {}", status, body)),
+                            );
+                        }
+                        Err(e) => {
+                            info.as_object_mut().unwrap().insert(
+                                "error".to_string(),
+                                serde_json::json!(format!("Failed to reach API: {}", e)),
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    info.as_object_mut().unwrap().insert(
+                        "error".to_string(),
+                        serde_json::json!(format!("Failed to reach API: {}", e)),
+                    );
+                }
+            }
+            info
+        }
+        ProviderType::Zai => {
+            let key = match api_key_opt.as_ref() {
+                Some(k) => k,
+                None => {
+                    return Ok(Json(serde_json::json!({
+                        "provider_type": "zai",
+                        "provider_name": provider_name,
+                        "error": "No API key configured"
+                    })));
+                }
+            };
+
+            // Z.AI doesn't expose rate-limit headers; do a health-check style call
+            let resp = client
+                .post("https://open.bigmodel.cn/api/paas/v4/chat/completions")
+                .header("Authorization", format!("Bearer {}", key))
+                .header("Content-Type", "application/json")
+                .json(&serde_json::json!({
+                    "model": "glm-4.7-flash",
+                    "max_tokens": 1,
+                    "messages": [{"role": "user", "content": "hi"}]
+                }))
+                .send()
+                .await;
+
+            match resp {
+                Ok(r) => {
+                    let status_code = r.status().as_u16();
+                    let body = r.json::<serde_json::Value>().await.unwrap_or_default();
+                    let mut info = serde_json::json!({
+                        "provider_type": "zai",
+                        "provider_name": provider_name,
+                        "status": if status_code < 400 { "connected" } else { "error" },
+                    });
+                    // Z.AI returns usage in response body for completed requests
+                    if let Some(usage) = body.get("usage") {
+                        info.as_object_mut()
+                            .unwrap()
+                            .insert("last_call_usage".to_string(), usage.clone());
+                    }
+                    if status_code >= 400 {
+                        info.as_object_mut().unwrap().insert(
+                            "error".to_string(),
+                            serde_json::json!(format!("API returned {}", status_code)),
+                        );
+                    }
+                    info
+                }
+                Err(e) => serde_json::json!({
+                    "provider_type": "zai",
+                    "provider_name": provider_name,
+                    "error": format!("Failed to reach API: {}", e)
+                }),
+            }
+        }
+        ProviderType::Google => {
+            // Google doesn't expose rate-limit headers via the standard Gemini API
+            // Check if we have OAuth credentials and try userinfo
+            let mut info = serde_json::json!({
+                "provider_type": "google",
+                "provider_name": provider_name,
+                "account_email": account_email,
+            });
+
+            if let Some(ref o) = oauth {
+                // Try to get additional account info from Google userinfo
+                match client
+                    .get("https://www.googleapis.com/oauth2/v2/userinfo")
+                    .header("Authorization", format!("Bearer {}", o.access_token))
+                    .send()
+                    .await
+                {
+                    Ok(r) if r.status().is_success() => {
+                        if let Ok(data) = r.json::<serde_json::Value>().await {
+                            let map = info.as_object_mut().unwrap();
+                            if let Some(name) = data.get("name").and_then(|v| v.as_str()) {
+                                map.insert("account_name".to_string(), serde_json::json!(name));
+                            }
+                            if let Some(email) = data.get("email").and_then(|v| v.as_str()) {
+                                map.insert("account_email".to_string(), serde_json::json!(email));
+                            }
+                            if let Some(pic) = data.get("picture").and_then(|v| v.as_str()) {
+                                map.insert("account_picture".to_string(), serde_json::json!(pic));
+                            }
+                            map.insert("status".to_string(), serde_json::json!("connected"));
+                        }
+                    }
+                    Ok(r) => {
+                        let status_code = r.status().as_u16();
+                        info["error"] = serde_json::json!(format!(
+                            "OAuth verification failed (HTTP {})",
+                            status_code
+                        ));
+                    }
+                    Err(e) => {
+                        info["error"] = serde_json::json!(format!("Failed to verify OAuth: {}", e));
+                    }
+                }
+            } else if api_key_opt.is_some() {
+                info.as_object_mut()
+                    .unwrap()
+                    .insert("status".to_string(), serde_json::json!("connected"));
+            } else {
+                info.as_object_mut().unwrap().insert(
+                    "error".to_string(),
+                    serde_json::json!("No credentials configured"),
+                );
+            }
+            info
+        }
+        _ => {
+            // Generic: just return what we know
+            serde_json::json!({
+                "provider_type": provider_type.id(),
+                "provider_name": provider_name,
+                "account_email": account_email,
+                "status": if api_key_opt.is_some() || oauth.is_some() { "connected" } else { "no_credentials" },
+            })
+        }
+    };
+
+    Ok(Json(usage_result))
+}
+
 /// POST /api/ai/providers - Create a new provider.
 async fn create_provider(
     State(state): State<Arc<super::routes::AppState>>,
@@ -4630,146 +5416,46 @@ async fn create_provider(
 
     let provider_type = req.provider_type;
 
-    // label and priority are only supported for providers stored in AIProviderStore
-    // (Custom and Amp). Standard providers are stored in OpenCode's config which
-    // doesn't support these fields.
-    if provider_type != ProviderType::Custom && provider_type != ProviderType::Amp {
-        if req.label.is_some() {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                "label is only supported for custom/amp providers".to_string(),
-            ));
-        }
-        if req.priority.is_some() && req.priority != Some(0) {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                "priority is only supported for custom/amp providers".to_string(),
-            ));
-        }
-    }
-
-    // For custom providers and Amp, store in AIProviderStore (ai_providers.json).
-    // Custom: workspace preparation reads custom models and base URL from here.
-    // Amp: keys are read by get_all_amp_keys_from_ai_providers() for rotation.
-    //       Amp doesn't use OpenCode's auth.json (opencode_auth_keys returns []).
-    if provider_type == ProviderType::Custom || provider_type == ProviderType::Amp {
-        let mut provider = crate::ai_providers::AIProvider::new(provider_type, req.name.clone());
-        provider.label = req.label.clone();
-        provider.priority = req.priority.unwrap_or(0);
-        provider.base_url = req.base_url.clone();
-        provider.api_key = req.api_key.clone();
-        provider.custom_models = req.custom_models.clone();
-        provider.custom_env_var = req.custom_env_var.clone();
-        provider.npm_package = req.npm_package.clone();
-        provider.enabled = req.enabled;
-
-        state.ai_providers.add(provider.clone()).await;
-
-        tracing::info!(
-            "Created {} AI provider: {} ({})",
-            provider_type.display_name(),
-            req.name,
-            provider.id
-        );
-
-        let now = chrono::Utc::now();
-        let default_backend = if provider_type == ProviderType::Amp {
-            "amp".to_string()
-        } else {
-            "opencode".to_string()
-        };
-        return Ok(Json(ProviderResponse {
-            id: provider.id.to_string(),
-            provider_type,
-            provider_type_name: provider_type.display_name().to_string(),
-            name: req.name,
-            label: req.label,
-            priority: req.priority.unwrap_or(0),
-            google_project_id: None,
-            has_api_key: req.api_key.is_some(),
-            has_oauth: false,
-            base_url: req.base_url,
-            custom_models: req.custom_models,
-            custom_env_var: req.custom_env_var,
-            npm_package: req.npm_package,
-            enabled: req.enabled,
-            is_default: false,
-            uses_oauth: false,
-            auth_methods: vec![],
-            status: if req.api_key.is_some() || provider.base_url.is_some() {
-                ProviderStatusResponse::Connected
-            } else {
-                ProviderStatusResponse::NeedsAuth { auth_url: None }
-            },
-            use_for_backends: req
-                .use_for_backends
-                .unwrap_or_else(|| vec![default_backend]),
-            account_email: provider.account_email.clone(),
-            created_at: now,
-            updated_at: now,
-        }));
-    }
-
-    let config_path = get_opencode_config_path(&state.config.working_dir);
-    let mut opencode_config = read_opencode_config(&config_path).map_err(internal_error)?;
-
-    // Default use_for_backends to ["opencode"] if not specified.
+    // All providers are now stored in AIProviderStore (ai_providers.json).
+    // Standard providers are additionally synced to opencode.json + auth.json
+    // for runtime consumption by OpenCode.
     let use_for_backends = req
         .use_for_backends
-        .or_else(|| Some(vec!["opencode".to_string()]));
+        .clone()
+        .unwrap_or_else(|| default_backends_for_provider(provider_type));
 
-    set_provider_config_entry(
-        &mut opencode_config,
-        provider_type,
-        Some(req.name),
-        Some(req.base_url),
-        Some(req.enabled),
-        use_for_backends.clone(),
-        req.google_project_id.map(Some),
-    );
+    let mut provider = crate::ai_providers::AIProvider::new(provider_type, req.name.clone());
+    provider.label = req.label.clone();
+    provider.priority = req.priority.unwrap_or(0);
+    provider.base_url = req.base_url.clone();
+    provider.api_key = req.api_key.clone();
+    provider.google_project_id = req.google_project_id.clone();
+    provider.custom_models = req.custom_models.clone();
+    provider.custom_env_var = req.custom_env_var.clone();
+    provider.npm_package = req.npm_package.clone();
+    provider.use_for_backends = Some(use_for_backends);
+    provider.enabled = req.enabled;
 
-    write_opencode_config(&config_path, &opencode_config).map_err(internal_error)?;
-
-    // Save backends to separate state file (not in opencode.json)
-    if let Some(ref backends) = use_for_backends {
-        if let Err(e) = update_provider_backends(
-            &state.config.working_dir,
-            provider_type.id(),
-            backends.clone(),
-        ) {
-            tracing::error!("Failed to save provider backends: {}", e);
-        }
-    }
-
-    if let Some(ref api_key) = req.api_key {
-        if let Err(e) = sync_api_key_to_opencode_auth(provider_type, api_key) {
-            tracing::error!("Failed to sync API key to OpenCode: {}", e);
-        }
-    }
-
-    let auth_kind = if req.api_key.is_some() {
-        Some(AuthKind::ApiKey)
-    } else {
-        None
-    };
-    let default_provider = read_default_provider_state(&state.config.working_dir)
-        .or_else(|| get_default_provider(&opencode_config));
-    let config_entry = get_provider_config_entry(&opencode_config, provider_type);
-    let response = build_provider_response(
-        provider_type,
-        config_entry,
-        auth_kind,
-        default_provider,
-        use_for_backends,
-        None,
-    );
+    state.ai_providers.add(provider.clone()).await;
 
     tracing::info!(
-        "Created AI provider config for: {} ({})",
-        response.name,
-        response.provider_type
+        "Created AI provider: {} ({}, {})",
+        provider_type.display_name(),
+        req.name,
+        provider.id
     );
 
+    // For standard providers, sync to opencode.json + auth.json for runtime compatibility
+    if provider_type != ProviderType::Custom && provider_type != ProviderType::Amp {
+        sync_store_to_opencode(
+            &state.ai_providers,
+            &state.config.working_dir,
+            provider_type,
+        )
+        .await;
+    }
+
+    let response = build_response_from_store(&provider);
     Ok(Json(response))
 }
 
@@ -4778,31 +5464,28 @@ async fn get_provider(
     State(state): State<Arc<super::routes::AppState>>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<Json<ProviderResponse>, (StatusCode, String)> {
+    // Try UUID first (all providers are now in the store)
+    if let Ok(uuid) = uuid::Uuid::parse_str(&id) {
+        if let Some(provider) = state.ai_providers.get(uuid).await {
+            return Ok(Json(build_response_from_store(&provider)));
+        }
+    }
+
+    // Fall back to provider type ID - find the first matching provider in the store
     let provider_type = ProviderType::from_id(&id)
         .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Provider {} not found", id)))?;
-    let config_path = get_opencode_config_path(&state.config.working_dir);
-    let opencode_config = read_opencode_config(&config_path).map_err(internal_error)?;
-    let auth_map = read_opencode_auth_map().map_err(internal_error)?;
-    let default_provider = read_default_provider_state(&state.config.working_dir)
-        .or_else(|| get_default_provider(&opencode_config));
-    let backends_state = read_provider_backends_state(&state.config.working_dir);
-    let accounts_state = read_provider_accounts_state(&state.config.working_dir);
-    let config_entry = get_provider_config_entry(&opencode_config, provider_type);
-    let auth_kind = auth_map.get(&provider_type).copied();
-    let backends = backends_state.get(provider_type.id()).cloned();
-    let account_email = accounts_state.get(provider_type.id()).cloned();
-    let response = build_provider_response(
-        provider_type,
-        config_entry,
-        auth_kind,
-        default_provider,
-        backends,
-        account_email,
-    );
-    Ok(Json(response))
+    let provider = state
+        .ai_providers
+        .get_by_type(provider_type)
+        .await
+        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Provider {} not found", id)))?;
+    Ok(Json(build_response_from_store(&provider)))
 }
 
 /// PUT /api/ai/providers/:id - Update a provider.
+///
+/// All providers are now in AIProviderStore. The `:id` can be a UUID or
+/// a provider type ID (for backwards compat, finds the first matching).
 async fn update_provider(
     State(state): State<Arc<super::routes::AppState>>,
     AxumPath(id): AxumPath<String>,
@@ -4820,110 +5503,17 @@ async fn update_provider(
         }
     }
 
-    // Try UUID first (store-based providers: Amp, Custom)
-    if let Ok(uuid) = uuid::Uuid::parse_str(&id) {
-        return update_store_provider(&state, uuid, req).await;
+    // Find the provider in the store - try UUID first, then provider type ID
+    let existing = if let Ok(uuid) = uuid::Uuid::parse_str(&id) {
+        state.ai_providers.get(uuid).await
+    } else {
+        let provider_type = ProviderType::from_id(&id)
+            .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Provider {} not found", id)))?;
+        state.ai_providers.get_by_type(provider_type).await
     }
+    .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Provider {} not found", id)))?;
 
-    // Otherwise, treat as provider type ID (standard providers)
-    let provider_type = ProviderType::from_id(&id)
-        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Provider {} not found", id)))?;
-
-    // label and priority are only supported for providers stored in AIProviderStore
-    if req.label.is_some() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "label is only supported for custom/amp providers".to_string(),
-        ));
-    }
-    if req.priority.is_some() && req.priority != Some(0) {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "priority is only supported for custom/amp providers".to_string(),
-        ));
-    }
-
-    let config_path = get_opencode_config_path(&state.config.working_dir);
-    let mut opencode_config = read_opencode_config(&config_path).map_err(internal_error)?;
-
-    set_provider_config_entry(
-        &mut opencode_config,
-        provider_type,
-        req.name,
-        req.base_url,
-        req.enabled,
-        req.use_for_backends.clone(),
-        req.google_project_id,
-    );
-
-    write_opencode_config(&config_path, &opencode_config).map_err(internal_error)?;
-
-    // Save backends to separate state file if provided
-    if let Some(ref backends) = req.use_for_backends {
-        if let Err(e) = update_provider_backends(
-            &state.config.working_dir,
-            provider_type.id(),
-            backends.clone(),
-        ) {
-            tracing::error!("Failed to save provider backends: {}", e);
-        }
-    }
-
-    if let Some(api_key_update) = req.api_key {
-        match api_key_update {
-            Some(api_key) => {
-                if let Err(e) = sync_api_key_to_opencode_auth(provider_type, &api_key) {
-                    tracing::error!("Failed to sync API key to OpenCode: {}", e);
-                }
-            }
-            None => {
-                if let Err(e) = remove_opencode_auth_entry(provider_type) {
-                    tracing::error!("Failed to remove OpenCode auth entry: {}", e);
-                }
-            }
-        }
-    }
-
-    let auth_map = read_opencode_auth_map().map_err(internal_error)?;
-    let default_provider = read_default_provider_state(&state.config.working_dir)
-        .or_else(|| get_default_provider(&opencode_config));
-    let backends_state = read_provider_backends_state(&state.config.working_dir);
-    let accounts_state = read_provider_accounts_state(&state.config.working_dir);
-    let config_entry = get_provider_config_entry(&opencode_config, provider_type);
-    let auth_kind = auth_map.get(&provider_type).copied();
-    let backends = backends_state.get(provider_type.id()).cloned();
-    let account_email = accounts_state.get(provider_type.id()).cloned();
-    let response = build_provider_response(
-        provider_type,
-        config_entry,
-        auth_kind,
-        default_provider,
-        backends,
-        account_email,
-    );
-
-    tracing::info!("Updated AI provider config: {} ({})", response.name, id);
-
-    Ok(Json(response))
-}
-
-/// Update a store-based provider (Amp, Custom) by UUID.
-async fn update_store_provider(
-    state: &Arc<super::routes::AppState>,
-    uuid: uuid::Uuid,
-    req: UpdateProviderRequest,
-) -> Result<Json<ProviderResponse>, (StatusCode, String)> {
-    let providers = state.ai_providers.list().await;
-    let existing = providers
-        .into_iter()
-        .find(|p| p.id == uuid)
-        .ok_or_else(|| {
-            (
-                StatusCode::NOT_FOUND,
-                format!("Provider {} not found", uuid),
-            )
-        })?;
-
+    let uuid = existing.id;
     let mut updated = existing.clone();
     if let Some(name) = req.name {
         updated.name = name;
@@ -4934,6 +5524,9 @@ async fn update_store_provider(
     if let Some(priority) = req.priority {
         updated.priority = priority;
     }
+    if let Some(google_project_id) = req.google_project_id {
+        updated.google_project_id = google_project_id;
+    }
     if let Some(base_url) = req.base_url {
         updated.base_url = base_url;
     }
@@ -4943,10 +5536,13 @@ async fn update_store_provider(
     if let Some(api_key_update) = req.api_key {
         updated.api_key = api_key_update;
     }
+    if let Some(ref backends) = req.use_for_backends {
+        updated.use_for_backends = Some(backends.clone());
+    }
 
     let result = state
         .ai_providers
-        .update(uuid, updated.clone())
+        .update(uuid, updated)
         .await
         .ok_or_else(|| {
             (
@@ -4955,42 +5551,13 @@ async fn update_store_provider(
             )
         })?;
 
+    // Sync to opencode.json for standard providers
     let pt = result.provider_type;
-    let default_backend = if pt == ProviderType::Amp {
-        "amp".to_string()
-    } else {
-        "opencode".to_string()
-    };
-    let now = chrono::Utc::now();
-    let has_credentials = result.api_key.is_some() || result.base_url.is_some();
-    let response = ProviderResponse {
-        id: result.id.to_string(),
-        provider_type: pt,
-        provider_type_name: pt.display_name().to_string(),
-        name: result.name,
-        label: result.label,
-        priority: result.priority,
-        google_project_id: None,
-        has_api_key: result.api_key.is_some(),
-        has_oauth: false,
-        base_url: result.base_url,
-        custom_models: result.custom_models,
-        custom_env_var: result.custom_env_var,
-        npm_package: result.npm_package,
-        enabled: result.enabled,
-        is_default: result.is_default,
-        uses_oauth: false,
-        auth_methods: vec![],
-        status: if has_credentials {
-            ProviderStatusResponse::Connected
-        } else {
-            ProviderStatusResponse::NeedsAuth { auth_url: None }
-        },
-        use_for_backends: vec![default_backend],
-        account_email: result.account_email.clone(),
-        created_at: now,
-        updated_at: result.updated_at,
-    };
+    if pt != ProviderType::Custom && pt != ProviderType::Amp {
+        sync_store_to_opencode(&state.ai_providers, &state.config.working_dir, pt).await;
+    }
+
+    let response = build_response_from_store(&result);
 
     tracing::info!(
         "Updated {} provider: {} ({})",
@@ -5010,44 +5577,43 @@ async fn delete_provider(
     State(state): State<Arc<super::routes::AppState>>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<(StatusCode, String), (StatusCode, String)> {
-    // Try UUID first (store-based providers: Amp, Custom)
-    if let Ok(uuid) = uuid::Uuid::parse_str(&id) {
-        if state.ai_providers.delete(uuid).await {
-            return Ok((
-                StatusCode::OK,
-                format!("Provider {} deleted successfully", id),
-            ));
-        }
+    // Find the provider in the store - try UUID first, then provider type ID
+    let provider = if let Ok(uuid) = uuid::Uuid::parse_str(&id) {
+        state.ai_providers.get(uuid).await
+    } else {
+        let provider_type = ProviderType::from_id(&id)
+            .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Provider {} not found", id)))?;
+        state.ai_providers.get_by_type(provider_type).await
+    }
+    .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Provider {} not found", id)))?;
+
+    let provider_type = provider.provider_type;
+    let uuid = provider.id;
+
+    // Delete from AIProviderStore
+    if !state.ai_providers.delete(uuid).await {
         return Err((StatusCode::NOT_FOUND, format!("Provider {} not found", id)));
     }
 
-    // Otherwise, treat as provider type ID (standard providers)
-    let provider_type = ProviderType::from_id(&id)
-        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Provider {} not found", id)))?;
-    let config_path = get_opencode_config_path(&state.config.working_dir);
-    let mut opencode_config = read_opencode_config(&config_path).map_err(internal_error)?;
-
-    remove_provider_config_entry(&mut opencode_config, provider_type);
-    write_opencode_config(&config_path, &opencode_config).map_err(internal_error)?;
-
-    if let Err(e) = remove_opencode_auth_entry(provider_type) {
-        tracing::error!("Failed to remove OpenCode auth entry: {}", e);
+    // Re-sync opencode.json for this provider type (will remove if no more of this type)
+    if provider_type != ProviderType::Custom && provider_type != ProviderType::Amp {
+        sync_store_to_opencode(
+            &state.ai_providers,
+            &state.config.working_dir,
+            provider_type,
+        )
+        .await;
     }
 
+    // Clear default if this was the default
     if read_default_provider_state(&state.config.working_dir) == Some(provider_type) {
-        if let Err(e) = clear_default_provider_state(&state.config.working_dir) {
-            tracing::error!("Failed to clear default provider state: {}", e);
+        // Check if there are still providers of this type
+        let remaining = state.ai_providers.get_all_by_type(provider_type).await;
+        if remaining.is_empty() {
+            if let Err(e) = clear_default_provider_state(&state.config.working_dir) {
+                tracing::error!("Failed to clear default provider state: {}", e);
+            }
         }
-    }
-
-    // Remove provider backends state
-    if let Err(e) = remove_provider_backends(&state.config.working_dir, provider_type.id()) {
-        tracing::error!("Failed to remove provider backends state: {}", e);
-    }
-
-    // Clean up account email state
-    if let Err(e) = remove_provider_account(&state.config.working_dir, provider_type.id()) {
-        tracing::error!("Failed to remove provider account state: {}", e);
     }
 
     Ok((
@@ -5061,47 +5627,34 @@ async fn authenticate_provider(
     State(state): State<Arc<super::routes::AppState>>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<Json<AuthResponse>, (StatusCode, String)> {
-    // Try UUID first (store-based providers: Amp, Custom)
-    if let Ok(uuid) = uuid::Uuid::parse_str(&id) {
-        let provider = state
-            .ai_providers
-            .get(uuid)
-            .await
+    // Find the provider in the store
+    let provider = if let Ok(uuid) = uuid::Uuid::parse_str(&id) {
+        state.ai_providers.get(uuid).await
+    } else {
+        let provider_type = ProviderType::from_id(&id)
             .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Provider {} not found", id)))?;
+        state.ai_providers.get_by_type(provider_type).await
+    }
+    .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Provider {} not found", id)))?;
 
-        // Store-based providers: connected if they have an API key or a base URL
-        let has_credentials = provider
-            .api_key
-            .as_ref()
-            .is_some_and(|k| !k.trim().is_empty())
-            || provider.base_url.is_some();
+    let provider_type = provider.provider_type;
+    let has_credentials = provider.has_credentials();
+
+    if has_credentials {
         return Ok(Json(AuthResponse {
-            success: has_credentials,
-            message: if has_credentials {
-                "Provider is authenticated".to_string()
-            } else {
-                "API key is required for this provider".to_string()
-            },
+            success: true,
+            message: "Provider is authenticated".to_string(),
             auth_url: None,
         }));
     }
 
-    let provider_type = ProviderType::from_id(&id)
-        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Provider {} not found", id)))?;
-    let auth_map = read_opencode_auth_map().map_err(internal_error)?;
-
-    // For OAuth providers, we need to return an auth URL
+    // For OAuth providers, return an auth URL
     if provider_type.uses_oauth() {
         let auth_url = match provider_type {
             ProviderType::Anthropic => {
-                // For Anthropic/Claude, this would typically use Claude's OAuth flow
-                // For now, we'll indicate that manual auth is needed
                 Some("https://console.anthropic.com/settings/keys".to_string())
             }
-            ProviderType::GithubCopilot => {
-                // GitHub Copilot uses device code flow
-                Some("https://github.com/login/device".to_string())
-            }
+            ProviderType::GithubCopilot => Some("https://github.com/login/device".to_string()),
             _ => None,
         };
 
@@ -5115,20 +5668,11 @@ async fn authenticate_provider(
         }));
     }
 
-    // For API key providers, check if key is set
-    if auth_map.get(&provider_type) == Some(&AuthKind::ApiKey) {
-        Ok(Json(AuthResponse {
-            success: true,
-            message: "Provider is authenticated".to_string(),
-            auth_url: None,
-        }))
-    } else {
-        Ok(Json(AuthResponse {
-            success: false,
-            message: "API key is required for this provider".to_string(),
-            auth_url: None,
-        }))
-    }
+    Ok(Json(AuthResponse {
+        success: false,
+        message: "API key is required for this provider".to_string(),
+        auth_url: None,
+    }))
 }
 
 /// POST /api/ai/providers/:id/default - Set as default provider.
@@ -5136,92 +5680,49 @@ async fn set_default(
     State(state): State<Arc<super::routes::AppState>>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<Json<ProviderResponse>, (StatusCode, String)> {
-    // Try UUID first (store-based providers: Amp, Custom)
-    if let Ok(uuid) = uuid::Uuid::parse_str(&id) {
-        let provider = state
-            .ai_providers
-            .get(uuid)
-            .await
+    // Find the provider in the store - try UUID first, then provider type ID
+    let provider = if let Ok(uuid) = uuid::Uuid::parse_str(&id) {
+        state.ai_providers.get(uuid).await
+    } else {
+        let provider_type = ProviderType::from_id(&id)
             .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Provider {} not found", id)))?;
-        state.ai_providers.set_default(uuid).await;
-
-        let pt = provider.provider_type;
-        let default_backend = if pt == ProviderType::Amp {
-            "amp".to_string()
-        } else {
-            "opencode".to_string()
-        };
-        let now = chrono::Utc::now();
-        let has_credentials = provider.api_key.is_some() || provider.base_url.is_some();
-        let response = ProviderResponse {
-            id: provider.id.to_string(),
-            provider_type: pt,
-            provider_type_name: pt.display_name().to_string(),
-            name: provider.name,
-            label: provider.label,
-            priority: provider.priority,
-            google_project_id: None,
-            has_api_key: provider.api_key.is_some(),
-            has_oauth: false,
-            base_url: provider.base_url,
-            custom_models: provider.custom_models,
-            custom_env_var: provider.custom_env_var,
-            npm_package: provider.npm_package,
-            enabled: provider.enabled,
-            is_default: true,
-            uses_oauth: false,
-            auth_methods: vec![],
-            status: if has_credentials {
-                ProviderStatusResponse::Connected
-            } else {
-                ProviderStatusResponse::NeedsAuth { auth_url: None }
-            },
-            use_for_backends: vec![default_backend],
-            account_email: provider.account_email.clone(),
-            created_at: now,
-            updated_at: provider.updated_at,
-        };
-        tracing::info!("Set default AI provider: {} ({})", response.name, id);
-        return Ok(Json(response));
+        state.ai_providers.get_by_type(provider_type).await
     }
+    .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Provider {} not found", id)))?;
 
-    // Standard providers: by type ID
-    let provider_type = ProviderType::from_id(&id)
-        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Provider {} not found", id)))?;
-    write_default_provider_state(&state.config.working_dir, provider_type)
-        .map_err(internal_error)?;
+    let uuid = provider.id;
+    state.ai_providers.set_default(uuid).await;
 
-    let config_path = get_opencode_config_path(&state.config.working_dir);
-    let opencode_config = read_opencode_config(&config_path).map_err(internal_error)?;
-    let auth_map = read_opencode_auth_map().map_err(internal_error)?;
-    let backends_state = read_provider_backends_state(&state.config.working_dir);
-    let accounts_state = read_provider_accounts_state(&state.config.working_dir);
-    let default_provider = Some(provider_type);
-    let config_entry = get_provider_config_entry(&opencode_config, provider_type);
-    let auth_kind = auth_map.get(&provider_type).copied();
-    let backends = backends_state.get(provider_type.id()).cloned();
-    let account_email = accounts_state.get(provider_type.id()).cloned();
-    let response = build_provider_response(
-        provider_type,
-        config_entry,
-        auth_kind,
-        default_provider,
-        backends,
-        account_email,
-    );
+    // Also persist default in legacy state file for backwards compat
+    let _ = write_default_provider_state(&state.config.working_dir, provider.provider_type);
 
+    // Re-read from store to get updated is_default flag
+    let updated = state
+        .ai_providers
+        .get(uuid)
+        .await
+        .unwrap_or(provider.clone());
+    let response = build_response_from_store(&updated);
     tracing::info!("Set default AI provider: {} ({})", response.name, id);
-
     Ok(Json(response))
 }
 
 /// GET /api/ai/providers/:id/auth/methods - Get available auth methods for a provider.
 async fn get_auth_methods(
-    State(_state): State<Arc<super::routes::AppState>>,
+    State(state): State<Arc<super::routes::AppState>>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<Json<Vec<AuthMethod>>, (StatusCode, String)> {
-    let provider_type = ProviderType::from_id(&id)
-        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Provider {} not found", id)))?;
+    let provider_type = if let Ok(uuid) = uuid::Uuid::parse_str(&id) {
+        state
+            .ai_providers
+            .get(uuid)
+            .await
+            .map(|p| p.provider_type)
+            .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Provider {} not found", id)))?
+    } else {
+        ProviderType::from_id(&id)
+            .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Provider {} not found", id)))?
+    };
     Ok(Json(provider_type.auth_methods()))
 }
 
@@ -5293,8 +5794,18 @@ async fn oauth_authorize(
     AxumPath(id): AxumPath<String>,
     Json(req): Json<OAuthAuthorizeRequest>,
 ) -> Result<Json<OAuthAuthorizeResponse>, (StatusCode, String)> {
-    let provider_type = ProviderType::from_id(&id)
-        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Provider {} not found", id)))?;
+    // Resolve provider type from UUID or type ID
+    let provider_type = if let Ok(uuid) = uuid::Uuid::parse_str(&id) {
+        state
+            .ai_providers
+            .get(uuid)
+            .await
+            .map(|p| p.provider_type)
+            .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Provider {} not found", id)))?
+    } else {
+        ProviderType::from_id(&id)
+            .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Provider {} not found", id)))?
+    };
 
     let auth_methods = provider_type.auth_methods();
     let method = auth_methods
@@ -5444,8 +5955,78 @@ async fn oauth_callback(
     AxumPath(id): AxumPath<String>,
     Json(req): Json<OAuthCallbackRequest>,
 ) -> axum::response::Response {
-    match oauth_callback_inner(State(state), AxumPath(id), Json(req)).await {
-        Ok(json) => json.into_response(),
+    let use_for_backends = req.use_for_backends.clone();
+    let provider_type_id = id.clone();
+    match oauth_callback_inner(State(state.clone()), AxumPath(id), Json(req)).await {
+        Ok(json) => {
+            // After successful OAuth, upsert the provider in AIProviderStore.
+            // The OAuth callback already synced creds to auth.json; now mirror that
+            // into the store so multiple accounts of the same type are tracked.
+            if let Some(provider_type) = ProviderType::from_id(&provider_type_id) {
+                let backends = use_for_backends
+                    .unwrap_or_else(|| default_backends_for_provider(provider_type));
+
+                // Read the credentials that oauth_callback_inner just wrote to auth.json
+                let auth = read_opencode_auth().unwrap_or_default();
+                let auth_entry = auth.get(provider_type.id());
+
+                let accounts_state = read_provider_accounts_state(&state.config.working_dir);
+                let account_email = accounts_state
+                    .get(provider_type.id())
+                    .cloned()
+                    .or_else(|| json.0.account_email.clone());
+
+                let name = if let Some(ref email) = account_email {
+                    format!("{} ({})", provider_type.display_name(), email)
+                } else {
+                    provider_type.display_name().to_string()
+                };
+
+                let mut provider = crate::ai_providers::AIProvider::new(provider_type, name);
+                provider.use_for_backends = Some(backends);
+                provider.account_email = account_email;
+
+                // Extract credentials from auth.json
+                if let Some(entry) = auth_entry {
+                    let auth_type = entry.get("type").and_then(|v| v.as_str());
+                    match auth_type {
+                        Some("api_key") | Some("api") => {
+                            provider.api_key = entry
+                                .get("key")
+                                .or_else(|| entry.get("api_key"))
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string());
+                        }
+                        Some("oauth") => {
+                            let refresh = entry
+                                .get("refresh")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or_default()
+                                .to_string();
+                            let access = entry
+                                .get("access")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or_default()
+                                .to_string();
+                            let expires =
+                                entry.get("expires").and_then(|v| v.as_i64()).unwrap_or(0);
+                            provider.oauth = Some(crate::ai_providers::OAuthCredentials {
+                                refresh_token: refresh,
+                                access_token: access,
+                                expires_at: expires,
+                            });
+                        }
+                        _ => {}
+                    }
+                }
+
+                let store_id = state.ai_providers.add(provider.clone()).await;
+                // Return a response with the store UUID so the frontend can reference it
+                let stored = state.ai_providers.get(store_id).await.unwrap_or(provider);
+                return Json(build_response_from_store(&stored)).into_response();
+            }
+            json.into_response()
+        }
         Err((status, message)) => (status, message).into_response(),
     }
 }
@@ -5455,12 +6036,27 @@ async fn oauth_callback_inner(
     AxumPath(id): AxumPath<String>,
     Json(req): Json<OAuthCallbackRequest>,
 ) -> Result<Json<ProviderResponse>, (axum::http::StatusCode, String)> {
-    let provider_type = ProviderType::from_id(&id).ok_or_else(|| {
-        (
-            axum::http::StatusCode::NOT_FOUND,
-            format!("Provider {} not found", id),
-        )
-    })?;
+    // Resolve provider type from UUID or type ID
+    let provider_type = if let Ok(uuid) = uuid::Uuid::parse_str(&id) {
+        state
+            .ai_providers
+            .get(uuid)
+            .await
+            .map(|p| p.provider_type)
+            .ok_or_else(|| {
+                (
+                    axum::http::StatusCode::NOT_FOUND,
+                    format!("Provider {} not found", id),
+                )
+            })?
+    } else {
+        ProviderType::from_id(&id).ok_or_else(|| {
+            (
+                axum::http::StatusCode::NOT_FOUND,
+                format!("Provider {} not found", id),
+            )
+        })?
+    };
 
     // Get pending OAuth state
     let pending = {
@@ -5884,11 +6480,11 @@ async fn oauth_callback_inner(
                 tracing::error!("Failed to sync credentials to OpenCode: {}", e);
             }
 
-            // Persist backend targeting for OpenAI (defaults to ["opencode"]).
+            // Persist backend targeting for OpenAI.
             let backends = req
                 .use_for_backends
                 .clone()
-                .unwrap_or_else(|| vec!["opencode".to_string()]);
+                .unwrap_or_else(|| default_backends_for_provider(provider_type));
             if let Err(e) = update_provider_backends(
                 &state.config.working_dir,
                 provider_type.id(),
@@ -6061,30 +6657,32 @@ async fn oauth_callback_inner(
                 }
             }
 
-            // Save backend targeting if provided in the callback request
+            // Persist backend targeting for Google even if the callback omitted it.
             let config_path = get_opencode_config_path(&state.config.working_dir);
             let mut opencode_config = read_opencode_config(&config_path).map_err(internal_error)?;
 
-            if let Some(ref backends_list) = req.use_for_backends {
-                set_provider_config_entry(
-                    &mut opencode_config,
-                    provider_type,
-                    None,
-                    None,
-                    None,
-                    req.use_for_backends.clone(),
-                    None,
-                );
-                if let Err(e) = write_opencode_config(&config_path, &opencode_config) {
-                    tracing::error!("Failed to write OpenCode config: {}", e);
-                }
-                if let Err(e) = update_provider_backends(
-                    &state.config.working_dir,
-                    provider_type.id(),
-                    backends_list.clone(),
-                ) {
-                    tracing::error!("Failed to save provider backends: {}", e);
-                }
+            let backends_list = req
+                .use_for_backends
+                .clone()
+                .unwrap_or_else(|| default_backends_for_provider(provider_type));
+            set_provider_config_entry(
+                &mut opencode_config,
+                provider_type,
+                None,
+                None,
+                None,
+                Some(backends_list.clone()),
+                None,
+            );
+            if let Err(e) = write_opencode_config(&config_path, &opencode_config) {
+                tracing::error!("Failed to write OpenCode config: {}", e);
+            }
+            if let Err(e) = update_provider_backends(
+                &state.config.working_dir,
+                provider_type.id(),
+                backends_list,
+            ) {
+                tracing::error!("Failed to save provider backends: {}", e);
             }
             let backends_state = read_provider_backends_state(&state.config.working_dir);
             let default_provider = get_default_provider(&opencode_config);

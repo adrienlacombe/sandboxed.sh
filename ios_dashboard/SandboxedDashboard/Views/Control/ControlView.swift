@@ -1649,8 +1649,12 @@ struct ControlView: View {
                                     Task {
                                         do {
                                             let mission = try await self.api.getMission(id: viewingId)
+                                            let events = try await self.api.getMissionEvents(
+                                                id: viewingId,
+                                                types: self.historyEventTypes
+                                            )
                                             await MainActor.run {
-                                                self.applyViewingMission(mission)
+                                                self.applyViewingMissionWithEvents(mission, events: events)
                                             }
                                         } catch {
                                             // Ignore errors - we'll get updates via stream
@@ -1839,6 +1843,75 @@ struct ControlView: View {
     private var historyEventTypes: [String] {
         ["user_message", "assistant_message", "tool_call", "tool_result", "text_delta", "thinking"]
     }
+
+    private var streamingThoughtPrefix: String {
+        "stream-thinking-"
+    }
+
+    private func isStreamingFallbackThought(_ message: ChatMessage) -> Bool {
+        message.id.hasPrefix(streamingThoughtPrefix)
+    }
+
+    private func finalizeActiveThinkingMessages() {
+        for index in messages.indices {
+            guard messages[index].isThinking, !messages[index].thinkingDone else {
+                continue
+            }
+
+            let existing = messages[index]
+            let startTime = existing.thinkingStartTime ?? existing.timestamp
+            messages[index] = ChatMessage(
+                id: existing.id,
+                type: .thinking(done: true, startTime: startTime),
+                content: existing.content,
+                toolUI: existing.toolUI,
+                toolData: existing.toolData,
+                timestamp: existing.timestamp
+            )
+        }
+    }
+
+    private func upsertStreamingFallbackThought(content: String, done: Bool) {
+        let trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+
+        messages.removeAll { $0.isPhase }
+
+        if let activeRealThought = messages.last(where: {
+            $0.isThinking && !$0.thinkingDone && !isStreamingFallbackThought($0)
+        }), !activeRealThought.content.isEmpty {
+            return
+        }
+
+        if let index = messages.lastIndex(where: {
+            $0.isThinking && !$0.thinkingDone && isStreamingFallbackThought($0)
+        }) {
+            let existing = messages[index]
+            let startTime = existing.thinkingStartTime ?? existing.timestamp
+            let mergedContent: String
+            if content.hasPrefix(existing.content) {
+                mergedContent = content
+            } else {
+                mergedContent = existing.content + content
+            }
+            messages[index] = ChatMessage(
+                id: existing.id,
+                type: .thinking(done: done, startTime: startTime),
+                content: mergedContent,
+                toolUI: existing.toolUI,
+                toolData: existing.toolData,
+                timestamp: existing.timestamp
+            )
+        } else {
+            messages.append(
+                ChatMessage(
+                    id: "\(streamingThoughtPrefix)\(Date().timeIntervalSince1970)",
+                    type: .thinking(done: done, startTime: Date()),
+                    content: content
+                )
+            )
+        }
+    }
     
     private func handleStreamEvent(type: String, data: [String: Any], isHistoricalReplay: Bool = false) {
         // Filter events by mission_id - only show events for the mission we're viewing
@@ -1903,6 +1976,7 @@ struct ControlView: View {
 
                     // Clear progress and auto-close desktop stream when idle
                     if newState == .idle {
+                        finalizeActiveThinkingMessages()
                         progress = nil
                         // Auto-close desktop stream when agent finishes
                         showDesktopStream = false
@@ -1916,6 +1990,7 @@ struct ControlView: View {
         case "user_message":
             if let content = data["content"] as? String,
                let id = data["id"] as? String {
+                finalizeActiveThinkingMessages()
                 // Skip if we already have this message with this ID
                 guard !messages.contains(where: { $0.id == id }) else { break }
 
@@ -1962,9 +2037,8 @@ struct ControlView: View {
                     }
                 }
 
-                // Remove any incomplete thinking messages and phase messages
-                // Mark active tool calls as completed instead of removing them
-                messages.removeAll { ($0.isThinking && !$0.thinkingDone) || $0.isPhase }
+                finalizeActiveThinkingMessages()
+                messages.removeAll { $0.isPhase }
 
                 // Mark any remaining active tool calls as completed
                 markActiveToolCallsAsCompleted(withState: .success)
@@ -1976,39 +2050,49 @@ struct ControlView: View {
                 )
                 messages.append(message)
             }
+
+        case "text_delta":
+            if !isHistoricalReplay, let content = data["content"] as? String {
+                upsertStreamingFallbackThought(content: content, done: false)
+            }
             
         case "thinking":
-            if let content = data["content"] as? String {
-                let done = data["done"] as? Bool ?? false
+            let content = data["content"] as? String ?? ""
+            let done = data["done"] as? Bool ?? false
+            let trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
 
-                // Skip empty thinking content
-                guard !content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { break }
-
-                // Remove phase items when thinking starts
-                messages.removeAll { $0.isPhase }
-
-                // Find existing thinking message or create new
-                if let index = messages.lastIndex(where: { $0.isThinking && !$0.thinkingDone }) {
-                    let existingStartTime = messages[index].thinkingStartTime ?? Date()
-                    messages[index].content = content
-                    if done {
-                        messages[index] = ChatMessage(
-                            id: messages[index].id,
-                            type: .thinking(done: true, startTime: existingStartTime),
-                            content: messages[index].content
-                        )
-                    }
-                } else {
-                    // Create new thinking message - whether done or not
-                    // This handles the case where we receive a completed thought without seeing it active first
-                    // (e.g., when joining a mission mid-thought or reconnecting)
-                    let message = ChatMessage(
-                        id: "thinking-\(Date().timeIntervalSince1970)",
-                        type: .thinking(done: done, startTime: Date()),
-                        content: content
-                    )
-                    messages.append(message)
+            if trimmed.isEmpty {
+                if done {
+                    finalizeActiveThinkingMessages()
                 }
+                break
+            }
+
+            // Remove phase items when thinking starts
+            messages.removeAll { $0.isPhase }
+
+            // Find existing thinking message or create new
+            if let index = messages.lastIndex(where: { $0.isThinking && !$0.thinkingDone }) {
+                let existing = messages[index]
+                let existingStartTime = existing.thinkingStartTime ?? existing.timestamp
+                messages[index] = ChatMessage(
+                    id: existing.id,
+                    type: .thinking(done: done, startTime: existingStartTime),
+                    content: content,
+                    toolUI: existing.toolUI,
+                    toolData: existing.toolData,
+                    timestamp: existing.timestamp
+                )
+            } else {
+                // Create new thinking message - whether done or not
+                // This handles the case where we receive a completed thought without seeing it active first
+                // (e.g., when joining a mission mid-thought or reconnecting)
+                let message = ChatMessage(
+                    id: "thinking-\(Date().timeIntervalSince1970)",
+                    type: .thinking(done: done, startTime: Date()),
+                    content: content
+                )
+                messages.append(message)
             }
             
         case "agent_phase":
@@ -2044,6 +2128,7 @@ struct ControlView: View {
             
         case "error":
             if let errorMessage = data["message"] as? String {
+                finalizeActiveThinkingMessages()
                 // Filter out SSE-specific reconnection errors - these are handled by the reconnection logic
                 // Use specific patterns to avoid filtering legitimate agent errors
                 let lower = errorMessage.lowercased()
@@ -2068,6 +2153,7 @@ struct ControlView: View {
             if let toolCallId = data["tool_call_id"] as? String,
                let name = data["name"] as? String,
                let args = data["args"] as? [String: Any] {
+                finalizeActiveThinkingMessages()
                 // Parse UI tool calls
                 if let toolUI = ToolUIContent.parse(name: name, args: args) {
                     let message = ChatMessage(
@@ -2169,6 +2255,7 @@ struct ControlView: View {
                 // If mission is no longer active AND it's the currently viewed mission,
                 // mark all pending tools as cancelled
                 if newStatus != .active && viewingMissionId == missionId {
+                    finalizeActiveThinkingMessages()
                     markActiveToolCallsAsCompleted(withState: .cancelled)
                 }
 

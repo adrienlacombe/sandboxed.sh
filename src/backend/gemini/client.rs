@@ -391,6 +391,8 @@ pub enum GeminiEvent {
         #[serde(default)]
         status: Option<String>,
         #[serde(default)]
+        error: Option<GeminiErrorDetail>,
+        #[serde(default)]
         stats: Option<GeminiStats>,
     },
 
@@ -528,7 +530,11 @@ mod tests {
         let json = r#"{"type":"result","status":"success","stats":{"total_input_tokens":1000,"total_output_tokens":250}}"#;
         let event: GeminiEvent = serde_json::from_str(json).unwrap();
         match event {
-            GeminiEvent::Result { status, stats } => {
+            GeminiEvent::Result {
+                status,
+                error: _,
+                stats,
+            } => {
                 assert_eq!(status.as_deref(), Some("success"));
                 let stats = stats.unwrap();
                 assert_eq!(stats.total_input_tokens, Some(1000));

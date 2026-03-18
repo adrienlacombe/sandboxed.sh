@@ -9,6 +9,11 @@ use std::sync::Arc;
 
 use chrono::Utc;
 use jsonwebtoken::{EncodingKey, Header};
+use sandboxed_sh::ai_providers::ProviderType;
+use sandboxed_sh::api::ai_providers::{
+    default_backends_for_provider, get_openai_api_key_for_codex_default, provider_targets_backend,
+    read_oauth_token_entry,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use uuid::Uuid;
@@ -151,6 +156,12 @@ struct SendMessageParams {
 }
 
 #[derive(Debug, Deserialize)]
+struct BackendAuthStatusParams {
+    #[serde(default)]
+    backend: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct CreateWorktreeParams {
     /// Path relative to the workspace root where the worktree will be created
     path: String,
@@ -249,6 +260,28 @@ impl OrchestratorMcp {
 
     fn get_tools() -> Vec<ToolDefinition> {
         vec![
+            ToolDefinition {
+                name: "get_workspace_layout".to_string(),
+                description: "Return the boss mission's workspace paths so you can stop guessing where the real project root is before delegating.".to_string(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {}
+                }),
+            },
+            ToolDefinition {
+                name: "get_backend_auth_status".to_string(),
+                description: "Report which backends are actually usable from the backend's credential store and provider targeting. Use this instead of guessing from shell env vars or CLI login checks.".to_string(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "backend": {
+                            "type": "string",
+                            "enum": ["claudecode", "codex", "gemini", "opencode", "amp"],
+                            "description": "Optional single backend to inspect. If omitted, returns all common backends."
+                        }
+                    }
+                }),
+            },
             ToolDefinition {
                 name: "create_worker_mission".to_string(),
                 description: "Create a new worker mission (child of the current boss mission). The worker will start executing immediately. IMPORTANT: You must set the 'backend' field to match the harness you want (claudecode, codex, gemini, opencode). If omitted, defaults to the workspace default (usually claudecode).".to_string(),
@@ -367,7 +400,43 @@ impl OrchestratorMcp {
             },
             ToolDefinition {
                 name: "send_message_to_worker".to_string(),
-                description: "Send a text message/instruction to a running worker mission.".to_string(),
+                description: "Send a follow-up message to a worker mission. This can continue a running worker and can also reactivate an interrupted, failed, completed, or pending worker by queuing new targeted work.".to_string(),
+                input_schema: json!({
+                    "type": "object",
+                    "required": ["mission_id", "content"],
+                    "properties": {
+                        "mission_id": {
+                            "type": "string",
+                            "description": "UUID of the worker mission"
+                        },
+                        "content": {
+                            "type": "string",
+                            "description": "Message content to send to the worker"
+                        }
+                    }
+                }),
+            },
+            ToolDefinition {
+                name: "resume_worker".to_string(),
+                description: "Resume or retry a worker by sending it a targeted follow-up message. Use this when a worker was interrupted, failed, blocked, or needs corrective guidance.".to_string(),
+                input_schema: json!({
+                    "type": "object",
+                    "required": ["mission_id", "content"],
+                    "properties": {
+                        "mission_id": {
+                            "type": "string",
+                            "description": "UUID of the worker mission"
+                        },
+                        "content": {
+                            "type": "string",
+                            "description": "Recovery or retry instructions for the worker"
+                        }
+                    }
+                }),
+            },
+            ToolDefinition {
+                name: "retask_worker".to_string(),
+                description: "Change a worker's assignment by sending it a new targeted prompt. Use this instead of abandoning a worker when its scope should change.".to_string(),
                 input_schema: json!({
                     "type": "object",
                     "required": ["mission_id", "content"],
@@ -665,6 +734,142 @@ impl OrchestratorMcp {
         Ok(result)
     }
 
+    async fn resume_worker(&self, params: SendMessageParams) -> Result<Value, String> {
+        let mission_id = params.mission_id.clone();
+        let result = self.send_message(params).await?;
+        Ok(json!({
+            "success": true,
+            "action": "resume_worker",
+            "mission_id": mission_id,
+            "result": result,
+        }))
+    }
+
+    async fn retask_worker(&self, params: SendMessageParams) -> Result<Value, String> {
+        let mission_id = params.mission_id.clone();
+        let result = self.send_message(params).await?;
+        Ok(json!({
+            "success": true,
+            "action": "retask_worker",
+            "mission_id": mission_id,
+            "result": result,
+        }))
+    }
+
+    fn get_workspace_layout(&self) -> Value {
+        let workspace_dir = std::env::var("WORKING_DIR").ok();
+        let workspace_root = std::env::var("SANDBOXED_SH_WORKSPACE_ROOT").ok();
+        let workspace_mount = std::env::var("SANDBOXED_SH_WORKSPACE").ok();
+        let workspace_type = std::env::var("SANDBOXED_SH_WORKSPACE_TYPE").ok();
+        let runtime_workspace_file = std::env::var("SANDBOXED_SH_RUNTIME_WORKSPACE_FILE").ok();
+
+        let git_root = workspace_dir.as_deref().and_then(find_git_root);
+
+        json!({
+            "workspace_dir": workspace_dir,
+            "workspace_root": workspace_root,
+            "workspace_mount": workspace_mount,
+            "workspace_type": workspace_type,
+            "runtime_workspace_file": runtime_workspace_file,
+            "git_root": git_root,
+        })
+    }
+
+    fn get_backend_auth_status(&self, params: BackendAuthStatusParams) -> Value {
+        let backends = params
+            .backend
+            .map(|backend| vec![backend])
+            .unwrap_or_else(|| {
+                vec![
+                    "claudecode".to_string(),
+                    "codex".to_string(),
+                    "gemini".to_string(),
+                    "opencode".to_string(),
+                ]
+            });
+
+        let data_dir = openagent_data_dir();
+        // provider_targets_backend / load_ai_providers expect a workspace root
+        // and internally append `.sandboxed-sh/...`. The data_dir already IS
+        // `.sandboxed-sh`, so we use its parent as the workspace root.
+        let workspace_root = data_dir
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| data_dir.clone());
+        let auth_json_path = opencode_auth_json_path();
+        let codex_auth_path = codex_auth_json_path();
+
+        let statuses: Vec<Value> = backends
+            .into_iter()
+            .map(|backend| match backend.as_str() {
+                "claudecode" => backend_auth_entry(
+                    "claudecode",
+                    ProviderType::Anthropic,
+                    &workspace_root,
+                    provider_targets_backend(&workspace_root, ProviderType::Anthropic, "claudecode"),
+                    read_oauth_token_entry(ProviderType::Anthropic).is_some(),
+                    false,
+                    None,
+                ),
+                "codex" => {
+                    let has_oauth = read_oauth_token_entry(ProviderType::OpenAI).is_some();
+                    let has_api_key =
+                        get_openai_api_key_for_codex_default(&workspace_root).is_some();
+                    let has_host_auth = looks_like_json_file(&codex_auth_path);
+                    let targeted =
+                        provider_targets_backend(&workspace_root, ProviderType::OpenAI, "codex");
+                    backend_auth_entry(
+                        "codex",
+                        ProviderType::OpenAI,
+                        &workspace_root,
+                        targeted,
+                        has_oauth || has_api_key || has_host_auth,
+                        has_host_auth,
+                        Some(json!({
+                            "has_api_key": has_api_key,
+                            "has_oauth": has_oauth,
+                            "has_host_auth_json": has_host_auth,
+                        })),
+                    )
+                }
+                "gemini" => backend_auth_entry(
+                    "gemini",
+                    ProviderType::Google,
+                    &workspace_root,
+                    provider_targets_backend(&workspace_root, ProviderType::Google, "gemini"),
+                    read_oauth_token_entry(ProviderType::Google).is_some()
+                        || opencode_auth_has_provider(&auth_json_path, "google")
+                        || opencode_auth_has_provider(&auth_json_path, "gemini"),
+                    false,
+                    Some(json!({
+                        "default_backends": default_backends_for_provider(ProviderType::Google),
+                    })),
+                ),
+                "opencode" => json!({
+                    "backend": "opencode",
+                    "ready": true,
+                    "reason": "OpenCode routes through configured providers; inspect provider selection separately.",
+                }),
+                "amp" => json!({
+                    "backend": "amp",
+                    "ready": true,
+                    "reason": "Amp auth is handled by AMP_API_KEY or provider store, not this tool.",
+                }),
+                other => json!({
+                    "backend": other,
+                    "ready": false,
+                    "reason": "Unknown backend",
+                }),
+            })
+            .collect();
+
+        json!({
+            "openagent_data_dir": data_dir,
+            "statuses": statuses,
+            "note": "Shell env vars and CLI login status inside a worker shell are not authoritative for backend auth.",
+        })
+    }
+
     fn create_worktree(&self, params: CreateWorktreeParams) -> Result<Value, String> {
         let path = &params.path;
         let branch = &params.branch;
@@ -918,6 +1123,12 @@ impl OrchestratorMcp {
 
     async fn handle_call(&self, method: &str, params: Value) -> Result<Value, String> {
         match method {
+            "get_workspace_layout" => Ok(self.get_workspace_layout()),
+            "get_backend_auth_status" => {
+                let params: BackendAuthStatusParams =
+                    serde_json::from_value(params).map_err(|e| format!("Invalid params: {}", e))?;
+                Ok(self.get_backend_auth_status(params))
+            }
             "create_worker_mission" => {
                 let params: CreateWorkerParams =
                     serde_json::from_value(params).map_err(|e| format!("Invalid params: {}", e))?;
@@ -944,6 +1155,16 @@ impl OrchestratorMcp {
                 let params: SendMessageParams =
                     serde_json::from_value(params).map_err(|e| format!("Invalid params: {}", e))?;
                 self.send_message(params).await
+            }
+            "resume_worker" => {
+                let params: SendMessageParams =
+                    serde_json::from_value(params).map_err(|e| format!("Invalid params: {}", e))?;
+                self.resume_worker(params).await
+            }
+            "retask_worker" => {
+                let params: SendMessageParams =
+                    serde_json::from_value(params).map_err(|e| format!("Invalid params: {}", e))?;
+                self.retask_worker(params).await
             }
             "create_worktree" => {
                 let params: CreateWorktreeParams =
@@ -1026,6 +1247,112 @@ impl OrchestratorMcp {
             _ => JsonRpcResponse::error(req.id, -32601, format!("Unknown method: {}", req.method)),
         }
     }
+}
+
+fn find_git_root(path: &str) -> Option<String> {
+    let output = Command::new("git")
+        .arg("rev-parse")
+        .arg("--show-toplevel")
+        .current_dir(path)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let root = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if root.is_empty() {
+        None
+    } else {
+        Some(root)
+    }
+}
+
+fn openagent_data_dir() -> std::path::PathBuf {
+    std::env::var("OPENAGENT_DATA_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::path::PathBuf::from("/root/.sandboxed-sh"))
+}
+
+fn opencode_auth_json_path() -> std::path::PathBuf {
+    if let Ok(data_home) = std::env::var("XDG_DATA_HOME") {
+        return std::path::PathBuf::from(data_home)
+            .join("opencode")
+            .join("auth.json");
+    }
+
+    std::path::PathBuf::from("/var/lib/opencode/.local/share/opencode/auth.json")
+}
+
+fn codex_auth_json_path() -> std::path::PathBuf {
+    if let Ok(home) = std::env::var("HOME") {
+        let candidate = std::path::PathBuf::from(&home)
+            .join(".codex")
+            .join("auth.json");
+        if candidate.exists() {
+            return candidate;
+        }
+    }
+
+    std::path::PathBuf::from("/var/lib/opencode/.codex/auth.json")
+}
+
+fn looks_like_json_file(path: &std::path::Path) -> bool {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|contents| serde_json::from_str::<serde_json::Value>(&contents).ok())
+        .is_some()
+}
+
+fn opencode_auth_has_provider(path: &std::path::Path, provider: &str) -> bool {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|contents| serde_json::from_str::<serde_json::Value>(&contents).ok())
+        .and_then(|value| value.get(provider).cloned())
+        .is_some()
+}
+
+fn backend_auth_entry(
+    backend: &str,
+    provider_type: ProviderType,
+    data_dir: &std::path::Path,
+    targeted: bool,
+    has_credentials: bool,
+    has_cli_auth: bool,
+    extra: Option<Value>,
+) -> Value {
+    let ready = targeted && (has_credentials || has_cli_auth);
+    let reason = if ready {
+        "backend is targeted and credentials are available"
+    } else if has_credentials || has_cli_auth {
+        "credentials exist, but this provider is not targeted to that backend"
+    } else if targeted {
+        "backend is targeted, but no credentials were found"
+    } else {
+        "backend is not targeted and no credentials were found"
+    };
+
+    let mut value = json!({
+        "backend": backend,
+        "provider": provider_type.id(),
+        "ready": ready,
+        "targeted": targeted,
+        "has_credentials": has_credentials,
+        "has_cli_auth": has_cli_auth,
+        "default_backends": default_backends_for_provider(provider_type),
+        "data_dir": data_dir,
+        "reason": reason,
+    });
+
+    if let Some(extra) = extra {
+        if let (Some(map), Some(extra_map)) = (value.as_object_mut(), extra.as_object()) {
+            for (key, entry) in extra_map {
+                map.insert(key.clone(), entry.clone());
+            }
+        }
+    }
+
+    value
 }
 
 // =============================================================================
