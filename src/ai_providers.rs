@@ -324,6 +324,9 @@ pub struct AIProvider {
     /// NPM package for custom provider (defaults to @ai-sdk/openai-compatible)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub npm_package: Option<String>,
+    /// Which backends this provider is used for (e.g., ["opencode", "claudecode", "codex"])
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub use_for_backends: Option<Vec<String>>,
     /// Whether this provider is enabled
     #[serde(default = "default_enabled")]
     pub enabled: bool,
@@ -373,6 +376,7 @@ impl AIProvider {
             custom_models: None,
             custom_env_var: None,
             npm_package: None,
+            use_for_backends: None,
             enabled: true,
             is_default: false,
             account_email: None,

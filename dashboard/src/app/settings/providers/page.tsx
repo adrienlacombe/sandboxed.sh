@@ -401,14 +401,10 @@ export default function ProvidersPage() {
   const handleSaveEdit = async () => {
     if (!editingProvider) return;
 
-    const provider = providers.find((p) => p.id === editingProvider);
-    const isCustom = provider?.provider_type === 'custom';
-
     try {
       await updateAIProvider(editingProvider, {
         name: editForm.name,
-        // label is only accepted by the backend for custom providers
-        ...(isCustom ? { label: editForm.label?.trim() || null } : {}),
+        label: editForm.label?.trim() || null,
         google_project_id:
           editForm.google_project_id === ''
             ? null
@@ -514,17 +510,15 @@ export default function ProvidersPage() {
                           placeholder="Name"
                           className="w-full rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2 text-sm text-white focus:outline-none focus:border-indigo-500/50"
                         />
-                        {provider.provider_type === 'custom' && (
-                          <input
-                            type="text"
-                            value={editForm.label ?? ''}
-                            onChange={(e) =>
-                              setEditForm({ ...editForm, label: e.target.value })
-                            }
-                            placeholder="Account label (e.g. Team, Personal)"
-                            className="w-full rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2 text-sm text-white focus:outline-none focus:border-indigo-500/50"
-                          />
-                        )}
+                        <input
+                          type="text"
+                          value={editForm.label ?? ''}
+                          onChange={(e) =>
+                            setEditForm({ ...editForm, label: e.target.value })
+                          }
+                          placeholder="Account label (e.g. Team, Personal)"
+                          className="w-full rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2 text-sm text-white focus:outline-none focus:border-indigo-500/50"
+                        />
                         <input
                           type="password"
                           value={editForm.api_key ?? ''}
