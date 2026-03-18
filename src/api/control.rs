@@ -5275,6 +5275,32 @@ fn mission_status_summary_for_terminal_reason(reason: TerminalReason) -> Option<
     }
 }
 
+/// If the turn ended with `LlmError` but the agent produced substantive output,
+/// downgrade the reason to `TurnComplete` so the mission stays active and can
+/// be picked up by the next automation cycle or user message. This prevents
+/// transient backend errors (e.g. Codex "Failed to shutdown rollout recorder")
+/// from killing missions that actually completed their work.
+fn maybe_recover_soft_llm_error(result: &mut crate::agents::AgentResult) {
+    if result.terminal_reason != Some(TerminalReason::LlmError) {
+        return;
+    }
+    let output = result.output.trim();
+    // Only recover when we have real content — not just an error message.
+    // Heuristic: at least 20 chars and doesn't look like a bare error.
+    if output.len() >= 20
+        && !output.starts_with("Codex produced no output")
+        && !output.starts_with("Codex CLI produced no JSON")
+        && !output.starts_with("No response from")
+    {
+        tracing::info!(
+            output_len = output.len(),
+            "Recovering from soft LlmError: agent produced valid output, upgrading to TurnComplete"
+        );
+        result.success = true;
+        result.terminal_reason = Some(TerminalReason::TurnComplete);
+    }
+}
+
 async fn maybe_finalize_terminal_mission(
     mission_store: &Arc<dyn MissionStore>,
     events_tx: &tokio::sync::broadcast::Sender<AgentEvent>,
@@ -7272,7 +7298,8 @@ async fn control_actor_loop(
                     main_runner_activity = None;
                     let mut completed_terminal_reason = None;
                     match res {
-                        Ok((_mid, _user_msg, agent_result)) => {
+                        Ok((_mid, _user_msg, mut agent_result)) => {
+                            maybe_recover_soft_llm_error(&mut agent_result);
                             completed_terminal_reason = agent_result.terminal_reason;
                             // Only append assistant to local history if this mission is still the current mission.
                             // Note: User message was already added before execution started.
@@ -7639,7 +7666,8 @@ async fn control_actor_loop(
 
                 for (mission_id, runner) in parallel_runners.iter_mut() {
                     if runner.check_finished() {
-                        if let Some((_msg_id, _user_msg, result)) = runner.poll_completion().await {
+                        if let Some((_msg_id, _user_msg, mut result)) = runner.poll_completion().await {
+                            maybe_recover_soft_llm_error(&mut result);
                             tracing::info!(
                                 "Parallel mission {} completed (success: {}, cost: {} cents)",
                                 mission_id, result.success, result.cost_cents
