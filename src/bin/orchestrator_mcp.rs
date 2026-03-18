@@ -170,12 +170,20 @@ struct CreateWorktreeParams {
     /// Optional: base branch to create from (defaults to HEAD)
     #[serde(default)]
     base: Option<String>,
+    /// Optional: path to the git repo directory. If omitted, auto-detects by
+    /// searching for .git within the workspace root (2 levels deep).
+    #[serde(default)]
+    repo_path: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct RemoveWorktreeParams {
     /// Path of the worktree to remove
     path: String,
+    /// Optional: path to the git repo directory. If omitted, auto-detects by
+    /// searching for .git within the workspace root (2 levels deep).
+    #[serde(default)]
+    repo_path: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -470,6 +478,10 @@ impl OrchestratorMcp {
                         "base": {
                             "type": "string",
                             "description": "Base branch/commit to create from (defaults to HEAD)"
+                        },
+                        "repo_path": {
+                            "type": "string",
+                            "description": "Path to the git repo to create the worktree from. If omitted, auto-detects by searching for .git within the workspace root (2 levels deep). Use this when the repo is in a subdirectory (e.g. /workspaces/mission-xxx/verity)."
                         }
                     }
                 }),
@@ -484,6 +496,10 @@ impl OrchestratorMcp {
                         "path": {
                             "type": "string",
                             "description": "Path of the worktree to remove"
+                        },
+                        "repo_path": {
+                            "type": "string",
+                            "description": "Path to the git repo that owns the worktree. If omitted, auto-detects by searching for .git within the workspace root (2 levels deep)."
                         }
                     }
                 }),
@@ -873,9 +889,11 @@ impl OrchestratorMcp {
     fn create_worktree(&self, params: CreateWorktreeParams) -> Result<Value, String> {
         let path = &params.path;
         let branch = &params.branch;
+        let repo_dir = resolve_repo_path(params.repo_path.as_deref());
 
         // Check if branch exists
         let branch_exists = Command::new("git")
+            .current_dir(&repo_dir)
             .args(["rev-parse", "--verify", branch])
             .output()
             .map(|o| o.status.success())
@@ -884,6 +902,7 @@ impl OrchestratorMcp {
         let output = if branch_exists {
             // Branch exists, just create worktree on it
             Command::new("git")
+                .current_dir(&repo_dir)
                 .args(["worktree", "add", path, branch])
                 .output()
                 .map_err(|e| format!("Failed to run git worktree add: {}", e))?
@@ -891,6 +910,7 @@ impl OrchestratorMcp {
             // Create new branch from base
             let base = params.base.as_deref().unwrap_or("HEAD");
             Command::new("git")
+                .current_dir(&repo_dir)
                 .args(["worktree", "add", "-b", branch, path, base])
                 .output()
                 .map_err(|e| format!("Failed to run git worktree add: {}", e))?
@@ -905,12 +925,16 @@ impl OrchestratorMcp {
             "success": true,
             "path": path,
             "branch": branch,
-            "message": format!("Worktree created at {} on branch {}", path, branch),
+            "repo_path": repo_dir,
+            "message": format!("Worktree created at {} on branch {} (repo: {})", path, branch, repo_dir),
         }))
     }
 
     fn remove_worktree(&self, params: RemoveWorktreeParams) -> Result<Value, String> {
+        let repo_dir = resolve_repo_path(params.repo_path.as_deref());
+
         let output = Command::new("git")
+            .current_dir(&repo_dir)
             .args(["worktree", "remove", "--force", &params.path])
             .output()
             .map_err(|e| format!("Failed to run git worktree remove: {}", e))?;
@@ -923,6 +947,7 @@ impl OrchestratorMcp {
         Ok(json!({
             "success": true,
             "path": params.path,
+            "repo_path": repo_dir,
             "message": format!("Worktree removed at {}", params.path),
         }))
     }
@@ -991,11 +1016,16 @@ impl OrchestratorMcp {
             params.target_statuses
         };
 
-        let timeout = std::time::Duration::from_secs(params.timeout_seconds);
+        // Clamp timeout to MAX_INTERNAL_TIMEOUT_SECS to stay under Codex CLI's 120s limit
+        let effective_timeout_secs = params.timeout_seconds.min(MAX_INTERNAL_TIMEOUT_SECS);
+        let timeout = std::time::Duration::from_secs(effective_timeout_secs);
         let interval = std::time::Duration::from_secs(params.poll_interval_seconds);
         let start = std::time::Instant::now();
         let mut error_counts: std::collections::HashMap<Uuid, u32> =
             ids.iter().map(|id| (*id, 0u32)).collect();
+        // Track latest known status per worker for the timeout snapshot
+        let mut last_statuses: std::collections::HashMap<Uuid, Value> =
+            std::collections::HashMap::new();
 
         loop {
             for id in &ids {
@@ -1007,9 +1037,18 @@ impl OrchestratorMcp {
                         Ok(mission) => {
                             *errors = 0;
                             let status = mission["status"].as_str().unwrap_or("");
+                            last_statuses.insert(
+                                *id,
+                                json!({
+                                    "mission_id": id.to_string(),
+                                    "status": status,
+                                    "title": mission["title"].as_str().unwrap_or(""),
+                                }),
+                            );
                             if target_statuses.iter().any(|s| s == status) {
                                 return Ok(json!({
                                     "reached_target": true,
+                                    "internal_timeout": false,
                                     "mission_id": id.to_string(),
                                     "status": status,
                                     "elapsed_seconds": start.elapsed().as_secs(),
@@ -1051,10 +1090,27 @@ impl OrchestratorMcp {
             }
 
             if start.elapsed() > timeout {
+                let worker_snapshots: Vec<Value> = ids
+                    .iter()
+                    .map(|id| {
+                        last_statuses.get(id).cloned().unwrap_or_else(|| {
+                            json!({
+                                "mission_id": id.to_string(),
+                                "status": "unknown",
+                            })
+                        })
+                    })
+                    .collect();
+                let was_clamped = params.timeout_seconds > MAX_INTERNAL_TIMEOUT_SECS;
                 return Ok(json!({
                     "reached_target": false,
-                    "elapsed_seconds": start.elapsed().as_secs(),
+                    "internal_timeout": was_clamped,
                     "timeout": true,
+                    "elapsed_seconds": start.elapsed().as_secs(),
+                    "effective_timeout_seconds": effective_timeout_secs,
+                    "requested_timeout_seconds": params.timeout_seconds,
+                    "worker_statuses": worker_snapshots,
+                    "hint": "No worker reached a target status within the time limit. Call wait_for_any_worker again to continue waiting.",
                 }));
             }
 
@@ -1077,7 +1133,9 @@ impl OrchestratorMcp {
             params.target_statuses
         };
 
-        let timeout = std::time::Duration::from_secs(params.timeout_seconds);
+        // Clamp timeout to MAX_INTERNAL_TIMEOUT_SECS to stay under Codex CLI's 120s limit
+        let effective_timeout_secs = params.timeout_seconds.min(MAX_INTERNAL_TIMEOUT_SECS);
+        let timeout = std::time::Duration::from_secs(effective_timeout_secs);
         let interval = std::time::Duration::from_secs(params.poll_interval_seconds);
         let start = std::time::Instant::now();
 
@@ -1100,6 +1158,7 @@ impl OrchestratorMcp {
             if target_statuses.iter().any(|s| s == status) {
                 return Ok(json!({
                     "reached_target": true,
+                    "internal_timeout": false,
                     "status": status,
                     "elapsed_seconds": start.elapsed().as_secs(),
                     "mission": mission,
@@ -1108,12 +1167,17 @@ impl OrchestratorMcp {
 
             // Check timeout
             if start.elapsed() > timeout {
+                let was_clamped = params.timeout_seconds > MAX_INTERNAL_TIMEOUT_SECS;
                 return Ok(json!({
                     "reached_target": false,
+                    "internal_timeout": was_clamped,
+                    "timeout": true,
                     "status": status,
                     "elapsed_seconds": start.elapsed().as_secs(),
-                    "timeout": true,
+                    "effective_timeout_seconds": effective_timeout_secs,
+                    "requested_timeout_seconds": params.timeout_seconds,
                     "mission": mission,
+                    "hint": "Worker has not reached a target status yet. Call wait_for_worker again to continue waiting.",
                 }));
             }
 
@@ -1247,6 +1311,70 @@ impl OrchestratorMcp {
             _ => JsonRpcResponse::error(req.id, -32601, format!("Unknown method: {}", req.method)),
         }
     }
+}
+
+/// Hard cap on how long any wait_for_* poll loop may run, to stay well under
+/// Codex CLI's 120-second MCP tool-call timeout.
+const MAX_INTERNAL_TIMEOUT_SECS: u64 = 90;
+
+/// Try to locate the git repository root that worktree commands should target.
+///
+/// Resolution order:
+/// 1. If `explicit` is `Some`, use it directly.
+/// 2. Walk the workspace root looking for `.git` entries up to 2 levels deep.
+///    If exactly one repo is found, use it.
+/// 3. Fall back to the workspace root (original behaviour).
+fn resolve_repo_path(explicit: Option<&str>) -> String {
+    if let Some(p) = explicit {
+        return p.to_string();
+    }
+
+    let workspace_root = std::env::var("WORKING_DIR")
+        .or_else(|_| std::env::var("SANDBOXED_SH_WORKSPACE_ROOT"))
+        .unwrap_or_else(|_| ".".to_string());
+
+    // Search up to 2 levels deep for .git dirs/files
+    let mut repos: Vec<String> = Vec::new();
+
+    // Level 0: workspace root itself
+    let root_path = std::path::Path::new(&workspace_root);
+    if root_path.join(".git").exists() {
+        return workspace_root;
+    }
+
+    // Level 1
+    if let Ok(entries) = std::fs::read_dir(root_path) {
+        for entry in entries.flatten() {
+            let child = entry.path();
+            if !child.is_dir() {
+                continue;
+            }
+            if child.join(".git").exists() {
+                if let Some(s) = child.to_str() {
+                    repos.push(s.to_string());
+                }
+                continue;
+            }
+            // Level 2
+            if let Ok(sub_entries) = std::fs::read_dir(&child) {
+                for sub_entry in sub_entries.flatten() {
+                    let grandchild = sub_entry.path();
+                    if grandchild.is_dir() && grandchild.join(".git").exists() {
+                        if let Some(s) = grandchild.to_str() {
+                            repos.push(s.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if repos.len() == 1 {
+        return repos.into_iter().next().unwrap();
+    }
+
+    // Multiple or zero repos found – fall back to workspace root
+    workspace_root
 }
 
 fn find_git_root(path: &str) -> Option<String> {
