@@ -11329,8 +11329,20 @@ pub async fn run_codex_turn(
                         total_output_tokens = total_output_tokens.saturating_add(output_tokens);
                     }
                     ExecutionEvent::Error { message } => {
-                        error_message = Some(message.clone());
-                        tracing::error!("Codex error: {}", message);
+                        // Codex CLI sometimes emits non-fatal internal errors (e.g.
+                        // "Failed to shutdown rollout recorder") after the agent has
+                        // already produced a valid response. Ignore these if we
+                        // already have assistant output.
+                        if assistant_message.trim().is_empty() {
+                            error_message = Some(message.clone());
+                            tracing::error!("Codex error: {}", message);
+                        } else {
+                            tracing::warn!(
+                                "Ignoring post-response Codex error (have {}B assistant output): {}",
+                                assistant_message.len(),
+                                message
+                            );
+                        }
                     }
                     ExecutionEvent::MessageComplete { session_id: _ } => {
                         success = error_message.is_none();
