@@ -789,6 +789,13 @@ impl OrchestratorMcp {
             });
 
         let data_dir = openagent_data_dir();
+        // provider_targets_backend / load_ai_providers expect a workspace root
+        // and internally append `.sandboxed-sh/...`. The data_dir already IS
+        // `.sandboxed-sh`, so we use its parent as the workspace root.
+        let workspace_root = data_dir
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| data_dir.clone());
         let auth_json_path = opencode_auth_json_path();
         let codex_auth_path = codex_auth_json_path();
 
@@ -798,8 +805,8 @@ impl OrchestratorMcp {
                 "claudecode" => backend_auth_entry(
                     "claudecode",
                     ProviderType::Anthropic,
-                    &data_dir,
-                    provider_targets_backend(&data_dir, ProviderType::Anthropic, "claudecode"),
+                    &workspace_root,
+                    provider_targets_backend(&workspace_root, ProviderType::Anthropic, "claudecode"),
                     read_oauth_token_entry(ProviderType::Anthropic).is_some(),
                     false,
                     None,
@@ -807,14 +814,14 @@ impl OrchestratorMcp {
                 "codex" => {
                     let has_oauth = read_oauth_token_entry(ProviderType::OpenAI).is_some();
                     let has_api_key =
-                        get_openai_api_key_for_codex_default(&data_dir).is_some();
+                        get_openai_api_key_for_codex_default(&workspace_root).is_some();
                     let has_host_auth = looks_like_json_file(&codex_auth_path);
                     let targeted =
-                        provider_targets_backend(&data_dir, ProviderType::OpenAI, "codex");
+                        provider_targets_backend(&workspace_root, ProviderType::OpenAI, "codex");
                     backend_auth_entry(
                         "codex",
                         ProviderType::OpenAI,
-                        &data_dir,
+                        &workspace_root,
                         targeted,
                         has_oauth || has_api_key || has_host_auth,
                         has_host_auth,
@@ -828,8 +835,8 @@ impl OrchestratorMcp {
                 "gemini" => backend_auth_entry(
                     "gemini",
                     ProviderType::Google,
-                    &data_dir,
-                    provider_targets_backend(&data_dir, ProviderType::Google, "gemini"),
+                    &workspace_root,
+                    provider_targets_backend(&workspace_root, ProviderType::Google, "gemini"),
                     read_oauth_token_entry(ProviderType::Google).is_some()
                         || opencode_auth_has_provider(&auth_json_path, "google")
                         || opencode_auth_has_provider(&auth_json_path, "gemini"),
