@@ -336,7 +336,7 @@ impl OrchestratorMcp {
             },
             ToolDefinition {
                 name: "batch_create_workers".to_string(),
-                description: "Create multiple worker missions at once. Each worker is created independently — if one fails, others still succeed. Use this to spawn many workers in parallel.".to_string(),
+                description: "Create multiple worker missions at once. Each worker is created independently — if one fails, others still succeed. The batch is automatically capped based on container resource limits (PIDs, memory) to prevent resource exhaustion. Check the 'warning' field in the response if your batch was reduced.".to_string(),
                 input_schema: json!({
                     "type": "object",
                     "required": ["workers"],
@@ -956,10 +956,28 @@ impl OrchestratorMcp {
         &self,
         params: BatchCreateWorkersParams,
     ) -> Result<Value, String> {
+        let requested = params.workers.len();
+        let resource_cap = estimate_max_workers();
+        let cap = resource_cap.max_workers;
+        let capped = requested > cap;
+
         let mut results = Vec::new();
         let mut errors = Vec::new();
+        let mut skipped = 0usize;
 
         for (i, worker_params) in params.workers.into_iter().enumerate() {
+            if i >= cap {
+                skipped += 1;
+                errors.push(json!({
+                    "index": i,
+                    "success": false,
+                    "error": format!(
+                        "Skipped: resource cap reached ({} max workers). {}",
+                        cap, resource_cap.reason
+                    ),
+                }));
+                continue;
+            }
             match self.create_worker(worker_params).await {
                 Ok(mission) => results.push(json!({
                     "index": i,
@@ -976,12 +994,30 @@ impl OrchestratorMcp {
             }
         }
 
-        Ok(json!({
+        let mut resp = json!({
             "created": results.len(),
             "failed": errors.len(),
             "results": results,
             "errors": errors,
-        }))
+        });
+
+        if capped {
+            resp["warning"] = json!(format!(
+                "Requested {} workers but capped to {} based on container resources. {}. \
+                 {} workers were skipped. Consider running workers sequentially or \
+                 reducing parallelism.",
+                requested, cap, resource_cap.reason, skipped
+            ));
+            resp["resource_cap"] = json!({
+                "max_workers": cap,
+                "pids_available": resource_cap.pids_available,
+                "pids_max": resource_cap.pids_max,
+                "memory_available_mb": resource_cap.memory_available_mb,
+                "memory_max_mb": resource_cap.memory_max_mb,
+            });
+        }
+
+        Ok(resp)
     }
 
     async fn wait_for_any_worker(&self, params: WaitForAnyWorkerParams) -> Result<Value, String> {
@@ -1375,6 +1411,114 @@ fn resolve_repo_path(explicit: Option<&str>) -> String {
 
     // Multiple or zero repos found – fall back to workspace root
     workspace_root
+}
+
+// =============================================================================
+// Container resource estimation
+// =============================================================================
+
+/// Per-worker resource estimates. Each Claude Code / Codex worker spawns
+/// node.js + bun + the CLI itself + child processes (LSP, git, etc.).
+const PIDS_PER_WORKER: u64 = 200;
+const MEMORY_PER_WORKER_MB: u64 = 800;
+/// Headroom reserved for the boss process, system daemons, and the orchestrator MCP.
+const PIDS_HEADROOM: u64 = 300;
+const MEMORY_HEADROOM_MB: u64 = 1024;
+/// Absolute cap even if resources appear plentiful (avoids thrashing).
+const ABSOLUTE_MAX_WORKERS: usize = 4;
+
+struct ResourceCap {
+    max_workers: usize,
+    reason: String,
+    pids_available: Option<u64>,
+    pids_max: Option<u64>,
+    memory_available_mb: Option<u64>,
+    memory_max_mb: Option<u64>,
+}
+
+/// Read a cgroup v2 file and return its value (or None if unreadable / "max").
+fn read_cgroup_u64(path: &str) -> Option<u64> {
+    let content = std::fs::read_to_string(path).ok()?;
+    let trimmed = content.trim();
+    if trimmed == "max" {
+        None // unlimited
+    } else {
+        trimmed.parse::<u64>().ok()
+    }
+}
+
+/// Estimate how many concurrent workers this container can support
+/// by reading cgroup v2 PID and memory limits.
+fn estimate_max_workers() -> ResourceCap {
+    let pids_max = read_cgroup_u64("/sys/fs/cgroup/pids.max");
+    let pids_current = read_cgroup_u64("/sys/fs/cgroup/pids.current").unwrap_or(0);
+    let mem_max = read_cgroup_u64("/sys/fs/cgroup/memory.max");
+    let mem_current = read_cgroup_u64("/sys/fs/cgroup/memory.current").unwrap_or(0);
+
+    let mem_current_mb = mem_current / (1024 * 1024);
+
+    // PID-based cap
+    let pid_cap = if let Some(max) = pids_max {
+        let available = max
+            .saturating_sub(pids_current)
+            .saturating_sub(PIDS_HEADROOM);
+        Some(available / PIDS_PER_WORKER)
+    } else {
+        None
+    };
+
+    // Memory-based cap
+    let mem_cap = if let Some(max) = mem_max {
+        let max_mb = max / (1024 * 1024);
+        let available_mb = max_mb
+            .saturating_sub(mem_current_mb)
+            .saturating_sub(MEMORY_HEADROOM_MB);
+        Some(available_mb / MEMORY_PER_WORKER_MB)
+    } else {
+        None
+    };
+
+    // Take the minimum of all caps
+    let mut effective = ABSOLUTE_MAX_WORKERS as u64;
+    let mut reasons = Vec::new();
+
+    if let Some(pc) = pid_cap {
+        if pc < effective {
+            effective = pc;
+        }
+        reasons.push(format!(
+            "PIDs: {}/{} used, ~{} available for workers",
+            pids_current,
+            pids_max.unwrap_or(0),
+            pc
+        ));
+    }
+    if let Some(mc) = mem_cap {
+        if mc < effective {
+            effective = mc;
+        }
+        reasons.push(format!(
+            "Memory: {}MB/{}MB used, ~{} workers fit",
+            mem_current_mb,
+            mem_max.map(|m| m / (1024 * 1024)).unwrap_or(0),
+            mc
+        ));
+    }
+    if reasons.is_empty() {
+        reasons.push("No cgroup limits detected, using absolute cap".to_string());
+    }
+
+    // Always allow at least 1 worker
+    let max_workers = (effective as usize).clamp(1, ABSOLUTE_MAX_WORKERS);
+
+    ResourceCap {
+        max_workers,
+        reason: reasons.join("; "),
+        pids_available: pid_cap.map(|p| p * PIDS_PER_WORKER),
+        pids_max,
+        memory_available_mb: mem_cap.map(|m| m * MEMORY_PER_WORKER_MB),
+        memory_max_mb: mem_max.map(|m| m / (1024 * 1024)),
+    }
 }
 
 fn find_git_root(path: &str) -> Option<String> {
