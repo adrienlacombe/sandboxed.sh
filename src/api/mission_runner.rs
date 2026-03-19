@@ -4287,6 +4287,24 @@ pub fn run_claudecode_turn<'a>(
             );
         }
 
+        // If still no final result, fall back to thinking buffer.
+        // This handles cases where the model's entire response is in extended thinking
+        // (no text content block), e.g. when the answer is generated as thinking content.
+        if final_result.trim().is_empty() && !thinking_buffer.is_empty() {
+            let mut sorted_entries: Vec<_> = thinking_buffer.iter().collect();
+            sorted_entries.sort_by_key(|(idx, _)| *idx);
+            final_result = sorted_entries
+                .into_iter()
+                .map(|(_, text)| text.clone())
+                .collect::<Vec<_>>()
+                .join("");
+            tracing::info!(
+                mission_id = %mission_id,
+                "Using accumulated thinking buffer as final result ({} chars, no text content was produced)",
+                final_result.len()
+            );
+        }
+
         if !had_error && !saw_terminal_result_event {
             had_error = true;
             let exit_summary = describe_pty_exit_status(&exit_status);

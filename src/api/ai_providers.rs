@@ -4906,9 +4906,23 @@ async fn get_provider_usage(
         ProviderType::Anthropic => {
             // Use API key or OAuth access token
             let auth = if let Some(ref key) = api_key_opt {
-                format!("{}", key)
+                key.clone()
             } else if let Some(ref o) = oauth {
-                format!("{}", o.access_token)
+                // Refresh the token if expired before using it
+                if oauth_token_expired(o.expires_at) {
+                    if let Err(e) = refresh_anthropic_oauth_token().await {
+                        tracing::warn!(
+                            "Failed to refresh Anthropic OAuth token for usage check: {}",
+                            e
+                        );
+                    }
+                    // Re-read the fresh token from auth.json
+                    read_oauth_token_entry(ProviderType::Anthropic)
+                        .map(|entry| entry.access_token)
+                        .unwrap_or_else(|| o.access_token.clone())
+                } else {
+                    o.access_token.clone()
+                }
             } else {
                 return Ok(Json(serde_json::json!({
                     "provider_type": provider_type.id(),
@@ -5051,10 +5065,25 @@ async fn get_provider_usage(
             }
         }
         ProviderType::OpenAI => {
+            // The OpenAI /v1/chat/completions endpoint requires an sk-... API key.
+            // OAuth access tokens (JWT from ChatGPT Plus/Pro) don't work there.
+            // Try to find an API key: explicit key > minted key from OAuth flow.
             let auth = if let Some(ref key) = api_key_opt {
                 key.clone()
-            } else if let Some(ref o) = oauth {
-                o.access_token.clone()
+            } else if oauth.is_some() {
+                // OAuth user — check if an API key was minted during Codex setup
+                if let Some(key) = get_openai_api_key_for_codex_default(&state.config.working_dir) {
+                    key
+                } else {
+                    // No API key available. Return connected status with account info
+                    // instead of making an API call that will 401.
+                    return Ok(Json(serde_json::json!({
+                        "provider_type": "openai",
+                        "provider_name": provider_name,
+                        "account_email": account_email,
+                        "status": "connected",
+                    })));
+                }
             } else {
                 return Ok(Json(serde_json::json!({
                     "provider_type": "openai",
@@ -5224,9 +5253,34 @@ async fn get_provider_usage(
             match coding_resp {
                 Ok(r) if r.status().is_success() => {
                     if let Ok(data) = r.json::<serde_json::Value>().await {
-                        info.as_object_mut()
-                            .unwrap()
-                            .insert("coding_plan".to_string(), data);
+                        let map = info.as_object_mut().unwrap();
+                        map.insert("status".to_string(), serde_json::json!("connected"));
+                        // Extract model_remains into a structured array.
+                        // Only include coding models (MiniMax-M*) since all models
+                        // share the same quota pool and showing 20+ entries is noisy.
+                        if let Some(models) = data.get("model_remains").and_then(|v| v.as_array()) {
+                            let model_usage: Vec<serde_json::Value> = models
+                                .iter()
+                                .filter(|m| {
+                                    m.get("model_name")
+                                        .and_then(|v| v.as_str())
+                                        .map(|n| n.starts_with("MiniMax-M"))
+                                        .unwrap_or(false)
+                                })
+                                .map(|m| {
+                                    serde_json::json!({
+                                        "model": m.get("model_name").and_then(|v| v.as_str()).unwrap_or("unknown"),
+                                        "interval_total": m.get("current_interval_total_count").and_then(|v| v.as_u64()).unwrap_or(0),
+                                        "interval_used": m.get("current_interval_usage_count").and_then(|v| v.as_u64()).unwrap_or(0),
+                                        "weekly_total": m.get("current_weekly_total_count").and_then(|v| v.as_u64()).unwrap_or(0),
+                                        "weekly_used": m.get("current_weekly_usage_count").and_then(|v| v.as_u64()).unwrap_or(0),
+                                        "interval_reset": m.get("end_time").and_then(|v| v.as_i64()).unwrap_or(0),
+                                        "weekly_reset": m.get("weekly_end_time").and_then(|v| v.as_i64()).unwrap_or(0),
+                                    })
+                                })
+                                .collect();
+                            map.insert("model_usage".to_string(), serde_json::json!(model_usage));
+                        }
                     }
                 }
                 Ok(_) => {

@@ -118,6 +118,7 @@ import {
 } from "lucide-react";
 import { IMAGE_PATH_PATTERN } from "@/lib/file-extensions";
 import { insertTextAtSelection, type TextSelection } from "@/lib/text-selection";
+import { useFaviconStatus } from "@/hooks/use-favicon-status";
 
 type StreamDiagnosticsState = {
   phase: "idle" | "connecting" | "open" | "streaming" | "closed" | "error";
@@ -6422,6 +6423,9 @@ export default function ControlClient() {
   const missionStatus = activeMission
     ? missionStatusLabel(activeMission.status)
     : null;
+
+  // Update favicon with mission status dot
+  useFaviconStatus(activeMission?.status ?? null, viewingMissionIsRunning);
 
   // Derive the last resolved model from assistant messages (for the debug dropdown)
   const lastResolvedModel = useMemo(() => {
