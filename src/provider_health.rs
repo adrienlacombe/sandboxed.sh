@@ -633,7 +633,7 @@ impl ModelChainStore {
                     },
                     ChainEntry {
                         provider_id: "minimax".to_string(),
-                        model_id: "MiniMax-M2.5".to_string(),
+                        model_id: "MiniMax-M2.7".to_string(),
                     },
                 ],
                 is_default: true,
@@ -641,6 +641,18 @@ impl ModelChainStore {
                 updated_at: now,
             });
             changed = true;
+        } else {
+            // Migrate builtin/smart: upgrade MiniMax-M2.5 → MiniMax-M2.7
+            if let Some(chain) = chains.iter_mut().find(|c| c.id == "builtin/smart") {
+                for entry in &mut chain.entries {
+                    if entry.provider_id == "minimax" && entry.model_id == "MiniMax-M2.5" {
+                        entry.model_id = "MiniMax-M2.7".to_string();
+                        chain.updated_at = now;
+                        changed = true;
+                        tracing::info!("Migrated builtin/smart: MiniMax-M2.5 → MiniMax-M2.7");
+                    }
+                }
+            }
         }
 
         if !chains.iter().any(|c| c.id == "builtin/cheap") {

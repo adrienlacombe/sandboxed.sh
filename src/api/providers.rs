@@ -594,9 +594,14 @@ fn default_providers_config() -> ProvidersConfig {
                 description: "MiniMax models via Minimax API key".to_string(),
                 models: vec![
                     ProviderModel {
+                        id: "MiniMax-M2.7".to_string(),
+                        name: "MiniMax M2.7".to_string(),
+                        description: Some("Most capable MiniMax model".to_string()),
+                    },
+                    ProviderModel {
                         id: "MiniMax-M2.5".to_string(),
                         name: "MiniMax M2.5".to_string(),
-                        description: Some("Most capable MiniMax model".to_string()),
+                        description: Some("Previous flagship MiniMax model".to_string()),
                     },
                     ProviderModel {
                         id: "MiniMax-M2.5-highspeed".to_string(),
