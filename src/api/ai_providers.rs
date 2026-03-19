@@ -4418,7 +4418,7 @@ async fn list_providers(
     let store_providers = state.ai_providers.list().await;
     let mut providers: Vec<ProviderResponse> = store_providers
         .iter()
-        .map(|p| build_response_from_store(p))
+        .map(build_response_from_store)
         .collect();
 
     providers.sort_by(|a, b| a.name.cmp(&b.name));

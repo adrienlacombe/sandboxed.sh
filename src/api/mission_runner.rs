@@ -4127,6 +4127,19 @@ pub fn run_claudecode_turn<'a>(
                                             _ => {}
                                         }
                                     }
+                                    // If no text content was produced this turn but we have
+                                    // thinking content, use it as the final result before
+                                    // clearing. This handles thinking-only responses.
+                                    if final_result.trim().is_empty() && !thinking_buffer.is_empty() {
+                                        let mut sorted: Vec<_> = thinking_buffer.iter().collect();
+                                        sorted.sort_by_key(|(idx, _)| *idx);
+                                        final_result = sorted.into_iter().map(|(_, t)| t.clone()).collect::<Vec<_>>().join("");
+                                        tracing::info!(
+                                            mission_id = %mission_id,
+                                            "Using thinking buffer as final result ({} chars, no text content in this turn)",
+                                            final_result.len()
+                                        );
+                                    }
                                     // Reset per-turn accumulation state so the next turn
                                     // starts fresh (block indices restart from 0 each turn)
                                     thinking_buffer.clear();

@@ -138,7 +138,7 @@ pub async fn refresh_all_mcps(State(state): State<Arc<AppState>>) -> Json<serde_
     // Spawn refresh_all in background
     let mcp = Arc::clone(&state.mcp);
     tokio::spawn(async move {
-        mcp.refresh_all().await;
+        mcp.refresh_all(false).await; // include all MCPs from UI
     });
 
     Json(serde_json::json!({ "success": true, "message": "Refresh started in background" }))

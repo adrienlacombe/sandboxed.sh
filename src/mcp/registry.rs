@@ -1041,13 +1041,13 @@ impl McpRegistry {
     }
 
     /// Refresh all MCP servers concurrently.
-    /// Skips workspace-scoped MCPs (e.g. orchestrator) since they require
-    /// per-mission context that isn't available at server startup.
-    pub async fn refresh_all(&self) {
+    /// When `skip_workspace` is true, workspace-scoped MCPs (e.g. orchestrator)
+    /// are skipped because they require per-mission context unavailable at startup.
+    pub async fn refresh_all(&self, skip_workspace: bool) {
         let states = self.states.read().await;
         let ids: Vec<Uuid> = states
             .iter()
-            .filter(|(_, state)| state.config.scope != McpScope::Workspace)
+            .filter(|(_, state)| !skip_workspace || state.config.scope != McpScope::Workspace)
             .map(|(id, _)| *id)
             .collect();
         drop(states);

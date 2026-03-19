@@ -131,7 +131,7 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
     {
         let mcp_clone = Arc::clone(&mcp);
         tokio::spawn(async move {
-            mcp_clone.refresh_all().await;
+            mcp_clone.refresh_all(true).await; // skip workspace MCPs at startup
         });
     }
 

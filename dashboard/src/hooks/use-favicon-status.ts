@@ -103,6 +103,8 @@ export function useFaviconStatus(status: MissionStatus | null, isRunning: boolea
       }
     };
 
+    let cancelled = false;
+
     if (cachedImg.current) {
       applyFavicon(cachedImg.current);
     } else {
@@ -110,10 +112,15 @@ export function useFaviconStatus(status: MissionStatus | null, isRunning: boolea
       img.crossOrigin = "anonymous";
       img.src = BASE_FAVICON;
       img.onload = () => {
+        if (cancelled) return; // stale load after status changed
         cachedImg.current = img;
         applyFavicon(img);
       };
     }
+
+    return () => {
+      cancelled = true;
+    };
   }, [status, isRunning]);
 
   // Cleanup on full unmount: restore originals, remove managed link

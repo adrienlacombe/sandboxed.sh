@@ -965,8 +965,9 @@ impl OrchestratorMcp {
         let mut errors = Vec::new();
         let mut skipped = 0usize;
 
+        let mut created_count = 0usize;
         for (i, worker_params) in params.workers.into_iter().enumerate() {
-            if i >= cap {
+            if created_count >= cap {
                 skipped += 1;
                 errors.push(json!({
                     "index": i,
@@ -979,11 +980,14 @@ impl OrchestratorMcp {
                 continue;
             }
             match self.create_worker(worker_params).await {
-                Ok(mission) => results.push(json!({
-                    "index": i,
-                    "success": true,
-                    "mission": mission,
-                })),
+                Ok(mission) => {
+                    created_count += 1;
+                    results.push(json!({
+                        "index": i,
+                        "success": true,
+                        "mission": mission,
+                    }));
+                }
                 Err(e) => {
                     errors.push(json!({
                         "index": i,
