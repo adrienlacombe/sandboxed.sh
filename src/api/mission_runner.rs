@@ -4127,6 +4127,20 @@ pub fn run_claudecode_turn<'a>(
                                             _ => {}
                                         }
                                     }
+                                    // If no text content was produced this turn but we have
+                                    // thinking content, use it as the final result before
+                                    // clearing. Only do this when no tool calls are pending —
+                                    // otherwise a later tool result may produce the real output.
+                                    if final_result.trim().is_empty() && !thinking_buffer.is_empty() && pending_tools.is_empty() {
+                                        let mut sorted: Vec<_> = thinking_buffer.iter().collect();
+                                        sorted.sort_by_key(|(idx, _)| *idx);
+                                        final_result = sorted.into_iter().map(|(_, t)| t.clone()).collect::<Vec<_>>().join("");
+                                        tracing::info!(
+                                            mission_id = %mission_id,
+                                            "Using thinking buffer as final result ({} chars, no text content in this turn)",
+                                            final_result.len()
+                                        );
+                                    }
                                     // Reset per-turn accumulation state so the next turn
                                     // starts fresh (block indices restart from 0 each turn)
                                     thinking_buffer.clear();
@@ -4283,6 +4297,24 @@ pub fn run_claudecode_turn<'a>(
             tracing::debug!(
                 mission_id = %mission_id,
                 "Using accumulated text buffer as final result ({} chars)",
+                final_result.len()
+            );
+        }
+
+        // If still no final result, fall back to thinking buffer.
+        // This handles cases where the model's entire response is in extended thinking
+        // (no text content block), e.g. when the answer is generated as thinking content.
+        if final_result.trim().is_empty() && !thinking_buffer.is_empty() {
+            let mut sorted_entries: Vec<_> = thinking_buffer.iter().collect();
+            sorted_entries.sort_by_key(|(idx, _)| *idx);
+            final_result = sorted_entries
+                .into_iter()
+                .map(|(_, text)| text.clone())
+                .collect::<Vec<_>>()
+                .join("");
+            tracing::info!(
+                mission_id = %mission_id,
+                "Using accumulated thinking buffer as final result ({} chars, no text content was produced)",
                 final_result.len()
             );
         }

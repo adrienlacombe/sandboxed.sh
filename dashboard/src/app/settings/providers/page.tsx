@@ -220,7 +220,7 @@ function UsageDetails({ usage, loading }: { usage: ProviderUsage | null; loading
       )}
 
       {/* OpenAI style rate limits */}
-      {type === 'openai' && (
+      {type === 'openai' && usage.requests_limit != null && (
         <div className="space-y-2">
           <UsageBar used={usage.requests_remaining} limit={usage.requests_limit} label="Requests" />
           <UsageBar used={usage.tokens_remaining} limit={usage.tokens_limit} label="Tokens" />
@@ -233,6 +233,11 @@ function UsageDetails({ usage, loading }: { usage: ProviderUsage | null; loading
             )}
           </div>
         </div>
+      )}
+
+      {/* OpenAI connected without rate limits (OAuth without API key) */}
+      {type === 'openai' && usage.status === 'connected' && usage.requests_limit == null && (
+        <div className="text-[11px] text-emerald-400/70">Connected via OAuth</div>
       )}
 
       {/* Cerebras style rate limits */}
@@ -251,12 +256,38 @@ function UsageDetails({ usage, loading }: { usage: ProviderUsage | null; loading
         </div>
       )}
 
-      {/* Minimax coding plan */}
-      {type === 'minimax' && usage.coding_plan && (
-        <div className="text-[11px] text-white/50">
-          <span className="text-white/30">Coding plan:</span>{' '}
-          <span className="font-mono">{JSON.stringify(usage.coding_plan)}</span>
+      {/* Minimax model usage */}
+      {type === 'minimax' && Array.isArray(usage.model_usage) && (
+        <div className="space-y-3">
+          {(usage.model_usage as Array<{
+            model: string;
+            interval_total: number;
+            interval_remaining: number;
+            weekly_total: number;
+            weekly_remaining: number;
+            interval_reset: number;
+            weekly_reset: number;
+          }>).map((m) => (
+            <div key={m.model} className="space-y-1">
+              <div className="text-[11px] text-white/50 font-medium">{m.model}</div>
+              <UsageBar used={m.interval_remaining} limit={m.interval_total} label="Interval" />
+              <UsageBar used={m.weekly_remaining} limit={m.weekly_total} label="Weekly" />
+              <div className="flex gap-4 text-[10px] text-white/30">
+                {m.interval_reset > 0 && (
+                  <span>Interval reset: {fmtReset(new Date(m.interval_reset).toISOString())}</span>
+                )}
+                {m.weekly_reset > 0 && (
+                  <span>Weekly reset: {fmtReset(new Date(m.weekly_reset).toISOString())}</span>
+                )}
+              </div>
+            </div>
+          ))}
         </div>
+      )}
+
+      {/* Minimax connected without model data */}
+      {type === 'minimax' && usage.status === 'connected' && !Array.isArray(usage.model_usage) && (
+        <div className="text-[11px] text-emerald-400/70">Connected</div>
       )}
 
       {/* Z.AI - minimal info */}
