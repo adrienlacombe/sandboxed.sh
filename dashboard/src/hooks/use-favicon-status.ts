@@ -105,21 +105,33 @@ export function useFaviconStatus(status: MissionStatus | null, isRunning: boolea
 
     let cancelled = false;
 
-    if (cachedImg.current) {
-      applyFavicon(cachedImg.current);
-    } else {
-      const img = new Image();
-      img.crossOrigin = "anonymous";
-      img.src = BASE_FAVICON;
-      img.onload = () => {
-        if (cancelled) return; // stale load after status changed
-        cachedImg.current = img;
-        applyFavicon(img);
-      };
-    }
+    const apply = () => {
+      if (cancelled) return;
+      if (cachedImg.current) {
+        applyFavicon(cachedImg.current);
+      } else {
+        const img = new Image();
+        img.crossOrigin = "anonymous";
+        img.src = BASE_FAVICON;
+        img.onload = () => {
+          if (cancelled) return;
+          cachedImg.current = img;
+          applyFavicon(img);
+        };
+      }
+    };
+
+    apply();
+
+    // Re-apply when tab becomes visible (Chrome tab restore, wake from sleep, etc.)
+    const onVisibility = () => {
+      if (document.visibilityState === "visible") apply();
+    };
+    document.addEventListener("visibilitychange", onVisibility);
 
     return () => {
       cancelled = true;
+      document.removeEventListener("visibilitychange", onVisibility);
     };
   }, [status, isRunning]);
 
