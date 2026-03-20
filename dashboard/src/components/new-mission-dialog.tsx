@@ -587,10 +587,10 @@ export function NewMissionDialog({
         type="button"
         onClick={() => setOpen((prev) => !prev)}
         disabled={isBusy}
-        className="flex items-center gap-2 rounded-lg bg-indigo-500/20 px-3 py-2 text-sm font-medium text-indigo-400 hover:bg-indigo-500/30 transition-colors disabled:opacity-50"
+        className="flex items-center gap-1.5 rounded-lg bg-indigo-500/20 px-2.5 py-2 text-sm font-medium text-indigo-400 hover:bg-indigo-500/30 transition-colors disabled:opacity-50"
+        title="Create new mission"
       >
         <Plus className="h-4 w-4" />
-        <span className="hidden sm:inline">New</span> Mission
       </button>
       {open && (
         <div className="absolute right-0 top-full mt-1 w-96 rounded-lg border border-white/[0.06] bg-[#1a1a1a] p-4 shadow-xl z-50">

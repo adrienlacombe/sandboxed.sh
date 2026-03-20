@@ -6514,8 +6514,8 @@ export default function ControlClient() {
       />
 
       {/* Header */}
-      <div className="relative z-10 mb-6 flex items-center justify-between gap-4">
-        <div className="flex items-center gap-3">
+      <div className="relative z-10 mb-6 flex items-center justify-between gap-2 sm:gap-4 overflow-hidden">
+        <div className="flex items-center gap-3 min-w-0">
           {/* Unified Mission Selector */}
           <div className="relative">
             <button
@@ -6558,7 +6558,7 @@ export default function ControlClient() {
           </div>
         </div>
 
-        <div className="flex items-center gap-3 shrink-0">
+        <div className="flex items-center gap-1.5 sm:gap-2 shrink-0">
           <NewMissionDialog
             workspaces={workspaces}
             disabled={missionLoading}
@@ -6576,7 +6576,7 @@ export default function ControlClient() {
             onClick={() => setShowAutomationsDialog(true)}
             disabled={!activeMission}
             className={cn(
-              "flex items-center gap-2 rounded-lg border px-3 py-2 text-sm transition-colors",
+              "flex items-center gap-1.5 rounded-lg border px-2.5 py-2 text-sm transition-colors",
               activeMission
                 ? "border-white/[0.06] bg-white/[0.02] text-white/70 hover:bg-white/[0.04]"
                 : "border-white/[0.04] bg-white/[0.01] text-white/30 cursor-not-allowed"
@@ -6584,14 +6584,13 @@ export default function ControlClient() {
             title={activeMission ? "Manage mission automations" : "Select a mission to manage automations"}
           >
             <Clock className="h-4 w-4" />
-            <span className="hidden sm:inline">Automations</span>
           </button>
 
           {/* Thinking panel toggle */}
           <button
             onClick={handleToggleThinkingPanel}
             className={cn(
-              "flex items-center gap-2 rounded-lg border px-3 py-2 text-sm transition-colors",
+              "flex items-center gap-1.5 rounded-lg border px-2.5 py-2 text-sm transition-colors",
               showThinkingPanel
                 ? "border-indigo-500/30 bg-indigo-500/10 text-indigo-400"
                 : "border-white/[0.06] bg-white/[0.02] text-white/70 hover:bg-white/[0.04]",
@@ -6600,9 +6599,8 @@ export default function ControlClient() {
             title={showThinkingPanel ? "Hide thinking panel" : "Show thinking panel"}
           >
             <Brain className={cn("h-4 w-4", hasActiveThinking && "animate-pulse")} />
-            <span className="hidden sm:inline">Thinking</span>
             {thinkingItemsCount > 0 && (
-              <span className="text-xs opacity-60">({thinkingItemsCount})</span>
+              <span className="text-xs opacity-60">{thinkingItemsCount}</span>
             )}
           </button>
 
@@ -6611,7 +6609,7 @@ export default function ControlClient() {
             <button
               onClick={() => setShowWorkerPanel((prev) => !prev)}
               className={cn(
-                "flex items-center gap-2 rounded-lg border px-3 py-2 text-sm transition-colors",
+                "flex items-center gap-1.5 rounded-lg border px-2.5 py-2 text-sm transition-colors",
                 showWorkerPanel
                   ? "border-violet-500/30 bg-violet-500/10 text-violet-400"
                   : "border-white/[0.06] bg-white/[0.02] text-white/70 hover:bg-white/[0.04]"
@@ -6619,9 +6617,8 @@ export default function ControlClient() {
               title={showWorkerPanel ? "Hide worker panel" : "Show worker panel"}
             >
               <Users className="h-4 w-4" />
-              <span className="hidden sm:inline">Workers</span>
               {childMissions.length > 0 && (
-                <span className="text-xs opacity-60">({childMissions.length})</span>
+                <span className="text-xs opacity-60">{childMissions.length}</span>
               )}
             </button>
           )}
@@ -6632,7 +6629,7 @@ export default function ControlClient() {
               <button
                 onClick={() => setShowDesktopStream(!showDesktopStream)}
                 className={cn(
-                  "flex items-center gap-2 rounded-l-lg border px-3 py-2 text-sm transition-colors",
+                  "flex items-center gap-1.5 rounded-l-lg border px-2.5 py-2 text-sm transition-colors",
                   showDesktopStream
                     ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-400"
                     : "border-white/[0.06] bg-white/[0.02] text-white/70 hover:bg-white/[0.04]"
@@ -6640,7 +6637,6 @@ export default function ControlClient() {
                 title={showDesktopStream ? "Hide desktop stream" : "Show desktop stream"}
               >
                 <Monitor className="h-4 w-4" />
-                <span className="hidden sm:inline">Desktop</span>
                 {showDesktopStream ? (
                   <PanelRightClose className="h-4 w-4" />
                 ) : (
