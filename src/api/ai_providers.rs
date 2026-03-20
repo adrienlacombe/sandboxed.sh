@@ -5510,6 +5510,9 @@ async fn create_provider(
         .await;
     }
 
+    // Refresh metadata LLM config so new API keys are picked up for title generation
+    super::metadata_llm::refresh_metadata_llm_config(&state.ai_providers).await;
+
     let response = build_response_from_store(&provider);
     Ok(Json(response))
 }
@@ -5614,6 +5617,9 @@ async fn update_provider(
 
     let response = build_response_from_store(&result);
 
+    // Refresh metadata LLM config so updated API keys are picked up for title generation
+    super::metadata_llm::refresh_metadata_llm_config(&state.ai_providers).await;
+
     tracing::info!(
         "Updated {} provider: {} ({})",
         pt.display_name(),
@@ -5670,6 +5676,9 @@ async fn delete_provider(
             }
         }
     }
+
+    // Refresh metadata LLM config in case the deleted provider was being used
+    super::metadata_llm::refresh_metadata_llm_config(&state.ai_providers).await;
 
     Ok((
         StatusCode::OK,
