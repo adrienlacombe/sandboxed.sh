@@ -4129,8 +4129,9 @@ pub fn run_claudecode_turn<'a>(
                                     }
                                     // If no text content was produced this turn but we have
                                     // thinking content, use it as the final result before
-                                    // clearing. This handles thinking-only responses.
-                                    if final_result.trim().is_empty() && !thinking_buffer.is_empty() {
+                                    // clearing. Only do this when no tool calls are pending —
+                                    // otherwise a later tool result may produce the real output.
+                                    if final_result.trim().is_empty() && !thinking_buffer.is_empty() && pending_tools.is_empty() {
                                         let mut sorted: Vec<_> = thinking_buffer.iter().collect();
                                         sorted.sort_by_key(|(idx, _)| *idx);
                                         final_result = sorted.into_iter().map(|(_, t)| t.clone()).collect::<Vec<_>>().join("");

@@ -5070,18 +5070,19 @@ async fn get_provider_usage(
             // Try to find an API key: explicit key > minted key from OAuth flow.
             let auth = if let Some(ref key) = api_key_opt {
                 key.clone()
-            } else if oauth.is_some() {
+            } else if let Some(ref o) = oauth {
                 // OAuth user — check if an API key was minted during Codex setup
                 if let Some(key) = get_openai_api_key_for_codex_default(&state.config.working_dir) {
                     key
                 } else {
-                    // No API key available. Return connected status with account info
-                    // instead of making an API call that will 401.
+                    // No API key available. Validate OAuth token health before
+                    // returning status so expired sessions don't show as connected.
+                    let token_ok = !oauth_token_expired(o.expires_at);
                     return Ok(Json(serde_json::json!({
                         "provider_type": "openai",
                         "provider_name": provider_name,
                         "account_email": account_email,
-                        "status": "connected",
+                        "status": if token_ok { "connected" } else { "needs_reauth" },
                     })));
                 }
             } else {
@@ -5271,9 +5272,9 @@ async fn get_provider_usage(
                                     serde_json::json!({
                                         "model": m.get("model_name").and_then(|v| v.as_str()).unwrap_or("unknown"),
                                         "interval_total": m.get("current_interval_total_count").and_then(|v| v.as_u64()).unwrap_or(0),
-                                        "interval_used": m.get("current_interval_usage_count").and_then(|v| v.as_u64()).unwrap_or(0),
+                                        "interval_remaining": m.get("current_interval_usage_count").and_then(|v| v.as_u64()).unwrap_or(0),
                                         "weekly_total": m.get("current_weekly_total_count").and_then(|v| v.as_u64()).unwrap_or(0),
-                                        "weekly_used": m.get("current_weekly_usage_count").and_then(|v| v.as_u64()).unwrap_or(0),
+                                        "weekly_remaining": m.get("current_weekly_usage_count").and_then(|v| v.as_u64()).unwrap_or(0),
                                         "interval_reset": m.get("end_time").and_then(|v| v.as_i64()).unwrap_or(0),
                                         "weekly_reset": m.get("weekly_end_time").and_then(|v| v.as_i64()).unwrap_or(0),
                                     })

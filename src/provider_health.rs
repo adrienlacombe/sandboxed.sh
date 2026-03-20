@@ -643,14 +643,18 @@ impl ModelChainStore {
             changed = true;
         } else {
             // Migrate builtin/smart: upgrade MiniMax-M2.5 → MiniMax-M2.7
+            // Only if the chain exactly matches the old stock config (not user-customized).
             if let Some(chain) = chains.iter_mut().find(|c| c.id == "builtin/smart") {
-                for entry in &mut chain.entries {
-                    if entry.provider_id == "minimax" && entry.model_id == "MiniMax-M2.5" {
-                        entry.model_id = "MiniMax-M2.7".to_string();
-                        chain.updated_at = now;
-                        changed = true;
-                        tracing::info!("Migrated builtin/smart: MiniMax-M2.5 → MiniMax-M2.7");
-                    }
+                let is_old_stock = chain.entries.len() == 2
+                    && chain.entries[0].provider_id == "zai"
+                    && chain.entries[0].model_id == "glm-5"
+                    && chain.entries[1].provider_id == "minimax"
+                    && chain.entries[1].model_id == "MiniMax-M2.5";
+                if is_old_stock {
+                    chain.entries[1].model_id = "MiniMax-M2.7".to_string();
+                    chain.updated_at = now;
+                    changed = true;
+                    tracing::info!("Migrated builtin/smart: MiniMax-M2.5 → MiniMax-M2.7");
                 }
             }
         }

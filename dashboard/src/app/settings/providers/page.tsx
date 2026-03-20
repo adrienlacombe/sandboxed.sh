@@ -262,16 +262,16 @@ function UsageDetails({ usage, loading }: { usage: ProviderUsage | null; loading
           {(usage.model_usage as Array<{
             model: string;
             interval_total: number;
-            interval_used: number;
+            interval_remaining: number;
             weekly_total: number;
-            weekly_used: number;
+            weekly_remaining: number;
             interval_reset: number;
             weekly_reset: number;
           }>).map((m) => (
             <div key={m.model} className="space-y-1">
               <div className="text-[11px] text-white/50 font-medium">{m.model}</div>
-              <UsageBar used={m.interval_total - m.interval_used} limit={m.interval_total} label="Interval" />
-              <UsageBar used={m.weekly_total - m.weekly_used} limit={m.weekly_total} label="Weekly" />
+              <UsageBar used={m.interval_remaining} limit={m.interval_total} label="Interval" />
+              <UsageBar used={m.weekly_remaining} limit={m.weekly_total} label="Weekly" />
               <div className="flex gap-4 text-[10px] text-white/30">
                 {m.interval_reset > 0 && (
                   <span>Interval reset: {fmtReset(new Date(m.interval_reset).toISOString())}</span>

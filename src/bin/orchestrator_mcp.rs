@@ -1512,8 +1512,9 @@ fn estimate_max_workers() -> ResourceCap {
         reasons.push("No cgroup limits detected, using absolute cap".to_string());
     }
 
-    // Always allow at least 1 worker
-    let max_workers = (effective as usize).clamp(1, ABSOLUTE_MAX_WORKERS);
+    // Allow 0 when resources are exhausted — spawning even one worker
+    // can tip the container into OOM / PID-exhaustion.
+    let max_workers = (effective as usize).min(ABSOLUTE_MAX_WORKERS);
 
     ResourceCap {
         max_workers,
