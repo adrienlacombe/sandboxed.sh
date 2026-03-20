@@ -273,11 +273,22 @@ async fn try_build_config_from_providers(
 ) -> Option<MetadataLlmConfig> {
     use crate::ai_providers::ProviderType;
 
-    /// Resolve the API key for a provider: use the stored key first, then
-    /// fall back to the provider type's environment variable.
+    /// Resolve the API key/token for a provider: use the stored key first,
+    /// then OAuth credentials from disk, then the provider type's env var.
     fn resolve_api_key(provider: &crate::ai_providers::AIProvider) -> Option<String> {
         if let Some(ref key) = provider.api_key {
             return Some(key.clone());
+        }
+        // Check OAuth credentials from disk (source of truth, updated by
+        // background refresh). The store's oauth.access_token can be stale.
+        if let Some(entry) =
+            crate::api::ai_providers::read_oauth_token_entry(provider.provider_type)
+        {
+            if !entry.access_token.is_empty()
+                && !crate::api::ai_providers::oauth_token_expired(entry.expires_at)
+            {
+                return Some(entry.access_token);
+            }
         }
         if let Some(env_var) = provider.provider_type.env_var_name() {
             if let Ok(key) = std::env::var(env_var) {
@@ -344,14 +355,24 @@ async fn try_build_config_from_providers(
         }
     }
 
-    // Try Google Gemini via OAuth (OpenAI-compatible endpoint)
-    if let Some(provider) = ai_providers.get_by_type(ProviderType::Google).await {
-        if let Some(oauth) = &provider.oauth {
-            if !oauth.access_token.is_empty() {
+    // Try Google Gemini via OAuth (OpenAI-compatible endpoint).
+    // Read from credential files (source of truth) rather than the provider
+    // store, since the store's oauth.access_token is not updated when the
+    // background refresh task rotates tokens.
+    if ai_providers
+        .get_by_type(ProviderType::Google)
+        .await
+        .is_some()
+    {
+        if let Some(entry) = crate::api::ai_providers::read_oauth_token_entry(ProviderType::Google)
+        {
+            if !entry.access_token.is_empty()
+                && !crate::api::ai_providers::oauth_token_expired(entry.expires_at)
+            {
                 tracing::info!("[MetadataLLM] Using Google Gemini via OAuth");
                 return Some(MetadataLlmConfig {
                     base_url: "https://generativelanguage.googleapis.com/v1beta/openai".to_string(),
-                    api_key: oauth.access_token.clone(),
+                    api_key: entry.access_token,
                     model: "gemini-2.0-flash".to_string(),
                     api_format: ApiFormat::OpenAI,
                 });

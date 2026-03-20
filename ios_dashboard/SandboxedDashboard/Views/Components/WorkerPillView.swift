@@ -15,6 +15,7 @@ struct WorkerPillView: View {
 
     private var activeCount: Int {
         workers.filter { m in
+            m.status == .active || m.status == .pending || m.status == .blocked ||
             runningWorkers.contains { $0.missionId == m.id }
         }.count
     }
@@ -24,7 +25,7 @@ struct WorkerPillView: View {
     }
 
     private var failedCount: Int {
-        workers.filter { $0.status == .failed || $0.status == .notFeasible }.count
+        workers.filter { $0.status == .failed || $0.status == .notFeasible || $0.status == .interrupted }.count
     }
 
     var body: some View {

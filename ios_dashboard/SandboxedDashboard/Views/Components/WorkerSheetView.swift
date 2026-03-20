@@ -15,7 +15,7 @@ struct WorkerSheetView: View {
 
     private var activeWorkers: [Mission] {
         workers.filter { m in
-            m.status == .active || m.status == .pending ||
+            m.status == .active || m.status == .pending || m.status == .blocked ||
             runningWorkers.contains { $0.missionId == m.id }
         }
     }

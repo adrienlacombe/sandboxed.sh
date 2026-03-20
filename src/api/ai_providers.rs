@@ -2763,7 +2763,7 @@ fn get_all_opencode_auth_paths() -> Vec<PathBuf> {
     paths
 }
 
-fn oauth_token_expired(expires_at: i64) -> bool {
+pub fn oauth_token_expired(expires_at: i64) -> bool {
     let now = chrono::Utc::now().timestamp_millis();
     let buffer = 5 * 60 * 1000; // 5 minutes in milliseconds
     expires_at < (now + buffer)

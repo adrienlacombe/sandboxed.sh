@@ -137,11 +137,6 @@ struct Mission: Codable, Identifiable, Hashable {
         parentMissionId = try container.decodeIfPresent(String.self, forKey: .parentMissionId)
     }
 
-    /// Whether this mission is a worker (child of a boss mission)
-    var isWorker: Bool {
-        parentMissionId != nil
-    }
-
     var displayTitle: String {
         if let title = title, !title.isEmpty {
             return title.count > 60 ? String(title.prefix(60)) + "..." : title

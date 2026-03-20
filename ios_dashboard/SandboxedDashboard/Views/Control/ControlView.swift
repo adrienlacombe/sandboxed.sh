@@ -1175,6 +1175,7 @@ struct ControlView: View {
                     guard fetchingMissionId == id else { return }
                     childMissions = workers
                 } else {
+                    guard fetchingMissionId == id else { return }
                     childMissions = []
                 }
             }
@@ -1764,8 +1765,9 @@ struct ControlView: View {
         }
 
         // Also refresh child missions if viewing a boss mission
-        if let id = viewingMissionId, !childMissions.isEmpty {
+        if let id = viewingMissionId {
             if let workers = try? await api.getChildMissions(parentId: id) {
+                guard viewingMissionId == id else { return }
                 childMissions = workers
             }
         }
