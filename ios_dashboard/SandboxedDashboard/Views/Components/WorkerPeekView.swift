@@ -226,7 +226,7 @@ struct WorkerPeekView: View {
 
     private func loadEvents() async {
         do {
-            let types = ["user_message", "assistant_message", "tool_call", "tool_result", "thinking"]
+            let types = ["user_message", "assistant_message", "tool_call", "tool_result", "text_delta", "thinking"]
             events = try await api.getMissionEvents(id: mission.id, types: types, limit: 200)
             isLoading = false
         } catch {

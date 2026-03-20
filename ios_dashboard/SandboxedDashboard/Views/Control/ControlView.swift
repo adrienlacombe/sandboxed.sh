@@ -1105,6 +1105,9 @@ struct ControlView: View {
         let previousViewingId = viewingMissionId
         viewingMissionId = id
 
+        // Clear stale workers from previous mission immediately
+        childMissions = []
+
         // Try to load cached version first for immediate display with consistent event-based rendering
         let hasCache: Bool
         if let cachedData = loadCachedMissionData(id) {
@@ -1816,6 +1819,9 @@ struct ControlView: View {
         viewingMissionId = id
         fetchingMissionId = id
 
+        // Clear stale workers from previous mission immediately
+        childMissions = []
+
         isLoading = true
 
         // Determine the run state for this mission from runningMissions
@@ -1864,6 +1870,14 @@ struct ControlView: View {
 
             isLoading = false
             HapticService.selectionChanged()
+
+            // Fetch child (worker) missions in background
+            Task {
+                if let workers = try? await api.getChildMissions(parentId: id) {
+                    guard fetchingMissionId == id else { return }
+                    childMissions = workers
+                }
+            }
         } catch {
             // Race condition guard: only show error if this is still the mission we want
             guard fetchingMissionId == id else { return }
