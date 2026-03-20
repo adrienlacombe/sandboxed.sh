@@ -190,6 +190,14 @@ final class APIService {
         return try await get(urlString)
     }
 
+    /// Get child (worker) missions for a boss mission.
+    /// Filters the full mission list by parent_mission_id on the client side,
+    /// since the backend includes parent_mission_id in the mission response.
+    func getChildMissions(parentId: String) async throws -> [Mission] {
+        let all: [Mission] = try await get("/api/control/missions?limit=200&offset=0")
+        return all.filter { $0.parentMissionId == parentId }
+    }
+
     func searchMissions(query: String, limit: Int? = nil) async throws -> [MissionSearchResult] {
         var queryItems: [URLQueryItem] = [URLQueryItem(name: "q", value: query)]
         if let limit {

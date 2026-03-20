@@ -1485,7 +1485,9 @@ async fn oauth_token_refresher_loop(
                 );
             }
 
-            match ai_providers_api::refresh_oauth_token_with_lock(provider_type).await {
+            match ai_providers_api::refresh_oauth_token_with_lock(provider_type, entry.expires_at)
+                .await
+            {
                 Ok((_new_access, _new_refresh, new_expires_at)) => {
                     let new_time_until = new_expires_at - now_ms;
                     tracing::info!(

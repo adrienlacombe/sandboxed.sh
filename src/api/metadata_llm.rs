@@ -10,15 +10,26 @@ use tokio::sync::RwLock;
 /// Global metadata LLM client, initialized once at startup.
 static METADATA_LLM: OnceLock<Arc<MetadataLlmClient>> = OnceLock::new();
 
+/// API format for the metadata LLM provider.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApiFormat {
+    /// OpenAI-compatible `/chat/completions` endpoint.
+    OpenAI,
+    /// Anthropic `/v1/messages` endpoint.
+    Anthropic,
+}
+
 /// Configuration for the metadata LLM.
 #[derive(Debug, Clone)]
 pub struct MetadataLlmConfig {
-    /// OpenAI-compatible base URL (e.g. `https://openrouter.ai/api/v1`).
+    /// Base URL (e.g. `https://openrouter.ai/api/v1` or `https://api.anthropic.com`).
     pub base_url: String,
     /// API key for authentication.
     pub api_key: String,
     /// Model ID (e.g. `google/gemini-2.0-flash-001`).
     pub model: String,
+    /// API format to use.
+    pub api_format: ApiFormat,
 }
 
 /// Lightweight client for metadata summarization.
@@ -109,33 +120,59 @@ impl MetadataLlmClient {
                 .to_string()
         };
 
-        let body = serde_json::json!({
-            "model": cfg.model,
-            "messages": [
-                { "role": "system", "content": system_prompt },
-                {
-                    "role": "user",
-                    "content": format!(
-                        "User request:\n{}\n\nAssistant response:\n{}",
-                        user_excerpt, assistant_excerpt
-                    )
-                }
-            ],
-            "max_tokens": 80,
-            "temperature": 0.2,
-        });
+        let user_content = format!(
+            "User request:\n{}\n\nAssistant response:\n{}",
+            user_excerpt, assistant_excerpt
+        );
 
-        let url = format!("{}/chat/completions", cfg.base_url.trim_end_matches('/'));
+        let (url, body, auth_header) = match cfg.api_format {
+            ApiFormat::Anthropic => {
+                let url = format!("{}/v1/messages", cfg.base_url.trim_end_matches('/'));
+                let body = serde_json::json!({
+                    "model": cfg.model,
+                    "system": system_prompt,
+                    "messages": [
+                        { "role": "user", "content": user_content }
+                    ],
+                    "max_tokens": 80,
+                    "temperature": 0.2,
+                });
+                (url, body, ("x-api-key".to_string(), cfg.api_key.clone()))
+            }
+            ApiFormat::OpenAI => {
+                let url = format!("{}/chat/completions", cfg.base_url.trim_end_matches('/'));
+                let body = serde_json::json!({
+                    "model": cfg.model,
+                    "messages": [
+                        { "role": "system", "content": system_prompt },
+                        { "role": "user", "content": user_content }
+                    ],
+                    "max_tokens": 80,
+                    "temperature": 0.2,
+                });
+                (
+                    url,
+                    body,
+                    (
+                        "Authorization".to_string(),
+                        format!("Bearer {}", cfg.api_key),
+                    ),
+                )
+            }
+        };
 
-        let result = self
+        let mut req = self
             .http
             .post(&url)
             .header("Content-Type", "application/json")
-            .header("Authorization", format!("Bearer {}", cfg.api_key))
-            .timeout(std::time::Duration::from_secs(10))
-            .json(&body)
-            .send()
-            .await;
+            .header(&auth_header.0, &auth_header.1)
+            .timeout(std::time::Duration::from_secs(10));
+
+        if cfg.api_format == ApiFormat::Anthropic {
+            req = req.header("anthropic-version", "2023-06-01");
+        }
+
+        let result = req.json(&body).send().await;
 
         let resp = match result {
             Ok(r) if r.status().is_success() => r,
@@ -157,10 +194,16 @@ impl MetadataLlmClient {
             }
         };
 
-        let text = json["choices"][0]["message"]["content"]
-            .as_str()
-            .unwrap_or("")
-            .trim();
+        let text = match cfg.api_format {
+            ApiFormat::Anthropic => {
+                // Anthropic: {"content": [{"type": "text", "text": "..."}]}
+                json["content"][0]["text"].as_str().unwrap_or("").trim()
+            }
+            ApiFormat::OpenAI => json["choices"][0]["message"]["content"]
+                .as_str()
+                .unwrap_or("")
+                .trim(),
+        };
 
         parse_title_status(text)
     }
@@ -230,100 +273,147 @@ async fn try_build_config_from_providers(
 ) -> Option<MetadataLlmConfig> {
     use crate::ai_providers::ProviderType;
 
-    // 1. Try OpenRouter — cheapest for metadata summarization
-    if let Some(provider) = ai_providers.get_by_type(ProviderType::OpenRouter).await {
-        if let Some(api_key) = &provider.api_key {
-            return Some(MetadataLlmConfig {
-                base_url: provider
-                    .base_url
-                    .clone()
-                    .unwrap_or_else(|| "https://openrouter.ai/api/v1".to_string()),
-                api_key: api_key.clone(),
-                model: "google/gemini-2.0-flash-001".to_string(),
-            });
+    /// Resolve the API key/token for a provider: use the stored key first,
+    /// then OAuth credentials from disk, then the provider type's env var.
+    fn resolve_api_key(provider: &crate::ai_providers::AIProvider) -> Option<String> {
+        if let Some(ref key) = provider.api_key {
+            return Some(key.clone());
         }
+        // Check OAuth credentials from disk (source of truth, updated by
+        // background refresh). The store's oauth.access_token can be stale.
+        if let Some(entry) =
+            crate::api::ai_providers::read_oauth_token_entry(provider.provider_type)
+        {
+            if !entry.access_token.is_empty()
+                && !crate::api::ai_providers::oauth_token_expired(entry.expires_at)
+            {
+                return Some(entry.access_token);
+            }
+        }
+        if let Some(env_var) = provider.provider_type.env_var_name() {
+            if let Ok(key) = std::env::var(env_var) {
+                if !key.trim().is_empty() {
+                    return Some(key);
+                }
+            }
+        }
+        None
     }
 
-    // 2. Try Groq (free tier, fast)
-    if let Some(provider) = ai_providers.get_by_type(ProviderType::Groq).await {
-        if let Some(api_key) = &provider.api_key {
-            return Some(MetadataLlmConfig {
-                base_url: provider
-                    .base_url
-                    .clone()
-                    .unwrap_or_else(|| "https://api.groq.com/openai/v1".to_string()),
-                api_key: api_key.clone(),
-                model: "llama-3.3-70b-versatile".to_string(),
-            });
-        }
-    }
+    // Provider candidates in priority order (cheapest/fastest first).
+    // Each entry: (provider_type, default_base_url, model, api_format)
+    let candidates: &[(ProviderType, &str, &str, ApiFormat)] = &[
+        (
+            ProviderType::OpenRouter,
+            "https://openrouter.ai/api/v1",
+            "google/gemini-2.0-flash-001",
+            ApiFormat::OpenAI,
+        ),
+        (
+            ProviderType::Groq,
+            "https://api.groq.com/openai/v1",
+            "llama-3.3-70b-versatile",
+            ApiFormat::OpenAI,
+        ),
+        (
+            ProviderType::Cerebras,
+            "https://api.cerebras.ai/v1",
+            "llama3.1-8b",
+            ApiFormat::OpenAI,
+        ),
+        (
+            ProviderType::OpenAI,
+            "https://api.openai.com/v1",
+            "gpt-4.1-nano",
+            ApiFormat::OpenAI,
+        ),
+        (
+            ProviderType::Anthropic,
+            "https://api.anthropic.com",
+            "claude-haiku-4-5-20251001",
+            ApiFormat::Anthropic,
+        ),
+    ];
 
-    // 3. Try Cerebras (free tier)
-    if let Some(provider) = ai_providers.get_by_type(ProviderType::Cerebras).await {
-        if let Some(api_key) = &provider.api_key {
-            return Some(MetadataLlmConfig {
-                base_url: provider
-                    .base_url
-                    .clone()
-                    .unwrap_or_else(|| "https://api.cerebras.ai/v1".to_string()),
-                api_key: api_key.clone(),
-                model: "llama-3.3-70b".to_string(),
-            });
-        }
-    }
-
-    // 4. Try OpenAI
-    if let Some(provider) = ai_providers.get_by_type(ProviderType::OpenAI).await {
-        if let Some(api_key) = &provider.api_key {
-            return Some(MetadataLlmConfig {
-                base_url: provider
-                    .base_url
-                    .clone()
-                    .unwrap_or_else(|| "https://api.openai.com/v1".to_string()),
-                api_key: api_key.clone(),
-                model: "gpt-4.1-nano".to_string(),
-            });
-        }
-    }
-
-    // 5. Try Google Gemini via OAuth (OpenAI-compatible endpoint)
-    if let Some(provider) = ai_providers.get_by_type(ProviderType::Google).await {
-        if let Some(oauth) = &provider.oauth {
-            if !oauth.access_token.is_empty() {
-                tracing::info!("[MetadataLLM] Using Google Gemini via OAuth");
+    for (provider_type, default_base_url, model, api_format) in candidates {
+        if let Some(provider) = ai_providers.get_by_type(*provider_type).await {
+            if let Some(api_key) = resolve_api_key(&provider) {
+                tracing::info!(
+                    "[MetadataLLM] Using {} provider",
+                    provider_type.display_name()
+                );
                 return Some(MetadataLlmConfig {
-                    base_url: "https://generativelanguage.googleapis.com/v1beta/openai".to_string(),
-                    api_key: oauth.access_token.clone(),
-                    model: "gemini-2.0-flash".to_string(),
+                    base_url: provider
+                        .base_url
+                        .clone()
+                        .unwrap_or_else(|| default_base_url.to_string()),
+                    api_key,
+                    model: model.to_string(),
+                    api_format: *api_format,
                 });
             }
         }
     }
 
-    // 5. Fallback: check environment variables directly
-    let env_providers: &[(&str, &str, &str)] = &[
+    // Try Google Gemini via OAuth (OpenAI-compatible endpoint).
+    // Read from credential files (source of truth) rather than the provider
+    // store, since the store's oauth.access_token is not updated when the
+    // background refresh task rotates tokens.
+    if ai_providers
+        .get_by_type(ProviderType::Google)
+        .await
+        .is_some()
+    {
+        if let Some(entry) = crate::api::ai_providers::read_oauth_token_entry(ProviderType::Google)
+        {
+            if !entry.access_token.is_empty()
+                && !crate::api::ai_providers::oauth_token_expired(entry.expires_at)
+            {
+                tracing::info!("[MetadataLLM] Using Google Gemini via OAuth");
+                return Some(MetadataLlmConfig {
+                    base_url: "https://generativelanguage.googleapis.com/v1beta/openai".to_string(),
+                    api_key: entry.access_token,
+                    model: "gemini-2.0-flash".to_string(),
+                    api_format: ApiFormat::OpenAI,
+                });
+            }
+        }
+    }
+
+    // Final fallback: check environment variables for providers not in the store
+    let env_providers: &[(&str, &str, &str, ApiFormat)] = &[
         (
             "OPENROUTER_API_KEY",
             "https://openrouter.ai/api/v1",
             "google/gemini-2.0-flash-001",
+            ApiFormat::OpenAI,
         ),
         (
             "CEREBRAS_API_KEY",
             "https://api.cerebras.ai/v1",
-            "llama-3.3-70b",
+            "llama3.1-8b",
+            ApiFormat::OpenAI,
         ),
         (
             "GROQ_API_KEY",
             "https://api.groq.com/openai/v1",
             "llama-3.3-70b-versatile",
+            ApiFormat::OpenAI,
         ),
         (
             "OPENAI_API_KEY",
             "https://api.openai.com/v1",
             "gpt-4.1-nano",
+            ApiFormat::OpenAI,
+        ),
+        (
+            "ANTHROPIC_API_KEY",
+            "https://api.anthropic.com",
+            "claude-haiku-4-5-20251001",
+            ApiFormat::Anthropic,
         ),
     ];
-    for (env_var, base_url, model) in env_providers {
+    for (env_var, base_url, model, api_format) in env_providers {
         if let Ok(api_key) = std::env::var(env_var) {
             if !api_key.trim().is_empty() {
                 tracing::info!("[MetadataLLM] Using {} from environment", env_var);
@@ -331,6 +421,7 @@ async fn try_build_config_from_providers(
                     base_url: base_url.to_string(),
                     api_key,
                     model: model.to_string(),
+                    api_format: *api_format,
                 });
             }
         }
