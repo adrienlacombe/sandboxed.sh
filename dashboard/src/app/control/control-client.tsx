@@ -6514,8 +6514,8 @@ export default function ControlClient() {
       />
 
       {/* Header */}
-      <div className="relative z-10 mb-6 flex items-center justify-between gap-2 sm:gap-4 overflow-hidden">
-        <div className="flex items-center gap-3 min-w-0">
+      <div className="relative z-10 mb-6 flex items-center justify-between gap-2 lg:gap-4">
+        <div className="flex items-center gap-3 min-w-0 overflow-hidden">
           {/* Unified Mission Selector */}
           <div className="relative">
             <button
@@ -6558,7 +6558,7 @@ export default function ControlClient() {
           </div>
         </div>
 
-        <div className="flex items-center gap-1.5 sm:gap-2 shrink-0">
+        <div className="flex items-center gap-1.5 lg:gap-2 shrink-0">
           <NewMissionDialog
             workspaces={workspaces}
             disabled={missionLoading}
@@ -6584,6 +6584,7 @@ export default function ControlClient() {
             title={activeMission ? "Manage mission automations" : "Select a mission to manage automations"}
           >
             <Clock className="h-4 w-4" />
+            <span className="hidden lg:inline">Automations</span>
           </button>
 
           {/* Thinking panel toggle */}
@@ -6599,6 +6600,7 @@ export default function ControlClient() {
             title={showThinkingPanel ? "Hide thinking panel" : "Show thinking panel"}
           >
             <Brain className={cn("h-4 w-4", hasActiveThinking && "animate-pulse")} />
+            <span className="hidden lg:inline">Thinking</span>
             {thinkingItemsCount > 0 && (
               <span className="text-xs opacity-60">{thinkingItemsCount}</span>
             )}
@@ -6617,6 +6619,7 @@ export default function ControlClient() {
               title={showWorkerPanel ? "Hide worker panel" : "Show worker panel"}
             >
               <Users className="h-4 w-4" />
+              <span className="hidden lg:inline">Workers</span>
               {childMissions.length > 0 && (
                 <span className="text-xs opacity-60">{childMissions.length}</span>
               )}
@@ -6637,6 +6640,7 @@ export default function ControlClient() {
                 title={showDesktopStream ? "Hide desktop stream" : "Show desktop stream"}
               >
                 <Monitor className="h-4 w-4" />
+                <span className="hidden lg:inline">Desktop</span>
                 {showDesktopStream ? (
                   <PanelRightClose className="h-4 w-4" />
                 ) : (

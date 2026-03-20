@@ -591,6 +591,7 @@ export function NewMissionDialog({
         title="Create new mission"
       >
         <Plus className="h-4 w-4" />
+        <span className="hidden lg:inline">New Mission</span>
       </button>
       {open && (
         <div className="absolute right-0 top-full mt-1 w-96 rounded-lg border border-white/[0.06] bg-[#1a1a1a] p-4 shadow-xl z-50">
