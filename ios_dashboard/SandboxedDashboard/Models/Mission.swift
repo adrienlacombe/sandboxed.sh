@@ -88,6 +88,7 @@ struct Mission: Codable, Identifiable, Hashable {
     var updatedAt: String
     let interruptedAt: String?
     let resumable: Bool
+    let parentMissionId: String?
 
     func hash(into hasher: inout Hasher) {
         hasher.combine(id)
@@ -110,6 +111,7 @@ struct Mission: Codable, Identifiable, Hashable {
         case createdAt = "created_at"
         case updatedAt = "updated_at"
         case interruptedAt = "interrupted_at"
+        case parentMissionId = "parent_mission_id"
     }
 
     init(from decoder: Decoder) throws {
@@ -132,6 +134,12 @@ struct Mission: Codable, Identifiable, Hashable {
         updatedAt = try container.decode(String.self, forKey: .updatedAt)
         interruptedAt = try container.decodeIfPresent(String.self, forKey: .interruptedAt)
         resumable = try container.decodeIfPresent(Bool.self, forKey: .resumable) ?? false
+        parentMissionId = try container.decodeIfPresent(String.self, forKey: .parentMissionId)
+    }
+
+    /// Whether this mission is a worker (child of a boss mission)
+    var isWorker: Bool {
+        parentMissionId != nil
     }
 
     var displayTitle: String {

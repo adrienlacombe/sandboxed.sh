@@ -56,6 +56,10 @@ struct ControlView: View {
     @State private var desktopDisplayId = ":101"
     private let availableDisplays = [":99", ":100", ":101", ":102"]
 
+    // Worker (child mission) state
+    @State private var childMissions: [Mission] = []
+    @State private var showWorkerSheet = false
+
     // Workspace selection state (global)
     private var workspaceState = WorkspaceState.shared
     @State private var showNewMissionSheet = false
@@ -79,7 +83,24 @@ struct ControlView: View {
             
             VStack(spacing: 0) {
                 // Messages
-                messagesView
+                ZStack(alignment: .bottom) {
+                    messagesView
+
+                    // Worker pill overlay for boss missions
+                    if !childMissions.isEmpty {
+                        WorkerPillView(
+                            workers: childMissions,
+                            runningWorkers: runningMissions,
+                            onTap: {
+                                HapticService.lightTap()
+                                showWorkerSheet = true
+                            }
+                        )
+                        .padding(.bottom, 12)
+                        .transition(.move(edge: .bottom).combined(with: .opacity))
+                        .animation(.spring(response: 0.3), value: childMissions.count)
+                    }
+                }
 
                 // Input area
                 inputView
@@ -153,16 +174,34 @@ struct ControlView: View {
             }
             
             ToolbarItem(placement: .topBarLeading) {
-                // Thoughts panel button (moved from trailing)
-                Button {
-                    showThoughts = true
-                    HapticService.lightTap()
-                } label: {
-                    Image(systemName: "brain")
-                        .font(.system(size: 14))
-                        .foregroundStyle(
-                            messages.contains(where: { $0.isThinking }) ? Theme.accent : Theme.textSecondary
-                        )
+                HStack(spacing: 12) {
+                    // Thoughts panel button
+                    Button {
+                        showThoughts = true
+                        HapticService.lightTap()
+                    } label: {
+                        Image(systemName: "brain")
+                            .font(.system(size: 14))
+                            .foregroundStyle(
+                                messages.contains(where: { $0.isThinking }) ? Theme.accent : Theme.textSecondary
+                            )
+                    }
+
+                    // Workers button (only visible for boss missions)
+                    if !childMissions.isEmpty {
+                        Button {
+                            showWorkerSheet = true
+                            HapticService.lightTap()
+                        } label: {
+                            HStack(spacing: 3) {
+                                Image(systemName: "person.3")
+                                    .font(.system(size: 12))
+                                Text("\(childMissions.count)")
+                                    .font(.caption2.weight(.medium))
+                            }
+                            .foregroundStyle(Theme.accent)
+                        }
+                    }
                 }
             }
 
@@ -338,6 +377,12 @@ struct ControlView: View {
         }
         .sheet(isPresented: $showThoughts) {
             ThoughtsSheet(messages: messages)
+                .presentationDetents([.medium, .large])
+                .presentationDragIndicator(.visible)
+                .presentationBackgroundInteraction(.enabled(upThrough: .medium))
+        }
+        .sheet(isPresented: $showWorkerSheet) {
+            WorkerSheetView(workers: childMissions, runningWorkers: runningMissions)
                 .presentationDetents([.medium, .large])
                 .presentationDragIndicator(.visible)
                 .presentationBackgroundInteraction(.enabled(upThrough: .medium))
@@ -1123,11 +1168,22 @@ struct ControlView: View {
 
             isLoading = false
             HapticService.success()
+
+            // Fetch child (worker) missions in background
+            Task {
+                if let workers = try? await api.getChildMissions(parentId: id) {
+                    guard fetchingMissionId == id else { return }
+                    childMissions = workers
+                } else {
+                    childMissions = []
+                }
+            }
         } catch {
             // Race condition guard
             guard fetchingMissionId == id else { return }
 
             isLoading = false
+            childMissions = []
             print("Failed to load mission: \(error)")
 
             // Revert viewing state to avoid filtering out events
@@ -1705,6 +1761,13 @@ struct ControlView: View {
             runningMissions = try await api.getRunningMissions()
         } catch {
             print("Failed to refresh running missions: \(error)")
+        }
+
+        // Also refresh child missions if viewing a boss mission
+        if let id = viewingMissionId, !childMissions.isEmpty {
+            if let workers = try? await api.getChildMissions(parentId: id) {
+                childMissions = workers
+            }
         }
     }
 
