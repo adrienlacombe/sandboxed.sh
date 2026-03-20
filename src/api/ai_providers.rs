@@ -7010,12 +7010,19 @@ pub fn sync_oauth_to_all_tiers(
 /// 1. Acquires an exclusive file lock so only one refresh runs at a time.
 /// 2. Re-reads the latest credentials from disk (another process may have
 ///    already refreshed with a rotated token).
-/// 3. Skips the refresh if the token is still fresh.
+/// 3. Skips the refresh only if another process already refreshed (token has
+///    a newer expiry than `known_expires_at`).
 /// 4. Calls `refresh_oauth_token_internal` and syncs results to all tiers.
+///
+/// `known_expires_at` is the expiry timestamp the caller observed before
+/// requesting the refresh. If the on-disk token has a *different* (newer)
+/// expiry after acquiring the lock, it means another process already
+/// refreshed and we can skip.  Pass `0` to always refresh.
 ///
 /// Returns `(new_access_token, new_refresh_token, expires_at)` on success.
 pub async fn refresh_oauth_token_with_lock(
     provider_type: ProviderType,
+    known_expires_at: i64,
 ) -> Result<(String, String, i64), OAuthRefreshError> {
     // Acquire exclusive lock — prevents concurrent refreshes from racing on
     // the same rotating refresh token.
@@ -7031,7 +7038,7 @@ pub async fn refresh_oauth_token_with_lock(
 
             // Re-read credentials — the other process likely refreshed already.
             if let Some(entry) = read_oauth_token_entry(provider_type) {
-                if !oauth_token_expired(entry.expires_at) {
+                if entry.expires_at > known_expires_at && !oauth_token_expired(entry.expires_at) {
                     tracing::info!(
                         provider = ?provider_type,
                         "Background refresher: token was refreshed by another process"
@@ -7056,10 +7063,15 @@ pub async fn refresh_oauth_token_with_lock(
         ))
     })?;
 
-    if !oauth_token_expired(entry.expires_at) {
+    // Skip only if another process already refreshed (the on-disk token has a
+    // newer expiry than what the caller saw). This avoids re-using a rotated
+    // refresh token that's already been consumed.
+    if entry.expires_at > known_expires_at && !oauth_token_expired(entry.expires_at) {
         tracing::info!(
             provider = ?provider_type,
-            "Background refresher: token is fresh after acquiring lock, skipping"
+            old_expires_at = known_expires_at,
+            new_expires_at = entry.expires_at,
+            "Background refresher: token was already refreshed by another process, skipping"
         );
         return Ok((entry.access_token, entry.refresh_token, entry.expires_at));
     }
