@@ -5259,6 +5259,7 @@ fn mission_status_for_terminal_reason(
         TerminalReason::InfiniteLoop => Some((MissionStatus::Failed, "infinite_loop")),
         TerminalReason::RateLimited => Some((MissionStatus::Failed, "rate_limited")),
         TerminalReason::CapacityLimited => Some((MissionStatus::Failed, "capacity_limited")),
+        TerminalReason::AuthError => Some((MissionStatus::Failed, "auth_error")),
     }
 }
 
@@ -5272,6 +5273,7 @@ fn mission_status_summary_for_terminal_reason(reason: TerminalReason) -> Option<
         TerminalReason::LlmError => Some("Model error".to_string()),
         TerminalReason::RateLimited => Some("Provider rate limited".to_string()),
         TerminalReason::CapacityLimited => Some("Provider capacity limit reached".to_string()),
+        TerminalReason::AuthError => Some("Authentication failed".to_string()),
     }
 }
 

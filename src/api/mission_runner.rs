@@ -2230,6 +2230,67 @@ async fn run_mission_turn(
                 }
             }
 
+            // Auth error recovery: if the token was revoked server-side but the
+            // local expiry hadn't passed yet, invalidate stale credentials, force
+            // an OAuth refresh, and retry once.
+            if result.terminal_reason == Some(TerminalReason::AuthError) && !cancel.is_cancelled() {
+                tracing::warn!(
+                    mission_id = %mission_id,
+                    "Auth error detected — invalidating stale credentials and retrying"
+                );
+
+                // Delete the per-mission CLI credentials (they have a stale access token)
+                let mission_creds = mission_work_dir.join(".claude").join(".credentials.json");
+                if mission_creds.exists() {
+                    let _ = std::fs::remove_file(&mission_creds);
+                    tracing::info!(
+                        path = %mission_creds.display(),
+                        "Removed stale per-mission CLI credentials"
+                    );
+                }
+
+                // Also invalidate the host CLI credentials so they aren't copied again
+                for host_path in &[
+                    std::path::PathBuf::from("/var/lib/opencode/.claude/.credentials.json"),
+                    std::path::PathBuf::from("/root/.claude/.credentials.json"),
+                ] {
+                    if host_path.exists() {
+                        let _ = std::fs::remove_file(host_path);
+                        tracing::info!(
+                            path = %host_path.display(),
+                            "Removed stale host CLI credentials"
+                        );
+                    }
+                }
+
+                // Force OAuth token refresh (bypasses local expiry check since
+                // the token was revoked server-side despite not being locally expired)
+                if let Err(e) = super::ai_providers::force_refresh_anthropic_oauth_token().await {
+                    tracing::warn!("OAuth refresh after auth error failed: {}", e);
+                }
+
+                // Retry with fresh credentials (override_auth=None forces re-resolution)
+                result = run_claudecode_turn(
+                    &workspace,
+                    &mission_work_dir,
+                    &effective_msg,
+                    config.default_model.as_deref(),
+                    model_effort.as_deref(),
+                    effective_agent.as_deref(),
+                    mission_id,
+                    events_tx.clone(),
+                    cancel.clone(),
+                    secrets.clone(),
+                    &config.working_dir,
+                    effective_sid.as_deref(),
+                    false,
+                    Some(Arc::clone(&tool_hub)),
+                    Some(Arc::clone(&status)),
+                    None,
+                )
+                .await;
+            }
+
             // Account rotation: if rate-limited, try alternate Anthropic credentials.
             // The first entry in the list is the highest-priority credential, which
             // is almost certainly what the initial (override_auth=None) call used.
@@ -4439,6 +4500,8 @@ pub fn run_claudecode_turn<'a>(
             // false positives from tool output or user content.
             let reason = if is_rate_limited_error(&final_result) {
                 TerminalReason::RateLimited
+            } else if is_auth_error(&final_result) {
+                TerminalReason::AuthError
             } else {
                 TerminalReason::LlmError
             };
@@ -4820,6 +4883,21 @@ fn ascii_lower(byte: u8) -> u8 {
         b'A'..=b'Z' => byte + 32,
         _ => byte,
     }
+}
+
+fn is_auth_error(message: &str) -> bool {
+    const AUTH_MARKERS: [&str; 6] = [
+        "invalid authentication credentials",
+        "authentication_error",
+        "invalid api key",
+        "invalid x-api-key",
+        "failed to authenticate",
+        "error: 401",
+    ];
+
+    AUTH_MARKERS
+        .iter()
+        .any(|needle| contains_ascii_case_insensitive(message, needle))
 }
 
 fn is_rate_limited_error(message: &str) -> bool {
