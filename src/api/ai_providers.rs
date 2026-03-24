@@ -3013,6 +3013,14 @@ pub async fn ensure_anthropic_oauth_token_valid() -> Result<(), String> {
     refresh_anthropic_oauth_token().await
 }
 
+/// Force-refresh the Anthropic OAuth token regardless of local expiry.
+/// Used when the API rejects a token that hasn't locally expired yet
+/// (e.g., token was revoked server-side or rotated by another process).
+pub async fn force_refresh_anthropic_oauth_token() -> Result<(), String> {
+    tracing::info!("Force-refreshing Anthropic OAuth token (server-side revocation suspected)");
+    refresh_anthropic_oauth_token().await
+}
+
 /// Refresh the OpenAI OAuth token using the refresh token.
 /// Updates auth.json with the new access token and expiry.
 /// Uses file-based locking to prevent concurrent refresh attempts.
