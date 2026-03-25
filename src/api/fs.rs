@@ -247,18 +247,21 @@ pub async fn resolve_path_for_workspace(
         // This ensures uploaded files go to the right place for the agent to find them
         let context_path = if let Some(mid) = mission_id {
             if workspace.workspace_type == WorkspaceType::Container {
-                // For container workspaces, store inside the container rootfs so
-                // the file is always accessible at /root/context/{mission_id}/
-                // without depending on bind-mounts (which are unreliable when the
-                // container is already running and we use nsenter).
+                // For container workspaces, write to the HOST context root
+                // (config.working_dir/context/<mid>/).  This directory is
+                // bind-mounted into the container at /root/context, so the
+                // agent sees the files.  Writing to the container rootfs does
+                // NOT work because the bind-mount shadows the rootfs path.
                 let context_dir_name = std::env::var("SANDBOXED_SH_CONTEXT_DIR_NAME")
                     .ok()
                     .filter(|s| !s.trim().is_empty())
                     .unwrap_or_else(|| "context".to_string());
-                workspace_root
-                    .join("root")
-                    .join(context_dir_name)
-                    .join(mid.to_string())
+                let global_context_root = std::env::var("SANDBOXED_SH_CONTEXT_ROOT")
+                    .ok()
+                    .filter(|s| !s.trim().is_empty())
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| state.config.working_dir.join(&context_dir_name));
+                global_context_root.join(mid.to_string())
             } else {
                 // For host workspaces, use the global context root
                 let context_root = state.config.working_dir.join("context");

@@ -1125,6 +1125,89 @@ fn parse_opencode_sse_event(
                 resumable: true,
             })
         }
+        // opencode run --format json stdout events
+        "text" => {
+            let part = props.get("part").unwrap_or(&props);
+            let text = part.get("text").and_then(|v| v.as_str()).unwrap_or("");
+            if text.is_empty() {
+                None
+            } else {
+                state.last_emitted_text = Some(text.to_string());
+                Some(AgentEvent::TextDelta {
+                    content: text.to_string(),
+                    mission_id: Some(mission_id),
+                })
+            }
+        }
+        "step_start" => None,
+        "step_finish" => {
+            let part = props.get("part").unwrap_or(&props);
+            if let Some(tok) = part.get("tokens") {
+                let input = tok.get("input").and_then(|v| v.as_u64()).unwrap_or(0);
+                let output = tok.get("output").and_then(|v| v.as_u64()).unwrap_or(0);
+                if input > 0 || output > 0 {
+                    sse_usage = Some((input, output));
+                }
+            }
+            message_complete = true;
+            None
+        }
+        "tool_call" => {
+            let part = props.get("part").unwrap_or(&props);
+            let tool_name = part
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown")
+                .to_string();
+            let tool_id = part
+                .get("id")
+                .or_else(|| part.get("toolCallID"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let input_str = part
+                .get("input")
+                .or_else(|| part.get("args"))
+                .map(|v| {
+                    if v.is_string() {
+                        v.as_str().unwrap_or("").to_string()
+                    } else {
+                        serde_json::to_string(v).unwrap_or_default()
+                    }
+                })
+                .unwrap_or_default();
+            Some(AgentEvent::ToolCall {
+                tool_call_id: tool_id,
+                name: tool_name,
+                args: serde_json::Value::String(input_str),
+                mission_id: Some(mission_id),
+            })
+        }
+        "tool_result" => {
+            let part = props.get("part").unwrap_or(&props);
+            let tool_id = part
+                .get("id")
+                .or_else(|| part.get("toolCallID"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let tool_name = part
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown")
+                .to_string();
+            let result = part
+                .get("output")
+                .or_else(|| part.get("result"))
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            Some(AgentEvent::ToolResult {
+                tool_call_id: tool_id,
+                name: tool_name,
+                result,
+                mission_id: Some(mission_id),
+            })
+        }
         _ => None,
     };
 
@@ -8985,30 +9068,55 @@ pub async fn run_opencode_turn(
         escaped
     };
 
+    // Use the workspace config flag to decide between oh-my-opencode and plain opencode.
+    // oh-my-opencode wraps opencode with extra features (todo enforcement, background tasks)
+    // but requires a compatible opencode version.  When the flag is set, or when the
+    // workspace agent names are incompatible, fall back to plain `opencode run`.
     let use_plain_opencode = workspace
         .config
         .get("disable_oh_my_opencode")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
+    // When using plain opencode, always inject the builtin proxy provider since
+    // plain opencode lacks native provider credentials and routes through the proxy.
+    if use_plain_opencode {
+        ensure_opencode_provider_for_model(&opencode_config_dir_host, "builtin/fast");
+    }
+
     let mut shell_cmd = String::new();
     if runner_is_direct {
         shell_cmd.push_str(&shell_escape(&cli_runner));
         shell_cmd.push_str(" run");
     } else if use_plain_opencode {
-        shell_cmd.push_str(&shell_escape(&cli_runner));
-        shell_cmd.push_str(" opencode run");
+        // Use the opencode binary directly (installed via `bun install -g opencode-ai`).
+        // `bunx opencode` won't work because the `opencode` npm package is unpublished.
+        // Always route through builtin proxy since plain opencode lacks provider credentials.
+        // --format json produces structured events on stdout for the parser.
+        shell_cmd.push_str("/root/.bun/bin/opencode run --format json");
+        shell_cmd.push_str(" --model builtin/fast");
     } else {
         shell_cmd.push_str(&shell_escape(&cli_runner));
         shell_cmd.push_str(" oh-my-opencode run");
     }
 
     if let Some(a) = agent {
-        shell_cmd.push_str(" --agent ");
-        shell_cmd.push_str(&shell_escape(a));
+        if use_plain_opencode {
+            // plain opencode uses lowercase agent names directly
+            shell_cmd.push_str(" --agent ");
+            shell_cmd.push_str(&shell_escape(a));
+        } else {
+            shell_cmd.push_str(" --agent ");
+            shell_cmd.push_str(&shell_escape(a));
+        }
     }
 
-    shell_cmd.push_str(" --directory ");
+    // plain opencode uses --dir; oh-my-opencode uses --directory
+    if use_plain_opencode {
+        shell_cmd.push_str(" --dir ");
+    } else {
+        shell_cmd.push_str(" --directory ");
+    }
     shell_cmd.push_str(&shell_escape(&work_dir_arg));
 
     // Read message from file via command substitution to guarantee a single argument
@@ -9029,6 +9137,17 @@ pub async fn run_opencode_turn(
 
     // Build environment variables
     let mut env: HashMap<String, String> = HashMap::new();
+
+    // Ensure bun's global bin directories are in PATH so that oh-my-opencode
+    // can find the `opencode` binary installed via `bun install -g opencode-ai`.
+    {
+        let current_path = std::env::var("PATH").unwrap_or_default();
+        let bun_bins = "/root/.bun/bin:/root/.cache/.bun/bin";
+        if !current_path.contains("/root/.bun/bin") {
+            env.insert("PATH".to_string(), format!("{}:{}", bun_bins, current_path));
+        }
+    }
+
     let opencode_auth = sync_opencode_auth_to_workspace(workspace, app_working_dir);
 
     // Allow per-mission OpenCode server port; default to an allocated free port.
@@ -9195,8 +9314,9 @@ pub async fn run_opencode_turn(
     // Used to skip inactivity timeouts during long tool runs (builds, tests, etc.).
     let (sse_tool_depth_tx, sse_tool_depth_rx) = tokio::sync::watch::channel(0u32);
 
-    // oh-my-opencode doesn't support --format json, so use SSE curl for events.
-    let use_json_stdout = false;
+    // plain opencode with --format json outputs structured events to stdout.
+    // oh-my-opencode uses SSE from its internal server instead.
+    let use_json_stdout = use_plain_opencode;
     let sse_handle = if !use_json_stdout
         && command_available(&workspace_exec, work_dir, "curl").await
     {

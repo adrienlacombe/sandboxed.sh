@@ -814,6 +814,9 @@ async fn shutdown_signal(state: Arc<AppState>) {
         return;
     }
 
+    // Grab a mission store reference before consuming sessions.
+    let mission_store = sessions.first().map(|cs| cs.mission_store.clone());
+
     let mut all_interrupted: Vec<Uuid> = Vec::new();
     for control in sessions {
         let (tx, rx) = tokio::sync::oneshot::channel();
@@ -839,10 +842,28 @@ async fn shutdown_signal(state: Arc<AppState>) {
     if all_interrupted.is_empty() {
         tracing::info!("No running missions to interrupt");
     } else {
-        tracing::info!(
-            "Marked {} missions as interrupted: {:?}",
+        tracing::warn!(
+            "SHUTDOWN: Interrupted {} active mission(s):",
             all_interrupted.len(),
-            all_interrupted
+        );
+        // Log details for each interrupted mission so operators can resume them.
+        if let Some(store) = mission_store.as_ref() {
+            for mid in &all_interrupted {
+                let title = store
+                    .get_mission(*mid)
+                    .await
+                    .ok()
+                    .flatten()
+                    .and_then(|m| m.title)
+                    .unwrap_or_else(|| "<untitled>".to_string());
+                tracing::warn!("  SHUTDOWN: mission {} - \"{}\"", mid, title,);
+            }
+        }
+        // Log a single copy-pasteable line for easy resume.
+        let ids: Vec<String> = all_interrupted.iter().map(|id| id.to_string()).collect();
+        tracing::warn!(
+            "SHUTDOWN: To resume, reset these mission IDs: {}",
+            ids.join(" "),
         );
     }
 

@@ -1389,7 +1389,7 @@ function ThinkingGroupItem({
 // Threshold for collapsing long thoughts (in characters)
 const THOUGHT_COLLAPSE_THRESHOLD = 800;
 
-function ThinkingPanelItem({
+const ThinkingPanelItem = memo(function ThinkingPanelItem({
   item,
   isActive,
   basePath,
@@ -1499,7 +1499,7 @@ function ThinkingPanelItem({
       </div>
     </div>
   );
-}
+});
 
 // Thinking side panel component
 function ThinkingPanel({
@@ -1558,14 +1558,36 @@ function ThinkingPanel({
     setVisibleThoughtsLimit(INITIAL_VISIBLE_THOUGHTS);
   }, [missionId]);
 
+  // Memoize the visible slice to avoid re-rendering completed items when only active content changes
+  const visibleCompletedItems = useMemo(
+    () => completedItems.slice(-visibleThoughtsLimit),
+    [completedItems, visibleThoughtsLimit]
+  );
+
   const scrollRef = useRef<HTMLDivElement>(null);
 
-  // Auto-scroll to bottom when active thought content changes
-  useEffect(() => {
-    if (scrollRef.current && activeItems.length > 0) {
-      scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+  // Auto-scroll to bottom when active thought content changes.
+  // Use useLayoutEffect to set scroll before paint (prevents flicker).
+  // Only scroll if already near the bottom (user hasn't scrolled up to read history).
+  const userScrolledUpRef = useRef(false);
+  useLayoutEffect(() => {
+    const el = scrollRef.current;
+    if (el && activeItems.length > 0 && !userScrolledUpRef.current) {
+      el.scrollTop = el.scrollHeight;
     }
   }, [activeItems.map((i) => `${i.id}:${i.content.length}`).join("|")]);
+
+  // Track whether user has manually scrolled up
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    const handleScroll = () => {
+      const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+      userScrolledUpRef.current = distanceFromBottom > 80;
+    };
+    el.addEventListener("scroll", handleScroll, { passive: true });
+    return () => el.removeEventListener("scroll", handleScroll);
+  }, []);
 
   // Handle Escape key
   useEffect(() => {
@@ -1636,7 +1658,7 @@ function ThinkingPanel({
                     </span>
                   </button>
                 )}
-                {completedItems.slice(-visibleThoughtsLimit).map((item) => (
+                {visibleCompletedItems.map((item) => (
                   <ThinkingPanelItem key={item.id} item={item} isActive={false} basePath={basePath} />
                 ))}
                 {activeItems.length > 0 && (
@@ -7867,8 +7889,8 @@ export default function ControlClient() {
           )}
 
           {/* Show resume buttons for interrupted/blocked missions, otherwise show normal input */}
-          {/* Note: showResumeUI checks viewingMissionIsRunning and if the last turn completed */}
-          {showResumeUI ? (
+          {/* Both are always rendered to prevent unmounting the input (which loses typed text) */}
+          {showResumeUI && (
             <div className="mx-auto flex max-w-3xl gap-3 items-center justify-center py-2">
               <div className="flex items-center gap-2 text-sm text-white/50 mr-4">
                 <AlertTriangle className="h-4 w-4 text-amber-400" />
@@ -7890,8 +7912,8 @@ export default function ControlClient() {
                 Custom Message
               </button>
             </div>
-          ) : (
-            <div className="mx-auto max-w-3xl w-full space-y-2">
+          )}
+          <div className={cn("mx-auto max-w-3xl w-full space-y-2", showResumeUI && "hidden")}>
               {/* Queue Strip - shows queued messages when present */}
               <QueueStrip
                 items={queuedItems}
@@ -7966,7 +7988,6 @@ export default function ControlClient() {
               )}
               </form>
             </div>
-          )}
         </div>
       </div>
 
