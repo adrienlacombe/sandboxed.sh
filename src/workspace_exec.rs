@@ -755,24 +755,77 @@ impl WorkspaceExec {
         args: &[String],
         env: HashMap<String, String>,
     ) -> anyhow::Result<std::process::Output> {
-        let env = self.build_env(env);
-        let mut cmd = self
-            .build_command(
-                cwd,
-                program,
-                args,
-                env,
-                Stdio::null(),
-                Stdio::piped(),
-                Stdio::piped(),
-            )
-            .await
-            .context("Failed to build workspace command")?;
-        let output = cmd
-            .output()
-            .await
-            .context("Failed to run workspace command")?;
-        Ok(output)
+        // Retry loop: when multiple missions target the same container workspace,
+        // concurrent systemd-nspawn boots race for a directory lock. The loser gets
+        // "Directory tree … is currently busy".  On retry build_command() re-checks
+        // running_container_leader() and will find the now-registered leader, falling
+        // back to nsenter (which is concurrent-safe).
+        let max_attempts: u64 = if self.workspace.workspace_type == WorkspaceType::Container {
+            8
+        } else {
+            1
+        };
+
+        for attempt in 1..=max_attempts {
+            let env_for_attempt = self.build_env(env.clone());
+            let mut cmd = self
+                .build_command(
+                    cwd,
+                    program,
+                    args,
+                    env_for_attempt,
+                    Stdio::null(),
+                    Stdio::piped(),
+                    Stdio::piped(),
+                )
+                .await
+                .context("Failed to build workspace command")?;
+            let output = cmd
+                .output()
+                .await
+                .context("Failed to run workspace command")?;
+
+            // Detect nspawn container boot race and retry.
+            // Two failure modes when multiple missions race to boot the same container:
+            //   1. "Directory tree … is currently busy" — nspawn rejects the boot
+            //   2. Process killed with signal 9 + empty output — nspawn loses the lock race
+            // In both cases, retrying lets build_command() find the now-running container
+            // leader and fall back to nsenter.
+            if !output.status.success() && attempt < max_attempts {
+                let combined = format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr),
+                );
+                let is_busy = combined.contains("currently busy");
+                let is_killed = {
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::process::ExitStatusExt;
+                        output.status.signal() == Some(9) && combined.trim().is_empty()
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        false
+                    }
+                };
+                if is_busy || is_killed {
+                    tracing::info!(
+                        workspace = %self.workspace.name,
+                        attempt = attempt,
+                        max_attempts = max_attempts,
+                        is_busy = is_busy,
+                        is_killed = is_killed,
+                        "Container nspawn race detected, retrying"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(500 * attempt)).await;
+                    continue;
+                }
+            }
+
+            return Ok(output);
+        }
+        unreachable!()
     }
 
     pub async fn spawn_streaming(

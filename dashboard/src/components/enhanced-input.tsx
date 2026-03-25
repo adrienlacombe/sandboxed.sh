@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useEffect, useRef, useCallback, useMemo, forwardRef, useImperativeHandle } from 'react';
+import { useState, useEffect, useRef, useCallback, useMemo, forwardRef, useImperativeHandle, memo } from 'react';
 import { listLibraryCommands, getBuiltinCommands as fetchBuiltinCommands, getVisibleAgents, type CommandSummary, type CommandParam, type BuiltinCommandsResponse } from '@/lib/api';
 import { cn } from '@/lib/utils';
 
@@ -53,9 +53,9 @@ interface AutocompleteItem {
   params?: CommandParam[];
 }
 
-export const EnhancedInput = forwardRef<EnhancedInputHandle, EnhancedInputProps>(function EnhancedInput({
-  value,
-  onChange,
+export const EnhancedInput = memo(forwardRef<EnhancedInputHandle, EnhancedInputProps>(function EnhancedInput({
+  value: externalValue,
+  onChange: externalOnChange,
   onSubmit,
   onCanSubmitChange,
   onFilePaste,
@@ -64,6 +64,27 @@ export const EnhancedInput = forwardRef<EnhancedInputHandle, EnhancedInputProps>
   className,
   backend,
 }, ref) {
+  // Internal state for the input value — immune to parent re-renders.
+  // Syncs FROM parent only when the parent explicitly pushes a new value
+  // (e.g., clearing after submit, inserting upload notes).
+  const [value, setValueState] = useState(externalValue);
+  const lastExternalValueRef = useRef(externalValue);
+
+  // Sync external → internal only when the parent pushes a genuinely new value
+  useEffect(() => {
+    if (externalValue !== lastExternalValueRef.current) {
+      lastExternalValueRef.current = externalValue;
+      setValueState(externalValue);
+    }
+  }, [externalValue]);
+
+  // Wrapper that updates both internal state and notifies parent
+  const onChange = useCallback((newValue: string) => {
+    setValueState(newValue);
+    lastExternalValueRef.current = newValue;
+    externalOnChange(newValue);
+  }, [externalOnChange]);
+
   const [commands, setCommands] = useState<CommandSummary[]>([]);
   const [agents, setAgents] = useState<string[]>([]);
   const [showAutocomplete, setShowAutocomplete] = useState(false);
@@ -736,4 +757,4 @@ export const EnhancedInput = forwardRef<EnhancedInputHandle, EnhancedInputProps>
       )}
     </div>
   );
-});
+}));
