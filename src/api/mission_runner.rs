@@ -2991,7 +2991,16 @@ pub fn run_claudecode_turn<'a>(
         // credentials file. We run each mission with a per-mission HOME, and copy the
         // host credentials into the mission directory if needed.
         let mission_creds_path = work_dir.join(".claude").join(".credentials.json");
-        if !looks_like_claude_cli_credentials(&mission_creds_path) {
+        // Copy host credentials if missing OR if the existing ones are expired/near-expiry.
+        let needs_copy = if !looks_like_claude_cli_credentials(&mission_creds_path) {
+            true
+        } else if let Some((expires_at, _)) = claude_cli_credentials_info(&mission_creds_path) {
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            expires_at < now_ms + 120_000 // 2 minute buffer
+        } else {
+            false
+        };
+        if needs_copy {
             if let Some(host_creds) = find_host_claude_cli_credentials() {
                 if let Some(parent) = mission_creds_path.parent() {
                     if let Err(e) = std::fs::create_dir_all(parent) {
