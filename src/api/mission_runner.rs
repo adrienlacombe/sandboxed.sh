@@ -3862,6 +3862,16 @@ pub fn run_claudecode_turn<'a>(
         // before breaking the loop. This lets us capture any final `result` event
         // that may already be buffered in the PTY/channel.
         let mut process_exit_grace_deadline: Option<Instant> = None;
+
+        // Periodic credential refresh: OAuth tokens expire after ~7 hours.
+        // For long-running missions, refresh the token in the mission's
+        // .claude/.credentials.json before it expires so Claude Code can
+        // pick up the new token on its next API call.
+        let mut cred_refresh_interval =
+            tokio::time::interval(std::time::Duration::from_secs(30 * 60));
+        cred_refresh_interval.tick().await; // consume the immediate first tick
+        let cred_refresh_work_dir = work_dir.clone();
+
         // Process events until completion or cancellation
         loop {
             tokio::select! {
@@ -3872,6 +3882,54 @@ pub fn run_claudecode_turn<'a>(
                     reader_handle.abort();
                     return AgentResult::failure("Cancelled".to_string(), 0)
                         .with_terminal_reason(TerminalReason::Cancelled);
+                }
+                _ = cred_refresh_interval.tick() => {
+                    // Refresh credentials mid-mission if they're near expiry.
+                    // First ensure the HOST credentials are fresh (they may also
+                    // expire during very long missions).
+                    if let Some(host_creds_path) = find_host_claude_cli_credentials() {
+                        if let Some((host_exp, _)) = claude_cli_credentials_info(&host_creds_path) {
+                            let now_ms = chrono::Utc::now().timestamp_millis();
+                            if host_exp < now_ms + 120_000 {
+                                tracing::info!(
+                                    mission_id = %mission_id,
+                                    "Host credentials near expiry, triggering OAuth refresh"
+                                );
+                                // Trigger the server-side OAuth refresh
+                                let _ = crate::api::ai_providers::refresh_oauth_token_with_lock(
+                                    crate::ai_providers::ProviderType::Anthropic,
+                                    host_exp,
+                                ).await;
+                            }
+                        }
+                    }
+                    // Now copy fresh host credentials to the mission directory
+                    let mission_creds = cred_refresh_work_dir.join(".claude").join(".credentials.json");
+                    if let Some((expires_at, _)) = claude_cli_credentials_info(&mission_creds) {
+                        let now_ms = chrono::Utc::now().timestamp_millis();
+                        let remaining_min = (expires_at - now_ms) / 60_000;
+                        if remaining_min < 60 {
+                            tracing::info!(
+                                mission_id = %mission_id,
+                                remaining_min = remaining_min,
+                                "Mission credentials near expiry, refreshing from host"
+                            );
+                            if let Some(host_creds) = find_host_claude_cli_credentials() {
+                                if let Err(e) = std::fs::copy(&host_creds, &mission_creds) {
+                                    tracing::warn!(
+                                        mission_id = %mission_id,
+                                        error = %e,
+                                        "Failed to refresh mission credentials from host"
+                                    );
+                                } else {
+                                    tracing::info!(
+                                        mission_id = %mission_id,
+                                        "Refreshed mission credentials from host"
+                                    );
+                                }
+                            }
+                        }
+                    }
                 }
                 _ = tokio::time::sleep_until(startup_deadline), if !saw_non_init_event => {
                     tracing::warn!(
