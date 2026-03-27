@@ -4338,11 +4338,22 @@ pub fn run_claudecode_turn<'a>(
                                             _ => {}
                                         }
                                     }
-                                    // If no text content was produced this turn but we have
-                                    // thinking content, use it as the final result before
-                                    // clearing. Only do this when no tool calls are pending —
-                                    // otherwise a later tool result may produce the real output.
-                                    if final_result.trim().is_empty() && !thinking_buffer.is_empty() && pending_tools.is_empty() {
+                                    // Before clearing per-turn buffers, preserve any
+                                    // content as final_result so it survives to the
+                                    // post-loop fallback checks.  We always overwrite
+                                    // here because this is the *latest* turn — its
+                                    // content is more relevant than earlier turns'.
+                                    if final_result.trim().is_empty() && !text_buffer.is_empty() {
+                                        let mut sorted: Vec<_> = text_buffer.iter().collect();
+                                        sorted.sort_by_key(|(idx, _)| *idx);
+                                        final_result = sorted.into_iter().map(|(_, t)| t.clone()).collect::<Vec<_>>().join("");
+                                        tracing::info!(
+                                            mission_id = %mission_id,
+                                            "Using text buffer as final result ({} chars, text was streamed but not in ContentBlock::Text)",
+                                            final_result.len()
+                                        );
+                                    }
+                                    if final_result.trim().is_empty() && !thinking_buffer.is_empty() {
                                         let mut sorted: Vec<_> = thinking_buffer.iter().collect();
                                         sorted.sort_by_key(|(idx, _)| *idx);
                                         final_result = sorted.into_iter().map(|(_, t)| t.clone()).collect::<Vec<_>>().join("");
@@ -4426,7 +4437,17 @@ pub fn run_claudecode_turn<'a>(
                                         // Sending Error here would cause duplicate messages.
                                         final_result = error_msg;
                                     } else if let Some(result) = res.result {
-                                        final_result = result;
+                                        // Only overwrite final_result if the Result event
+                                        // carries actual content.  Claude Code sometimes
+                                        // sends `"result": ""` on a successful turn whose
+                                        // last output was thinking-only or tool-use-only;
+                                        // overwriting a valid final_result with "" causes
+                                        // the spurious "produced no output" error.
+                                        if !result.trim().is_empty()
+                                            || final_result.trim().is_empty()
+                                        {
+                                            final_result = result;
+                                        }
                                     }
                                     tracing::info!(
                                         mission_id = %mission_id,
@@ -4587,45 +4608,58 @@ pub fn run_claudecode_turn<'a>(
         }
 
         if final_result.trim().is_empty() && !had_error {
-            had_error = true;
-            if !non_json_output.is_empty() {
-                tracing::warn!(
+            // If we saw a terminal Result event with no error, the turn
+            // completed successfully — the model just didn't produce text
+            // (e.g. its final action was a tool call like `gh pr create`).
+            // Treat this as success with a synthetic summary rather than
+            // flagging it as an error.
+            if saw_terminal_result_event {
+                final_result = "Task completed (model produced no final text output).".to_string();
+                tracing::info!(
                     mission_id = %mission_id,
-                    exit_status = ?exit_status,
-                    "Claude Code produced no parseable JSON output"
-                );
-                final_result = format!(
-                    "Claude Code produced no parseable output. Last output: {}",
-                    non_json_output.join(" | ")
-                );
-            } else if !malformed_json_output.is_empty() {
-                tracing::warn!(
-                    mission_id = %mission_id,
-                    exit_status = ?exit_status,
-                    "Claude Code produced malformed JSON output"
-                );
-                final_result = format!(
-                    "Claude Code produced malformed stream-json output. Last malformed lines: {}",
-                    malformed_json_output.join(" | ")
+                    "Claude Code completed successfully but produced no text output; using synthetic summary"
                 );
             } else {
-                let exit_summary = describe_pty_exit_status(&exit_status);
-                let mut message = format!(
-                    "Claude Code produced no output. Exit status: {}.",
-                    exit_summary
-                );
-                if exit_summary.contains("signal: Some(\"Killed\")") {
-                    message.push_str(
-                        " The process was killed by the OS (often OOM or sandbox limits).",
+                had_error = true;
+                if !non_json_output.is_empty() {
+                    tracing::warn!(
+                        mission_id = %mission_id,
+                        exit_status = ?exit_status,
+                        "Claude Code produced no parseable JSON output"
                     );
+                    final_result = format!(
+                        "Claude Code produced no parseable output. Last output: {}",
+                        non_json_output.join(" | ")
+                    );
+                } else if !malformed_json_output.is_empty() {
+                    tracing::warn!(
+                        mission_id = %mission_id,
+                        exit_status = ?exit_status,
+                        "Claude Code produced malformed JSON output"
+                    );
+                    final_result = format!(
+                        "Claude Code produced malformed stream-json output. Last malformed lines: {}",
+                        malformed_json_output.join(" | ")
+                    );
+                } else {
+                    let exit_summary = describe_pty_exit_status(&exit_status);
+                    let mut message = format!(
+                        "Claude Code produced no output. Exit status: {}.",
+                        exit_summary
+                    );
+                    if exit_summary.contains("signal: Some(\"Killed\")") {
+                        message.push_str(
+                            " The process was killed by the OS (often OOM or sandbox limits).",
+                        );
+                    }
+                    message.push_str(" Check CLI installation or authentication.");
+                    tracing::warn!(
+                        mission_id = %mission_id,
+                        exit_status = ?exit_status,
+                        "Claude Code produced no output"
+                    );
+                    final_result = message;
                 }
-                message.push_str(" Check CLI installation or authentication.");
-                tracing::warn!(
-                    mission_id = %mission_id,
-                    exit_status = ?exit_status,
-                    "Claude Code produced no output"
-                );
-                final_result = message;
             }
         }
 
