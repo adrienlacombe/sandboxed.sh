@@ -97,6 +97,7 @@ impl MissionStore for InMemoryMissionStore {
             terminal_reason: None,
             parent_mission_id,
             working_directory: working_directory.map(|s| s.to_string()),
+            mission_mode: super::MissionMode::default(),
         };
         self.missions
             .write()

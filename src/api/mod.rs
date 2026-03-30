@@ -42,6 +42,7 @@ mod routes;
 pub mod secrets;
 pub mod settings;
 pub mod system;
+pub mod telegram;
 pub mod types;
 pub mod workspaces;
 

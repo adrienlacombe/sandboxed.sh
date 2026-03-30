@@ -114,6 +114,8 @@ pub struct AppState {
     pub proxy_api_keys: super::proxy_keys::SharedProxyApiKeyStore,
     /// Deferred queue for proxy requests that opt into async-on-rate-limit mode
     pub deferred_requests: Arc<deferred_proxy_api::DeferredRequestStore>,
+    /// Telegram bridge for assistant missions
+    pub telegram_bridge: super::telegram::SharedTelegramBridge,
 }
 
 /// Start the HTTP server.
@@ -385,8 +387,11 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         tracing::info!("Configuration library disabled (no remote configured)");
     }
 
+    // Create Telegram bridge (shared across all user sessions).
+    let telegram_bridge = Arc::new(super::telegram::TelegramBridge::new());
+
     // Spawn the single global control session actor.
-    let control_state = control::ControlHub::new(
+    let mut control_state = control::ControlHub::new(
         config.clone(),
         Arc::clone(&root_agent),
         Arc::clone(&mcp),
@@ -394,6 +399,7 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         Arc::clone(&library),
         secrets.clone(),
     );
+    control_state.set_telegram_bridge(Arc::clone(&telegram_bridge));
 
     let state = Arc::new(AppState {
         config: config.clone(),
@@ -434,6 +440,7 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
             }),
         proxy_api_keys,
         deferred_requests,
+        telegram_bridge,
     });
 
     // Initialize the metadata LLM client for AI-powered mission titles/descriptions
@@ -639,6 +646,23 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         .route(
             "/api/control/missions/:id/automation-executions",
             get(control::get_mission_automation_executions),
+        )
+        // Telegram channel endpoints
+        .route(
+            "/api/control/missions/:id/telegram-channels",
+            get(control::list_telegram_channels),
+        )
+        .route(
+            "/api/control/missions/:id/telegram-channels",
+            post(control::create_telegram_channel),
+        )
+        .route(
+            "/api/control/telegram-channels/:id",
+            axum::routing::delete(control::delete_telegram_channel),
+        )
+        .route(
+            "/api/control/telegram-channels/:id/toggle",
+            post(control::toggle_telegram_channel),
         )
         // Parallel execution endpoints
         .route("/api/control/running", get(control::list_running_missions))

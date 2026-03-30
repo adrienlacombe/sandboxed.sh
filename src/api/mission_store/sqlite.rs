@@ -2,8 +2,8 @@
 
 use super::{
     now_string, sanitize_filename, Automation, AutomationExecution, CommandSource, ExecutionStatus,
-    FreshSession, Mission, MissionHistoryEntry, MissionStatus, MissionStore, RetryConfig,
-    StopPolicy, StoredEvent, TriggerType, WebhookConfig,
+    FreshSession, Mission, MissionHistoryEntry, MissionMode, MissionStatus, MissionStore,
+    RetryConfig, StopPolicy, StoredEvent, TelegramChannel, TriggerType, WebhookConfig,
 };
 use crate::api::control::{AgentEvent, AgentTreeNode, DesktopSessionInfo};
 use async_trait::async_trait;
@@ -199,6 +199,23 @@ CREATE TABLE IF NOT EXISTS automation_executions (
 CREATE INDEX IF NOT EXISTS idx_executions_automation ON automation_executions(automation_id, triggered_at DESC);
 CREATE INDEX IF NOT EXISTS idx_executions_mission ON automation_executions(mission_id, triggered_at DESC);
 CREATE INDEX IF NOT EXISTS idx_executions_status ON automation_executions(status);
+
+-- Telegram channels (communication bridges between Telegram and missions)
+CREATE TABLE IF NOT EXISTS telegram_channels (
+    id TEXT PRIMARY KEY NOT NULL,
+    mission_id TEXT NOT NULL,
+    bot_token TEXT NOT NULL,
+    bot_username TEXT,
+    allowed_chat_ids TEXT NOT NULL DEFAULT '[]',
+    trigger_mode TEXT NOT NULL DEFAULT 'direct_message',
+    active INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY (mission_id) REFERENCES missions(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_telegram_channels_mission ON telegram_channels(mission_id);
+CREATE INDEX IF NOT EXISTS idx_telegram_channels_active ON telegram_channels(active);
 "#;
 
 /// Content size threshold for inline storage (64KB).
@@ -273,6 +290,12 @@ impl SqliteMissionStore {
                 TriggerType::Webhook { config }
             }
             "agent_finished" => TriggerType::AgentFinished,
+            "telegram" => {
+                let config: super::TelegramTriggerConfig =
+                    serde_json::from_str(&trigger_data)
+                        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+                TriggerType::Telegram { config }
+            }
             _ => {
                 return Err(rusqlite::Error::ToSqlConversionFailure(
                     format!("Unknown trigger type: {}", trigger_type).into(),
@@ -642,6 +665,52 @@ impl SqliteMissionStore {
                 .map_err(|e| format!("Failed to add working_directory column: {}", e))?;
         }
 
+        // Check if 'mission_mode' column exists in missions table
+        let has_mission_mode_column: bool = conn
+            .prepare("SELECT 1 FROM pragma_table_info('missions') WHERE name = 'mission_mode'")
+            .map_err(|e| format!("Failed to check for mission_mode column: {}", e))?
+            .exists([])
+            .map_err(|e| format!("Failed to query table info: {}", e))?;
+
+        if !has_mission_mode_column {
+            tracing::info!(
+                "Running migration: adding 'mission_mode' column to missions table"
+            );
+            conn.execute(
+                "ALTER TABLE missions ADD COLUMN mission_mode TEXT NOT NULL DEFAULT 'task'",
+                [],
+            )
+            .map_err(|e| format!("Failed to add mission_mode column: {}", e))?;
+        }
+
+        // Ensure telegram_channels table exists (for existing databases)
+        let has_telegram_channels: bool = conn
+            .prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='telegram_channels'")
+            .map_err(|e| format!("Failed to check for telegram_channels table: {}", e))?
+            .exists([])
+            .map_err(|e| format!("Failed to query sqlite_master: {}", e))?;
+
+        if !has_telegram_channels {
+            tracing::info!("Running migration: creating 'telegram_channels' table");
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS telegram_channels (
+                    id TEXT PRIMARY KEY NOT NULL,
+                    mission_id TEXT NOT NULL,
+                    bot_token TEXT NOT NULL,
+                    bot_username TEXT,
+                    allowed_chat_ids TEXT NOT NULL DEFAULT '[]',
+                    trigger_mode TEXT NOT NULL DEFAULT 'direct_message',
+                    active INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY (mission_id) REFERENCES missions(id) ON DELETE CASCADE
+                );
+                CREATE INDEX IF NOT EXISTS idx_telegram_channels_mission ON telegram_channels(mission_id);
+                CREATE INDEX IF NOT EXISTS idx_telegram_channels_active ON telegram_channels(active);",
+            )
+            .map_err(|e| format!("Failed to create telegram_channels table: {}", e))?;
+        }
+
         // Migrate automations table to new schema
         Self::migrate_automations_table(conn)?;
         Self::ensure_automation_indexes(conn)?;
@@ -899,7 +968,8 @@ impl MissionStore for SqliteMissionStore {
                             model_effort,
                             created_at, updated_at, interrupted_at, resumable, desktop_sessions,
                             COALESCE(backend, 'opencode') as backend, session_id, terminal_reason,
-                            config_profile, parent_mission_id, working_directory
+                            config_profile, parent_mission_id, working_directory,
+                            COALESCE(mission_mode, 'task') as mission_mode
                      FROM missions
                      ORDER BY updated_at DESC
                      LIMIT ?1 OFFSET ?2",
@@ -946,6 +1016,9 @@ impl MissionStore for SqliteMissionStore {
                         terminal_reason,
                         parent_mission_id: row.get::<_, Option<String>>(22)?.and_then(|s| Uuid::parse_str(&s).ok()),
                         working_directory: row.get(23)?,
+                        mission_mode: row.get::<_, Option<String>>(24)?
+                            .and_then(|s| serde_json::from_value(serde_json::Value::String(s)).ok())
+                            .unwrap_or_default(),
                     })
                 })
                 .map_err(|e| e.to_string())?
@@ -972,7 +1045,8 @@ impl MissionStore for SqliteMissionStore {
                             model_effort,
                             created_at, updated_at, interrupted_at, resumable, desktop_sessions,
                             COALESCE(backend, 'opencode') as backend, session_id, terminal_reason,
-                            config_profile, parent_mission_id, working_directory
+                            config_profile, parent_mission_id, working_directory,
+                            COALESCE(mission_mode, 'task') as mission_mode
                      FROM missions WHERE id = ?1",
                 )
                 .map_err(|e| e.to_string())?;
@@ -1017,6 +1091,9 @@ impl MissionStore for SqliteMissionStore {
                         terminal_reason,
                         parent_mission_id: row.get::<_, Option<String>>(22)?.and_then(|s| Uuid::parse_str(&s).ok()),
                         working_directory: row.get(23)?,
+                        mission_mode: row.get::<_, Option<String>>(24)?
+                            .and_then(|s| serde_json::from_value(serde_json::Value::String(s)).ok())
+                            .unwrap_or_default(),
                     })
                 })
                 .optional()
@@ -1132,14 +1209,19 @@ impl MissionStore for SqliteMissionStore {
             terminal_reason: None,
             parent_mission_id,
             working_directory: working_directory.map(|s| s.to_string()),
+            mission_mode: MissionMode::default(),
         };
 
         let m = mission.clone();
+        let mission_mode_str = serde_json::to_value(&m.mission_mode)
+            .ok()
+            .and_then(|v| v.as_str().map(|s| s.to_string()))
+            .unwrap_or_else(|| "task".to_string());
         tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
             conn.execute(
-                "INSERT INTO missions (id, status, title, short_description, metadata_updated_at, metadata_source, metadata_model, metadata_version, workspace_id, agent, model_override, model_effort, backend, config_profile, created_at, updated_at, resumable, session_id, parent_mission_id, working_directory)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
+                "INSERT INTO missions (id, status, title, short_description, metadata_updated_at, metadata_source, metadata_model, metadata_version, workspace_id, agent, model_override, model_effort, backend, config_profile, created_at, updated_at, resumable, session_id, parent_mission_id, working_directory, mission_mode)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
                 params![
                     m.id.to_string(),
                     status_to_string(m.status),
@@ -1161,6 +1243,7 @@ impl MissionStore for SqliteMissionStore {
                     m.session_id,
                     m.parent_mission_id.map(|id| id.to_string()),
                     m.working_directory,
+                    mission_mode_str,
                 ],
             )
             .map_err(|e| e.to_string())?;
@@ -1178,7 +1261,7 @@ impl MissionStore for SqliteMissionStore {
         tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
             let mut stmt = conn
-                .prepare("SELECT id, status, title, short_description, metadata_updated_at, metadata_source, metadata_model, metadata_version, workspace_id, agent, model_override, model_effort, backend, config_profile, created_at, updated_at, interrupted_at, resumable, session_id, terminal_reason, parent_mission_id, working_directory FROM missions WHERE parent_mission_id = ?1")
+                .prepare("SELECT id, status, title, short_description, metadata_updated_at, metadata_source, metadata_model, metadata_version, workspace_id, agent, model_override, model_effort, backend, config_profile, created_at, updated_at, interrupted_at, resumable, session_id, terminal_reason, parent_mission_id, working_directory, COALESCE(mission_mode, 'task') as mission_mode FROM missions WHERE parent_mission_id = ?1")
                 .map_err(|e| e.to_string())?;
             let missions = stmt
                 .query_map(params![parent_id_str], |row| {
@@ -1208,6 +1291,9 @@ impl MissionStore for SqliteMissionStore {
                         terminal_reason: row.get(19)?,
                         parent_mission_id: row.get::<_, Option<String>>(20)?.and_then(|s| Uuid::parse_str(&s).ok()),
                         working_directory: row.get(21)?,
+                        mission_mode: row.get::<_, Option<String>>(22)?
+                            .and_then(|s| serde_json::from_value(serde_json::Value::String(s)).ok())
+                            .unwrap_or_default(),
                     })
                 })
                 .map_err(|e| e.to_string())?
@@ -1583,6 +1669,7 @@ impl MissionStore for SqliteMissionStore {
                         terminal_reason: None,
                         parent_mission_id: None,
                         working_directory: None,
+                        mission_mode: MissionMode::default(),
                     })
                 })
                 .map_err(|e| e.to_string())?
@@ -1646,6 +1733,7 @@ impl MissionStore for SqliteMissionStore {
                         session_id: None,
                         terminal_reason: None,
                         parent_mission_id: None,
+                        mission_mode: MissionMode::default(),
                         working_directory: None,
                     })
                 })
@@ -2197,6 +2285,10 @@ impl MissionStore for SqliteMissionStore {
                 serde_json::to_string(config).map_err(|e| e.to_string())?,
             ),
             TriggerType::AgentFinished => ("agent_finished", "{}".to_string()),
+            TriggerType::Telegram { config } => (
+                "telegram",
+                serde_json::to_string(config).map_err(|e| e.to_string())?,
+            ),
         };
 
         // Serialize variables
@@ -2407,6 +2499,10 @@ impl MissionStore for SqliteMissionStore {
                 serde_json::to_string(config).map_err(|e| e.to_string())?,
             ),
             TriggerType::AgentFinished => ("agent_finished", "{}".to_string()),
+            TriggerType::Telegram { config } => (
+                "telegram",
+                serde_json::to_string(config).map_err(|e| e.to_string())?,
+            ),
         };
 
         // Serialize variables
@@ -2679,6 +2775,176 @@ impl MissionStore for SqliteMissionStore {
         })
         .await
         .map_err(|e| format!("Task join error: {}", e))?
+    }
+
+    // === Telegram Channel methods ===
+
+    async fn create_telegram_channel(
+        &self,
+        channel: TelegramChannel,
+    ) -> Result<TelegramChannel, String> {
+        let conn = self.conn.clone();
+        let c = channel.clone();
+        let allowed_chat_ids_json =
+            serde_json::to_string(&c.allowed_chat_ids).unwrap_or_else(|_| "[]".to_string());
+        let trigger_mode_str = serde_json::to_value(&c.trigger_mode)
+            .ok()
+            .and_then(|v| v.as_str().map(|s| s.to_string()))
+            .unwrap_or_else(|| "direct_message".to_string());
+
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "INSERT INTO telegram_channels (id, mission_id, bot_token, bot_username, allowed_chat_ids, trigger_mode, active, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    c.id.to_string(),
+                    c.mission_id.to_string(),
+                    c.bot_token,
+                    c.bot_username,
+                    allowed_chat_ids_json,
+                    trigger_mode_str,
+                    c.active as i32,
+                    c.created_at,
+                    c.updated_at,
+                ],
+            )
+            .map_err(|e| e.to_string())?;
+            Ok::<_, String>(())
+        })
+        .await
+        .map_err(|e| e.to_string())??;
+
+        Ok(channel)
+    }
+
+    async fn get_telegram_channel(&self, id: Uuid) -> Result<Option<TelegramChannel>, String> {
+        let conn = self.conn.clone();
+        let id_str = id.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            conn.query_row(
+                "SELECT id, mission_id, bot_token, bot_username, allowed_chat_ids, trigger_mode, active, created_at, updated_at
+                 FROM telegram_channels WHERE id = ?1",
+                params![id_str],
+                |row| Ok(row_to_telegram_channel(row)),
+            )
+            .optional()
+            .map_err(|e| e.to_string())
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
+    async fn list_telegram_channels(
+        &self,
+        mission_id: Uuid,
+    ) -> Result<Vec<TelegramChannel>, String> {
+        let conn = self.conn.clone();
+        let mission_id_str = mission_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, mission_id, bot_token, bot_username, allowed_chat_ids, trigger_mode, active, created_at, updated_at
+                     FROM telegram_channels WHERE mission_id = ?1 ORDER BY created_at DESC",
+                )
+                .map_err(|e| e.to_string())?;
+            let channels = stmt
+                .query_map(params![mission_id_str], |row| Ok(row_to_telegram_channel(row)))
+                .map_err(|e| e.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?;
+            Ok(channels)
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
+    async fn list_all_active_telegram_channels(&self) -> Result<Vec<TelegramChannel>, String> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, mission_id, bot_token, bot_username, allowed_chat_ids, trigger_mode, active, created_at, updated_at
+                     FROM telegram_channels WHERE active = 1",
+                )
+                .map_err(|e| e.to_string())?;
+            let channels = stmt
+                .query_map([], |row| Ok(row_to_telegram_channel(row)))
+                .map_err(|e| e.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?;
+            Ok(channels)
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
+    async fn update_telegram_channel(&self, channel: TelegramChannel) -> Result<(), String> {
+        let conn = self.conn.clone();
+        let allowed_chat_ids_json =
+            serde_json::to_string(&channel.allowed_chat_ids).unwrap_or_else(|_| "[]".to_string());
+        let trigger_mode_str = serde_json::to_value(&channel.trigger_mode)
+            .ok()
+            .and_then(|v| v.as_str().map(|s| s.to_string()))
+            .unwrap_or_else(|| "direct_message".to_string());
+
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "UPDATE telegram_channels SET bot_token = ?1, bot_username = ?2, allowed_chat_ids = ?3, trigger_mode = ?4, active = ?5, updated_at = ?6 WHERE id = ?7",
+                params![
+                    channel.bot_token,
+                    channel.bot_username,
+                    allowed_chat_ids_json,
+                    trigger_mode_str,
+                    channel.active as i32,
+                    channel.updated_at,
+                    channel.id.to_string(),
+                ],
+            )
+            .map_err(|e| e.to_string())?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
+    async fn delete_telegram_channel(&self, id: Uuid) -> Result<bool, String> {
+        let conn = self.conn.clone();
+        let id_str = id.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let deleted = conn
+                .execute("DELETE FROM telegram_channels WHERE id = ?1", params![id_str])
+                .map_err(|e| e.to_string())?;
+            Ok(deleted > 0)
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+}
+
+/// Parse a Telegram channel from a SQLite row.
+fn row_to_telegram_channel(row: &rusqlite::Row<'_>) -> TelegramChannel {
+    let id_str: String = row.get(0).unwrap_or_default();
+    let mission_id_str: String = row.get(1).unwrap_or_default();
+    let allowed_chat_ids_json: String = row.get(4).unwrap_or_else(|_| "[]".to_string());
+    let trigger_mode_str: String = row.get(5).unwrap_or_else(|_| "direct_message".to_string());
+
+    TelegramChannel {
+        id: Uuid::parse_str(&id_str).unwrap_or_default(),
+        mission_id: Uuid::parse_str(&mission_id_str).unwrap_or_default(),
+        bot_token: row.get(2).unwrap_or_default(),
+        bot_username: row.get(3).unwrap_or_default(),
+        allowed_chat_ids: serde_json::from_str(&allowed_chat_ids_json).unwrap_or_default(),
+        trigger_mode: serde_json::from_value(serde_json::Value::String(trigger_mode_str))
+            .unwrap_or_default(),
+        active: row.get::<_, i32>(6).unwrap_or(0) != 0,
+        created_at: row.get(7).unwrap_or_default(),
+        updated_at: row.get(8).unwrap_or_default(),
     }
 }
 

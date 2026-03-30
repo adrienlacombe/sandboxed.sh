@@ -77,6 +77,9 @@ idna_adapter = "=1.1.0"
 # File locking for OAuth token refresh synchronization
 fs2 = "0.4"
 
+# HTML to text conversion (for Telegram markdown rendering)
+html-escape = "0.2"
+
 [[bin]]
 name = "sandboxed-sh"
 path = "src/main.rs"

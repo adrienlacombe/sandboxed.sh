@@ -3079,6 +3079,7 @@ pub struct ControlHub {
     workspaces: workspace::SharedWorkspaceStore,
     library: SharedLibrary,
     secrets: Option<Arc<SecretsStore>>,
+    telegram_bridge: Option<super::telegram::SharedTelegramBridge>,
 }
 
 impl ControlHub {
@@ -3098,7 +3099,13 @@ impl ControlHub {
             workspaces,
             library,
             secrets,
+            telegram_bridge: None,
         }
+    }
+
+    /// Set the Telegram bridge reference (called after AppState is created).
+    pub fn set_telegram_bridge(&mut self, bridge: super::telegram::SharedTelegramBridge) {
+        self.telegram_bridge = Some(bridge);
     }
 
     pub async fn get_or_spawn(&self, user: &AuthUser) -> ControlState {
@@ -3143,6 +3150,18 @@ impl ControlHub {
             self.secrets.clone(),
         );
         sessions.insert(user.id.clone(), state.clone());
+
+        // Boot Telegram channels for this user's missions
+        if let Some(ref bridge) = self.telegram_bridge {
+            let bridge = Arc::clone(bridge);
+            let store = Arc::clone(&state.mission_store);
+            let cmd_tx = state.cmd_tx.clone();
+            let events_tx = state.events_tx.clone();
+            tokio::spawn(async move {
+                bridge.boot_from_store(&store, cmd_tx, events_tx).await;
+            });
+        }
+
         state
     }
 
@@ -4844,6 +4863,10 @@ async fn automation_scheduler_loop(
                 }
                 TriggerType::AgentFinished => {
                     // Skip agent_finished automations - they're triggered when a turn completes.
+                    continue;
+                }
+                TriggerType::Telegram { .. } => {
+                    // Skip Telegram automations - they're triggered via the Telegram bridge.
                     continue;
                 }
             };
@@ -9364,6 +9387,177 @@ pub async fn webhook_receiver(
             ))
         }
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Telegram Channel endpoints
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// List Telegram channels for a mission.
+pub async fn list_telegram_channels(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    Path(mission_id): Path<Uuid>,
+) -> Result<Json<Vec<super::mission_store::TelegramChannel>>, (StatusCode, String)> {
+    let control = control_for_user(&state, &user).await;
+    let channels = control
+        .mission_store
+        .list_telegram_channels(mission_id)
+        .await
+        .map_err(internal_error)?;
+    Ok(Json(channels))
+}
+
+/// Create a Telegram channel for a mission.
+pub async fn create_telegram_channel(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    Path(mission_id): Path<Uuid>,
+    Json(req): Json<CreateTelegramChannelRequest>,
+) -> Result<Json<super::mission_store::TelegramChannel>, (StatusCode, String)> {
+    use super::mission_store::{now_string, TelegramChannel, TelegramTriggerMode};
+
+    let control = control_for_user(&state, &user).await;
+
+    // Verify mission exists
+    let _mission = control
+        .mission_store
+        .get_mission(mission_id)
+        .await
+        .map_err(internal_error)?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                format!("Mission {} not found", mission_id),
+            )
+        })?;
+
+    let now = now_string();
+    let channel = TelegramChannel {
+        id: Uuid::new_v4(),
+        mission_id,
+        bot_token: req.bot_token,
+        bot_username: req.bot_username,
+        allowed_chat_ids: req.allowed_chat_ids.unwrap_or_default(),
+        trigger_mode: req.trigger_mode.unwrap_or(TelegramTriggerMode::All),
+        active: true,
+        created_at: now.clone(),
+        updated_at: now,
+    };
+
+    let created = control
+        .mission_store
+        .create_telegram_channel(channel)
+        .await
+        .map_err(internal_error)?;
+
+    // Start the poller
+    state
+        .telegram_bridge
+        .start_channel(
+            created.clone(),
+            control.cmd_tx.clone(),
+            control.events_tx.clone(),
+        )
+        .await;
+
+    tracing::info!(
+        "Created Telegram channel {} for mission {}",
+        created.id,
+        mission_id
+    );
+
+    Ok(Json(created))
+}
+
+#[derive(Deserialize)]
+pub struct CreateTelegramChannelRequest {
+    pub bot_token: String,
+    #[serde(default)]
+    pub bot_username: Option<String>,
+    #[serde(default)]
+    pub allowed_chat_ids: Option<Vec<i64>>,
+    #[serde(default)]
+    pub trigger_mode: Option<super::mission_store::TelegramTriggerMode>,
+}
+
+/// Delete a Telegram channel.
+pub async fn delete_telegram_channel(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    Path(channel_id): Path<Uuid>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let control = control_for_user(&state, &user).await;
+
+    // Stop the poller
+    state.telegram_bridge.stop_channel(channel_id).await;
+
+    let deleted = control
+        .mission_store
+        .delete_telegram_channel(channel_id)
+        .await
+        .map_err(internal_error)?;
+
+    if deleted {
+        tracing::info!("Deleted Telegram channel {}", channel_id);
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err((
+            StatusCode::NOT_FOUND,
+            format!("Telegram channel {} not found", channel_id),
+        ))
+    }
+}
+
+/// Toggle a Telegram channel's active state.
+pub async fn toggle_telegram_channel(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    Path(channel_id): Path<Uuid>,
+    Json(req): Json<ToggleTelegramChannelRequest>,
+) -> Result<Json<super::mission_store::TelegramChannel>, (StatusCode, String)> {
+    let control = control_for_user(&state, &user).await;
+
+    let mut channel = control
+        .mission_store
+        .get_telegram_channel(channel_id)
+        .await
+        .map_err(internal_error)?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                format!("Telegram channel {} not found", channel_id),
+            )
+        })?;
+
+    channel.active = req.active;
+    channel.updated_at = super::mission_store::now_string();
+
+    control
+        .mission_store
+        .update_telegram_channel(channel.clone())
+        .await
+        .map_err(internal_error)?;
+
+    if channel.active {
+        state
+            .telegram_bridge
+            .start_channel(
+                channel.clone(),
+                control.cmd_tx.clone(),
+                control.events_tx.clone(),
+            )
+            .await;
+    } else {
+        state.telegram_bridge.stop_channel(channel_id).await;
+    }
+
+    Ok(Json(channel))
+}
+
+#[derive(Deserialize)]
+pub struct ToggleTelegramChannelRequest {
+    pub active: bool,
 }
 
 #[cfg(test)]
