@@ -3157,8 +3157,12 @@ impl ControlHub {
             let store = Arc::clone(&state.mission_store);
             let cmd_tx = state.cmd_tx.clone();
             let events_tx = state.events_tx.clone();
+            let public_url = std::env::var("SANDBOXED_PUBLIC_URL")
+                .unwrap_or_else(|_| format!("http://{}:{}", self.config.host, self.config.port));
             tokio::spawn(async move {
-                bridge.boot_from_store(&store, cmd_tx, events_tx).await;
+                bridge
+                    .boot_from_store(&store, cmd_tx, events_tx, &public_url)
+                    .await;
             });
         }
 
@@ -9433,6 +9437,7 @@ pub async fn create_telegram_channel(
         })?;
 
     let now = now_string();
+    let webhook_secret = Uuid::new_v4().to_string().replace('-', "");
     let channel = TelegramChannel {
         id: Uuid::new_v4(),
         mission_id,
@@ -9441,6 +9446,7 @@ pub async fn create_telegram_channel(
         allowed_chat_ids: req.allowed_chat_ids.unwrap_or_default(),
         trigger_mode: req.trigger_mode.unwrap_or(TelegramTriggerMode::All),
         active: true,
+        webhook_secret: Some(webhook_secret),
         created_at: now.clone(),
         updated_at: now,
     };
@@ -9451,13 +9457,16 @@ pub async fn create_telegram_channel(
         .await
         .map_err(internal_error)?;
 
-    // Start the poller
+    // Register the webhook
+    let public_url = std::env::var("SANDBOXED_PUBLIC_URL")
+        .unwrap_or_else(|_| format!("http://{}:{}", state.config.host, state.config.port));
     state
         .telegram_bridge
         .start_channel(
             created.clone(),
             control.cmd_tx.clone(),
             control.events_tx.clone(),
+            &public_url,
         )
         .await;
 
@@ -9540,12 +9549,15 @@ pub async fn toggle_telegram_channel(
         .map_err(internal_error)?;
 
     if channel.active {
+        let public_url = std::env::var("SANDBOXED_PUBLIC_URL")
+            .unwrap_or_else(|_| format!("http://{}:{}", state.config.host, state.config.port));
         state
             .telegram_bridge
             .start_channel(
                 channel.clone(),
                 control.cmd_tx.clone(),
                 control.events_tx.clone(),
+                &public_url,
             )
             .await;
     } else {
@@ -9558,6 +9570,46 @@ pub async fn toggle_telegram_channel(
 #[derive(Deserialize)]
 pub struct ToggleTelegramChannelRequest {
     pub active: bool,
+}
+
+/// Telegram webhook receiver (unauthenticated — verified via secret token header).
+pub async fn telegram_webhook_receiver(
+    State(state): State<Arc<AppState>>,
+    Path(channel_id): Path<Uuid>,
+    headers: axum::http::HeaderMap,
+    Json(update): Json<super::telegram::Update>,
+) -> StatusCode {
+    // Look up the channel context in the bridge
+    let ctx = match state.telegram_bridge.get_channel_context(channel_id).await {
+        Some(ctx) => ctx,
+        None => {
+            tracing::debug!("Telegram webhook for unknown channel {}", channel_id);
+            return StatusCode::NOT_FOUND;
+        }
+    };
+
+    // Verify the secret token if one was set
+    if let Some(ref expected_secret) = ctx.channel.webhook_secret {
+        let header_secret = headers
+            .get("x-telegram-bot-api-secret-token")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        if header_secret != expected_secret {
+            tracing::warn!(
+                "Telegram webhook secret mismatch for channel {}",
+                channel_id
+            );
+            return StatusCode::FORBIDDEN;
+        }
+    }
+
+    // Process the message
+    if let Some(ref msg) = update.message {
+        let http = state.telegram_bridge.http().clone();
+        super::telegram::process_webhook_message(&ctx, msg, &http).await;
+    }
+
+    StatusCode::OK
 }
 
 #[cfg(test)]

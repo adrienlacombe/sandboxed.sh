@@ -209,6 +209,7 @@ CREATE TABLE IF NOT EXISTS telegram_channels (
     allowed_chat_ids TEXT NOT NULL DEFAULT '[]',
     trigger_mode TEXT NOT NULL DEFAULT 'direct_message',
     active INTEGER NOT NULL DEFAULT 1,
+    webhook_secret TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     FOREIGN KEY (mission_id) REFERENCES missions(id) ON DELETE CASCADE
@@ -701,6 +702,7 @@ impl SqliteMissionStore {
                     allowed_chat_ids TEXT NOT NULL DEFAULT '[]',
                     trigger_mode TEXT NOT NULL DEFAULT 'direct_message',
                     active INTEGER NOT NULL DEFAULT 1,
+                    webhook_secret TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     FOREIGN KEY (mission_id) REFERENCES missions(id) ON DELETE CASCADE
@@ -709,6 +711,18 @@ impl SqliteMissionStore {
                 CREATE INDEX IF NOT EXISTS idx_telegram_channels_active ON telegram_channels(active);",
             )
             .map_err(|e| format!("Failed to create telegram_channels table: {}", e))?;
+        } else {
+            // Add webhook_secret column if missing (migration for existing tables)
+            let has_webhook_secret: bool = conn
+                .prepare("SELECT 1 FROM pragma_table_info('telegram_channels') WHERE name='webhook_secret'")
+                .map_err(|e| format!("Failed to check for webhook_secret column: {}", e))?
+                .exists([])
+                .map_err(|e| format!("Failed to query pragma_table_info: {}", e))?;
+            if !has_webhook_secret {
+                tracing::info!("Running migration: adding 'webhook_secret' column to telegram_channels");
+                conn.execute("ALTER TABLE telegram_channels ADD COLUMN webhook_secret TEXT", [])
+                    .map_err(|e| format!("Failed to add webhook_secret column: {}", e))?;
+            }
         }
 
         // Migrate automations table to new schema
@@ -2795,8 +2809,8 @@ impl MissionStore for SqliteMissionStore {
         tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
             conn.execute(
-                "INSERT INTO telegram_channels (id, mission_id, bot_token, bot_username, allowed_chat_ids, trigger_mode, active, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                "INSERT INTO telegram_channels (id, mission_id, bot_token, bot_username, allowed_chat_ids, trigger_mode, active, webhook_secret, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 params![
                     c.id.to_string(),
                     c.mission_id.to_string(),
@@ -2805,6 +2819,7 @@ impl MissionStore for SqliteMissionStore {
                     allowed_chat_ids_json,
                     trigger_mode_str,
                     c.active as i32,
+                    c.webhook_secret,
                     c.created_at,
                     c.updated_at,
                 ],
@@ -2824,7 +2839,7 @@ impl MissionStore for SqliteMissionStore {
         tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
             conn.query_row(
-                "SELECT id, mission_id, bot_token, bot_username, allowed_chat_ids, trigger_mode, active, created_at, updated_at
+                "SELECT id, mission_id, bot_token, bot_username, allowed_chat_ids, trigger_mode, active, webhook_secret, created_at, updated_at
                  FROM telegram_channels WHERE id = ?1",
                 params![id_str],
                 |row| Ok(row_to_telegram_channel(row)),
@@ -2894,13 +2909,14 @@ impl MissionStore for SqliteMissionStore {
         tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
             conn.execute(
-                "UPDATE telegram_channels SET bot_token = ?1, bot_username = ?2, allowed_chat_ids = ?3, trigger_mode = ?4, active = ?5, updated_at = ?6 WHERE id = ?7",
+                "UPDATE telegram_channels SET bot_token = ?1, bot_username = ?2, allowed_chat_ids = ?3, trigger_mode = ?4, active = ?5, webhook_secret = ?6, updated_at = ?7 WHERE id = ?8",
                 params![
                     channel.bot_token,
                     channel.bot_username,
                     allowed_chat_ids_json,
                     trigger_mode_str,
                     channel.active as i32,
+                    channel.webhook_secret,
                     channel.updated_at,
                     channel.id.to_string(),
                 ],
@@ -2943,8 +2959,9 @@ fn row_to_telegram_channel(row: &rusqlite::Row<'_>) -> TelegramChannel {
         trigger_mode: serde_json::from_value(serde_json::Value::String(trigger_mode_str))
             .unwrap_or_default(),
         active: row.get::<_, i32>(6).unwrap_or(0) != 0,
-        created_at: row.get(7).unwrap_or_default(),
-        updated_at: row.get(8).unwrap_or_default(),
+        webhook_secret: row.get(7).unwrap_or_default(),
+        created_at: row.get(8).unwrap_or_default(),
+        updated_at: row.get(9).unwrap_or_default(),
     }
 }
 

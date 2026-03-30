@@ -350,8 +350,11 @@ pub struct TelegramChannel {
     /// How the bot should be triggered
     #[serde(default)]
     pub trigger_mode: TelegramTriggerMode,
-    /// Whether this channel is currently active (polling)
+    /// Whether this channel is currently active
     pub active: bool,
+    /// Secret token for Telegram webhook verification
+    #[serde(skip_serializing)]
+    pub webhook_secret: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }

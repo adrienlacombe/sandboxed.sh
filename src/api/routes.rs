@@ -502,6 +502,11 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
             "/api/webhooks/:mission_id/:webhook_id",
             post(control::webhook_receiver),
         )
+        // Telegram webhook receiver (no auth - uses Telegram secret_token header validation)
+        .route(
+            "/api/telegram/webhook/:channel_id",
+            post(control::telegram_webhook_receiver),
+        )
         // WebSocket console uses subprotocol-based auth (browser can't set Authorization header)
         .route("/api/console/ws", get(console::console_ws))
         // WebSocket workspace shell uses subprotocol-based auth
