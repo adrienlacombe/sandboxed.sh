@@ -9466,9 +9466,16 @@ pub async fn create_telegram_channel(
             .update_mission_mode(mission_id, MissionMode::Assistant)
             .await
         {
-            tracing::warn!("Failed to set assistant mode on mission {}: {}", mission_id, e);
+            tracing::warn!(
+                "Failed to set assistant mode on mission {}: {}",
+                mission_id,
+                e
+            );
         } else {
-            tracing::info!("Auto-set mission {} to Assistant mode (Telegram channel attached)", mission_id);
+            tracing::info!(
+                "Auto-set mission {} to Assistant mode (Telegram channel attached)",
+                mission_id
+            );
         }
     }
 
@@ -9655,6 +9662,7 @@ pub async fn telegram_webhook_receiver(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::mission_store::MissionMode;
     use std::sync::Arc;
 
     fn test_automation_with_mode(
@@ -12180,6 +12188,7 @@ And the report:
             terminal_reason: None,
             parent_mission_id: None,
             working_directory: None,
+            mission_mode: MissionMode::default(),
         };
         let weak = Mission {
             id: Uuid::new_v4(),
@@ -12207,6 +12216,7 @@ And the report:
             terminal_reason: None,
             parent_mission_id: None,
             working_directory: None,
+            mission_mode: MissionMode::default(),
         };
 
         let strong_score = mission_search_relevance_score(
@@ -12249,6 +12259,7 @@ And the report:
             terminal_reason: None,
             parent_mission_id: None,
             working_directory: None,
+            mission_mode: MissionMode::default(),
         };
 
         let score = mission_search_relevance_score(
@@ -12288,6 +12299,7 @@ And the report:
             terminal_reason: None,
             parent_mission_id: None,
             working_directory: None,
+            mission_mode: MissionMode::default(),
         };
 
         let score = mission_search_relevance_score(
@@ -12327,6 +12339,7 @@ And the report:
             terminal_reason: None,
             parent_mission_id: None,
             working_directory: None,
+            mission_mode: MissionMode::default(),
         };
 
         let score = mission_search_relevance_score(
@@ -12366,6 +12379,7 @@ And the report:
             terminal_reason: None,
             parent_mission_id: None,
             working_directory: None,
+            mission_mode: MissionMode::default(),
         };
 
         let score = mission_search_relevance_score(
@@ -12489,6 +12503,7 @@ And the report:
             terminal_reason: None,
             parent_mission_id: None,
             working_directory: None,
+            mission_mode: MissionMode::default(),
         };
         let before = mission_search_freshness_key(
             &[MissionSearchCandidate {

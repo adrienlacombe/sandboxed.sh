@@ -293,9 +293,8 @@ impl SqliteMissionStore {
             }
             "agent_finished" => TriggerType::AgentFinished,
             "telegram" => {
-                let config: super::TelegramTriggerConfig =
-                    serde_json::from_str(&trigger_data)
-                        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+                let config: super::TelegramTriggerConfig = serde_json::from_str(&trigger_data)
+                    .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
                 TriggerType::Telegram { config }
             }
             _ => {
@@ -675,9 +674,7 @@ impl SqliteMissionStore {
             .map_err(|e| format!("Failed to query table info: {}", e))?;
 
         if !has_mission_mode_column {
-            tracing::info!(
-                "Running migration: adding 'mission_mode' column to missions table"
-            );
+            tracing::info!("Running migration: adding 'mission_mode' column to missions table");
             conn.execute(
                 "ALTER TABLE missions ADD COLUMN mission_mode TEXT NOT NULL DEFAULT 'task'",
                 [],
@@ -720,9 +717,14 @@ impl SqliteMissionStore {
                 .exists([])
                 .map_err(|e| format!("Failed to query pragma_table_info: {}", e))?;
             if !has_webhook_secret {
-                tracing::info!("Running migration: adding 'webhook_secret' column to telegram_channels");
-                conn.execute("ALTER TABLE telegram_channels ADD COLUMN webhook_secret TEXT", [])
-                    .map_err(|e| format!("Failed to add webhook_secret column: {}", e))?;
+                tracing::info!(
+                    "Running migration: adding 'webhook_secret' column to telegram_channels"
+                );
+                conn.execute(
+                    "ALTER TABLE telegram_channels ADD COLUMN webhook_secret TEXT",
+                    [],
+                )
+                .map_err(|e| format!("Failed to add webhook_secret column: {}", e))?;
             }
             // Add instructions column if missing (ignore "duplicate column" from concurrent init)
             let has_instructions: bool = conn
@@ -731,11 +733,18 @@ impl SqliteMissionStore {
                 .exists([])
                 .map_err(|e| format!("Failed to query pragma_table_info: {}", e))?;
             if !has_instructions {
-                tracing::info!("Running migration: adding 'instructions' column to telegram_channels");
-                match conn.execute("ALTER TABLE telegram_channels ADD COLUMN instructions TEXT", []) {
+                tracing::info!(
+                    "Running migration: adding 'instructions' column to telegram_channels"
+                );
+                match conn.execute(
+                    "ALTER TABLE telegram_channels ADD COLUMN instructions TEXT",
+                    [],
+                ) {
                     Ok(_) => {}
                     Err(e) if e.to_string().contains("duplicate column") => {
-                        tracing::debug!("instructions column already exists (concurrent migration)");
+                        tracing::debug!(
+                            "instructions column already exists (concurrent migration)"
+                        );
                     }
                     Err(e) => return Err(format!("Failed to add instructions column: {}", e)),
                 }
@@ -3030,7 +3039,10 @@ impl MissionStore for SqliteMissionStore {
         tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
             let deleted = conn
-                .execute("DELETE FROM telegram_channels WHERE id = ?1", params![id_str])
+                .execute(
+                    "DELETE FROM telegram_channels WHERE id = ?1",
+                    params![id_str],
+                )
                 .map_err(|e| e.to_string())?;
             Ok(deleted > 0)
         })

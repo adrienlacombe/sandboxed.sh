@@ -37,6 +37,12 @@ pub struct ChannelContext {
     pub events_tx: broadcast::Sender<AgentEvent>,
 }
 
+impl Default for TelegramBridge {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TelegramBridge {
     pub fn new() -> Self {
         Self {
@@ -104,7 +110,10 @@ impl TelegramBridge {
             events_tx,
         };
 
-        self.active_channels.write().await.insert(ctx.channel.id, ctx);
+        self.active_channels
+            .write()
+            .await
+            .insert(ctx.channel.id, ctx);
     }
 
     /// Remove webhook and routing context for a channel.
@@ -159,13 +168,8 @@ impl TelegramBridge {
                     );
                 }
                 for channel in channels {
-                    self.start_channel(
-                        channel,
-                        cmd_tx.clone(),
-                        events_tx.clone(),
-                        public_base_url,
-                    )
-                    .await;
+                    self.start_channel(channel, cmd_tx.clone(), events_tx.clone(), public_base_url)
+                        .await;
                 }
             }
             Err(e) => {
@@ -327,11 +331,7 @@ async fn delete_webhook(http: &Client, base_url: &str) -> Result<(), String> {
 
 /// Process an incoming Telegram message from a webhook.
 /// Called by the axum route handler.
-pub async fn process_webhook_message(
-    ctx: &ChannelContext,
-    msg: &Message,
-    http: &Client,
-) {
+pub async fn process_webhook_message(ctx: &ChannelContext, msg: &Message, http: &Client) {
     let text = match &msg.text {
         Some(t) => t,
         None => return,
@@ -400,9 +400,15 @@ pub async fn process_webhook_message(
     let mission_id = ctx.channel.mission_id;
 
     tokio::spawn(async move {
-        if let Err(e) =
-            stream_response(events_rx, &http_clone, &bot_token, chat_id, reply_to, mission_id)
-                .await
+        if let Err(e) = stream_response(
+            events_rx,
+            &http_clone,
+            &bot_token,
+            chat_id,
+            reply_to,
+            mission_id,
+        )
+        .await
         {
             tracing::warn!(
                 "Failed to stream Telegram reply for mission {}: {}",
@@ -506,9 +512,11 @@ async fn stream_response(
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
             // If we sent a partial message, finalize it
-            if sent_message_id.is_some() && !accumulated_text.is_empty() {
-                let final_text = format!("{}...\n\n_(timed out)_", accumulated_text);
-                let _ = edit_message(http, &base_url, chat_id, sent_message_id.unwrap(), &final_text).await;
+            if let Some(msg_id) = sent_message_id {
+                if !accumulated_text.is_empty() {
+                    let final_text = format!("{}...\n\n_(timed out)_", accumulated_text);
+                    let _ = edit_message(http, &base_url, chat_id, msg_id, &final_text).await;
+                }
             }
             return Err("Timeout waiting for agent response".to_string());
         }
@@ -523,7 +531,14 @@ async fn stream_response(
                     }) if mid == mission_id => {
                         accumulated_text = content;
 
-                        if sent_message_id.is_none() {
+                        if let Some(msg_id) = sent_message_id {
+                            if last_edit.elapsed() >= edit_interval {
+                                // Throttled edit
+                                let display = truncate_for_telegram(&accumulated_text);
+                                let _ = edit_message(http, &base_url, chat_id, msg_id, &display).await;
+                                last_edit = tokio::time::Instant::now();
+                            }
+                        } else {
                             // Send initial message
                             match send_message(http, &base_url, chat_id, &accumulated_text, Some(reply_to)).await {
                                 Ok(msg_id) => {
@@ -534,11 +549,6 @@ async fn stream_response(
                                     tracing::warn!("Failed to send initial Telegram message: {}", e);
                                 }
                             }
-                        } else if last_edit.elapsed() >= edit_interval {
-                            // Throttled edit
-                            let display = truncate_for_telegram(&accumulated_text);
-                            let _ = edit_message(http, &base_url, chat_id, sent_message_id.unwrap(), &display).await;
-                            last_edit = tokio::time::Instant::now();
                         }
                     }
                     Ok(AgentEvent::AssistantMessage {

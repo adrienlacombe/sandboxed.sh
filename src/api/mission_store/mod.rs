@@ -730,10 +730,7 @@ pub trait MissionStore: Send + Sync {
     }
 
     /// Update a Telegram channel.
-    async fn update_telegram_channel(
-        &self,
-        channel: TelegramChannel,
-    ) -> Result<(), String> {
+    async fn update_telegram_channel(&self, channel: TelegramChannel) -> Result<(), String> {
         let _ = channel;
         Err("Telegram channels not supported by this store".to_string())
     }
