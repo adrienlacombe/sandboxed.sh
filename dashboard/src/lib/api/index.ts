@@ -147,3 +147,16 @@ export {
   getAutomationExecutions,
   getMissionAutomationExecutions,
 } from "./automations";
+
+// Telegram
+export {
+  type TelegramTriggerMode,
+  type TelegramChannel,
+  type CreateTelegramChannelInput,
+  type UpdateTelegramChannelInput,
+  listTelegramChannels,
+  createTelegramChannel,
+  updateTelegramChannel,
+  deleteTelegramChannel,
+  listAssistantMissions,
+} from "./telegram";
