@@ -210,6 +210,7 @@ CREATE TABLE IF NOT EXISTS telegram_channels (
     trigger_mode TEXT NOT NULL DEFAULT 'direct_message',
     active INTEGER NOT NULL DEFAULT 1,
     webhook_secret TEXT,
+    instructions TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     FOREIGN KEY (mission_id) REFERENCES missions(id) ON DELETE CASCADE
@@ -722,6 +723,22 @@ impl SqliteMissionStore {
                 tracing::info!("Running migration: adding 'webhook_secret' column to telegram_channels");
                 conn.execute("ALTER TABLE telegram_channels ADD COLUMN webhook_secret TEXT", [])
                     .map_err(|e| format!("Failed to add webhook_secret column: {}", e))?;
+            }
+            // Add instructions column if missing (ignore "duplicate column" from concurrent init)
+            let has_instructions: bool = conn
+                .prepare("SELECT 1 FROM pragma_table_info('telegram_channels') WHERE name='instructions'")
+                .map_err(|e| format!("Failed to check for instructions column: {}", e))?
+                .exists([])
+                .map_err(|e| format!("Failed to query pragma_table_info: {}", e))?;
+            if !has_instructions {
+                tracing::info!("Running migration: adding 'instructions' column to telegram_channels");
+                match conn.execute("ALTER TABLE telegram_channels ADD COLUMN instructions TEXT", []) {
+                    Ok(_) => {}
+                    Err(e) if e.to_string().contains("duplicate column") => {
+                        tracing::debug!("instructions column already exists (concurrent migration)");
+                    }
+                    Err(e) => return Err(format!("Failed to add instructions column: {}", e)),
+                }
             }
         }
 
@@ -2791,6 +2808,83 @@ impl MissionStore for SqliteMissionStore {
         .map_err(|e| format!("Task join error: {}", e))?
     }
 
+    async fn update_mission_mode(&self, id: Uuid, mode: MissionMode) -> Result<(), String> {
+        let conn = self.conn.clone();
+        let id_str = id.to_string();
+        let mode_str = serde_json::to_value(&mode)
+            .ok()
+            .and_then(|v| v.as_str().map(|s| s.to_string()))
+            .unwrap_or_else(|| "task".to_string());
+        let now = now_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "UPDATE missions SET mission_mode = ?1, updated_at = ?2 WHERE id = ?3",
+                params![mode_str, now, id_str],
+            )
+            .map_err(|e| e.to_string())?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| format!("Task join error: {}", e))?
+    }
+
+    async fn list_assistant_missions(&self) -> Result<Vec<Mission>, String> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, status, title, workspace_id, agent, backend, created_at, updated_at, mission_mode, short_description
+                     FROM missions WHERE mission_mode = 'assistant' ORDER BY updated_at DESC",
+                )
+                .map_err(|e| e.to_string())?;
+            let missions = stmt
+                .query_map([], |row| {
+                    let id_str: String = row.get(0).unwrap_or_default();
+                    let status_str: String = row.get(1).unwrap_or_else(|_| "pending".to_string());
+                    let workspace_id_str: String = row.get(3).unwrap_or_default();
+                    let mode_str: String = row.get(8).unwrap_or_else(|_| "task".to_string());
+                    Ok(Mission {
+                        id: Uuid::parse_str(&id_str).unwrap_or_default(),
+                        status: serde_json::from_value(serde_json::Value::String(status_str))
+                            .unwrap_or(MissionStatus::Pending),
+                        title: row.get(2).unwrap_or_default(),
+                        short_description: row.get(9).unwrap_or_default(),
+                        metadata_updated_at: None,
+                        metadata_source: None,
+                        metadata_model: None,
+                        metadata_version: None,
+                        workspace_id: Uuid::parse_str(&workspace_id_str).unwrap_or_default(),
+                        workspace_name: None,
+                        agent: row.get(4).unwrap_or_default(),
+                        model_override: None,
+                        model_effort: None,
+                        backend: row.get(5).unwrap_or_else(|_| "claudecode".to_string()),
+                        config_profile: None,
+                        history: vec![],
+                        created_at: row.get(6).unwrap_or_default(),
+                        updated_at: row.get(7).unwrap_or_default(),
+                        interrupted_at: None,
+                        resumable: false,
+                        desktop_sessions: vec![],
+                        session_id: None,
+                        terminal_reason: None,
+                        parent_mission_id: None,
+                        working_directory: None,
+                        mission_mode: serde_json::from_value(serde_json::Value::String(mode_str))
+                            .unwrap_or_default(),
+                    })
+                })
+                .map_err(|e| e.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?;
+            Ok(missions)
+        })
+        .await
+        .map_err(|e| format!("Task join error: {}", e))?
+    }
+
     // === Telegram Channel methods ===
 
     async fn create_telegram_channel(
@@ -2809,8 +2903,8 @@ impl MissionStore for SqliteMissionStore {
         tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
             conn.execute(
-                "INSERT INTO telegram_channels (id, mission_id, bot_token, bot_username, allowed_chat_ids, trigger_mode, active, webhook_secret, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                "INSERT INTO telegram_channels (id, mission_id, bot_token, bot_username, allowed_chat_ids, trigger_mode, active, webhook_secret, instructions, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                 params![
                     c.id.to_string(),
                     c.mission_id.to_string(),
@@ -2820,6 +2914,7 @@ impl MissionStore for SqliteMissionStore {
                     trigger_mode_str,
                     c.active as i32,
                     c.webhook_secret,
+                    c.instructions,
                     c.created_at,
                     c.updated_at,
                 ],
@@ -2839,7 +2934,7 @@ impl MissionStore for SqliteMissionStore {
         tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
             conn.query_row(
-                "SELECT id, mission_id, bot_token, bot_username, allowed_chat_ids, trigger_mode, active, webhook_secret, created_at, updated_at
+                "SELECT id, mission_id, bot_token, bot_username, allowed_chat_ids, trigger_mode, active, webhook_secret, instructions, created_at, updated_at
                  FROM telegram_channels WHERE id = ?1",
                 params![id_str],
                 |row| Ok(row_to_telegram_channel(row)),
@@ -2861,7 +2956,7 @@ impl MissionStore for SqliteMissionStore {
             let conn = conn.blocking_lock();
             let mut stmt = conn
                 .prepare(
-                    "SELECT id, mission_id, bot_token, bot_username, allowed_chat_ids, trigger_mode, active, created_at, updated_at
+                    "SELECT id, mission_id, bot_token, bot_username, allowed_chat_ids, trigger_mode, active, webhook_secret, instructions, created_at, updated_at
                      FROM telegram_channels WHERE mission_id = ?1 ORDER BY created_at DESC",
                 )
                 .map_err(|e| e.to_string())?;
@@ -2882,7 +2977,7 @@ impl MissionStore for SqliteMissionStore {
             let conn = conn.blocking_lock();
             let mut stmt = conn
                 .prepare(
-                    "SELECT id, mission_id, bot_token, bot_username, allowed_chat_ids, trigger_mode, active, created_at, updated_at
+                    "SELECT id, mission_id, bot_token, bot_username, allowed_chat_ids, trigger_mode, active, webhook_secret, instructions, created_at, updated_at
                      FROM telegram_channels WHERE active = 1",
                 )
                 .map_err(|e| e.to_string())?;
@@ -2909,7 +3004,7 @@ impl MissionStore for SqliteMissionStore {
         tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
             conn.execute(
-                "UPDATE telegram_channels SET bot_token = ?1, bot_username = ?2, allowed_chat_ids = ?3, trigger_mode = ?4, active = ?5, webhook_secret = ?6, updated_at = ?7 WHERE id = ?8",
+                "UPDATE telegram_channels SET bot_token = ?1, bot_username = ?2, allowed_chat_ids = ?3, trigger_mode = ?4, active = ?5, webhook_secret = ?6, instructions = ?7, updated_at = ?8 WHERE id = ?9",
                 params![
                     channel.bot_token,
                     channel.bot_username,
@@ -2917,6 +3012,7 @@ impl MissionStore for SqliteMissionStore {
                     trigger_mode_str,
                     channel.active as i32,
                     channel.webhook_secret,
+                    channel.instructions,
                     channel.updated_at,
                     channel.id.to_string(),
                 ],
@@ -2944,6 +3040,10 @@ impl MissionStore for SqliteMissionStore {
 }
 
 /// Parse a Telegram channel from a SQLite row.
+/// Parse a Telegram channel from a SQLite row.
+/// Column order: id(0), mission_id(1), bot_token(2), bot_username(3),
+///   allowed_chat_ids(4), trigger_mode(5), active(6), webhook_secret(7),
+///   instructions(8), created_at(9), updated_at(10)
 fn row_to_telegram_channel(row: &rusqlite::Row<'_>) -> TelegramChannel {
     let id_str: String = row.get(0).unwrap_or_default();
     let mission_id_str: String = row.get(1).unwrap_or_default();
@@ -2960,8 +3060,9 @@ fn row_to_telegram_channel(row: &rusqlite::Row<'_>) -> TelegramChannel {
             .unwrap_or_default(),
         active: row.get::<_, i32>(6).unwrap_or(0) != 0,
         webhook_secret: row.get(7).unwrap_or_default(),
-        created_at: row.get(8).unwrap_or_default(),
-        updated_at: row.get(9).unwrap_or_default(),
+        instructions: row.get(8).unwrap_or_default(),
+        created_at: row.get(9).unwrap_or_default(),
+        updated_at: row.get(10).unwrap_or_default(),
     }
 }
 

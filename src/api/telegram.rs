@@ -357,10 +357,18 @@ pub async fn process_webhook_message(
 
     let clean_text = strip_bot_mention(text, &ctx.bot_username);
 
-    let content = format!(
-        "[Telegram from {} in chat {}] {}",
-        sender_name, msg.chat.id, clean_text
-    );
+    // Build message content with optional system instructions
+    let content = if let Some(ref instructions) = ctx.channel.instructions {
+        format!(
+            "[Telegram from {} in chat {}] [Instructions: {}] {}",
+            sender_name, msg.chat.id, instructions, clean_text
+        )
+    } else {
+        format!(
+            "[Telegram from {} in chat {}] {}",
+            sender_name, msg.chat.id, clean_text
+        )
+    };
 
     tracing::info!(
         "Telegram webhook message for mission {} from {}: {}",

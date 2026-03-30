@@ -339,7 +339,8 @@ pub struct TelegramChannel {
     pub id: Uuid,
     /// Mission this channel is connected to
     pub mission_id: Uuid,
-    /// Bot token for the Telegram Bot API
+    /// Bot token for the Telegram Bot API (never exposed in API responses)
+    #[serde(skip_serializing)]
     pub bot_token: String,
     /// Optional bot username (e.g. "ana_bot")
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -355,6 +356,10 @@ pub struct TelegramChannel {
     /// Secret token for Telegram webhook verification
     #[serde(skip_serializing)]
     pub webhook_secret: Option<String>,
+    /// System instructions prepended to every Telegram message for this channel.
+    /// Use this to customize assistant behavior (e.g. "Don't use markdown formatting").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -680,6 +685,17 @@ pub trait MissionStore: Send + Sync {
     ) -> Result<u32, String> {
         let _ = (mission_id, success, error);
         Ok(0)
+    }
+
+    /// Update the mission mode (Task/Assistant).
+    async fn update_mission_mode(&self, id: Uuid, mode: MissionMode) -> Result<(), String> {
+        let _ = (id, mode);
+        Err("Not supported".to_string())
+    }
+
+    /// List all missions in Assistant mode.
+    async fn list_assistant_missions(&self) -> Result<Vec<Mission>, String> {
+        Ok(vec![])
     }
 
     // === Telegram Channel methods ===

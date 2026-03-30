@@ -476,6 +476,21 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
     // Start deferred proxy queue worker.
     deferred_proxy_api::start_worker(Arc::clone(&state));
 
+    // Eagerly boot the default user's control session so Telegram webhooks
+    // are re-registered immediately on server start (rather than waiting
+    // for the first authenticated API call).
+    {
+        let state_clone = Arc::clone(&state);
+        tokio::spawn(async move {
+            let default_user = super::auth::AuthUser {
+                id: "default".to_string(),
+                username: "default".to_string(),
+            };
+            let _ = state_clone.control.get_or_spawn(&default_user).await;
+            tracing::info!("Eagerly booted default control session (Telegram webhooks registered)");
+        });
+    }
+
     // Fetch model catalog from provider APIs in background
     {
         let catalog = Arc::clone(&state.model_catalog);
@@ -651,6 +666,11 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         .route(
             "/api/control/missions/:id/automation-executions",
             get(control::get_mission_automation_executions),
+        )
+        // Assistant missions
+        .route(
+            "/api/control/assistants",
+            get(control::list_assistant_missions),
         )
         // Telegram channel endpoints
         .route(

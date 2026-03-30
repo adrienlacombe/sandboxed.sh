@@ -6097,9 +6097,14 @@ async fn control_actor_loop(
                             }
                         }
 
-                        // Case 2: Target differs from main AND main is running → start parallel
+                        // Case 2: Target differs from main → start parallel
+                        // When target_mission_id is explicitly set (e.g. from Telegram),
+                        // always use parallel execution to avoid hijacking the main session.
+                        // When the target is merely inferred (current differs from running),
+                        // only start parallel when main is busy.
+                        let force_parallel = target_mission_id.is_some(); // explicit target (e.g. Telegram)
                         if let Some(tid) = effective_target {
-                            if !target_is_main && main_is_running {
+                            if !target_is_main && (main_is_running || force_parallel) {
                                 // Check capacity
                                 let parallel_running = parallel_runners.values().filter(|r| r.is_running()).count();
                                 let total_running = parallel_running + 1; // +1 for main
@@ -9394,6 +9399,24 @@ pub async fn webhook_receiver(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Assistant missions
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// List all missions with MissionMode::Assistant.
+pub async fn list_assistant_missions(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+) -> Result<Json<Vec<super::mission_store::Mission>>, (StatusCode, String)> {
+    let control = control_for_user(&state, &user).await;
+    let missions = control
+        .mission_store
+        .list_assistant_missions()
+        .await
+        .map_err(internal_error)?;
+    Ok(Json(missions))
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Telegram Channel endpoints
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -9419,12 +9442,12 @@ pub async fn create_telegram_channel(
     Path(mission_id): Path<Uuid>,
     Json(req): Json<CreateTelegramChannelRequest>,
 ) -> Result<Json<super::mission_store::TelegramChannel>, (StatusCode, String)> {
-    use super::mission_store::{now_string, TelegramChannel, TelegramTriggerMode};
+    use super::mission_store::{now_string, MissionMode, TelegramChannel, TelegramTriggerMode};
 
     let control = control_for_user(&state, &user).await;
 
     // Verify mission exists
-    let _mission = control
+    let mission = control
         .mission_store
         .get_mission(mission_id)
         .await
@@ -9435,6 +9458,19 @@ pub async fn create_telegram_channel(
                 format!("Mission {} not found", mission_id),
             )
         })?;
+
+    // Auto-set mission to Assistant mode when adding a Telegram channel
+    if mission.mission_mode != MissionMode::Assistant {
+        if let Err(e) = control
+            .mission_store
+            .update_mission_mode(mission_id, MissionMode::Assistant)
+            .await
+        {
+            tracing::warn!("Failed to set assistant mode on mission {}: {}", mission_id, e);
+        } else {
+            tracing::info!("Auto-set mission {} to Assistant mode (Telegram channel attached)", mission_id);
+        }
+    }
 
     let now = now_string();
     let webhook_secret = Uuid::new_v4().to_string().replace('-', "");
@@ -9447,6 +9483,7 @@ pub async fn create_telegram_channel(
         trigger_mode: req.trigger_mode.unwrap_or(TelegramTriggerMode::All),
         active: true,
         webhook_secret: Some(webhook_secret),
+        instructions: req.instructions,
         created_at: now.clone(),
         updated_at: now,
     };
@@ -9488,6 +9525,9 @@ pub struct CreateTelegramChannelRequest {
     pub allowed_chat_ids: Option<Vec<i64>>,
     #[serde(default)]
     pub trigger_mode: Option<super::mission_store::TelegramTriggerMode>,
+    /// System instructions for the assistant (e.g. "Don't use markdown formatting")
+    #[serde(default)]
+    pub instructions: Option<String>,
 }
 
 /// Delete a Telegram channel.
