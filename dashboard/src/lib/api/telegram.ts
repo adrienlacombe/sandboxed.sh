@@ -80,3 +80,14 @@ export async function listAssistantMissions(): Promise<unknown[]> {
     "Failed to fetch assistant missions"
   );
 }
+
+export async function setMissionMode(
+  missionId: string,
+  mode: "task" | "assistant"
+): Promise<void> {
+  await apiPost(
+    `/api/control/missions/${missionId}/mode`,
+    { mode },
+    "Failed to set mission mode"
+  );
+}

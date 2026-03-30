@@ -9,6 +9,7 @@ import {
   createTelegramChannel,
   updateTelegramChannel,
   deleteTelegramChannel,
+  setMissionMode,
   type TelegramChannel,
   type TelegramTriggerMode,
 } from '@/lib/api';
@@ -23,6 +24,7 @@ import {
   ChevronDown,
   ChevronUp,
   Settings,
+  Undo2,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { toast } from '@/components/toast';
@@ -35,7 +37,7 @@ const TRIGGER_MODE_LABELS: Record<TelegramTriggerMode, string> = {
 };
 
 export default function TelegramSettingsPage() {
-  const { data: missions = [] } = useSWR('missions', listMissions, {
+  const { data: missions = [], mutate: mutateMissions } = useSWR('missions', listMissions, {
     revalidateOnFocus: false,
   });
 
@@ -201,6 +203,18 @@ export default function TelegramSettingsPage() {
   const getMissionTitle = (missionId: string) => {
     const m = allMissions.find((m: Mission) => m.id === missionId);
     return m?.title || missionId.slice(0, 8) + '...';
+  };
+
+  const handleRevertToTask = async (missionId: string) => {
+    const title = getMissionTitle(missionId);
+    if (!confirm(`Revert "${title}" from assistant back to task mode?`)) return;
+    try {
+      await setMissionMode(missionId, 'task');
+      await mutateMissions();
+      toast.success(`"${title}" reverted to task mode`);
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : 'Failed to change mission mode');
+    }
   };
 
   // ESC to close dialogs
@@ -407,6 +421,44 @@ export default function TelegramSettingsPage() {
                 )}
               </div>
             ))}
+          </div>
+        )}
+
+        {/* Assistant missions that can be reverted */}
+        {assistantMissions.length > 0 && (
+          <div>
+            <h2 className="text-sm font-medium text-white/60 mb-3">Assistant Missions</h2>
+            <div className="space-y-2">
+              {assistantMissions.map((m: Mission) => {
+                const missionChannels = channelsByMission[m.id] || [];
+                return (
+                  <div
+                    key={m.id}
+                    className="flex items-center gap-3 rounded-xl border border-white/[0.06] bg-white/[0.02] p-3"
+                  >
+                    <span className="inline-flex items-center rounded bg-indigo-500/10 border border-indigo-500/20 px-1.5 py-0.5 text-[10px] font-medium text-indigo-400 shrink-0">
+                      Assistant
+                    </span>
+                    <div className="flex-1 min-w-0">
+                      <p className="text-sm text-white truncate">
+                        {m.title || m.id.slice(0, 8) + '...'}
+                      </p>
+                      <p className="text-[10px] text-white/40">
+                        {missionChannels.length} channel{missionChannels.length !== 1 ? 's' : ''}
+                      </p>
+                    </div>
+                    <button
+                      onClick={() => handleRevertToTask(m.id)}
+                      className="flex items-center gap-1.5 px-3 py-1.5 text-xs text-white/50 hover:text-white hover:bg-white/[0.06] rounded-lg transition-colors"
+                      title="Revert to task mode"
+                    >
+                      <Undo2 className="h-3.5 w-3.5" />
+                      Revert to Task
+                    </button>
+                  </div>
+                );
+              })}
+            </div>
           </div>
         )}
 

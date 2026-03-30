@@ -159,4 +159,5 @@ export {
   updateTelegramChannel,
   deleteTelegramChannel,
   listAssistantMissions,
+  setMissionMode,
 } from "./telegram";

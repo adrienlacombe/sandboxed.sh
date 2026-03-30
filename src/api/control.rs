@@ -9416,6 +9416,41 @@ pub async fn list_assistant_missions(
     Ok(Json(missions))
 }
 
+/// Set mission mode (task or assistant).
+pub async fn set_mission_mode(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    Path(id): Path<Uuid>,
+    Json(req): Json<SetMissionModeRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    use super::mission_store::MissionMode;
+
+    let mode = match req.mode.as_str() {
+        "task" => MissionMode::Task,
+        "assistant" => MissionMode::Assistant,
+        other => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("Invalid mission mode: {other}. Must be 'task' or 'assistant'."),
+            ));
+        }
+    };
+
+    let control = control_for_user(&state, &user).await;
+    control
+        .mission_store
+        .update_mission_mode(id, mode)
+        .await
+        .map_err(internal_error)?;
+
+    Ok(ok_json())
+}
+
+#[derive(Deserialize)]
+pub struct SetMissionModeRequest {
+    pub mode: String,
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Telegram Channel endpoints
 // ─────────────────────────────────────────────────────────────────────────────

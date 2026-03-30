@@ -617,6 +617,10 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
             post(control::set_mission_title),
         )
         .route(
+            "/api/control/missions/:id/mode",
+            post(control::set_mission_mode),
+        )
+        .route(
             "/api/control/missions/:id/cancel",
             post(control::cancel_mission),
         )
