@@ -10,7 +10,9 @@
 //! 4. A response task streams `TextDelta` events back via `editMessageText`
 
 use crate::api::control::{AgentEvent, ControlCommand};
-use crate::api::mission_store::{MissionStore, TelegramChannel, TelegramTriggerMode};
+use crate::api::mission_store::{
+    MissionMode, MissionStore, TelegramChannel, TelegramChatMission, TelegramTriggerMode,
+};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -35,6 +37,7 @@ pub struct ChannelContext {
     pub bot_username: String,
     pub cmd_tx: mpsc::Sender<ControlCommand>,
     pub events_tx: broadcast::Sender<AgentEvent>,
+    pub mission_store: Arc<dyn MissionStore>,
 }
 
 impl Default for TelegramBridge {
@@ -57,6 +60,7 @@ impl TelegramBridge {
         channel: TelegramChannel,
         cmd_tx: mpsc::Sender<ControlCommand>,
         events_tx: broadcast::Sender<AgentEvent>,
+        mission_store: Arc<dyn MissionStore>,
         public_base_url: &str,
     ) {
         self.stop_channel(channel.id).await;
@@ -95,11 +99,16 @@ impl TelegramBridge {
             return;
         }
 
+        let mode_label = if channel.auto_create_missions {
+            "auto-create".to_string()
+        } else {
+            format!("mission: {}", channel.mission_id)
+        };
         tracing::info!(
-            "Registered Telegram webhook for channel {} (bot: @{}, mission: {}, url: {})",
+            "Registered Telegram webhook for channel {} (bot: @{}, {}, url: {})",
             channel.id,
             bot_username,
-            channel.mission_id,
+            mode_label,
             webhook_url,
         );
 
@@ -108,6 +117,7 @@ impl TelegramBridge {
             bot_username,
             cmd_tx,
             events_tx,
+            mission_store,
         };
 
         self.active_channels
@@ -168,8 +178,14 @@ impl TelegramBridge {
                     );
                 }
                 for channel in channels {
-                    self.start_channel(channel, cmd_tx.clone(), events_tx.clone(), public_base_url)
-                        .await;
+                    self.start_channel(
+                        channel,
+                        cmd_tx.clone(),
+                        events_tx.clone(),
+                        store.clone(),
+                        public_base_url,
+                    )
+                    .await;
                 }
             }
             Err(e) => {
@@ -329,6 +345,98 @@ async fn delete_webhook(http: &Client, base_url: &str) -> Result<(), String> {
 // Message processing (used by webhook handler)
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Resolve or auto-create a mission for a Telegram chat.
+async fn resolve_or_create_mission(
+    ctx: &ChannelContext,
+    chat_id: i64,
+    sender_name: &str,
+) -> Option<Uuid> {
+    // 1. Look up existing mapping
+    if let Ok(Some(mapping)) = ctx
+        .mission_store
+        .get_telegram_chat_mission(ctx.channel.id, chat_id)
+        .await
+    {
+        return Some(mapping.mission_id);
+    }
+
+    // 2. Create a new mission via ControlCommand
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let title = Some(format!("Telegram: {}", sender_name));
+
+    let _ = ctx
+        .cmd_tx
+        .send(ControlCommand::CreateMission {
+            title,
+            workspace_id: ctx.channel.default_workspace_id,
+            agent: ctx.channel.default_agent.clone(),
+            model_override: ctx.channel.default_model_override.clone(),
+            model_effort: ctx.channel.default_model_effort.clone(),
+            backend: ctx.channel.default_backend.clone(),
+            config_profile: ctx.channel.default_config_profile.clone(),
+            parent_mission_id: None,
+            working_directory: None,
+            respond: tx,
+        })
+        .await;
+
+    match rx.await {
+        Ok(Ok(mission)) => {
+            let mission_id = mission.id;
+
+            // Set to assistant mode
+            let _ = ctx
+                .mission_store
+                .update_mission_mode(mission_id, MissionMode::Assistant)
+                .await;
+
+            // Store the mapping
+            let mapping = TelegramChatMission {
+                id: Uuid::new_v4(),
+                channel_id: ctx.channel.id,
+                chat_id,
+                mission_id,
+                chat_title: None,
+                created_at: crate::api::mission_store::now_string(),
+            };
+            // Handle race condition: if another message already created the mapping, look it up
+            match ctx.mission_store.create_telegram_chat_mission(mapping).await {
+                Ok(_) => {}
+                Err(e) if e.contains("UNIQUE constraint") => {
+                    // Another concurrent message already created the mapping
+                    if let Ok(Some(existing)) = ctx
+                        .mission_store
+                        .get_telegram_chat_mission(ctx.channel.id, chat_id)
+                        .await
+                    {
+                        return Some(existing.mission_id);
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("Failed to store chat-mission mapping: {}", e);
+                }
+            }
+
+            tracing::info!(
+                "Auto-created mission {} for Telegram chat {} on channel {}",
+                mission_id,
+                chat_id,
+                ctx.channel.id
+            );
+
+            Some(mission_id)
+        }
+        _ => {
+            tracing::error!(
+                "Failed to create mission for chat {} on channel {}",
+                chat_id,
+                ctx.channel.id
+            );
+            None
+        }
+    }
+}
+
 /// Process an incoming Telegram message from a webhook.
 /// Called by the axum route handler.
 pub async fn process_webhook_message(ctx: &ChannelContext, msg: &Message, http: &Client) {
@@ -357,6 +465,27 @@ pub async fn process_webhook_message(ctx: &ChannelContext, msg: &Message, http: 
 
     let clean_text = strip_bot_mention(text, &ctx.bot_username);
 
+    // Resolve target mission: auto-create per chat or legacy single-mission
+    let target_mission_id = if ctx.channel.auto_create_missions {
+        match resolve_or_create_mission(ctx, msg.chat.id, &sender_name).await {
+            Some(id) => id,
+            None => {
+                let base_url = format!("https://api.telegram.org/bot{}", ctx.channel.bot_token);
+                let _ = send_message(
+                    http,
+                    &base_url,
+                    msg.chat.id,
+                    "Sorry, I couldn't start a new conversation. Please try again.",
+                    Some(msg.message_id),
+                )
+                .await;
+                return;
+            }
+        }
+    } else {
+        ctx.channel.mission_id
+    };
+
     // Build message content with optional system instructions
     let content = if let Some(ref instructions) = ctx.channel.instructions {
         format!(
@@ -372,7 +501,7 @@ pub async fn process_webhook_message(ctx: &ChannelContext, msg: &Message, http: 
 
     tracing::info!(
         "Telegram webhook message for mission {} from {}: {}",
-        ctx.channel.mission_id,
+        target_mission_id,
         sender_name,
         &clean_text[..clean_text.len().min(100)]
     );
@@ -386,7 +515,7 @@ pub async fn process_webhook_message(ctx: &ChannelContext, msg: &Message, http: 
             id: msg_id,
             content,
             agent: None,
-            target_mission_id: Some(ctx.channel.mission_id),
+            target_mission_id: Some(target_mission_id),
             respond: queued_tx,
         })
         .await;
@@ -397,7 +526,7 @@ pub async fn process_webhook_message(ctx: &ChannelContext, msg: &Message, http: 
     let bot_token = ctx.channel.bot_token.clone();
     let chat_id = msg.chat.id;
     let reply_to = msg.message_id;
-    let mission_id = ctx.channel.mission_id;
+    let mission_id = target_mission_id;
 
     tokio::spawn(async move {
         if let Err(e) = stream_response(

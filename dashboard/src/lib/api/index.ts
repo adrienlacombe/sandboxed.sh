@@ -152,12 +152,17 @@ export {
 export {
   type TelegramTriggerMode,
   type TelegramChannel,
+  type TelegramChatMission,
   type CreateTelegramChannelInput,
+  type CreateTelegramBotInput,
   type UpdateTelegramChannelInput,
   listTelegramChannels,
   createTelegramChannel,
   updateTelegramChannel,
   deleteTelegramChannel,
+  listTelegramBots,
+  createTelegramBot,
+  listBotChats,
   listAssistantMissions,
   setMissionMode,
 } from "./telegram";

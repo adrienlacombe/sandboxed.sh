@@ -9526,6 +9526,13 @@ pub async fn create_telegram_channel(
         active: true,
         webhook_secret: Some(webhook_secret),
         instructions: req.instructions,
+        auto_create_missions: false,
+        default_backend: None,
+        default_model_override: None,
+        default_model_effort: None,
+        default_workspace_id: None,
+        default_config_profile: None,
+        default_agent: None,
         created_at: now.clone(),
         updated_at: now,
     };
@@ -9545,6 +9552,7 @@ pub async fn create_telegram_channel(
             created.clone(),
             control.cmd_tx.clone(),
             control.events_tx.clone(),
+            control.mission_store.clone(),
             &public_url,
         )
         .await;
@@ -9639,6 +9647,7 @@ pub async fn toggle_telegram_channel(
                 channel.clone(),
                 control.cmd_tx.clone(),
                 control.events_tx.clone(),
+                control.mission_store.clone(),
                 &public_url,
             )
             .await;
@@ -9652,6 +9661,124 @@ pub async fn toggle_telegram_channel(
 #[derive(Deserialize)]
 pub struct ToggleTelegramChannelRequest {
     pub active: bool,
+}
+
+// === Standalone Telegram Bot endpoints (auto-create missions per chat) ===
+
+/// Create a standalone Telegram bot configuration (auto-creates missions per chat).
+pub async fn create_telegram_bot(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    Json(req): Json<CreateTelegramBotRequest>,
+) -> Result<Json<super::mission_store::TelegramChannel>, (StatusCode, String)> {
+    use super::mission_store::{now_string, TelegramChannel, TelegramTriggerMode};
+
+    let control = control_for_user(&state, &user).await;
+
+    let now = now_string();
+    let webhook_secret = Uuid::new_v4().to_string().replace('-', "");
+    let channel = TelegramChannel {
+        id: Uuid::new_v4(),
+        // Sentinel UUID — not used for routing when auto_create_missions is true
+        mission_id: Uuid::nil(),
+        bot_token: req.bot_token,
+        bot_username: req.bot_username,
+        allowed_chat_ids: req.allowed_chat_ids.unwrap_or_default(),
+        trigger_mode: req.trigger_mode.unwrap_or(TelegramTriggerMode::All),
+        active: true,
+        webhook_secret: Some(webhook_secret),
+        instructions: req.instructions,
+        auto_create_missions: true,
+        default_backend: req.default_backend,
+        default_model_override: req.default_model_override,
+        default_model_effort: req.default_model_effort,
+        default_workspace_id: req.default_workspace_id,
+        default_config_profile: req.default_config_profile,
+        default_agent: req.default_agent,
+        created_at: now.clone(),
+        updated_at: now,
+    };
+
+    let created = control
+        .mission_store
+        .create_telegram_channel(channel)
+        .await
+        .map_err(internal_error)?;
+
+    // Register the webhook
+    let public_url = std::env::var("SANDBOXED_PUBLIC_URL")
+        .unwrap_or_else(|_| format!("http://{}:{}", state.config.host, state.config.port));
+    state
+        .telegram_bridge
+        .start_channel(
+            created.clone(),
+            control.cmd_tx.clone(),
+            control.events_tx.clone(),
+            control.mission_store.clone(),
+            &public_url,
+        )
+        .await;
+
+    tracing::info!(
+        "Created Telegram bot {} (auto-create missions)",
+        created.id
+    );
+
+    Ok(Json(created))
+}
+
+#[derive(Deserialize)]
+pub struct CreateTelegramBotRequest {
+    pub bot_token: String,
+    #[serde(default)]
+    pub bot_username: Option<String>,
+    #[serde(default)]
+    pub allowed_chat_ids: Option<Vec<i64>>,
+    #[serde(default)]
+    pub trigger_mode: Option<super::mission_store::TelegramTriggerMode>,
+    #[serde(default)]
+    pub instructions: Option<String>,
+    #[serde(default)]
+    pub default_backend: Option<String>,
+    #[serde(default)]
+    pub default_model_override: Option<String>,
+    #[serde(default)]
+    pub default_model_effort: Option<String>,
+    #[serde(default)]
+    pub default_workspace_id: Option<Uuid>,
+    #[serde(default)]
+    pub default_config_profile: Option<String>,
+    #[serde(default)]
+    pub default_agent: Option<String>,
+}
+
+/// List all Telegram bot configurations.
+pub async fn list_telegram_bots(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+) -> Result<Json<Vec<super::mission_store::TelegramChannel>>, (StatusCode, String)> {
+    let control = control_for_user(&state, &user).await;
+    let channels = control
+        .mission_store
+        .list_all_telegram_channels()
+        .await
+        .map_err(internal_error)?;
+    Ok(Json(channels))
+}
+
+/// List chat-to-mission mappings for a Telegram bot.
+pub async fn list_bot_chats(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    Path(channel_id): Path<Uuid>,
+) -> Result<Json<Vec<super::mission_store::TelegramChatMission>>, (StatusCode, String)> {
+    let control = control_for_user(&state, &user).await;
+    let mappings = control
+        .mission_store
+        .list_telegram_chat_missions(channel_id)
+        .await
+        .map_err(internal_error)?;
+    Ok(Json(mappings))
 }
 
 /// Telegram webhook receiver (unauthenticated — verified via secret token header).

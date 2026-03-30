@@ -3,16 +3,19 @@
 import { useState, useEffect } from 'react';
 import useSWR from 'swr';
 import {
-  listMissions,
-  type Mission,
-  listTelegramChannels,
-  createTelegramChannel,
+  listTelegramBots,
+  createTelegramBot,
   updateTelegramChannel,
   deleteTelegramChannel,
-  setMissionMode,
+  listBotChats,
+  listMissions,
+  type Mission,
   type TelegramChannel,
+  type TelegramChatMission,
   type TelegramTriggerMode,
+  type CreateTelegramBotInput,
 } from '@/lib/api';
+import { listBackends, listWorkspaces, type Backend, type Workspace } from '@/lib/api';
 import {
   MessageCircle,
   Plus,
@@ -24,7 +27,6 @@ import {
   ChevronDown,
   ChevronUp,
   Settings,
-  Undo2,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { toast } from '@/components/toast';
@@ -36,80 +38,88 @@ const TRIGGER_MODE_LABELS: Record<TelegramTriggerMode, string> = {
   direct_message: 'Direct messages only',
 };
 
+const BACKEND_LABELS: Record<string, string> = {
+  claudecode: 'Claude Code',
+  opencode: 'OpenCode',
+  codex: 'Codex',
+  gemini: 'Gemini',
+  amp: 'Amp',
+};
+
 export default function TelegramSettingsPage() {
-  const { data: missions = [], mutate: mutateMissions } = useSWR('missions', listMissions, {
+  const { data: bots = [], mutate: mutateBots } = useSWR('telegram-bots', listTelegramBots, {
+    revalidateOnFocus: false,
+  });
+  const { data: backends = [] } = useSWR('backends', listBackends, {
+    revalidateOnFocus: false,
+  });
+  const { data: workspaces = [] } = useSWR('workspaces', listWorkspaces, {
+    revalidateOnFocus: false,
+  });
+  const { data: missions = [] } = useSWR('missions', listMissions, {
     revalidateOnFocus: false,
   });
 
-  const assistantMissions = missions.filter(
-    (m: Mission) => m.mission_mode === 'assistant'
-  );
-  const allMissions = missions;
-
-  // Channel data keyed by mission ID
-  const [channelsByMission, setChannelsByMission] = useState<Record<string, TelegramChannel[]>>({});
-  const [loadingChannels, setLoadingChannels] = useState(true);
-  const [expandedMissions, setExpandedMissions] = useState<Set<string>>(new Set());
+  // Chat mappings keyed by bot ID
+  const [chatsByBot, setChatsByBot] = useState<Record<string, TelegramChatMission[]>>({});
+  const [expandedBots, setExpandedBots] = useState<Set<string>>(new Set());
+  const [loadingChats, setLoadingChats] = useState<Set<string>>(new Set());
 
   // Create dialog
   const [showCreateDialog, setShowCreateDialog] = useState(false);
-  const [createMissionId, setCreateMissionId] = useState('');
   const [createBotToken, setCreateBotToken] = useState('');
   const [createBotUsername, setCreateBotUsername] = useState('');
   const [createTriggerMode, setCreateTriggerMode] = useState<TelegramTriggerMode>('all');
   const [createInstructions, setCreateInstructions] = useState('');
   const [createAllowedChatIds, setCreateAllowedChatIds] = useState('');
+  const [createBackend, setCreateBackend] = useState('claudecode');
+  const [createModelOverride, setCreateModelOverride] = useState('');
+  const [createModelEffort, setCreateModelEffort] = useState('');
+  const [createWorkspaceId, setCreateWorkspaceId] = useState('');
+  const [createConfigProfile, setCreateConfigProfile] = useState('');
   const [creating, setCreating] = useState(false);
 
-  // Edit instructions dialog
-  const [editingChannel, setEditingChannel] = useState<TelegramChannel | null>(null);
+  // Edit dialog
+  const [editingBot, setEditingBot] = useState<TelegramChannel | null>(null);
   const [editInstructions, setEditInstructions] = useState('');
   const [editTriggerMode, setEditTriggerMode] = useState<TelegramTriggerMode>('all');
   const [saving, setSaving] = useState(false);
 
-  // Load channels for all missions that have them
-  useEffect(() => {
-    if (missions.length === 0) return;
+  const loadChats = async (botId: string) => {
+    if (chatsByBot[botId]) return; // already loaded
+    setLoadingChats((prev) => new Set(prev).add(botId));
+    try {
+      const chats = await listBotChats(botId);
+      setChatsByBot((prev) => ({ ...prev, [botId]: chats }));
+    } catch {
+      // ignore
+    } finally {
+      setLoadingChats((prev) => {
+        const next = new Set(prev);
+        next.delete(botId);
+        return next;
+      });
+    }
+  };
 
-    const loadAll = async () => {
-      setLoadingChannels(true);
-      const results: Record<string, TelegramChannel[]> = {};
-      // Load channels for assistant missions
-      const targets = assistantMissions.length > 0 ? assistantMissions : [];
-      await Promise.all(
-        targets.map(async (m: Mission) => {
-          try {
-            const channels = await listTelegramChannels(m.id);
-            if (channels.length > 0) {
-              results[m.id] = channels;
-            }
-          } catch {
-            // Mission may not have channels endpoint yet
-          }
-        })
-      );
-      setChannelsByMission(results);
-      setLoadingChannels(false);
-    };
-
-    loadAll();
-  }, [missions.length, assistantMissions.length]);
-
-  const allChannels = Object.entries(channelsByMission).flatMap(([missionId, channels]) =>
-    channels.map((ch) => ({ ...ch, missionId }))
-  );
+  const toggleExpand = (botId: string) => {
+    setExpandedBots((prev) => {
+      const next = new Set(prev);
+      if (next.has(botId)) {
+        next.delete(botId);
+      } else {
+        next.add(botId);
+        loadChats(botId);
+      }
+      return next;
+    });
+  };
 
   const handleCreate = async () => {
-    if (!createMissionId || !createBotToken.trim()) return;
+    if (!createBotToken.trim()) return;
     setCreating(true);
     try {
-      const input: {
-        bot_token: string;
-        bot_username?: string;
-        trigger_mode?: TelegramTriggerMode;
-        instructions?: string;
-        allowed_chat_ids?: number[];
-      } = {
+      const input: CreateTelegramBotInput = {
         bot_token: createBotToken.trim(),
       };
       if (createBotUsername.trim()) input.bot_username = createBotUsername.trim();
@@ -121,100 +131,79 @@ export default function TelegramSettingsPage() {
           .map((s) => parseInt(s.trim(), 10))
           .filter((n) => !isNaN(n));
       }
+      if (createBackend) input.default_backend = createBackend;
+      if (createModelOverride.trim()) input.default_model_override = createModelOverride.trim();
+      if (createModelEffort) input.default_model_effort = createModelEffort;
+      if (createWorkspaceId) input.default_workspace_id = createWorkspaceId;
+      if (createConfigProfile.trim()) input.default_config_profile = createConfigProfile.trim();
 
-      const channel = await createTelegramChannel(createMissionId, input);
-      setChannelsByMission((prev) => ({
-        ...prev,
-        [createMissionId]: [...(prev[createMissionId] || []), channel],
-      }));
+      const bot = await createTelegramBot(input);
+      await mutateBots();
       setShowCreateDialog(false);
       resetCreateForm();
-      toast.success(`Telegram channel created for @${channel.bot_username || 'bot'}`);
+      toast.success(`Bot @${bot.bot_username || 'bot'} created`);
     } catch (err) {
-      toast.error(err instanceof Error ? err.message : 'Failed to create channel');
+      toast.error(err instanceof Error ? err.message : 'Failed to create bot');
     } finally {
       setCreating(false);
     }
   };
 
-  const handleToggleActive = async (channel: TelegramChannel) => {
+  const handleToggleActive = async (bot: TelegramChannel) => {
     try {
-      const updated = await updateTelegramChannel(channel.id, {
-        active: !channel.active,
-      });
-      setChannelsByMission((prev) => ({
-        ...prev,
-        [channel.mission_id]: (prev[channel.mission_id] || []).map((ch) =>
-          ch.id === updated.id ? updated : ch
-        ),
-      }));
-      toast.success(updated.active ? 'Channel activated' : 'Channel deactivated');
+      await updateTelegramChannel(bot.id, { active: !bot.active });
+      await mutateBots();
+      toast.success(bot.active ? 'Bot deactivated' : 'Bot activated');
     } catch (err) {
-      toast.error(err instanceof Error ? err.message : 'Failed to toggle channel');
+      toast.error(err instanceof Error ? err.message : 'Failed to toggle bot');
     }
   };
 
-  const handleDelete = async (channel: TelegramChannel) => {
-    if (!confirm(`Delete Telegram channel @${channel.bot_username || channel.id.slice(0, 8)}?`)) return;
+  const handleDelete = async (bot: TelegramChannel) => {
+    if (!confirm(`Delete bot @${bot.bot_username || bot.id.slice(0, 8)}?`)) return;
     try {
-      await deleteTelegramChannel(channel.id);
-      setChannelsByMission((prev) => ({
-        ...prev,
-        [channel.mission_id]: (prev[channel.mission_id] || []).filter((ch) => ch.id !== channel.id),
-      }));
-      toast.success('Telegram channel deleted');
+      await deleteTelegramChannel(bot.id);
+      await mutateBots();
+      toast.success('Bot deleted');
     } catch (err) {
-      toast.error(err instanceof Error ? err.message : 'Failed to delete channel');
+      toast.error(err instanceof Error ? err.message : 'Failed to delete bot');
     }
   };
 
   const handleSaveEdit = async () => {
-    if (!editingChannel) return;
+    if (!editingBot) return;
     setSaving(true);
     try {
-      const updated = await updateTelegramChannel(editingChannel.id, {
+      await updateTelegramChannel(editingBot.id, {
         instructions: editInstructions.trim() || undefined,
         trigger_mode: editTriggerMode,
       });
-      setChannelsByMission((prev) => ({
-        ...prev,
-        [editingChannel.mission_id]: (prev[editingChannel.mission_id] || []).map((ch) =>
-          ch.id === updated.id ? updated : ch
-        ),
-      }));
-      setEditingChannel(null);
-      toast.success('Channel updated');
+      await mutateBots();
+      setEditingBot(null);
+      toast.success('Bot updated');
     } catch (err) {
-      toast.error(err instanceof Error ? err.message : 'Failed to update channel');
+      toast.error(err instanceof Error ? err.message : 'Failed to update bot');
     } finally {
       setSaving(false);
     }
   };
 
   const resetCreateForm = () => {
-    setCreateMissionId('');
     setCreateBotToken('');
     setCreateBotUsername('');
     setCreateTriggerMode('all');
     setCreateInstructions('');
     setCreateAllowedChatIds('');
+    setCreateBackend('claudecode');
+    setCreateModelOverride('');
+    setCreateModelEffort('');
+    setCreateWorkspaceId('');
+    setCreateConfigProfile('');
   };
 
   const getMissionTitle = (missionId: string) => {
-    const m = allMissions.find((m: Mission) => m.id === missionId);
+    const m = missions.find((m: Mission) => m.id === missionId);
     return m?.title || missionId.slice(0, 8) + '...';
-  };
-
-  const handleRevertToTask = async (missionId: string) => {
-    const title = getMissionTitle(missionId);
-    if (!confirm(`Revert "${title}" from assistant back to task mode?`)) return;
-    try {
-      await setMissionMode(missionId, 'task');
-      await mutateMissions();
-      toast.success(`"${title}" reverted to task mode`);
-    } catch (err) {
-      toast.error(err instanceof Error ? err.message : 'Failed to change mission mode');
-    }
   };
 
   // ESC to close dialogs
@@ -222,20 +211,12 @@ export default function TelegramSettingsPage() {
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
         if (showCreateDialog) setShowCreateDialog(false);
-        if (editingChannel) setEditingChannel(null);
+        if (editingBot) setEditingBot(null);
       }
     };
     document.addEventListener('keydown', handleKeyDown);
     return () => document.removeEventListener('keydown', handleKeyDown);
-  }, [showCreateDialog, editingChannel]);
-
-  if (loadingChannels && missions.length === 0) {
-    return (
-      <div className="flex items-center justify-center min-h-[calc(100vh-4rem)]">
-        <Loader className="h-8 w-8 animate-spin text-white/40" />
-      </div>
-    );
-  }
+  }, [showCreateDialog, editingBot]);
 
   return (
     <div className="flex-1 p-6 overflow-auto">
@@ -243,9 +224,9 @@ export default function TelegramSettingsPage() {
         {/* Header */}
         <div className="flex items-center justify-between">
           <div>
-            <h1 className="text-2xl font-semibold text-white mb-2">Telegram</h1>
+            <h1 className="text-2xl font-semibold text-white mb-2">Telegram Bots</h1>
             <p className="text-white/50">
-              Connect Telegram bots to assistant missions for conversational AI.
+              Configure Telegram bots that auto-create missions for each conversation.
             </p>
           </div>
           <button
@@ -253,32 +234,32 @@ export default function TelegramSettingsPage() {
             className="flex items-center gap-2 px-4 py-2 text-sm font-medium text-white bg-indigo-500 hover:bg-indigo-600 rounded-lg transition-colors"
           >
             <Plus className="h-4 w-4" />
-            Add Channel
+            Add Bot
           </button>
         </div>
 
-        {/* Channels list */}
-        {allChannels.length === 0 ? (
+        {/* Bot list */}
+        {bots.length === 0 ? (
           <div className="rounded-xl border border-white/[0.06] bg-white/[0.02] p-12 text-center">
             <MessageCircle className="h-12 w-12 text-white/20 mx-auto mb-4" />
-            <h3 className="text-lg font-medium text-white mb-2">No Telegram channels</h3>
+            <h3 className="text-lg font-medium text-white mb-2">No Telegram bots</h3>
             <p className="text-sm text-white/50 mb-6 max-w-md mx-auto">
-              Create a Telegram bot via @BotFather, then add a channel here to connect it
-              to an assistant mission. The bot will receive and respond to messages.
+              Create a Telegram bot via @BotFather, then add it here. Each chat with the bot
+              will automatically create a new mission.
             </p>
             <button
               onClick={() => setShowCreateDialog(true)}
               className="inline-flex items-center gap-2 px-4 py-2 text-sm font-medium text-white bg-indigo-500 hover:bg-indigo-600 rounded-lg transition-colors"
             >
               <Plus className="h-4 w-4" />
-              Add Channel
+              Add Bot
             </button>
           </div>
         ) : (
           <div className="space-y-4">
-            {allChannels.map((channel) => (
+            {bots.map((bot) => (
               <div
-                key={channel.id}
+                key={bot.id}
                 className="rounded-xl border border-white/[0.06] bg-white/[0.02] overflow-hidden"
               >
                 <div className="p-4 flex items-center gap-4">
@@ -286,13 +267,13 @@ export default function TelegramSettingsPage() {
                   <div
                     className={cn(
                       'flex h-10 w-10 items-center justify-center rounded-lg',
-                      channel.active ? 'bg-emerald-500/10' : 'bg-white/[0.04]'
+                      bot.active ? 'bg-emerald-500/10' : 'bg-white/[0.04]'
                     )}
                   >
                     <Bot
                       className={cn(
                         'h-5 w-5',
-                        channel.active ? 'text-emerald-400' : 'text-white/40'
+                        bot.active ? 'text-emerald-400' : 'text-white/40'
                       )}
                     />
                   </div>
@@ -301,34 +282,49 @@ export default function TelegramSettingsPage() {
                   <div className="flex-1 min-w-0">
                     <div className="flex items-center gap-2">
                       <span className="text-sm font-medium text-white">
-                        @{channel.bot_username || 'unknown'}
+                        @{bot.bot_username || 'unknown'}
                       </span>
                       <span
                         className={cn(
                           'inline-flex items-center rounded-full px-2 py-0.5 text-[10px] font-medium',
-                          channel.active
+                          bot.active
                             ? 'bg-emerald-500/10 text-emerald-400'
                             : 'bg-white/[0.06] text-white/40'
                         )}
                       >
-                        {channel.active ? 'Active' : 'Inactive'}
+                        {bot.active ? 'Active' : 'Inactive'}
                       </span>
                       <span className="inline-flex items-center rounded bg-white/[0.06] px-1.5 py-0.5 text-[10px] text-white/40">
-                        {TRIGGER_MODE_LABELS[channel.trigger_mode]}
+                        {TRIGGER_MODE_LABELS[bot.trigger_mode]}
                       </span>
+                      {bot.auto_create_missions && (
+                        <span className="inline-flex items-center rounded bg-indigo-500/10 border border-indigo-500/20 px-1.5 py-0.5 text-[10px] font-medium text-indigo-400">
+                          Auto-create
+                        </span>
+                      )}
                     </div>
-                    <p className="text-xs text-white/40 mt-0.5">
-                      Mission: {getMissionTitle(channel.mission_id)}
-                    </p>
+                    <div className="flex items-center gap-3 mt-0.5">
+                      <p className="text-xs text-white/40">
+                        {BACKEND_LABELS[bot.default_backend || 'claudecode'] || bot.default_backend || 'Claude Code'}
+                      </p>
+                      {bot.default_model_override && (
+                        <p className="text-xs text-white/30">{bot.default_model_override}</p>
+                      )}
+                      {chatsByBot[bot.id] && (
+                        <p className="text-xs text-white/30">
+                          {chatsByBot[bot.id].length} chat{chatsByBot[bot.id].length !== 1 ? 's' : ''}
+                        </p>
+                      )}
+                    </div>
                   </div>
 
                   {/* Actions */}
                   <div className="flex items-center gap-1">
                     <button
                       onClick={() => {
-                        setEditingChannel(channel);
-                        setEditInstructions(channel.instructions || '');
-                        setEditTriggerMode(channel.trigger_mode);
+                        setEditingBot(bot);
+                        setEditInstructions(bot.instructions || '');
+                        setEditTriggerMode(bot.trigger_mode);
                       }}
                       className="p-2 rounded-lg text-white/40 hover:text-white hover:bg-white/[0.06] transition-colors"
                       title="Edit"
@@ -336,23 +332,23 @@ export default function TelegramSettingsPage() {
                       <Settings className="h-4 w-4" />
                     </button>
                     <button
-                      onClick={() => handleToggleActive(channel)}
+                      onClick={() => handleToggleActive(bot)}
                       className={cn(
                         'p-2 rounded-lg transition-colors',
-                        channel.active
+                        bot.active
                           ? 'text-emerald-400/60 hover:text-emerald-400 hover:bg-emerald-500/10'
                           : 'text-white/40 hover:text-white hover:bg-white/[0.06]'
                       )}
-                      title={channel.active ? 'Deactivate' : 'Activate'}
+                      title={bot.active ? 'Deactivate' : 'Activate'}
                     >
-                      {channel.active ? (
+                      {bot.active ? (
                         <Power className="h-4 w-4" />
                       ) : (
                         <PowerOff className="h-4 w-4" />
                       )}
                     </button>
                     <button
-                      onClick={() => handleDelete(channel)}
+                      onClick={() => handleDelete(bot)}
                       className="p-2 rounded-lg text-red-400/60 hover:text-red-400 hover:bg-red-500/10 transition-colors"
                       title="Delete"
                     >
@@ -361,104 +357,102 @@ export default function TelegramSettingsPage() {
                   </div>
                 </div>
 
-                {/* Expandable details */}
+                {/* Expandable details - show chats */}
                 <button
-                  onClick={() => {
-                    setExpandedMissions((prev) => {
-                      const next = new Set(prev);
-                      if (next.has(channel.id)) next.delete(channel.id);
-                      else next.add(channel.id);
-                      return next;
-                    });
-                  }}
+                  onClick={() => toggleExpand(bot.id)}
                   className="w-full flex items-center justify-center gap-1 py-1.5 border-t border-white/[0.04] text-[10px] text-white/30 hover:text-white/50 hover:bg-white/[0.02] transition-colors"
                 >
-                  {expandedMissions.has(channel.id) ? (
+                  {expandedBots.has(bot.id) ? (
                     <>
                       <ChevronUp className="h-3 w-3" /> Less
                     </>
                   ) : (
                     <>
-                      <ChevronDown className="h-3 w-3" /> Details
+                      <ChevronDown className="h-3 w-3" /> Chats & Details
                     </>
                   )}
                 </button>
-                {expandedMissions.has(channel.id) && (
-                  <div className="px-4 pb-4 space-y-2 border-t border-white/[0.04]">
+                {expandedBots.has(bot.id) && (
+                  <div className="px-4 pb-4 space-y-3 border-t border-white/[0.04]">
+                    {/* Bot details */}
                     <div className="grid grid-cols-2 gap-4 pt-3">
                       <div>
-                        <p className="text-[10px] text-white/30 mb-1">Channel ID</p>
-                        <p className="text-xs text-white/60 font-mono">{channel.id}</p>
+                        <p className="text-[10px] text-white/30 mb-1">Bot ID</p>
+                        <p className="text-xs text-white/60 font-mono">{bot.id}</p>
                       </div>
                       <div>
-                        <p className="text-[10px] text-white/30 mb-1">Mission ID</p>
-                        <p className="text-xs text-white/60 font-mono">{channel.mission_id}</p>
+                        <p className="text-[10px] text-white/30 mb-1">Backend</p>
+                        <p className="text-xs text-white/60">
+                          {BACKEND_LABELS[bot.default_backend || 'claudecode'] || bot.default_backend || 'Claude Code'}
+                          {bot.default_model_override ? ` / ${bot.default_model_override}` : ''}
+                          {bot.default_model_effort ? ` (${bot.default_model_effort})` : ''}
+                        </p>
                       </div>
                       <div>
                         <p className="text-[10px] text-white/30 mb-1">Allowed Chat IDs</p>
                         <p className="text-xs text-white/60">
-                          {channel.allowed_chat_ids?.length
-                            ? channel.allowed_chat_ids.join(', ')
+                          {bot.allowed_chat_ids?.length
+                            ? bot.allowed_chat_ids.join(', ')
                             : 'All chats'}
                         </p>
                       </div>
                       <div>
                         <p className="text-[10px] text-white/30 mb-1">Created</p>
                         <p className="text-xs text-white/60">
-                          {new Date(channel.created_at).toLocaleString()}
+                          {new Date(bot.created_at).toLocaleString()}
                         </p>
                       </div>
                     </div>
-                    {channel.instructions && (
-                      <div className="pt-2">
+                    {bot.instructions && (
+                      <div>
                         <p className="text-[10px] text-white/30 mb-1">Instructions</p>
                         <p className="text-xs text-white/60 whitespace-pre-wrap bg-white/[0.02] rounded-lg p-2 border border-white/[0.04]">
-                          {channel.instructions}
+                          {bot.instructions}
                         </p>
                       </div>
                     )}
+
+                    {/* Chat-to-mission mappings */}
+                    <div>
+                      <p className="text-[10px] text-white/30 mb-2">Active Conversations</p>
+                      {loadingChats.has(bot.id) ? (
+                        <div className="flex items-center gap-2 text-xs text-white/40">
+                          <Loader className="h-3 w-3 animate-spin" /> Loading...
+                        </div>
+                      ) : (chatsByBot[bot.id] || []).length === 0 ? (
+                        <p className="text-xs text-white/30 italic">
+                          No conversations yet. Message the bot on Telegram to start one.
+                        </p>
+                      ) : (
+                        <div className="space-y-1">
+                          {(chatsByBot[bot.id] || []).map((chat) => (
+                            <div
+                              key={chat.id}
+                              className="flex items-center gap-3 px-3 py-2 rounded-lg bg-white/[0.02] border border-white/[0.04]"
+                            >
+                              <div className="flex-1 min-w-0">
+                                <p className="text-xs text-white/60">
+                                  Chat {chat.chat_id}
+                                  {chat.chat_title && (
+                                    <span className="text-white/40"> ({chat.chat_title})</span>
+                                  )}
+                                </p>
+                                <p className="text-[10px] text-white/30">
+                                  Mission: {getMissionTitle(chat.mission_id)}
+                                </p>
+                              </div>
+                              <p className="text-[10px] text-white/20 shrink-0">
+                                {new Date(chat.created_at).toLocaleDateString()}
+                              </p>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
                   </div>
                 )}
               </div>
             ))}
-          </div>
-        )}
-
-        {/* Assistant missions that can be reverted */}
-        {assistantMissions.length > 0 && (
-          <div>
-            <h2 className="text-sm font-medium text-white/60 mb-3">Assistant Missions</h2>
-            <div className="space-y-2">
-              {assistantMissions.map((m: Mission) => {
-                const missionChannels = channelsByMission[m.id] || [];
-                return (
-                  <div
-                    key={m.id}
-                    className="flex items-center gap-3 rounded-xl border border-white/[0.06] bg-white/[0.02] p-3"
-                  >
-                    <span className="inline-flex items-center rounded bg-indigo-500/10 border border-indigo-500/20 px-1.5 py-0.5 text-[10px] font-medium text-indigo-400 shrink-0">
-                      Assistant
-                    </span>
-                    <div className="flex-1 min-w-0">
-                      <p className="text-sm text-white truncate">
-                        {m.title || m.id.slice(0, 8) + '...'}
-                      </p>
-                      <p className="text-[10px] text-white/40">
-                        {missionChannels.length} channel{missionChannels.length !== 1 ? 's' : ''}
-                      </p>
-                    </div>
-                    <button
-                      onClick={() => handleRevertToTask(m.id)}
-                      className="flex items-center gap-1.5 px-3 py-1.5 text-xs text-white/50 hover:text-white hover:bg-white/[0.06] rounded-lg transition-colors"
-                      title="Revert to task mode"
-                    >
-                      <Undo2 className="h-3.5 w-3.5" />
-                      Revert to Task
-                    </button>
-                  </div>
-                );
-              })}
-            </div>
           </div>
         )}
 
@@ -467,10 +461,9 @@ export default function TelegramSettingsPage() {
           <h3 className="text-base font-medium text-white mb-3">How it works</h3>
           <ol className="space-y-2 text-sm text-white/60 list-decimal list-inside">
             <li>Create a bot via <span className="text-white/80">@BotFather</span> on Telegram</li>
-            <li>Create a mission (any backend: Claude Code, OpenCode, etc.)</li>
-            <li>Add a Telegram channel here with the bot token</li>
-            <li>The mission automatically becomes an <span className="text-indigo-400">Assistant</span> mission</li>
-            <li>Messages to the bot are routed to the mission, responses streamed back</li>
+            <li>Add the bot here with a token and default mission settings</li>
+            <li>Each new Telegram chat auto-creates a mission with your defaults</li>
+            <li>Messages are routed to the chat&apos;s mission, responses streamed back</li>
           </ol>
           <p className="text-xs text-white/40 mt-4">
             For group chats, disable bot privacy mode via @BotFather (<code className="bg-white/[0.06] px-1 py-0.5 rounded">/setprivacy</code>) to let the bot see all messages.
@@ -481,25 +474,9 @@ export default function TelegramSettingsPage() {
       {/* Create Dialog */}
       {showCreateDialog && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50">
-          <div className="w-full max-w-lg p-6 rounded-xl bg-[#1a1a1c] border border-white/[0.06]">
-            <h3 className="text-lg font-medium text-white mb-4">Add Telegram Channel</h3>
+          <div className="w-full max-w-lg max-h-[90vh] overflow-y-auto p-6 rounded-xl bg-[#1a1a1c] border border-white/[0.06]">
+            <h3 className="text-lg font-medium text-white mb-4">Add Telegram Bot</h3>
             <div className="space-y-4">
-              <div>
-                <label className="block text-sm text-white/60 mb-1">Mission</label>
-                <select
-                  value={createMissionId}
-                  onChange={(e) => setCreateMissionId(e.target.value)}
-                  className="w-full px-4 py-2 rounded-lg bg-white/[0.04] border border-white/[0.08] text-white focus:outline-none focus:border-indigo-500/50"
-                >
-                  <option value="">Select a mission...</option>
-                  {allMissions.map((m: Mission) => (
-                    <option key={m.id} value={m.id}>
-                      {m.title || m.id.slice(0, 8) + '...'} ({m.backend || 'claudecode'})
-                      {m.mission_mode === 'assistant' ? ' [Assistant]' : ''}
-                    </option>
-                  ))}
-                </select>
-              </div>
               <div>
                 <label className="block text-sm text-white/60 mb-1">Bot Token</label>
                 <input
@@ -526,6 +503,90 @@ export default function TelegramSettingsPage() {
                   Auto-detected from token if omitted
                 </p>
               </div>
+
+              {/* Divider */}
+              <div className="border-t border-white/[0.06] pt-4">
+                <p className="text-xs text-white/40 mb-3">Default mission settings for new conversations</p>
+              </div>
+
+              <div>
+                <label className="block text-sm text-white/60 mb-1">Backend</label>
+                <select
+                  value={createBackend}
+                  onChange={(e) => setCreateBackend(e.target.value)}
+                  className="w-full px-4 py-2 rounded-lg bg-white/[0.04] border border-white/[0.08] text-white focus:outline-none focus:border-indigo-500/50"
+                >
+                  {backends.length > 0
+                    ? backends.map((b: Backend) => (
+                        <option key={b.id} value={b.id}>
+                          {BACKEND_LABELS[b.id] || b.name || b.id}
+                        </option>
+                      ))
+                    : ['claudecode', 'opencode', 'codex', 'gemini', 'amp'].map((id) => (
+                        <option key={id} value={id}>
+                          {BACKEND_LABELS[id] || id}
+                        </option>
+                      ))}
+                </select>
+              </div>
+              <div>
+                <label className="block text-sm text-white/60 mb-1">Model Override (optional)</label>
+                <input
+                  type="text"
+                  placeholder="e.g. claude-sonnet-4-5-20250929"
+                  value={createModelOverride}
+                  onChange={(e) => setCreateModelOverride(e.target.value)}
+                  className="w-full px-4 py-2 rounded-lg bg-white/[0.04] border border-white/[0.08] text-white placeholder:text-white/20 focus:outline-none focus:border-indigo-500/50 font-mono text-sm"
+                />
+              </div>
+              {(createBackend === 'claudecode' || createBackend === 'codex') && (
+                <div>
+                  <label className="block text-sm text-white/60 mb-1">Model Effort (optional)</label>
+                  <select
+                    value={createModelEffort}
+                    onChange={(e) => setCreateModelEffort(e.target.value)}
+                    className="w-full px-4 py-2 rounded-lg bg-white/[0.04] border border-white/[0.08] text-white focus:outline-none focus:border-indigo-500/50"
+                  >
+                    <option value="">Default</option>
+                    <option value="low">Low</option>
+                    <option value="medium">Medium</option>
+                    <option value="high">High</option>
+                  </select>
+                </div>
+              )}
+              {workspaces.length > 0 && (
+                <div>
+                  <label className="block text-sm text-white/60 mb-1">Workspace (optional)</label>
+                  <select
+                    value={createWorkspaceId}
+                    onChange={(e) => setCreateWorkspaceId(e.target.value)}
+                    className="w-full px-4 py-2 rounded-lg bg-white/[0.04] border border-white/[0.08] text-white focus:outline-none focus:border-indigo-500/50"
+                  >
+                    <option value="">Host (default)</option>
+                    {workspaces.map((w: Workspace) => (
+                      <option key={w.id} value={w.id}>
+                        {w.name || w.id.slice(0, 8) + '...'}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              )}
+              <div>
+                <label className="block text-sm text-white/60 mb-1">Config Profile (optional)</label>
+                <input
+                  type="text"
+                  placeholder="default"
+                  value={createConfigProfile}
+                  onChange={(e) => setCreateConfigProfile(e.target.value)}
+                  className="w-full px-4 py-2 rounded-lg bg-white/[0.04] border border-white/[0.08] text-white placeholder:text-white/20 focus:outline-none focus:border-indigo-500/50"
+                />
+              </div>
+
+              {/* Divider */}
+              <div className="border-t border-white/[0.06] pt-4">
+                <p className="text-xs text-white/40 mb-3">Bot behavior</p>
+              </div>
+
               <div>
                 <label className="block text-sm text-white/60 mb-1">Trigger Mode</label>
                 <select
@@ -541,6 +602,19 @@ export default function TelegramSettingsPage() {
                 </select>
               </div>
               <div>
+                <label className="block text-sm text-white/60 mb-1">Instructions (optional)</label>
+                <textarea
+                  placeholder="You are Ana, a helpful assistant. Respond in plain text without markdown."
+                  value={createInstructions}
+                  onChange={(e) => setCreateInstructions(e.target.value)}
+                  rows={3}
+                  className="w-full px-4 py-2 rounded-lg bg-white/[0.04] border border-white/[0.08] text-white placeholder:text-white/20 focus:outline-none focus:border-indigo-500/50 resize-none text-sm"
+                />
+                <p className="text-[10px] text-white/30 mt-1">
+                  Prepended to every message. Set personality and formatting rules.
+                </p>
+              </div>
+              <div>
                 <label className="block text-sm text-white/60 mb-1">Allowed Chat IDs (optional)</label>
                 <input
                   type="text"
@@ -551,19 +625,6 @@ export default function TelegramSettingsPage() {
                 />
                 <p className="text-[10px] text-white/30 mt-1">
                   Leave empty to allow all chats. Comma-separated Telegram chat IDs.
-                </p>
-              </div>
-              <div>
-                <label className="block text-sm text-white/60 mb-1">Instructions (optional)</label>
-                <textarea
-                  placeholder="You are Ana, a helpful assistant. Respond in plain text without markdown. Keep responses concise."
-                  value={createInstructions}
-                  onChange={(e) => setCreateInstructions(e.target.value)}
-                  rows={3}
-                  className="w-full px-4 py-2 rounded-lg bg-white/[0.04] border border-white/[0.08] text-white placeholder:text-white/20 focus:outline-none focus:border-indigo-500/50 resize-none text-sm"
-                />
-                <p className="text-[10px] text-white/30 mt-1">
-                  Prepended to every message. Use this to set personality and formatting rules.
                 </p>
               </div>
             </div>
@@ -579,10 +640,10 @@ export default function TelegramSettingsPage() {
               </button>
               <button
                 onClick={handleCreate}
-                disabled={!createMissionId || !createBotToken.trim() || creating}
+                disabled={!createBotToken.trim() || creating}
                 className="px-4 py-2 text-sm font-medium text-white bg-indigo-500 hover:bg-indigo-600 rounded-lg disabled:opacity-50 disabled:cursor-not-allowed"
               >
-                {creating ? 'Creating...' : 'Create Channel'}
+                {creating ? 'Creating...' : 'Add Bot'}
               </button>
             </div>
           </div>
@@ -590,11 +651,11 @@ export default function TelegramSettingsPage() {
       )}
 
       {/* Edit Dialog */}
-      {editingChannel && (
+      {editingBot && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50">
           <div className="w-full max-w-lg p-6 rounded-xl bg-[#1a1a1c] border border-white/[0.06]">
             <h3 className="text-lg font-medium text-white mb-4">
-              Edit @{editingChannel.bot_username || 'channel'}
+              Edit @{editingBot.bot_username || 'bot'}
             </h3>
             <div className="space-y-4">
               <div>
@@ -624,7 +685,7 @@ export default function TelegramSettingsPage() {
             </div>
             <div className="flex justify-end gap-2 mt-6">
               <button
-                onClick={() => setEditingChannel(null)}
+                onClick={() => setEditingBot(null)}
                 className="px-4 py-2 text-sm text-white/60 hover:text-white"
               >
                 Cancel

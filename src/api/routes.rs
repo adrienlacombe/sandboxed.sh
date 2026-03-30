@@ -693,6 +693,15 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
             "/api/control/telegram-channels/:id/toggle",
             post(control::toggle_telegram_channel),
         )
+        // Standalone Telegram bot endpoints (auto-create missions per chat)
+        .route(
+            "/api/control/telegram/bots",
+            get(control::list_telegram_bots).post(control::create_telegram_bot),
+        )
+        .route(
+            "/api/control/telegram/bots/:id/chats",
+            get(control::list_bot_chats),
+        )
         // Parallel execution endpoints
         .route("/api/control/running", get(control::list_running_missions))
         .route(
