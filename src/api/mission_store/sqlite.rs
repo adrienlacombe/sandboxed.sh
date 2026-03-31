@@ -702,8 +702,16 @@ impl SqliteMissionStore {
                     trigger_mode TEXT NOT NULL DEFAULT 'direct_message',
                     active INTEGER NOT NULL DEFAULT 1,
                     webhook_secret TEXT,
+                    instructions TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
+                    auto_create_missions INTEGER NOT NULL DEFAULT 0,
+                    default_backend TEXT,
+                    default_model_override TEXT,
+                    default_model_effort TEXT,
+                    default_workspace_id TEXT,
+                    default_config_profile TEXT,
+                    default_agent TEXT,
                     FOREIGN KEY (mission_id) REFERENCES missions(id) ON DELETE CASCADE
                 );
                 CREATE INDEX IF NOT EXISTS idx_telegram_channels_mission ON telegram_channels(mission_id);
@@ -784,9 +792,7 @@ impl SqliteMissionStore {
                     ) {
                         Ok(_) => {}
                         Err(e) if e.to_string().contains("duplicate column") => {}
-                        Err(e) => {
-                            return Err(format!("Failed to add {} column: {}", col_name, e))
-                        }
+                        Err(e) => return Err(format!("Failed to add {} column: {}", col_name, e)),
                     }
                 }
             }

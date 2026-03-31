@@ -6107,7 +6107,7 @@ async fn control_actor_loop(
                             if !target_is_main && (main_is_running || force_parallel) {
                                 // Check capacity
                                 let parallel_running = parallel_runners.values().filter(|r| r.is_running()).count();
-                                let total_running = parallel_running + 1; // +1 for main
+                                let total_running = parallel_running + if main_is_running { 1 } else { 0 };
                                 let max_parallel = crate::settings::max_parallel_missions_cached_or(config.max_parallel_missions);
 
                                 if total_running >= max_parallel {
@@ -9588,9 +9588,7 @@ pub async fn delete_telegram_channel(
 ) -> Result<StatusCode, (StatusCode, String)> {
     let control = control_for_user(&state, &user).await;
 
-    // Stop the poller
-    state.telegram_bridge.stop_channel(channel_id).await;
-
+    // Delete from store first (verifies ownership), then stop the poller
     let deleted = control
         .mission_store
         .delete_telegram_channel(channel_id)
@@ -9598,6 +9596,7 @@ pub async fn delete_telegram_channel(
         .map_err(internal_error)?;
 
     if deleted {
+        state.telegram_bridge.stop_channel(channel_id).await;
         tracing::info!("Deleted Telegram channel {}", channel_id);
         Ok(StatusCode::NO_CONTENT)
     } else {
@@ -9719,10 +9718,7 @@ pub async fn create_telegram_bot(
         )
         .await;
 
-    tracing::info!(
-        "Created Telegram bot {} (auto-create missions)",
-        created.id
-    );
+    tracing::info!("Created Telegram bot {} (auto-create missions)", created.id);
 
     Ok(Json(created))
 }

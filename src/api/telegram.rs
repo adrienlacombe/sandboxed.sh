@@ -400,7 +400,11 @@ async fn resolve_or_create_mission(
                 created_at: crate::api::mission_store::now_string(),
             };
             // Handle race condition: if another message already created the mapping, look it up
-            match ctx.mission_store.create_telegram_chat_mission(mapping).await {
+            match ctx
+                .mission_store
+                .create_telegram_chat_mission(mapping)
+                .await
+            {
                 Ok(_) => {}
                 Err(e) if e.contains("UNIQUE constraint") => {
                     // Another concurrent message already created the mapping
@@ -503,8 +507,12 @@ pub async fn process_webhook_message(ctx: &ChannelContext, msg: &Message, http: 
         "Telegram webhook message for mission {} from {}: {}",
         target_mission_id,
         sender_name,
-        &clean_text[..clean_text.len().min(100)]
+        &clean_text[..clean_text.floor_char_boundary(100)]
     );
+
+    // Subscribe to events BEFORE sending the command to avoid race conditions
+    // where the response arrives before the subscription is active.
+    let events_rx = ctx.events_tx.subscribe();
 
     // Send to mission
     let msg_id = Uuid::new_v4();
@@ -521,7 +529,6 @@ pub async fn process_webhook_message(ctx: &ChannelContext, msg: &Message, http: 
         .await;
 
     // Spawn a task to stream the response back to Telegram
-    let events_rx = ctx.events_tx.subscribe();
     let http_clone = http.clone();
     let bot_token = ctx.channel.bot_token.clone();
     let chat_id = msg.chat.id;
@@ -563,8 +570,16 @@ fn should_process_message(channel: &TelegramChannel, msg: &Message, bot_username
             entities.iter().any(|e| {
                 if e.entity_type == "mention" {
                     if let Some(ref text) = msg.text {
-                        let mention = &text[e.offset as usize..(e.offset + e.length) as usize];
-                        mention.eq_ignore_ascii_case(&format!("@{}", bot_username))
+                        // Telegram offsets are UTF-16 code units; convert to char-based indices
+                        let utf16_units: Vec<u16> = text.encode_utf16().collect();
+                        let start = e.offset as usize;
+                        let end = (e.offset + e.length) as usize;
+                        if end <= utf16_units.len() {
+                            if let Ok(mention) = String::from_utf16(&utf16_units[start..end]) {
+                                return mention.eq_ignore_ascii_case(&format!("@{}", bot_username));
+                            }
+                        }
+                        false
                     } else {
                         false
                     }
