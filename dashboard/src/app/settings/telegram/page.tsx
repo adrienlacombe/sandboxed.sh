@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useMemo } from 'react';
 import useSWR from 'swr';
 import {
   listTelegramBots,
@@ -15,7 +15,7 @@ import {
   type TelegramTriggerMode,
   type CreateTelegramBotInput,
 } from '@/lib/api';
-import { listBackends, listWorkspaces, type Backend, type Workspace } from '@/lib/api';
+import { listBackends, listWorkspaces, listBackendModelOptions, listProviders, type Backend, type BackendModelOption, type Provider, type Workspace } from '@/lib/api';
 import {
   MessageCircle,
   Plus,
@@ -56,6 +56,16 @@ export default function TelegramSettingsPage() {
   const { data: workspaces = [] } = useSWR('workspaces', listWorkspaces, {
     revalidateOnFocus: false,
   });
+  const { data: providersResponse } = useSWR(
+    'model-providers',
+    () => listProviders({ includeAll: true }),
+    { revalidateOnFocus: false, dedupingInterval: 60000 }
+  );
+  const { data: backendModelOptions } = useSWR(
+    'backend-model-options',
+    () => listBackendModelOptions({ includeAll: true }),
+    { revalidateOnFocus: false, dedupingInterval: 60000 }
+  );
   const { data: missions = [] } = useSWR('missions', listMissions, {
     revalidateOnFocus: false,
   });
@@ -69,7 +79,7 @@ export default function TelegramSettingsPage() {
   const [showCreateDialog, setShowCreateDialog] = useState(false);
   const [createBotToken, setCreateBotToken] = useState('');
   const [createBotUsername, setCreateBotUsername] = useState('');
-  const [createTriggerMode, setCreateTriggerMode] = useState<TelegramTriggerMode>('all');
+  const [createTriggerMode, setCreateTriggerMode] = useState<TelegramTriggerMode>('bot_mention');
   const [createInstructions, setCreateInstructions] = useState('');
   const [createAllowedChatIds, setCreateAllowedChatIds] = useState('');
   const [createBackend, setCreateBackend] = useState('claudecode');
@@ -78,6 +88,38 @@ export default function TelegramSettingsPage() {
   const [createWorkspaceId, setCreateWorkspaceId] = useState('');
   const [createConfigProfile, setCreateConfigProfile] = useState('');
   const [creating, setCreating] = useState(false);
+
+  // Model selector options (same logic as new-mission-dialog)
+  const providerAllowlist = useMemo(() => {
+    if (createBackend === 'claudecode') return new Set(['anthropic']);
+    if (createBackend === 'codex') return new Set(['openai']);
+    if (createBackend === 'gemini') return new Set(['google']);
+    return null;
+  }, [createBackend]);
+
+  const modelOptions = useMemo(() => {
+    const backendOptions = backendModelOptions?.backends?.[createBackend];
+    if (backendOptions && backendOptions.length > 0) {
+      return backendOptions as BackendModelOption[];
+    }
+    const providers = (providersResponse?.providers || []) as Provider[];
+    const options: Array<{ value: string; label: string; description?: string }> = [];
+    for (const provider of providers) {
+      if (providerAllowlist && !providerAllowlist.has(provider.id)) continue;
+      for (const model of provider.models) {
+        const value =
+          createBackend === 'opencode'
+            ? `${provider.id}/${model.id}`
+            : model.id;
+        options.push({
+          value,
+          label: `${provider.name} — ${model.name}`,
+          description: model.description,
+        });
+      }
+    }
+    return options;
+  }, [backendModelOptions, providersResponse, providerAllowlist, createBackend]);
 
   // Edit dialog
   const [editingBot, setEditingBot] = useState<TelegramChannel | null>(null);
@@ -531,13 +573,35 @@ export default function TelegramSettingsPage() {
               </div>
               <div>
                 <label className="block text-sm text-white/60 mb-1">Model Override (optional)</label>
-                <input
-                  type="text"
-                  placeholder="e.g. claude-sonnet-4-5-20250929"
+                <select
                   value={createModelOverride}
                   onChange={(e) => setCreateModelOverride(e.target.value)}
-                  className="w-full px-4 py-2 rounded-lg bg-white/[0.04] border border-white/[0.08] text-white placeholder:text-white/20 focus:outline-none focus:border-indigo-500/50 font-mono text-sm"
-                />
+                  disabled={createBackend === 'amp'}
+                  className="w-full px-4 py-2 rounded-lg bg-white/[0.04] border border-white/[0.08] text-white focus:outline-none focus:border-indigo-500/50 text-sm [&>option]:bg-slate-800 [&>option]:text-white [&>optgroup]:bg-slate-900 [&>optgroup]:text-white/70"
+                >
+                  <option value="">
+                    {createBackend === 'amp' ? 'Amp ignores model overrides' : 'No override (use default)'}
+                  </option>
+                  {(() => {
+                    const groupedOptions = new Map<string, Array<{ value: string; label: string; description?: string }>>();
+                    for (const option of modelOptions) {
+                      const providerName = option.label.split(' — ')[0] || 'Other';
+                      if (!groupedOptions.has(providerName)) groupedOptions.set(providerName, []);
+                      groupedOptions.get(providerName)!.push(option);
+                    }
+                    return Array.from(groupedOptions.entries()).map(([providerName, options]) => (
+                      <optgroup key={providerName} label={providerName}>
+                        {options.map((option) => {
+                          const modelName = option.label.split(' — ')[1] || option.label;
+                          const displayText = option.description ? `${modelName} - ${option.description}` : modelName;
+                          return (
+                            <option key={option.value} value={option.value}>{displayText}</option>
+                          );
+                        })}
+                      </optgroup>
+                    ));
+                  })()}
+                </select>
               </div>
               {(createBackend === 'claudecode' || createBackend === 'codex') && (
                 <div>
