@@ -225,8 +225,47 @@ pub struct Message {
     pub chat: Chat,
     pub from: Option<User>,
     pub text: Option<String>,
+    /// Caption for media messages (photos, documents, etc.)
+    pub caption: Option<String>,
     pub reply_to_message: Option<Box<Message>>,
     pub entities: Option<Vec<MessageEntity>>,
+    /// Document attachment (PDF, ZIP, etc.)
+    pub document: Option<TelegramDocument>,
+    /// Photo attachment (array of sizes, last is largest)
+    pub photo: Option<Vec<PhotoSize>>,
+    /// Voice message
+    pub voice: Option<TelegramFile>,
+    /// Audio file
+    pub audio: Option<TelegramFile>,
+    /// Video file
+    pub video: Option<TelegramFile>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TelegramDocument {
+    pub file_id: String,
+    pub file_name: Option<String>,
+    pub mime_type: Option<String>,
+    #[serde(default)]
+    pub file_size: Option<i64>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PhotoSize {
+    pub file_id: String,
+    pub width: i64,
+    pub height: i64,
+    #[serde(default)]
+    pub file_size: Option<i64>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TelegramFile {
+    pub file_id: String,
+    pub file_name: Option<String>,
+    pub mime_type: Option<String>,
+    #[serde(default)]
+    pub file_size: Option<i64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -273,6 +312,141 @@ struct EditMessageRequest<'a> {
     chat_id: i64,
     message_id: i64,
     text: &'a str,
+}
+
+/// Response from the Telegram `getFile` API.
+#[derive(Debug, Deserialize)]
+struct GetFileResponse {
+    file_path: Option<String>,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// File download helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Download a file from Telegram by file_id and save it to a local directory.
+/// Returns the local file path on success.
+async fn download_telegram_file(
+    http: &Client,
+    bot_token: &str,
+    file_id: &str,
+    filename: &str,
+    dest_dir: &std::path::Path,
+) -> Result<std::path::PathBuf, String> {
+    let base_url = format!("https://api.telegram.org/bot{}", bot_token);
+
+    // Step 1: Get file path from Telegram
+    let url = format!("{}/getFile", base_url);
+    let response = http
+        .post(&url)
+        .json(&serde_json::json!({ "file_id": file_id }))
+        .send()
+        .await
+        .map_err(|e| format!("getFile request failed: {}", e))?;
+
+    let body: TelegramResponse<GetFileResponse> = response
+        .json()
+        .await
+        .map_err(|e| format!("getFile parse failed: {}", e))?;
+
+    let tg_file_path = body
+        .result
+        .and_then(|r| r.file_path)
+        .ok_or_else(|| "getFile returned no file_path".to_string())?;
+
+    // Step 2: Download the file
+    let download_url = format!(
+        "https://api.telegram.org/file/bot{}/{}",
+        bot_token, tg_file_path
+    );
+    let file_bytes = http
+        .get(&download_url)
+        .send()
+        .await
+        .map_err(|e| format!("File download failed: {}", e))?
+        .bytes()
+        .await
+        .map_err(|e| format!("File read failed: {}", e))?;
+
+    // Step 3: Save to destination
+    tokio::fs::create_dir_all(dest_dir)
+        .await
+        .map_err(|e| format!("Failed to create upload dir: {}", e))?;
+
+    let safe_name = filename.replace(['/', '\\', '\0'], "_");
+    let dest_path = dest_dir.join(&safe_name);
+    tokio::fs::write(&dest_path, &file_bytes)
+        .await
+        .map_err(|e| format!("Failed to write file: {}", e))?;
+
+    tracing::info!(
+        "Downloaded Telegram file {} ({} bytes) to {}",
+        safe_name,
+        file_bytes.len(),
+        dest_path.display()
+    );
+
+    Ok(dest_path)
+}
+
+/// Extract file info from a Telegram message. Returns (file_id, filename, mime_type).
+fn extract_file_info(msg: &Message) -> Option<(String, String, String)> {
+    if let Some(ref doc) = msg.document {
+        let name = doc.file_name.clone().unwrap_or_else(|| {
+            format!(
+                "document_{}",
+                doc.file_id.chars().take(8).collect::<String>()
+            )
+        });
+        let mime = doc
+            .mime_type
+            .clone()
+            .unwrap_or_else(|| "application/octet-stream".to_string());
+        return Some((doc.file_id.clone(), name, mime));
+    }
+    if let Some(ref photos) = msg.photo {
+        if let Some(largest) = photos.last() {
+            let name = format!(
+                "photo_{}.jpg",
+                largest.file_id.chars().take(8).collect::<String>()
+            );
+            return Some((largest.file_id.clone(), name, "image/jpeg".to_string()));
+        }
+    }
+    if let Some(ref voice) = msg.voice {
+        let name = voice
+            .file_name
+            .clone()
+            .unwrap_or_else(|| "voice_message.ogg".to_string());
+        let mime = voice
+            .mime_type
+            .clone()
+            .unwrap_or_else(|| "audio/ogg".to_string());
+        return Some((voice.file_id.clone(), name, mime));
+    }
+    if let Some(ref audio) = msg.audio {
+        let name = audio
+            .file_name
+            .clone()
+            .unwrap_or_else(|| "audio.mp3".to_string());
+        let mime = audio
+            .mime_type
+            .clone()
+            .unwrap_or_else(|| "audio/mpeg".to_string());
+        return Some((audio.file_id.clone(), name, mime));
+    }
+    if let Some(ref video) = msg.video {
+        let name = video
+            .file_name
+            .clone()
+            .unwrap_or_else(|| "video.mp4".to_string());
+        let mime = video
+            .mime_type
+            .clone()
+            .unwrap_or_else(|| "video/mp4".to_string());
+        return Some((video.file_id.clone(), name, mime));
+    }
+    None
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -444,10 +618,13 @@ async fn resolve_or_create_mission(
 /// Process an incoming Telegram message from a webhook.
 /// Called by the axum route handler.
 pub async fn process_webhook_message(ctx: &ChannelContext, msg: &Message, http: &Client) {
-    let text = match &msg.text {
-        Some(t) => t,
-        None => return,
-    };
+    // Accept text, caption (on media), or file-only messages
+    let text = msg.text.as_deref().or(msg.caption.as_deref()).unwrap_or("");
+
+    let has_file = extract_file_info(msg).is_some();
+    if text.is_empty() && !has_file {
+        return;
+    }
 
     if !should_process_message(&ctx.channel, msg, &ctx.bot_username) {
         return;
@@ -490,18 +667,53 @@ pub async fn process_webhook_message(ctx: &ChannelContext, msg: &Message, http: 
         ctx.channel.mission_id
     };
 
-    // Build message content with optional system instructions
-    let content = if let Some(ref instructions) = ctx.channel.instructions {
-        format!(
-            "[Telegram from {} in chat {}] [Instructions: {}] {}",
-            sender_name, msg.chat.id, instructions, clean_text
+    // Download attached file if present
+    let file_annotation = if let Some((file_id, filename, mime)) = extract_file_info(msg) {
+        let upload_dir =
+            std::path::PathBuf::from("/tmp/telegram-uploads").join(target_mission_id.to_string());
+        match download_telegram_file(
+            http,
+            &ctx.channel.bot_token,
+            &file_id,
+            &filename,
+            &upload_dir,
         )
+        .await
+        {
+            Ok(local_path) => Some(format!(
+                "[Attached file: {} ({}), saved to: {}]",
+                filename,
+                mime,
+                local_path.display()
+            )),
+            Err(e) => {
+                tracing::warn!("Failed to download Telegram file: {}", e);
+                Some(format!(
+                    "[Attached file: {} ({}) — download failed: {}]",
+                    filename, mime, e
+                ))
+            }
+        }
     } else {
-        format!(
-            "[Telegram from {} in chat {}] {}",
-            sender_name, msg.chat.id, clean_text
-        )
+        None
     };
+
+    // Build message content with optional system instructions and file info
+    let mut parts = Vec::new();
+    parts.push(format!(
+        "[Telegram from {} in chat {}]",
+        sender_name, msg.chat.id
+    ));
+    if let Some(ref instructions) = ctx.channel.instructions {
+        parts.push(format!("[Instructions: {}]", instructions));
+    }
+    if let Some(ref file_info) = file_annotation {
+        parts.push(file_info.clone());
+    }
+    if !clean_text.is_empty() {
+        parts.push(clean_text.clone());
+    }
+    let content = parts.join(" ");
 
     tracing::info!(
         "Telegram webhook message for mission {} from {}: {}",
@@ -698,6 +910,7 @@ async fn stream_response(
                     Ok(AgentEvent::AssistantMessage {
                         content,
                         mission_id: Some(mid),
+                        shared_files,
                         ..
                     }) if mid == mission_id => {
                         // Final response — send or edit with complete text
@@ -711,6 +924,16 @@ async fn stream_response(
                             // No streaming happened, send the full response directly
                             send_chunked_message(http, &base_url, chat_id, &content, Some(reply_to)).await?;
                         }
+
+                        // Send shared files as Telegram documents/photos
+                        if let Some(files) = shared_files {
+                            for file in &files {
+                                if let Err(e) = send_file_to_telegram(http, &base_url, chat_id, file).await {
+                                    tracing::warn!("Failed to send file {} to Telegram: {}", file.name, e);
+                                }
+                            }
+                        }
+
                         return Ok(());
                     }
                     Ok(AgentEvent::Error {
@@ -774,6 +997,84 @@ async fn send_chat_action(http: &Client, base_url: &str, chat_id: i64) {
         }))
         .send()
         .await;
+}
+
+/// Send a file to a Telegram chat via sendDocument or sendPhoto.
+/// The file is read from the URL in SharedFile (which is a local file:// or http:// path).
+async fn send_file_to_telegram(
+    http: &Client,
+    base_url: &str,
+    chat_id: i64,
+    file: &crate::api::control::SharedFile,
+) -> Result<(), String> {
+    use reqwest::multipart;
+
+    // Read the file from the URL (which could be a relative workspace path or absolute)
+    let file_path = if file.url.starts_with("http://") || file.url.starts_with("https://") {
+        // Download from URL first
+        let resp = http
+            .get(&file.url)
+            .send()
+            .await
+            .map_err(|e| format!("Failed to fetch file from URL: {}", e))?;
+        let bytes = resp
+            .bytes()
+            .await
+            .map_err(|e| format!("Failed to read file bytes: {}", e))?;
+        let tmp_path = std::path::PathBuf::from("/tmp/telegram-outbound").join(&file.name);
+        if let Some(parent) = tmp_path.parent() {
+            let _ = tokio::fs::create_dir_all(parent).await;
+        }
+        tokio::fs::write(&tmp_path, &bytes)
+            .await
+            .map_err(|e| format!("Failed to write temp file: {}", e))?;
+        tmp_path
+    } else {
+        // Local file path (from workspace)
+        std::path::PathBuf::from(&file.url)
+    };
+
+    if !file_path.exists() {
+        return Err(format!("File not found: {}", file_path.display()));
+    }
+
+    let file_bytes = tokio::fs::read(&file_path)
+        .await
+        .map_err(|e| format!("Failed to read file: {}", e))?;
+
+    let is_image = file.content_type.starts_with("image/") && !file.content_type.contains("svg");
+
+    let (endpoint, field_name) = if is_image {
+        ("sendPhoto", "photo")
+    } else {
+        ("sendDocument", "document")
+    };
+
+    let url = format!("{}/{}", base_url, endpoint);
+    let file_part = multipart::Part::bytes(file_bytes)
+        .file_name(file.name.clone())
+        .mime_str(&file.content_type)
+        .map_err(|e| format!("Invalid MIME type: {}", e))?;
+
+    let form = multipart::Form::new()
+        .text("chat_id", chat_id.to_string())
+        .part(field_name, file_part);
+
+    let response = http
+        .post(&url)
+        .multipart(form)
+        .send()
+        .await
+        .map_err(|e| format!("{} request failed: {}", endpoint, e))?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(format!("{} API error {}: {}", endpoint, status, body));
+    }
+
+    tracing::info!("Sent file {} to Telegram chat {}", file.name, chat_id);
+    Ok(())
 }
 
 /// Send a message and return the message_id.
