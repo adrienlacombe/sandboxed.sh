@@ -8647,8 +8647,34 @@ async fn run_single_control_turn(
         _ => {
             // Default to opencode using per-workspace CLI execution
             let mid = mission_id.unwrap_or_else(Uuid::nil);
+            // Check profile's sandboxed config for disable_oh_my_opencode flag
+            let mut opencode_workspace = exec_workspace.clone();
+            if let Some(ref profile) = effective_config_profile {
+                let lib_guard = library.read().await;
+                if let Some(lib) = lib_guard.as_ref() {
+                    if let Ok(profile_data) = lib.get_config_profile(profile).await {
+                        if profile_data.sandboxed_config.disable_oh_my_opencode {
+                            tracing::info!(
+                                mission_id = ?mission_id,
+                                profile = %profile,
+                                "Enabling plain opencode mode from config profile"
+                            );
+                            let mut obj = opencode_workspace
+                                .config
+                                .as_object()
+                                .cloned()
+                                .unwrap_or_default();
+                            obj.insert(
+                                "disable_oh_my_opencode".to_string(),
+                                serde_json::json!(true),
+                            );
+                            opencode_workspace.config = serde_json::Value::Object(obj);
+                        }
+                    }
+                }
+            }
             Box::pin(super::mission_runner::run_opencode_turn(
-                exec_workspace,
+                &opencode_workspace,
                 &ctx.working_dir,
                 &user_message,
                 config.default_model.as_deref(),
