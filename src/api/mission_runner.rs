@@ -10137,6 +10137,53 @@ pub async fn run_opencode_turn(
                                 }
                             }
 
+                            // Handle plain opencode --format json events.
+                            // Plain opencode emits: step_start, text, step_finish
+                            // (different from oh-my-opencode's message.part.updated/completion)
+                            if event_type == "text" {
+                                if let Some(part) = json.get("part") {
+                                    if let Some(text) =
+                                        part.get("text").and_then(|t| t.as_str())
+                                    {
+                                        // Strip <think>...</think> tags for final result
+                                        let clean_text =
+                                            if let Some(end_pos) = text.find("</think>") {
+                                                text[end_pos + 8..].trim().to_string()
+                                            } else {
+                                                text.to_string()
+                                            };
+                                        if !clean_text.is_empty() {
+                                            final_result = clean_text.clone();
+                                            let _ = text_output_tx.send(true);
+                                            // Emit text delta for Telegram streaming
+                                            let _ =
+                                                events_tx.send(AgentEvent::TextDelta {
+                                                    content: clean_text,
+                                                    mission_id: Some(mission_id),
+                                                });
+                                        }
+                                    }
+                                }
+                            } else if event_type == "step_finish" {
+                                tracing::info!(
+                                    mission_id = %mission_id,
+                                    "OpenCode JSON step_finish event"
+                                );
+                                let _ = sse_complete_tx.send(true);
+                            } else if event_type == "step_start" {
+                                // Extract session ID from step_start
+                                if let Some(sid) =
+                                    json.get("sessionID").and_then(|s| s.as_str())
+                                {
+                                    let mut guard = session_id_capture
+                                        .lock()
+                                        .unwrap_or_else(|e| e.into_inner());
+                                    if guard.is_none() {
+                                        *guard = Some(sid.to_string());
+                                    }
+                                }
+                            }
+
                             // Handle completion and error events from oh-my-opencode
                             if event_type == "completion" {
                                 tracing::info!(mission_id = %mission_id, "OpenCode JSON completion event");
