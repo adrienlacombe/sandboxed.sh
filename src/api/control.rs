@@ -9662,6 +9662,85 @@ pub struct ToggleTelegramChannelRequest {
     pub active: bool,
 }
 
+/// Update a Telegram channel's settings (PATCH).
+pub async fn update_telegram_channel(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    Path(channel_id): Path<Uuid>,
+    Json(req): Json<UpdateTelegramChannelRequest>,
+) -> Result<Json<super::mission_store::TelegramChannel>, (StatusCode, String)> {
+    let control = control_for_user(&state, &user).await;
+
+    let mut channel = control
+        .mission_store
+        .get_telegram_channel(channel_id)
+        .await
+        .map_err(internal_error)?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                format!("Telegram channel {} not found", channel_id),
+            )
+        })?;
+
+    // Apply partial updates
+    if let Some(active) = req.active {
+        channel.active = active;
+    }
+    if let Some(trigger_mode) = req.trigger_mode {
+        channel.trigger_mode = trigger_mode;
+    }
+    if let Some(allowed_chat_ids) = req.allowed_chat_ids {
+        channel.allowed_chat_ids = allowed_chat_ids;
+    }
+    if let Some(instructions) = req.instructions {
+        channel.instructions = if instructions.is_empty() {
+            None
+        } else {
+            Some(instructions)
+        };
+    }
+    channel.updated_at = super::mission_store::now_string();
+
+    control
+        .mission_store
+        .update_telegram_channel(channel.clone())
+        .await
+        .map_err(internal_error)?;
+
+    // Re-register or stop webhook based on active state
+    if channel.active {
+        let public_url = std::env::var("SANDBOXED_PUBLIC_URL")
+            .unwrap_or_else(|_| format!("http://{}:{}", state.config.host, state.config.port));
+        state
+            .telegram_bridge
+            .start_channel(
+                channel.clone(),
+                control.cmd_tx.clone(),
+                control.events_tx.clone(),
+                control.mission_store.clone(),
+                &public_url,
+            )
+            .await;
+    } else {
+        state.telegram_bridge.stop_channel(channel_id).await;
+    }
+
+    Ok(Json(channel))
+}
+
+#[derive(Deserialize)]
+pub struct UpdateTelegramChannelRequest {
+    #[serde(default)]
+    pub active: Option<bool>,
+    #[serde(default)]
+    pub trigger_mode: Option<super::mission_store::TelegramTriggerMode>,
+    #[serde(default)]
+    pub allowed_chat_ids: Option<Vec<i64>>,
+    #[serde(default)]
+    pub instructions: Option<String>,
+}
+
 // === Standalone Telegram Bot endpoints (auto-create missions per chat) ===
 
 /// Create a standalone Telegram bot configuration (auto-creates missions per chat).
@@ -9670,16 +9749,37 @@ pub async fn create_telegram_bot(
     Extension(user): Extension<AuthUser>,
     Json(req): Json<CreateTelegramBotRequest>,
 ) -> Result<Json<super::mission_store::TelegramChannel>, (StatusCode, String)> {
-    use super::mission_store::{now_string, TelegramChannel, TelegramTriggerMode};
+    use super::mission_store::{now_string, MissionMode, TelegramChannel, TelegramTriggerMode};
 
     let control = control_for_user(&state, &user).await;
+
+    // Create a placeholder mission so the FK constraint is satisfied.
+    // When auto_create_missions is true, individual chat missions are auto-created;
+    // this placeholder is only used to anchor the channel row.
+    let placeholder_mission = control
+        .mission_store
+        .create_mission(
+            Some("Telegram Bot (auto-create)"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .map_err(internal_error)?;
+    // Set placeholder to assistant mode
+    let _ = control
+        .mission_store
+        .update_mission_mode(placeholder_mission.id, MissionMode::Assistant)
+        .await;
 
     let now = now_string();
     let webhook_secret = Uuid::new_v4().to_string().replace('-', "");
     let channel = TelegramChannel {
         id: Uuid::new_v4(),
-        // Sentinel UUID — not used for routing when auto_create_missions is true
-        mission_id: Uuid::nil(),
+        mission_id: placeholder_mission.id,
         bot_token: req.bot_token,
         bot_username: req.bot_username,
         allowed_chat_ids: req.allowed_chat_ids.unwrap_or_default(),

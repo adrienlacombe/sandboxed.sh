@@ -214,6 +214,13 @@ CREATE TABLE IF NOT EXISTS telegram_channels (
     instructions TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
+    auto_create_missions INTEGER NOT NULL DEFAULT 0,
+    default_backend TEXT,
+    default_model_override TEXT,
+    default_model_effort TEXT,
+    default_workspace_id TEXT,
+    default_config_profile TEXT,
+    default_agent TEXT,
     FOREIGN KEY (mission_id) REFERENCES missions(id) ON DELETE CASCADE
 );
 

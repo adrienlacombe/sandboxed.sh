@@ -817,7 +817,7 @@ fn should_process_message(channel: &TelegramChannel, msg: &Message, bot_username
         TelegramTriggerMode::DirectMessage => is_private,
         TelegramTriggerMode::BotMention => is_mention,
         TelegramTriggerMode::Reply => is_reply,
-        TelegramTriggerMode::All => is_private || is_mention || is_reply,
+        TelegramTriggerMode::All => true,
     }
 }
 

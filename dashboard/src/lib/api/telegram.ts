@@ -73,7 +73,7 @@ export interface UpdateTelegramChannelInput {
 
 export async function listTelegramChannels(missionId: string): Promise<TelegramChannel[]> {
   return apiGet<TelegramChannel[]>(
-    `/api/control/missions/${missionId}/telegram/channels`,
+    `/api/control/missions/${missionId}/telegram-channels`,
     "Failed to fetch Telegram channels"
   );
 }
@@ -83,7 +83,7 @@ export async function createTelegramChannel(
   input: CreateTelegramChannelInput
 ): Promise<TelegramChannel> {
   return apiPost<TelegramChannel>(
-    `/api/control/missions/${missionId}/telegram/channels`,
+    `/api/control/missions/${missionId}/telegram-channels`,
     input,
     "Failed to create Telegram channel"
   );
@@ -94,14 +94,14 @@ export async function updateTelegramChannel(
   updates: UpdateTelegramChannelInput
 ): Promise<TelegramChannel> {
   return apiPatch<TelegramChannel>(
-    `/api/control/telegram/channels/${channelId}`,
+    `/api/control/telegram-channels/${channelId}`,
     updates,
     "Failed to update Telegram channel"
   );
 }
 
 export async function deleteTelegramChannel(channelId: string): Promise<void> {
-  await apiDel(`/api/control/telegram/channels/${channelId}`, "Failed to delete Telegram channel");
+  await apiDel(`/api/control/telegram-channels/${channelId}`, "Failed to delete Telegram channel");
 }
 
 // ---------------------------------------------------------------------------

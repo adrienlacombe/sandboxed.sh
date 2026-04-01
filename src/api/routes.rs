@@ -687,7 +687,8 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         )
         .route(
             "/api/control/telegram-channels/:id",
-            axum::routing::delete(control::delete_telegram_channel),
+            axum::routing::delete(control::delete_telegram_channel)
+                .patch(control::update_telegram_channel),
         )
         .route(
             "/api/control/telegram-channels/:id/toggle",
