@@ -814,10 +814,11 @@ fn should_process_message(channel: &TelegramChannel, msg: &Message, bot_username
         .unwrap_or(false);
 
     match channel.trigger_mode {
-        TelegramTriggerMode::DirectMessage => is_private,
+        TelegramTriggerMode::MentionOrDm => is_private || is_mention || is_reply,
         TelegramTriggerMode::BotMention => is_mention,
         TelegramTriggerMode::Reply => is_reply,
-        TelegramTriggerMode::All => true,
+        TelegramTriggerMode::DirectMessage => is_private,
+        TelegramTriggerMode::Always => true,
     }
 }
 

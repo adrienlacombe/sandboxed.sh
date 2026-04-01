@@ -8,7 +8,7 @@ import { apiGet, apiPost, apiPatch, apiDel } from "./core";
 // Types
 // ---------------------------------------------------------------------------
 
-export type TelegramTriggerMode = "bot_mention" | "reply" | "direct_message" | "all";
+export type TelegramTriggerMode = "mention_or_dm" | "bot_mention" | "reply" | "direct_message" | "always";
 
 export interface TelegramChannel {
   id: string;

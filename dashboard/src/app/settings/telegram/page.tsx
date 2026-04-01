@@ -32,10 +32,11 @@ import { cn } from '@/lib/utils';
 import { toast } from '@/components/toast';
 
 const TRIGGER_MODE_LABELS: Record<TelegramTriggerMode, string> = {
-  all: 'All messages',
+  mention_or_dm: 'Mentions, replies & DMs',
   bot_mention: 'Bot @mentions only',
   reply: 'Replies to bot only',
   direct_message: 'Direct messages only',
+  always: 'All messages (no filter)',
 };
 
 const BACKEND_LABELS: Record<string, string> = {
@@ -79,7 +80,7 @@ export default function TelegramSettingsPage() {
   const [showCreateDialog, setShowCreateDialog] = useState(false);
   const [createBotToken, setCreateBotToken] = useState('');
   const [createBotUsername, setCreateBotUsername] = useState('');
-  const [createTriggerMode, setCreateTriggerMode] = useState<TelegramTriggerMode>('bot_mention');
+  const [createTriggerMode, setCreateTriggerMode] = useState<TelegramTriggerMode>('mention_or_dm');
   const [createInstructions, setCreateInstructions] = useState('');
   const [createAllowedChatIds, setCreateAllowedChatIds] = useState('');
   const [createBackend, setCreateBackend] = useState('claudecode');
@@ -124,7 +125,7 @@ export default function TelegramSettingsPage() {
   // Edit dialog
   const [editingBot, setEditingBot] = useState<TelegramChannel | null>(null);
   const [editInstructions, setEditInstructions] = useState('');
-  const [editTriggerMode, setEditTriggerMode] = useState<TelegramTriggerMode>('all');
+  const [editTriggerMode, setEditTriggerMode] = useState<TelegramTriggerMode>('mention_or_dm');
   const [saving, setSaving] = useState(false);
 
   const loadChats = async (botId: string) => {
@@ -165,7 +166,7 @@ export default function TelegramSettingsPage() {
         bot_token: createBotToken.trim(),
       };
       if (createBotUsername.trim()) input.bot_username = createBotUsername.trim();
-      if (createTriggerMode !== 'all') input.trigger_mode = createTriggerMode;
+      if (createTriggerMode !== 'mention_or_dm') input.trigger_mode = createTriggerMode;
       if (createInstructions.trim()) input.instructions = createInstructions.trim();
       if (createAllowedChatIds.trim()) {
         input.allowed_chat_ids = createAllowedChatIds
@@ -233,7 +234,7 @@ export default function TelegramSettingsPage() {
   const resetCreateForm = () => {
     setCreateBotToken('');
     setCreateBotUsername('');
-    setCreateTriggerMode('all');
+    setCreateTriggerMode('mention_or_dm');
     setCreateInstructions('');
     setCreateAllowedChatIds('');
     setCreateBackend('claudecode');

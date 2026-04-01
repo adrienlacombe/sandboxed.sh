@@ -9477,7 +9477,7 @@ pub async fn create_telegram_channel(
     Path(mission_id): Path<Uuid>,
     Json(req): Json<CreateTelegramChannelRequest>,
 ) -> Result<Json<super::mission_store::TelegramChannel>, (StatusCode, String)> {
-    use super::mission_store::{now_string, MissionMode, TelegramChannel, TelegramTriggerMode};
+    use super::mission_store::{now_string, MissionMode, TelegramChannel};
 
     let control = control_for_user(&state, &user).await;
 
@@ -9522,7 +9522,7 @@ pub async fn create_telegram_channel(
         bot_token: req.bot_token,
         bot_username: req.bot_username,
         allowed_chat_ids: req.allowed_chat_ids.unwrap_or_default(),
-        trigger_mode: req.trigger_mode.unwrap_or(TelegramTriggerMode::All),
+        trigger_mode: req.trigger_mode.unwrap_or_default(),
         active: true,
         webhook_secret: Some(webhook_secret),
         instructions: req.instructions,
@@ -9749,7 +9749,7 @@ pub async fn create_telegram_bot(
     Extension(user): Extension<AuthUser>,
     Json(req): Json<CreateTelegramBotRequest>,
 ) -> Result<Json<super::mission_store::TelegramChannel>, (StatusCode, String)> {
-    use super::mission_store::{now_string, MissionMode, TelegramChannel, TelegramTriggerMode};
+    use super::mission_store::{now_string, MissionMode, TelegramChannel};
 
     let control = control_for_user(&state, &user).await;
 
@@ -9783,7 +9783,7 @@ pub async fn create_telegram_bot(
         bot_token: req.bot_token,
         bot_username: req.bot_username,
         allowed_chat_ids: req.allowed_chat_ids.unwrap_or_default(),
-        trigger_mode: req.trigger_mode.unwrap_or(TelegramTriggerMode::All),
+        trigger_mode: req.trigger_mode.unwrap_or_default(),
         active: true,
         webhook_secret: Some(webhook_secret),
         instructions: req.instructions,

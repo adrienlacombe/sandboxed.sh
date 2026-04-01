@@ -401,15 +401,18 @@ pub struct TelegramChatMission {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum TelegramTriggerMode {
-    /// Trigger on @bot_username mentions in groups
-    BotMention,
-    /// Trigger on replies to bot messages
-    Reply,
-    /// Trigger on any direct message to the bot
+    /// Trigger on @bot_username mentions in groups, replies to bot, or DMs (recommended default)
     #[default]
+    MentionOrDm,
+    /// Trigger on @bot_username mentions in groups only
+    BotMention,
+    /// Trigger on replies to bot messages only
+    Reply,
+    /// Trigger on DMs only
     DirectMessage,
-    /// Trigger on all of the above
-    All,
+    /// Trigger on every message in allowed chats (no filtering)
+    #[serde(alias = "all")]
+    Always,
 }
 
 /// Get current timestamp as RFC3339 string.
