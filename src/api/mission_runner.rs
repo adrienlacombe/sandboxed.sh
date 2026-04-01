@@ -2046,7 +2046,7 @@ async fn run_mission_turn(
     convo.push('\n');
 
     // Ensure mission workspace exists and is configured for OpenCode.
-    let workspace = workspace::resolve_workspace(&workspaces, &config, workspace_id).await;
+    let mut workspace = workspace::resolve_workspace(&workspaces, &config, workspace_id).await;
     if let Err(e) =
         workspace::sync_workspace_mcp_binaries_for_workspace(&config.working_dir, &workspace).await
     {
@@ -2442,6 +2442,22 @@ async fn run_mission_turn(
             result
         }
         "opencode" => {
+            // Check profile's sandboxed config for disable_oh_my_opencode flag
+            if let Some(ref profile) = effective_config_profile {
+                let lib_guard = library.read().await;
+                if let Some(lib) = lib_guard.as_ref() {
+                    if let Ok(profile_data) = lib.get_config_profile(profile).await {
+                        if profile_data.sandboxed_config.disable_oh_my_opencode {
+                            let mut obj = workspace.config.as_object().cloned().unwrap_or_default();
+                            obj.insert(
+                                "disable_oh_my_opencode".to_string(),
+                                serde_json::json!(true),
+                            );
+                            workspace.config = serde_json::Value::Object(obj);
+                        }
+                    }
+                }
+            }
             // Use per-workspace CLI execution for all workspace types to ensure
             // native bash + correct filesystem scope.
             run_opencode_turn(
@@ -9087,11 +9103,17 @@ pub async fn run_opencode_turn(
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
-    // When using plain opencode, always inject the builtin proxy provider since
-    // plain opencode lacks native provider credentials and routes through the proxy.
-    if use_plain_opencode {
-        ensure_opencode_provider_for_model(&opencode_config_dir_host, "builtin/fast");
-    }
+    // When using plain opencode, inject the builtin proxy provider for the model.
+    let plain_opencode_model = if use_plain_opencode {
+        let m = resolved_model
+            .as_deref()
+            .filter(|m| m.starts_with("builtin/"))
+            .unwrap_or("builtin/fast");
+        ensure_opencode_provider_for_model(&opencode_config_dir_host, m);
+        m.to_string()
+    } else {
+        "builtin/fast".to_string()
+    };
 
     let mut shell_cmd = String::new();
     if runner_is_direct {
@@ -9103,7 +9125,8 @@ pub async fn run_opencode_turn(
         // Always route through builtin proxy since plain opencode lacks provider credentials.
         // --format json produces structured events on stdout for the parser.
         shell_cmd.push_str("/root/.bun/bin/opencode run --format json");
-        shell_cmd.push_str(" --model builtin/fast");
+        shell_cmd.push_str(" --model ");
+        shell_cmd.push_str(&shell_escape(&plain_opencode_model));
     } else {
         shell_cmd.push_str(&shell_escape(&cli_runner));
         shell_cmd.push_str(" oh-my-opencode run");
