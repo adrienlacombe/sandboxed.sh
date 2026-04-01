@@ -9103,6 +9103,12 @@ pub async fn run_opencode_turn(
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
+    tracing::info!(
+        mission_id = %mission_id,
+        use_plain_opencode = use_plain_opencode,
+        "OpenCode mode selection"
+    );
+
     // When using plain opencode, inject the builtin proxy provider for the model.
     let plain_opencode_model = if use_plain_opencode {
         let m = resolved_model
@@ -9120,11 +9126,10 @@ pub async fn run_opencode_turn(
         shell_cmd.push_str(&shell_escape(&cli_runner));
         shell_cmd.push_str(" run");
     } else if use_plain_opencode {
-        // Use the opencode binary directly (installed via `bun install -g opencode-ai`).
-        // `bunx opencode` won't work because the `opencode` npm package is unpublished.
+        // Use the opencode binary directly.
         // Always route through builtin proxy since plain opencode lacks provider credentials.
         // --format json produces structured events on stdout for the parser.
-        shell_cmd.push_str("/root/.bun/bin/opencode run --format json");
+        shell_cmd.push_str("opencode run --format json");
         shell_cmd.push_str(" --model ");
         shell_cmd.push_str(&shell_escape(&plain_opencode_model));
     } else {
