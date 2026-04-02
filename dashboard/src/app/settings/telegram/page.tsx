@@ -114,7 +114,6 @@ export default function TelegramSettingsPage() {
   };
 
   const modelOptions = useMemo(() => getModelOptionsForBackend(createBackend), [backendModelOptions, providersResponse, createBackend]);
-  const editModelOptions = useMemo(() => getModelOptionsForBackend(editBackend || 'claudecode'), [backendModelOptions, providersResponse, editBackend]);
 
   // Edit dialog
   const [editingBot, setEditingBot] = useState<TelegramChannel | null>(null);
@@ -126,6 +125,8 @@ export default function TelegramSettingsPage() {
   const [editWorkspaceId, setEditWorkspaceId] = useState('');
   const [editConfigProfile, setEditConfigProfile] = useState('');
   const [saving, setSaving] = useState(false);
+
+  const editModelOptions = useMemo(() => getModelOptionsForBackend(editBackend || 'claudecode'), [backendModelOptions, providersResponse, editBackend]);
 
   const loadChats = async (botId: string) => {
     if (chatsByBot[botId]) return; // already loaded
