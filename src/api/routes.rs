@@ -476,15 +476,22 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
     // Start deferred proxy queue worker.
     deferred_proxy_api::start_worker(Arc::clone(&state));
 
-    // Eagerly boot the default user's control session so Telegram webhooks
-    // are re-registered immediately on server start (rather than waiting
-    // for the first authenticated API call).
+    // Eagerly boot the control session so Telegram webhooks are re-registered
+    // immediately on server start (rather than waiting for the first
+    // authenticated API call). Use the same user ID that the auth middleware
+    // would assign — "dev" in dev mode, "default" otherwise — so that
+    // Telegram channels and missions are visible in the dashboard.
     {
         let state_clone = Arc::clone(&state);
+        let boot_user_id = if config.dev_mode {
+            "dev".to_string()
+        } else {
+            "default".to_string()
+        };
         tokio::spawn(async move {
             let default_user = super::auth::AuthUser {
-                id: "default".to_string(),
-                username: "default".to_string(),
+                id: boot_user_id.clone(),
+                username: boot_user_id,
             };
             let _ = state_clone.control.get_or_spawn(&default_user).await;
             tracing::info!("Eagerly booted default control session (Telegram webhooks registered)");
