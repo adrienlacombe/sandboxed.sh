@@ -90,42 +90,41 @@ export default function TelegramSettingsPage() {
   const [createConfigProfile, setCreateConfigProfile] = useState('');
   const [creating, setCreating] = useState(false);
 
-  // Model selector options (same logic as new-mission-dialog)
-  const providerAllowlist = useMemo(() => {
-    if (createBackend === 'claudecode') return new Set(['anthropic']);
-    if (createBackend === 'codex') return new Set(['openai']);
-    if (createBackend === 'gemini') return new Set(['google']);
-    return null;
-  }, [createBackend]);
+  // Model selector options helper
+  const getModelOptionsForBackend = (backend: string) => {
+    const allowlist =
+      backend === 'claudecode' ? new Set(['anthropic']) :
+      backend === 'codex' ? new Set(['openai']) :
+      backend === 'gemini' ? new Set(['google']) : null;
 
-  const modelOptions = useMemo(() => {
-    const backendOptions = backendModelOptions?.backends?.[createBackend];
-    if (backendOptions && backendOptions.length > 0) {
-      return backendOptions as BackendModelOption[];
+    const backendOpts = backendModelOptions?.backends?.[backend];
+    if (backendOpts && backendOpts.length > 0) {
+      return backendOpts as BackendModelOption[];
     }
     const providers = (providersResponse?.providers || []) as Provider[];
     const options: Array<{ value: string; label: string; description?: string }> = [];
     for (const provider of providers) {
-      if (providerAllowlist && !providerAllowlist.has(provider.id)) continue;
+      if (allowlist && !allowlist.has(provider.id)) continue;
       for (const model of provider.models) {
-        const value =
-          createBackend === 'opencode'
-            ? `${provider.id}/${model.id}`
-            : model.id;
-        options.push({
-          value,
-          label: `${provider.name} — ${model.name}`,
-          description: model.description,
-        });
+        const value = backend === 'opencode' ? `${provider.id}/${model.id}` : model.id;
+        options.push({ value, label: `${provider.name} — ${model.name}`, description: model.description });
       }
     }
     return options;
-  }, [backendModelOptions, providersResponse, providerAllowlist, createBackend]);
+  };
+
+  const modelOptions = useMemo(() => getModelOptionsForBackend(createBackend), [backendModelOptions, providersResponse, createBackend]);
+  const editModelOptions = useMemo(() => getModelOptionsForBackend(editBackend || 'claudecode'), [backendModelOptions, providersResponse, editBackend]);
 
   // Edit dialog
   const [editingBot, setEditingBot] = useState<TelegramChannel | null>(null);
   const [editInstructions, setEditInstructions] = useState('');
   const [editTriggerMode, setEditTriggerMode] = useState<TelegramTriggerMode>('mention_or_dm');
+  const [editBackend, setEditBackend] = useState('');
+  const [editModelOverride, setEditModelOverride] = useState('');
+  const [editModelEffort, setEditModelEffort] = useState('');
+  const [editWorkspaceId, setEditWorkspaceId] = useState('');
+  const [editConfigProfile, setEditConfigProfile] = useState('');
   const [saving, setSaving] = useState(false);
 
   const loadChats = async (botId: string) => {
@@ -220,6 +219,11 @@ export default function TelegramSettingsPage() {
       await updateTelegramChannel(editingBot.id, {
         instructions: editInstructions.trim() || undefined,
         trigger_mode: editTriggerMode,
+        default_backend: editBackend || undefined,
+        default_model_override: editModelOverride || undefined,
+        default_model_effort: editModelEffort || undefined,
+        default_workspace_id: editWorkspaceId || undefined,
+        default_config_profile: editConfigProfile || undefined,
       });
       await mutateBots();
       setEditingBot(null);
@@ -368,6 +372,11 @@ export default function TelegramSettingsPage() {
                         setEditingBot(bot);
                         setEditInstructions(bot.instructions || '');
                         setEditTriggerMode(bot.trigger_mode);
+                        setEditBackend(bot.default_backend || 'claudecode');
+                        setEditModelOverride(bot.default_model_override || '');
+                        setEditModelEffort(bot.default_model_effort || '');
+                        setEditWorkspaceId(bot.default_workspace_id || '');
+                        setEditConfigProfile(bot.default_config_profile || '');
                       }}
                       className="p-2 rounded-lg text-white/40 hover:text-white hover:bg-white/[0.06] transition-colors"
                       title="Edit"
@@ -718,11 +727,114 @@ export default function TelegramSettingsPage() {
       {/* Edit Dialog */}
       {editingBot && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50">
-          <div className="w-full max-w-lg p-6 rounded-xl bg-[#1a1a1c] border border-white/[0.06]">
+          <div className="w-full max-w-lg max-h-[90vh] overflow-y-auto p-6 rounded-xl bg-[#1a1a1c] border border-white/[0.06]">
             <h3 className="text-lg font-medium text-white mb-4">
               Edit @{editingBot.bot_username || 'bot'}
             </h3>
             <div className="space-y-4">
+              {/* Mission settings */}
+              <div className="border-b border-white/[0.06] pb-3">
+                <p className="text-xs text-white/40 mb-3">Default mission settings for new conversations</p>
+              </div>
+              <div>
+                <label className="block text-sm text-white/60 mb-1">Backend</label>
+                <select
+                  value={editBackend}
+                  onChange={(e) => setEditBackend(e.target.value)}
+                  className="w-full px-4 py-2 rounded-lg bg-white/[0.04] border border-white/[0.08] text-white focus:outline-none focus:border-indigo-500/50"
+                >
+                  {backends.length > 0
+                    ? backends.map((b: Backend) => (
+                        <option key={b.id} value={b.id}>
+                          {BACKEND_LABELS[b.id] || b.name || b.id}
+                        </option>
+                      ))
+                    : ['claudecode', 'opencode', 'codex', 'gemini', 'amp'].map((id) => (
+                        <option key={id} value={id}>
+                          {BACKEND_LABELS[id] || id}
+                        </option>
+                      ))}
+                </select>
+              </div>
+              <div>
+                <label className="block text-sm text-white/60 mb-1">Model Override</label>
+                <select
+                  value={editModelOverride}
+                  onChange={(e) => setEditModelOverride(e.target.value)}
+                  disabled={editBackend === 'amp'}
+                  className="w-full px-4 py-2 rounded-lg bg-white/[0.04] border border-white/[0.08] text-white focus:outline-none focus:border-indigo-500/50 text-sm [&>option]:bg-slate-800 [&>option]:text-white [&>optgroup]:bg-slate-900 [&>optgroup]:text-white/70"
+                >
+                  <option value="">
+                    {editBackend === 'amp' ? 'Amp ignores model overrides' : 'No override (use default)'}
+                  </option>
+                  {(() => {
+                    const groupedOptions = new Map<string, Array<{ value: string; label: string; description?: string }>>();
+                    for (const option of editModelOptions) {
+                      const providerName = option.label.split(' — ')[0] || 'Other';
+                      if (!groupedOptions.has(providerName)) groupedOptions.set(providerName, []);
+                      groupedOptions.get(providerName)!.push(option);
+                    }
+                    return Array.from(groupedOptions.entries()).map(([providerName, options]) => (
+                      <optgroup key={providerName} label={providerName}>
+                        {options.map((option) => {
+                          const modelName = option.label.split(' — ')[1] || option.label;
+                          const displayText = option.description ? `${modelName} - ${option.description}` : modelName;
+                          return (
+                            <option key={option.value} value={option.value}>{displayText}</option>
+                          );
+                        })}
+                      </optgroup>
+                    ));
+                  })()}
+                </select>
+              </div>
+              {(editBackend === 'claudecode' || editBackend === 'codex') && (
+                <div>
+                  <label className="block text-sm text-white/60 mb-1">Model Effort</label>
+                  <select
+                    value={editModelEffort}
+                    onChange={(e) => setEditModelEffort(e.target.value)}
+                    className="w-full px-4 py-2 rounded-lg bg-white/[0.04] border border-white/[0.08] text-white focus:outline-none focus:border-indigo-500/50"
+                  >
+                    <option value="">Default</option>
+                    <option value="low">Low</option>
+                    <option value="medium">Medium</option>
+                    <option value="high">High</option>
+                  </select>
+                </div>
+              )}
+              {workspaces.length > 0 && (
+                <div>
+                  <label className="block text-sm text-white/60 mb-1">Workspace</label>
+                  <select
+                    value={editWorkspaceId}
+                    onChange={(e) => setEditWorkspaceId(e.target.value)}
+                    className="w-full px-4 py-2 rounded-lg bg-white/[0.04] border border-white/[0.08] text-white focus:outline-none focus:border-indigo-500/50"
+                  >
+                    <option value="">Host (default)</option>
+                    {workspaces.map((w: Workspace) => (
+                      <option key={w.id} value={w.id}>
+                        {w.name || w.id.slice(0, 8) + '...'}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              )}
+              <div>
+                <label className="block text-sm text-white/60 mb-1">Config Profile</label>
+                <input
+                  type="text"
+                  placeholder="default"
+                  value={editConfigProfile}
+                  onChange={(e) => setEditConfigProfile(e.target.value)}
+                  className="w-full px-4 py-2 rounded-lg bg-white/[0.04] border border-white/[0.08] text-white placeholder:text-white/20 focus:outline-none focus:border-indigo-500/50"
+                />
+              </div>
+
+              {/* Bot behavior */}
+              <div className="border-t border-white/[0.06] pt-4">
+                <p className="text-xs text-white/40 mb-3">Bot behavior</p>
+              </div>
               <div>
                 <label className="block text-sm text-white/60 mb-1">Trigger Mode</label>
                 <select
