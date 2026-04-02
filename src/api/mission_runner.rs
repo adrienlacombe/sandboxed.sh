@@ -10402,9 +10402,11 @@ pub async fn run_opencode_turn(
         .clone();
     let has_sse_error = sse_error.is_some();
 
-    // Check exit status
+    // Check exit status.
+    // When we intentionally killed the process after seeing step_finish/completion
+    // (sse_complete_seen), don't treat the SIGKILL as an error — we have the response.
     if let Ok(status) = exit_status {
-        if !status.success() {
+        if !status.success() && !sse_complete_seen {
             had_error = true;
             if opencode_output_needs_fallback(&final_result) {
                 if let Some(err_msg) = stderr_error_message.lock().unwrap().clone() {
