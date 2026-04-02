@@ -9220,10 +9220,15 @@ pub async fn run_opencode_turn(
         opencode_port = "4096".to_string();
     }
 
-    env.insert("OPENCODE_SERVER_PORT".to_string(), opencode_port.clone());
-    if let Ok(host) = std::env::var("SANDBOXED_SH_OPENCODE_SERVER_HOSTNAME") {
-        if !host.trim().is_empty() {
-            env.insert("OPENCODE_SERVER_HOSTNAME".to_string(), host);
+    // Plain opencode manages its own serve process; skip the port wrapper
+    // to avoid conflicts. Oh-my-opencode needs the port override to coexist
+    // with other instances.
+    if !use_plain_opencode {
+        env.insert("OPENCODE_SERVER_PORT".to_string(), opencode_port.clone());
+        if let Ok(host) = std::env::var("SANDBOXED_SH_OPENCODE_SERVER_HOSTNAME") {
+            if !host.trim().is_empty() {
+                env.insert("OPENCODE_SERVER_HOSTNAME".to_string(), host);
+            }
         }
     }
     tracing::info!(
@@ -9298,7 +9303,8 @@ pub async fn run_opencode_turn(
     // the real binary at ~/.opencode/bin/opencode.
     // oh-my-opencode v3+ is a compiled binary that spawns `opencode serve --port=4096`;
     // the wrapper intercepts this and overrides the port.
-    if opencode_port != "4096" {
+    // Skip for plain opencode — it manages its own serve process.
+    if !use_plain_opencode && opencode_port != "4096" {
         install_opencode_serve_port_wrapper(&mut env, workspace, &opencode_port);
     }
 
