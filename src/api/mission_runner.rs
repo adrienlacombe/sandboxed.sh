@@ -9109,13 +9109,33 @@ pub async fn run_opencode_turn(
         "OpenCode mode selection"
     );
 
-    // When using plain opencode, inject the builtin proxy provider for the model.
+    // When using plain opencode, inject the builtin proxy provider for the model
+    // and strip MCP servers (they hang during boot and aren't needed for simple
+    // assistant-mode chat).
     let plain_opencode_model = if use_plain_opencode {
         let m = resolved_model
             .as_deref()
             .filter(|m| m.starts_with("builtin/"))
             .unwrap_or("builtin/fast");
         ensure_opencode_provider_for_model(&opencode_config_dir_host, m);
+
+        // Strip MCP servers from opencode.json to avoid long boot hangs
+        let config_path = opencode_config_dir_host.join("opencode.json");
+        if let Ok(content) = std::fs::read_to_string(&config_path) {
+            if let Ok(mut config) = serde_json::from_str::<serde_json::Value>(&content) {
+                if let Some(obj) = config.as_object_mut() {
+                    obj.insert("mcp".to_string(), serde_json::json!({}));
+                    if let Ok(updated) = serde_json::to_string_pretty(&config) {
+                        let _ = std::fs::write(&config_path, updated);
+                        tracing::info!(
+                            mission_id = %mission_id,
+                            "Stripped MCP servers from opencode.json for plain opencode mode"
+                        );
+                    }
+                }
+            }
+        }
+
         m.to_string()
     } else {
         "builtin/fast".to_string()
