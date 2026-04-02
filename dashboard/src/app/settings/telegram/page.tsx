@@ -15,7 +15,7 @@ import {
   type TelegramTriggerMode,
   type CreateTelegramBotInput,
 } from '@/lib/api';
-import { listBackends, listWorkspaces, listBackendModelOptions, listProviders, type Backend, type BackendModelOption, type Provider, type Workspace } from '@/lib/api';
+import { listBackends, listWorkspaces, listBackendModelOptions, listProviders, listConfigProfiles, type Backend, type BackendModelOption, type Provider, type Workspace, type ConfigProfileSummary } from '@/lib/api';
 import {
   MessageCircle,
   Plus,
@@ -68,6 +68,9 @@ export default function TelegramSettingsPage() {
     { revalidateOnFocus: false, dedupingInterval: 60000 }
   );
   const { data: missions = [] } = useSWR('missions', listMissions, {
+    revalidateOnFocus: false,
+  });
+  const { data: configProfiles = [] } = useSWR('config-profiles', listConfigProfiles, {
     revalidateOnFocus: false,
   });
 
@@ -648,13 +651,18 @@ export default function TelegramSettingsPage() {
               )}
               <div>
                 <label className="block text-sm text-white/60 mb-1">Config Profile (optional)</label>
-                <input
-                  type="text"
-                  placeholder="default"
+                <select
                   value={createConfigProfile}
                   onChange={(e) => setCreateConfigProfile(e.target.value)}
-                  className="w-full px-4 py-2 rounded-lg bg-white/[0.04] border border-white/[0.08] text-white placeholder:text-white/20 focus:outline-none focus:border-indigo-500/50"
-                />
+                  className="w-full px-4 py-2 rounded-lg bg-white/[0.04] border border-white/[0.08] text-white focus:outline-none focus:border-indigo-500/50"
+                >
+                  <option value="">None (use workspace default)</option>
+                  {configProfiles.map((p: ConfigProfileSummary) => (
+                    <option key={p.name} value={p.name}>
+                      {p.name}{p.is_default ? ' (default)' : ''}
+                    </option>
+                  ))}
+                </select>
               </div>
 
               {/* Divider */}
@@ -823,13 +831,18 @@ export default function TelegramSettingsPage() {
               )}
               <div>
                 <label className="block text-sm text-white/60 mb-1">Config Profile</label>
-                <input
-                  type="text"
-                  placeholder="default"
+                <select
                   value={editConfigProfile}
                   onChange={(e) => setEditConfigProfile(e.target.value)}
-                  className="w-full px-4 py-2 rounded-lg bg-white/[0.04] border border-white/[0.08] text-white placeholder:text-white/20 focus:outline-none focus:border-indigo-500/50"
-                />
+                  className="w-full px-4 py-2 rounded-lg bg-white/[0.04] border border-white/[0.08] text-white focus:outline-none focus:border-indigo-500/50"
+                >
+                  <option value="">None (use workspace default)</option>
+                  {configProfiles.map((p: ConfigProfileSummary) => (
+                    <option key={p.name} value={p.name}>
+                      {p.name}{p.is_default ? ' (default)' : ''}
+                    </option>
+                  ))}
+                </select>
               </div>
 
               {/* Bot behavior */}
