@@ -62,7 +62,7 @@ impl TelegramBridge {
         events_tx: broadcast::Sender<AgentEvent>,
         mission_store: Arc<dyn MissionStore>,
         public_base_url: &str,
-    ) {
+    ) -> Result<(), String> {
         self.stop_channel(channel.id).await;
 
         let base_url = format!("https://api.telegram.org/bot{}", channel.bot_token);
@@ -83,21 +83,21 @@ impl TelegramBridge {
             channel.id
         );
 
-        if let Err(e) = set_webhook(
+        set_webhook(
             &self.http,
             &base_url,
             &webhook_url,
             channel.webhook_secret.as_deref(),
         )
         .await
-        {
-            tracing::error!(
+        .map_err(|e| {
+            let msg = format!(
                 "Failed to set Telegram webhook for channel {}: {}",
-                channel.id,
-                e
+                channel.id, e
             );
-            return;
-        }
+            tracing::error!("{}", msg);
+            msg
+        })?;
 
         let mode_label = if channel.auto_create_missions {
             "auto-create".to_string()
@@ -124,6 +124,8 @@ impl TelegramBridge {
             .write()
             .await
             .insert(ctx.channel.id, ctx);
+
+        Ok(())
     }
 
     /// Remove webhook and routing context for a channel.
@@ -178,14 +180,19 @@ impl TelegramBridge {
                     );
                 }
                 for channel in channels {
-                    self.start_channel(
-                        channel,
-                        cmd_tx.clone(),
-                        events_tx.clone(),
-                        store.clone(),
-                        public_base_url,
-                    )
-                    .await;
+                    let ch_id = channel.id;
+                    if let Err(e) = self
+                        .start_channel(
+                            channel,
+                            cmd_tx.clone(),
+                            events_tx.clone(),
+                            store.clone(),
+                            public_base_url,
+                        )
+                        .await
+                    {
+                        tracing::warn!("Failed to boot Telegram channel {}: {}", ch_id, e);
+                    }
                 }
             }
             Err(e) => {
@@ -1211,7 +1218,7 @@ async fn send_chunked_message(
 
         let reply = if first { reply_to } else { None };
         first = false;
-        let _ = send_message(http, base_url, chat_id, chunk, reply).await;
+        send_message(http, base_url, chat_id, chunk, reply).await?;
     }
     Ok(())
 }

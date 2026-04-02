@@ -9581,7 +9581,8 @@ pub async fn create_telegram_channel(
             control.mission_store.clone(),
             &public_url,
         )
-        .await;
+        .await
+        .map_err(internal_error)?;
 
     tracing::info!(
         "Created Telegram channel {} for mission {}",
@@ -9675,7 +9676,8 @@ pub async fn toggle_telegram_channel(
                 control.mission_store.clone(),
                 &public_url,
             )
-            .await;
+            .await
+            .map_err(internal_error)?;
     } else {
         state.telegram_bridge.stop_channel(channel_id).await;
     }
@@ -9726,6 +9728,40 @@ pub async fn update_telegram_channel(
             Some(instructions)
         };
     }
+    if let Some(backend) = req.default_backend {
+        channel.default_backend = if backend.is_empty() {
+            None
+        } else {
+            Some(backend)
+        };
+    }
+    if let Some(model) = req.default_model_override {
+        channel.default_model_override = if model.is_empty() { None } else { Some(model) };
+    }
+    if let Some(effort) = req.default_model_effort {
+        channel.default_model_effort = if effort.is_empty() {
+            None
+        } else {
+            Some(effort)
+        };
+    }
+    if let Some(ws_id) = req.default_workspace_id {
+        channel.default_workspace_id = if ws_id.is_empty() {
+            None
+        } else {
+            uuid::Uuid::parse_str(&ws_id).ok()
+        };
+    }
+    if let Some(profile) = req.default_config_profile {
+        channel.default_config_profile = if profile.is_empty() {
+            None
+        } else {
+            Some(profile)
+        };
+    }
+    if let Some(agent) = req.default_agent {
+        channel.default_agent = if agent.is_empty() { None } else { Some(agent) };
+    }
     channel.updated_at = super::mission_store::now_string();
 
     control
@@ -9747,7 +9783,8 @@ pub async fn update_telegram_channel(
                 control.mission_store.clone(),
                 &public_url,
             )
-            .await;
+            .await
+            .map_err(internal_error)?;
     } else {
         state.telegram_bridge.stop_channel(channel_id).await;
     }
@@ -9765,6 +9802,18 @@ pub struct UpdateTelegramChannelRequest {
     pub allowed_chat_ids: Option<Vec<i64>>,
     #[serde(default)]
     pub instructions: Option<String>,
+    #[serde(default)]
+    pub default_backend: Option<String>,
+    #[serde(default)]
+    pub default_model_override: Option<String>,
+    #[serde(default)]
+    pub default_model_effort: Option<String>,
+    #[serde(default)]
+    pub default_workspace_id: Option<String>,
+    #[serde(default)]
+    pub default_config_profile: Option<String>,
+    #[serde(default)]
+    pub default_agent: Option<String>,
 }
 
 // === Standalone Telegram Bot endpoints (auto-create missions per chat) ===
@@ -9842,7 +9891,8 @@ pub async fn create_telegram_bot(
             control.mission_store.clone(),
             &public_url,
         )
-        .await;
+        .await
+        .map_err(internal_error)?;
 
     tracing::info!("Created Telegram bot {} (auto-create missions)", created.id);
 

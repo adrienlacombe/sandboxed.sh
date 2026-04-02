@@ -163,6 +163,4 @@ export {
   listTelegramBots,
   createTelegramBot,
   listBotChats,
-  listAssistantMissions,
-  setMissionMode,
 } from "./telegram";

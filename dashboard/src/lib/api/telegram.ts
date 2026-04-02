@@ -65,6 +65,12 @@ export interface UpdateTelegramChannelInput {
   trigger_mode?: TelegramTriggerMode;
   allowed_chat_ids?: number[];
   instructions?: string;
+  default_backend?: string;
+  default_model_override?: string;
+  default_model_effort?: string;
+  default_workspace_id?: string;
+  default_config_profile?: string;
+  default_agent?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -132,24 +138,3 @@ export async function listBotChats(botId: string): Promise<TelegramChatMission[]
   );
 }
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-export async function listAssistantMissions(): Promise<unknown[]> {
-  return apiGet<unknown[]>(
-    `/api/control/assistants`,
-    "Failed to fetch assistant missions"
-  );
-}
-
-export async function setMissionMode(
-  missionId: string,
-  mode: "task" | "assistant"
-): Promise<void> {
-  await apiPost(
-    `/api/control/missions/${missionId}/mode`,
-    { mode },
-    "Failed to set mission mode"
-  );
-}
