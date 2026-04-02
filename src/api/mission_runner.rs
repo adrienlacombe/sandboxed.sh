@@ -9149,7 +9149,10 @@ pub async fn run_opencode_turn(
         // Use the opencode binary directly.
         // Always route through builtin proxy since plain opencode lacks provider credentials.
         // --format json produces structured events on stdout for the parser.
-        shell_cmd.push_str("opencode run --format json");
+        // stdbuf -oL forces line-buffered stdout so JSON events flush immediately
+        // through the pipe (without it, opencode block-buffers and our parser
+        // sees nothing until the process exits or the 4KB buffer fills).
+        shell_cmd.push_str("stdbuf -oL opencode run --format json");
         shell_cmd.push_str(" --model ");
         shell_cmd.push_str(&shell_escape(&plain_opencode_model));
     } else {
