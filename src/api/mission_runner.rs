@@ -10199,11 +10199,23 @@ pub async fn run_opencode_turn(
                                     }
                                 }
                             } else if event_type == "step_finish" {
+                                // Only treat as completion if reason is "stop".
+                                // Tool-use steps have reason "tool_use" and are
+                                // followed by more steps — killing early would
+                                // abort the multi-step execution.
+                                let reason = json
+                                    .get("part")
+                                    .and_then(|p| p.get("reason"))
+                                    .and_then(|r| r.as_str())
+                                    .unwrap_or("");
                                 tracing::info!(
                                     mission_id = %mission_id,
+                                    reason = %reason,
                                     "OpenCode JSON step_finish event"
                                 );
-                                let _ = sse_complete_tx.send(true);
+                                if reason == "stop" {
+                                    let _ = sse_complete_tx.send(true);
+                                }
                             } else if event_type == "step_start" {
                                 // Extract session ID from step_start
                                 if let Some(sid) =
