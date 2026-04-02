@@ -236,6 +236,8 @@ pub struct Message {
     pub caption: Option<String>,
     pub reply_to_message: Option<Box<Message>>,
     pub entities: Option<Vec<MessageEntity>>,
+    /// Entities in the caption (for media messages with @mentions in captions)
+    pub caption_entities: Option<Vec<MessageEntity>>,
     /// Document attachment (PDF, ZIP, etc.)
     pub document: Option<TelegramDocument>,
     /// Photo attachment (array of sizes, last is largest)
@@ -366,11 +368,18 @@ async fn download_telegram_file(
         "https://api.telegram.org/file/bot{}/{}",
         bot_token, tg_file_path
     );
-    let file_bytes = http
+    let download_response = http
         .get(&download_url)
         .send()
         .await
-        .map_err(|e| format!("File download failed: {}", e))?
+        .map_err(|e| format!("File download failed: {}", e))?;
+    if !download_response.status().is_success() {
+        return Err(format!(
+            "File download HTTP error: {}",
+            download_response.status()
+        ));
+    }
+    let file_bytes = download_response
         .bytes()
         .await
         .map_err(|e| format!("File read failed: {}", e))?;
@@ -599,6 +608,7 @@ async fn resolve_or_create_mission(
                 }
                 Err(e) => {
                     tracing::error!("Failed to store chat-mission mapping: {}", e);
+                    return None;
                 }
             }
 
@@ -782,32 +792,37 @@ fn should_process_message(channel: &TelegramChannel, msg: &Message, bot_username
     }
 
     let is_private = msg.chat.chat_type == "private";
-    let is_mention = msg
-        .entities
-        .as_ref()
-        .map(|entities| {
-            entities.iter().any(|e| {
-                if e.entity_type == "mention" {
-                    if let Some(ref text) = msg.text {
-                        // Telegram offsets are UTF-16 code units; convert to char-based indices
-                        let utf16_units: Vec<u16> = text.encode_utf16().collect();
-                        let start = e.offset as usize;
-                        let end = (e.offset + e.length) as usize;
-                        if end <= utf16_units.len() {
-                            if let Ok(mention) = String::from_utf16(&utf16_units[start..end]) {
-                                return mention.eq_ignore_ascii_case(&format!("@{}", bot_username));
+
+    // Check for @bot_username mentions in both text entities and caption entities
+    let mention_target = format!("@{}", bot_username);
+    let has_mention_in = |entities: &Option<Vec<MessageEntity>>, text: &Option<String>| -> bool {
+        entities
+            .as_ref()
+            .map(|ents| {
+                ents.iter().any(|e| {
+                    if e.entity_type == "mention" {
+                        if let Some(ref t) = text {
+                            let utf16_units: Vec<u16> = t.encode_utf16().collect();
+                            let start = e.offset as usize;
+                            let end = (e.offset + e.length) as usize;
+                            if end <= utf16_units.len() {
+                                if let Ok(mention) = String::from_utf16(&utf16_units[start..end]) {
+                                    return mention.eq_ignore_ascii_case(&mention_target);
+                                }
                             }
+                            false
+                        } else {
+                            false
                         }
-                        false
                     } else {
                         false
                     }
-                } else {
-                    false
-                }
+                })
             })
-        })
-        .unwrap_or(false);
+            .unwrap_or(false)
+    };
+    let is_mention = has_mention_in(&msg.entities, &msg.text)
+        || has_mention_in(&msg.caption_entities, &msg.caption);
     let is_reply = msg
         .reply_to_message
         .as_ref()
@@ -829,12 +844,12 @@ fn should_process_message(channel: &TelegramChannel, msg: &Message, bot_username
     }
 }
 
-/// Strip @bot_username from the beginning of a message.
+/// Strip @bot_username from the beginning of a message (case-insensitive).
 fn strip_bot_mention(text: &str, bot_username: &str) -> String {
     let mention = format!("@{}", bot_username);
     let trimmed = text.trim();
-    if let Some(rest) = trimmed.strip_prefix(&mention) {
-        rest.trim().to_string()
+    if trimmed.len() >= mention.len() && trimmed[..mention.len()].eq_ignore_ascii_case(&mention) {
+        trimmed[mention.len()..].trim().to_string()
     } else {
         trimmed.to_string()
     }
@@ -1167,24 +1182,32 @@ async fn edit_message(
     Ok(())
 }
 
+/// Find the byte index that includes at most `max_chars` characters.
+fn char_boundary_at(text: &str, max_chars: usize) -> usize {
+    text.char_indices()
+        .nth(max_chars)
+        .map(|(i, _)| i)
+        .unwrap_or(text.len())
+}
+
 /// Truncate text to fit Telegram's 4096 character limit.
 fn truncate_for_telegram(text: &str) -> String {
-    if text.len() <= 4096 {
+    if text.chars().count() <= 4096 {
         text.to_string()
     } else {
-        // Truncate to 4090 chars + "..." indicator
-        let truncated = &text[..text.floor_char_boundary(4090)];
-        format!("{}...", truncated)
+        let boundary = char_boundary_at(text, 4090);
+        format!("{}...", &text[..boundary])
     }
 }
 
 /// Send overflow chunks (content beyond 4096 chars) as separate messages.
 async fn send_overflow_chunks(http: &Client, base_url: &str, chat_id: i64, text: &str) {
-    if text.len() <= 4096 {
+    if text.chars().count() <= 4096 {
         return;
     }
     // The first 4096 chars were already sent via edit. Send the rest in chunks.
-    let rest = &text[text.floor_char_boundary(4090)..];
+    let boundary = char_boundary_at(text, 4090);
+    let rest = &text[boundary..];
     if rest.is_empty() {
         return;
     }
@@ -1199,19 +1222,22 @@ async fn send_chunked_message(
     text: &str,
     reply_to: Option<i64>,
 ) -> Result<(), String> {
-    let max_len = 4000;
-    if text.len() <= max_len {
-        let _ = send_message(http, base_url, chat_id, text, reply_to).await?;
+    let max_chars = 4000;
+    if text.chars().count() <= max_chars {
+        send_message(http, base_url, chat_id, text, reply_to).await?;
         return Ok(());
     }
 
     let mut remaining = text;
     let mut first = true;
     while !remaining.is_empty() {
-        let boundary = if remaining.len() <= max_len {
-            remaining.len()
-        } else {
-            remaining.floor_char_boundary(max_len)
+        let boundary = {
+            let char_count = remaining.chars().count();
+            if char_count <= max_chars {
+                remaining.len()
+            } else {
+                char_boundary_at(remaining, max_chars)
+            }
         };
         let chunk = &remaining[..boundary];
         remaining = &remaining[boundary..];

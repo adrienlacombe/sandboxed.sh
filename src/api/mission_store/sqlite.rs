@@ -706,7 +706,7 @@ impl SqliteMissionStore {
                     bot_token TEXT NOT NULL,
                     bot_username TEXT,
                     allowed_chat_ids TEXT NOT NULL DEFAULT '[]',
-                    trigger_mode TEXT NOT NULL DEFAULT 'direct_message',
+                    trigger_mode TEXT NOT NULL DEFAULT 'mention_or_dm',
                     active INTEGER NOT NULL DEFAULT 1,
                     webhook_secret TEXT,
                     instructions TEXT,
