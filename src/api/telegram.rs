@@ -884,7 +884,7 @@ fn strip_bot_mention(text: &str, bot_username: &str) -> String {
 /// 2. On first `TextDelta`, sends an initial message and captures `message_id`
 /// 3. Accumulates subsequent deltas and calls `editMessageText` every ~1s
 /// 4. On `AssistantMessage`, sends final edit with full content
-async fn stream_response(
+pub async fn stream_response(
     mut events_rx: broadcast::Receiver<AgentEvent>,
     http: &Client,
     bot_token: &str,
@@ -938,7 +938,8 @@ async fn stream_response(
                             }
                         } else {
                             // Send initial message
-                            match send_message(http, &base_url, chat_id, &accumulated_text, Some(reply_to)).await {
+                            let reply = if reply_to > 0 { Some(reply_to) } else { None };
+                            match send_message(http, &base_url, chat_id, &accumulated_text, reply).await {
                                 Ok(msg_id) => {
                                     sent_message_id = Some(msg_id);
                                     last_edit = tokio::time::Instant::now();

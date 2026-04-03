@@ -3255,6 +3255,39 @@ impl MissionStore for SqliteMissionStore {
         Ok(mapping)
     }
 
+    async fn get_telegram_chat_mission_by_mission_id(
+        &self,
+        mission_id: Uuid,
+    ) -> Result<Option<TelegramChatMission>, String> {
+        let conn = self.conn.clone();
+        let mission_id_str = mission_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            conn.query_row(
+                "SELECT id, channel_id, chat_id, mission_id, chat_title, created_at
+                 FROM telegram_chat_missions WHERE mission_id = ?1 LIMIT 1",
+                params![mission_id_str],
+                |row| {
+                    let id_str: String = row.get(0)?;
+                    let channel_id_str: String = row.get(1)?;
+                    let mission_id_str2: String = row.get(3)?;
+                    Ok(TelegramChatMission {
+                        id: Uuid::parse_str(&id_str).unwrap_or_default(),
+                        channel_id: Uuid::parse_str(&channel_id_str).unwrap_or_default(),
+                        chat_id: row.get(2)?,
+                        mission_id: Uuid::parse_str(&mission_id_str2).unwrap_or_default(),
+                        chat_title: row.get(4)?,
+                        created_at: row.get(5)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|e| e.to_string())
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
     async fn list_telegram_chat_missions(
         &self,
         channel_id: Uuid,

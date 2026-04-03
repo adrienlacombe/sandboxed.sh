@@ -3148,6 +3148,7 @@ impl ControlHub {
             Arc::clone(&self.library),
             mission_store,
             self.secrets.clone(),
+            self.telegram_bridge.clone(),
         );
         sessions.insert(user.id.clone(), state.clone());
 
@@ -4590,6 +4591,7 @@ fn spawn_control_session(
     library: SharedLibrary,
     mission_store: Arc<dyn MissionStore>,
     secrets: Option<Arc<SecretsStore>>,
+    telegram_bridge: Option<super::telegram::SharedTelegramBridge>,
 ) -> ControlState {
     let (cmd_tx, cmd_rx) = mpsc::channel::<ControlCommand>(256);
     let (events_tx, events_rx) = broadcast::channel::<AgentEvent>(1024);
@@ -4764,6 +4766,8 @@ fn spawn_control_session(
             library.clone(),
             state.cmd_tx.clone(),
             workspaces.clone(),
+            state.events_tx.clone(),
+            telegram_bridge.clone(),
         ));
     } else if state.mission_store.is_persistent() {
         tracing::info!("Automation scheduler disabled by config");
@@ -4851,6 +4855,8 @@ async fn automation_scheduler_loop(
     library: SharedLibrary,
     cmd_tx: mpsc::Sender<ControlCommand>,
     workspaces: workspace::SharedWorkspaceStore,
+    events_tx: broadcast::Sender<AgentEvent>,
+    telegram_bridge: Option<super::telegram::SharedTelegramBridge>,
 ) {
     use super::automation_variables::{substitute_variables, SubstitutionContext};
     use super::mission_store::{AutomationExecution, CommandSource, ExecutionStatus, TriggerType};
@@ -5154,6 +5160,48 @@ async fn automation_scheduler_loop(
                                 "Failed to update automation last triggered time: {}",
                                 e
                             );
+                        }
+
+                        // Route response to Telegram if this mission has an
+                        // associated Telegram chat (proactive messaging).
+                        if let Some(ref bridge) = telegram_bridge {
+                            let mission_id = mission.id;
+                            let store = Arc::clone(&mission_store);
+                            let bridge = Arc::clone(bridge);
+                            let tg_events_rx = events_tx.subscribe();
+                            tokio::spawn(async move {
+                                // Look up the Telegram chat for this mission
+                                let chat_mapping = store
+                                    .get_telegram_chat_mission_by_mission_id(mission_id)
+                                    .await;
+                                if let Ok(Some(mapping)) = chat_mapping {
+                                    // Find the channel context to get the bot token
+                                    if let Some(ctx) =
+                                        bridge.get_channel_context(mapping.channel_id).await
+                                    {
+                                        tracing::info!(
+                                            "Routing automation response for mission {} to Telegram chat {}",
+                                            mission_id,
+                                            mapping.chat_id
+                                        );
+                                        if let Err(e) = super::telegram::stream_response(
+                                            tg_events_rx,
+                                            bridge.http(),
+                                            &ctx.channel.bot_token,
+                                            mapping.chat_id,
+                                            0, // no reply_to for proactive messages
+                                            mission_id,
+                                        )
+                                        .await
+                                        {
+                                            tracing::warn!(
+                                                "Failed to stream automation response to Telegram: {}",
+                                                e
+                                            );
+                                        }
+                                    }
+                                }
+                            });
                         }
 
                         break;

@@ -813,6 +813,15 @@ pub trait MissionStore: Send + Sync {
         Err("Not supported".to_string())
     }
 
+    /// Look up the Telegram chat mapping for a given mission_id (reverse lookup).
+    async fn get_telegram_chat_mission_by_mission_id(
+        &self,
+        mission_id: Uuid,
+    ) -> Result<Option<TelegramChatMission>, String> {
+        let _ = mission_id;
+        Ok(None)
+    }
+
     /// List all chat-to-mission mappings for a channel.
     async fn list_telegram_chat_missions(
         &self,
