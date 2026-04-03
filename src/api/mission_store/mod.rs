@@ -82,6 +82,9 @@ pub struct Mission {
     /// Working directory override (for git worktrees etc.)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub working_directory: Option<String>,
+    /// Mission operating mode (task or assistant)
+    #[serde(default)]
+    pub mission_mode: MissionMode,
 }
 
 fn default_backend() -> String {
@@ -154,6 +157,15 @@ pub enum TriggerType {
     Webhook { config: WebhookConfig },
     /// Trigger immediately after an agent turn finishes for the mission
     AgentFinished,
+    /// Telegram bot trigger (messages are routed via the Telegram bridge)
+    Telegram { config: TelegramTriggerConfig },
+}
+
+/// Configuration for a Telegram-triggered automation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TelegramTriggerConfig {
+    /// The channel ID this automation is linked to
+    pub channel_id: Uuid,
 }
 
 /// Stop policy for automation lifecycle.
@@ -299,6 +311,108 @@ pub struct AutomationExecution {
     /// Number of retry attempts made
     #[serde(default)]
     pub retry_count: u32,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Mission Mode
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Mission operating mode.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MissionMode {
+    /// Standard task execution — agent works toward a goal and completes.
+    #[default]
+    Task,
+    /// Persistent assistant — mission stays alive, waits for messages indefinitely.
+    /// Used for chat-based assistants (Telegram, Slack, etc.)
+    Assistant,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Communication Channels
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A communication channel that connects external messaging platforms to a mission.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TelegramChannel {
+    pub id: Uuid,
+    /// Mission this channel is connected to (sentinel UUID when auto_create_missions is true)
+    pub mission_id: Uuid,
+    /// Bot token for the Telegram Bot API (never exposed in API responses)
+    #[serde(skip_serializing)]
+    pub bot_token: String,
+    /// Optional bot username (e.g. "ana_bot")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bot_username: Option<String>,
+    /// Chat IDs allowed to interact with this bot (empty = allow all)
+    #[serde(default)]
+    pub allowed_chat_ids: Vec<i64>,
+    /// How the bot should be triggered
+    #[serde(default)]
+    pub trigger_mode: TelegramTriggerMode,
+    /// Whether this channel is currently active
+    pub active: bool,
+    /// Secret token for Telegram webhook verification
+    #[serde(skip_serializing)]
+    pub webhook_secret: Option<String>,
+    /// System instructions prepended to every Telegram message for this channel.
+    /// Use this to customize assistant behavior (e.g. "Don't use markdown formatting").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<String>,
+    /// When true, each Telegram chat auto-creates its own mission using the default_* settings.
+    #[serde(default)]
+    pub auto_create_missions: bool,
+    /// Default backend for auto-created missions (e.g. "claudecode", "opencode")
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_backend: Option<String>,
+    /// Default model override for auto-created missions
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_model_override: Option<String>,
+    /// Default model effort for auto-created missions (low/medium/high)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_model_effort: Option<String>,
+    /// Default workspace ID for auto-created missions
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_workspace_id: Option<Uuid>,
+    /// Default config profile for auto-created missions
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_config_profile: Option<String>,
+    /// Default agent for auto-created missions
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_agent: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// A mapping from a Telegram chat to an auto-created mission.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TelegramChatMission {
+    pub id: Uuid,
+    pub channel_id: Uuid,
+    pub chat_id: i64,
+    pub mission_id: Uuid,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat_title: Option<String>,
+    pub created_at: String,
+}
+
+/// How Telegram messages trigger the assistant.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TelegramTriggerMode {
+    /// Trigger on @bot_username mentions in groups, replies to bot, or DMs (recommended default)
+    #[default]
+    MentionOrDm,
+    /// Trigger on @bot_username mentions in groups only
+    BotMention,
+    /// Trigger on replies to bot messages only
+    Reply,
+    /// Trigger on DMs only
+    DirectMessage,
+    /// Trigger on every message in allowed chats (no filtering)
+    #[serde(alias = "all")]
+    Always,
 }
 
 /// Get current timestamp as RFC3339 string.
@@ -477,6 +591,16 @@ pub trait MissionStore: Send + Sync {
         Ok(vec![])
     }
 
+    /// Count events for a mission, optionally filtered by type.
+    async fn count_events(
+        &self,
+        mission_id: Uuid,
+        event_types: Option<&[&str]>,
+    ) -> Result<usize, String> {
+        let _ = (mission_id, event_types);
+        Ok(0)
+    }
+
     /// Get total cost in cents across all missions.
     /// Aggregates assistant_message metadata cost across all events.
     async fn get_total_cost_cents(&self) -> Result<u64, String> {
@@ -607,6 +731,104 @@ pub trait MissionStore: Send + Sync {
     ) -> Result<u32, String> {
         let _ = (mission_id, success, error);
         Ok(0)
+    }
+
+    /// Update the mission mode (Task/Assistant).
+    async fn update_mission_mode(&self, id: Uuid, mode: MissionMode) -> Result<(), String> {
+        let _ = (id, mode);
+        Err("Not supported".to_string())
+    }
+
+    /// List all missions in Assistant mode.
+    async fn list_assistant_missions(&self) -> Result<Vec<Mission>, String> {
+        Ok(vec![])
+    }
+
+    // === Telegram Channel methods ===
+
+    /// Create a Telegram channel for a mission.
+    async fn create_telegram_channel(
+        &self,
+        channel: TelegramChannel,
+    ) -> Result<TelegramChannel, String> {
+        let _ = channel;
+        Err("Telegram channels not supported by this store".to_string())
+    }
+
+    /// Get a Telegram channel by ID.
+    async fn get_telegram_channel(&self, id: Uuid) -> Result<Option<TelegramChannel>, String> {
+        let _ = id;
+        Ok(None)
+    }
+
+    /// List Telegram channels for a mission.
+    async fn list_telegram_channels(
+        &self,
+        mission_id: Uuid,
+    ) -> Result<Vec<TelegramChannel>, String> {
+        let _ = mission_id;
+        Ok(vec![])
+    }
+
+    /// List all active Telegram channels across all missions.
+    async fn list_all_active_telegram_channels(&self) -> Result<Vec<TelegramChannel>, String> {
+        Ok(vec![])
+    }
+
+    /// Update a Telegram channel.
+    async fn update_telegram_channel(&self, channel: TelegramChannel) -> Result<(), String> {
+        let _ = channel;
+        Err("Telegram channels not supported by this store".to_string())
+    }
+
+    /// Delete a Telegram channel.
+    async fn delete_telegram_channel(&self, id: Uuid) -> Result<bool, String> {
+        let _ = id;
+        Ok(false)
+    }
+
+    /// List all Telegram channels (both legacy and auto-create).
+    async fn list_all_telegram_channels(&self) -> Result<Vec<TelegramChannel>, String> {
+        Ok(vec![])
+    }
+
+    // === Telegram Chat-Mission mapping methods ===
+
+    /// Look up the mission for a specific (channel, chat_id) pair.
+    async fn get_telegram_chat_mission(
+        &self,
+        channel_id: Uuid,
+        chat_id: i64,
+    ) -> Result<Option<TelegramChatMission>, String> {
+        let _ = (channel_id, chat_id);
+        Ok(None)
+    }
+
+    /// Create a mapping from (channel, chat_id) to mission.
+    async fn create_telegram_chat_mission(
+        &self,
+        mapping: TelegramChatMission,
+    ) -> Result<TelegramChatMission, String> {
+        let _ = mapping;
+        Err("Not supported".to_string())
+    }
+
+    /// Look up the Telegram chat mapping for a given mission_id (reverse lookup).
+    async fn get_telegram_chat_mission_by_mission_id(
+        &self,
+        mission_id: Uuid,
+    ) -> Result<Option<TelegramChatMission>, String> {
+        let _ = mission_id;
+        Ok(None)
+    }
+
+    /// List all chat-to-mission mappings for a channel.
+    async fn list_telegram_chat_missions(
+        &self,
+        channel_id: Uuid,
+    ) -> Result<Vec<TelegramChatMission>, String> {
+        let _ = channel_id;
+        Ok(vec![])
     }
 }
 

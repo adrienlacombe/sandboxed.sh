@@ -303,10 +303,16 @@ impl WorkspaceExec {
     ) -> String {
         let mut cmd = String::new();
 
-        // Export env vars inside the shell command so they're available in the container
+        // Export env vars inside the shell command so they're available in the container.
+        // Keys are validated to POSIX env var names (alphanumeric + underscore) to prevent
+        // shell injection via crafted env var keys. Values are single-quote escaped.
         if let Some(env) = env {
             for (k, v) in env {
                 if k.trim().is_empty() {
+                    continue;
+                }
+                if !k.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+                    tracing::warn!(key = %k, "Skipping env var with invalid key characters");
                     continue;
                 }
                 cmd.push_str("export ");
@@ -354,6 +360,10 @@ impl WorkspaceExec {
         // Export env vars so the bootstrap script and program can use them.
         for (k, v) in env {
             if k.trim().is_empty() {
+                continue;
+            }
+            // Validate key: only POSIX env var names to prevent shell injection.
+            if !k.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
                 continue;
             }
             // When using nsenter, export ALL env vars (nsenter doesn't propagate them).

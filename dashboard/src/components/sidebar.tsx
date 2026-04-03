@@ -30,6 +30,7 @@ import {
   Lock,
   GitBranch,
   Sparkles,
+  MessageCircle,
 } from 'lucide-react';
 
 type NavItem = {
@@ -74,6 +75,7 @@ const navigation: NavItem[] = [
       { name: 'Backends', href: '/settings/backends', icon: Cpu },
       { name: 'Providers', href: '/settings/providers', icon: Key },
       { name: 'LLM', href: '/settings/llm', icon: Sparkles },
+      { name: 'Telegram', href: '/settings/telegram', icon: MessageCircle },
       { name: 'Security', href: '/settings/secrets', icon: Lock },
       { name: 'Data', href: '/settings/data', icon: Archive },
     ],

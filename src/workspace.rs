@@ -3556,6 +3556,44 @@ pub async fn prepare_mission_workspace_with_skills_backend(
                     );
                 }
             }
+
+            // Sync agents directory from profile (e.g. .opencode/agents/*.md)
+            {
+                let profile_path = lib.config_profile_path(profile);
+                let agents_src = profile_path.join(".opencode").join("agents");
+                if agents_src.is_dir() {
+                    let agents_dest = dir.join(".opencode").join("agent");
+                    if let Err(e) = tokio::fs::create_dir_all(&agents_dest).await {
+                        tracing::warn!(
+                            mission = %mission_id,
+                            error = %e,
+                            "Failed to create .opencode/agent directory"
+                        );
+                    } else {
+                        let mut count = 0u32;
+                        if let Ok(mut entries) = tokio::fs::read_dir(&agents_src).await {
+                            while let Ok(Some(entry)) = entries.next_entry().await {
+                                let path = entry.path();
+                                if path.extension().map(|e| e == "md").unwrap_or(false) {
+                                    let dest = agents_dest.join(entry.file_name());
+                                    if let Ok(content) = tokio::fs::read(&path).await {
+                                        let _ = tokio::fs::write(&dest, &content).await;
+                                        count += 1;
+                                    }
+                                }
+                            }
+                        }
+                        if count > 0 {
+                            tracing::info!(
+                                mission = %mission_id,
+                                count = count,
+                                profile = %profile,
+                                "Synced agents from config profile to workspace"
+                            );
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -3953,7 +3991,12 @@ async fn sync_workspace_mcp_binaries(
     container_root: &Path,
 ) -> anyhow::Result<()> {
     // Copy MCP binaries into the container so workspace-local MCP configs can run them directly.
-    for binary in ["workspace-mcp", "desktop-mcp", "orchestrator-mcp"] {
+    for binary in [
+        "workspace-mcp",
+        "desktop-mcp",
+        "orchestrator-mcp",
+        "automation-manager-mcp",
+    ] {
         if find_host_binary(binary, working_dir).is_none() {
             tracing::warn!(binary, "MCP binary not found on host; skipping copy");
             continue;

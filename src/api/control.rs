@@ -3079,6 +3079,7 @@ pub struct ControlHub {
     workspaces: workspace::SharedWorkspaceStore,
     library: SharedLibrary,
     secrets: Option<Arc<SecretsStore>>,
+    telegram_bridge: Option<super::telegram::SharedTelegramBridge>,
 }
 
 impl ControlHub {
@@ -3098,7 +3099,13 @@ impl ControlHub {
             workspaces,
             library,
             secrets,
+            telegram_bridge: None,
         }
+    }
+
+    /// Set the Telegram bridge reference (called after AppState is created).
+    pub fn set_telegram_bridge(&mut self, bridge: super::telegram::SharedTelegramBridge) {
+        self.telegram_bridge = Some(bridge);
     }
 
     pub async fn get_or_spawn(&self, user: &AuthUser) -> ControlState {
@@ -3141,8 +3148,25 @@ impl ControlHub {
             Arc::clone(&self.library),
             mission_store,
             self.secrets.clone(),
+            self.telegram_bridge.clone(),
         );
         sessions.insert(user.id.clone(), state.clone());
+
+        // Boot Telegram channels for this user's missions
+        if let Some(ref bridge) = self.telegram_bridge {
+            let bridge = Arc::clone(bridge);
+            let store = Arc::clone(&state.mission_store);
+            let cmd_tx = state.cmd_tx.clone();
+            let events_tx = state.events_tx.clone();
+            let public_url = std::env::var("SANDBOXED_PUBLIC_URL")
+                .unwrap_or_else(|_| format!("http://{}:{}", self.config.host, self.config.port));
+            tokio::spawn(async move {
+                bridge
+                    .boot_from_store(&store, cmd_tx, events_tx, &public_url)
+                    .await;
+            });
+        }
+
         state
     }
 
@@ -4144,6 +4168,9 @@ pub struct GetEventsQuery {
     /// Offset for pagination
     #[serde(default)]
     pub offset: Option<usize>,
+    /// When true, return the latest N events (computes offset from total count)
+    #[serde(default)]
+    pub latest: Option<bool>,
 }
 
 /// Get events for a mission (for debugging/replay).
@@ -4172,9 +4199,25 @@ pub async fn get_mission_events(
         .as_ref()
         .map(|s| s.split(',').map(|t| t.trim()).collect());
 
+    // When latest=true with a limit, compute offset to return the last N events
+    let offset = if query.latest.unwrap_or(false) {
+        if let Some(limit) = query.limit {
+            let total = control
+                .mission_store
+                .count_events(mission_id, types.as_deref())
+                .await
+                .map_err(internal_error)?;
+            Some(total.saturating_sub(limit))
+        } else {
+            query.offset
+        }
+    } else {
+        query.offset
+    };
+
     let events = control
         .mission_store
-        .get_events(mission_id, types.as_deref(), query.limit, query.offset)
+        .get_events(mission_id, types.as_deref(), query.limit, offset)
         .await
         .map_err(internal_error)?;
 
@@ -4548,6 +4591,7 @@ fn spawn_control_session(
     library: SharedLibrary,
     mission_store: Arc<dyn MissionStore>,
     secrets: Option<Arc<SecretsStore>>,
+    telegram_bridge: Option<super::telegram::SharedTelegramBridge>,
 ) -> ControlState {
     let (cmd_tx, cmd_rx) = mpsc::channel::<ControlCommand>(256);
     let (events_tx, events_rx) = broadcast::channel::<AgentEvent>(1024);
@@ -4722,6 +4766,8 @@ fn spawn_control_session(
             library.clone(),
             state.cmd_tx.clone(),
             workspaces.clone(),
+            state.events_tx.clone(),
+            telegram_bridge.clone(),
         ));
     } else if state.mission_store.is_persistent() {
         tracing::info!("Automation scheduler disabled by config");
@@ -4809,6 +4855,8 @@ async fn automation_scheduler_loop(
     library: SharedLibrary,
     cmd_tx: mpsc::Sender<ControlCommand>,
     workspaces: workspace::SharedWorkspaceStore,
+    events_tx: broadcast::Sender<AgentEvent>,
+    telegram_bridge: Option<super::telegram::SharedTelegramBridge>,
 ) {
     use super::automation_variables::{substitute_variables, SubstitutionContext};
     use super::mission_store::{AutomationExecution, CommandSource, ExecutionStatus, TriggerType};
@@ -4816,7 +4864,10 @@ async fn automation_scheduler_loop(
     // Check every 5 seconds for automations that need to run
     let check_interval = std::time::Duration::from_secs(5);
 
-    tracing::info!("Automation scheduler task started");
+    tracing::info!(
+        telegram_bridge_available = telegram_bridge.is_some(),
+        "Automation scheduler task started"
+    );
 
     let mut logged_unsupported = false;
 
@@ -4844,6 +4895,10 @@ async fn automation_scheduler_loop(
                 }
                 TriggerType::AgentFinished => {
                     // Skip agent_finished automations - they're triggered when a turn completes.
+                    continue;
+                }
+                TriggerType::Telegram { .. } => {
+                    // Skip Telegram automations - they're triggered via the Telegram bridge.
                     continue;
                 }
             };
@@ -5110,6 +5165,48 @@ async fn automation_scheduler_loop(
                             );
                         }
 
+                        // Route response to Telegram if this mission has an
+                        // associated Telegram chat (proactive messaging).
+                        if let Some(ref bridge) = telegram_bridge {
+                            let mission_id = mission.id;
+                            let store = Arc::clone(&mission_store);
+                            let bridge = Arc::clone(bridge);
+                            let tg_events_rx = events_tx.subscribe();
+                            tokio::spawn(async move {
+                                // Look up the Telegram chat for this mission
+                                let chat_mapping = store
+                                    .get_telegram_chat_mission_by_mission_id(mission_id)
+                                    .await;
+                                if let Ok(Some(mapping)) = chat_mapping {
+                                    // Find the channel context to get the bot token
+                                    if let Some(ctx) =
+                                        bridge.get_channel_context(mapping.channel_id).await
+                                    {
+                                        tracing::info!(
+                                            "Routing automation response for mission {} to Telegram chat {}",
+                                            mission_id,
+                                            mapping.chat_id
+                                        );
+                                        if let Err(e) = super::telegram::stream_response(
+                                            tg_events_rx,
+                                            bridge.http(),
+                                            &ctx.channel.bot_token,
+                                            mapping.chat_id,
+                                            0, // no reply_to for proactive messages
+                                            mission_id,
+                                        )
+                                        .await
+                                        {
+                                            tracing::warn!(
+                                                "Failed to stream automation response to Telegram: {}",
+                                                e
+                                            );
+                                        }
+                                    }
+                                }
+                            });
+                        }
+
                         break;
                     }
                     Err(e) => {
@@ -5348,6 +5445,19 @@ async fn maybe_finalize_terminal_mission(
                     mission_id = %mission_id,
                     context = log_context,
                     "Skipping mission completion because active automations are enabled"
+                );
+                return;
+            }
+
+            // Assistant missions (e.g. Telegram-linked) should stay active
+            // after each reply — they are long-lived by design.
+            if new_status == MissionStatus::Completed
+                && mission.mission_mode == super::mission_store::MissionMode::Assistant
+            {
+                tracing::debug!(
+                    mission_id = %mission_id,
+                    context = log_context,
+                    "Skipping mission completion for assistant-mode mission"
                 );
                 return;
             }
@@ -6070,12 +6180,17 @@ async fn control_actor_loop(
                             }
                         }
 
-                        // Case 2: Target differs from main AND main is running → start parallel
+                        // Case 2: Target differs from main → start parallel
+                        // When target_mission_id is explicitly set (e.g. from Telegram),
+                        // always use parallel execution to avoid hijacking the main session.
+                        // When the target is merely inferred (current differs from running),
+                        // only start parallel when main is busy.
+                        let force_parallel = target_mission_id.is_some(); // explicit target (e.g. Telegram)
                         if let Some(tid) = effective_target {
-                            if !target_is_main && main_is_running {
+                            if !target_is_main && (main_is_running || force_parallel) {
                                 // Check capacity
                                 let parallel_running = parallel_runners.values().filter(|r| r.is_running()).count();
-                                let total_running = parallel_running + 1; // +1 for main
+                                let total_running = parallel_running + if main_is_running { 1 } else { 0 };
                                 let max_parallel = crate::settings::max_parallel_missions_cached_or(config.max_parallel_missions);
 
                                 if total_running >= max_parallel {
@@ -8615,8 +8730,34 @@ async fn run_single_control_turn(
         _ => {
             // Default to opencode using per-workspace CLI execution
             let mid = mission_id.unwrap_or_else(Uuid::nil);
+            // Check profile's sandboxed config for disable_oh_my_opencode flag
+            let mut opencode_workspace = exec_workspace.clone();
+            if let Some(ref profile) = effective_config_profile {
+                let lib_guard = library.read().await;
+                if let Some(lib) = lib_guard.as_ref() {
+                    if let Ok(profile_data) = lib.get_config_profile(profile).await {
+                        if profile_data.sandboxed_config.disable_oh_my_opencode {
+                            tracing::info!(
+                                mission_id = ?mission_id,
+                                profile = %profile,
+                                "Enabling plain opencode mode from config profile"
+                            );
+                            let mut obj = opencode_workspace
+                                .config
+                                .as_object()
+                                .cloned()
+                                .unwrap_or_default();
+                            obj.insert(
+                                "disable_oh_my_opencode".to_string(),
+                                serde_json::json!(true),
+                            );
+                            opencode_workspace.config = serde_json::Value::Object(obj);
+                        }
+                    }
+                }
+            }
             Box::pin(super::mission_runner::run_opencode_turn(
-                exec_workspace,
+                &opencode_workspace,
                 &ctx.working_dir,
                 &user_message,
                 config.default_model.as_deref(),
@@ -9366,9 +9507,658 @@ pub async fn webhook_receiver(
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Assistant missions
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// List all missions with MissionMode::Assistant.
+pub async fn list_assistant_missions(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+) -> Result<Json<Vec<super::mission_store::Mission>>, (StatusCode, String)> {
+    let control = control_for_user(&state, &user).await;
+    let missions = control
+        .mission_store
+        .list_assistant_missions()
+        .await
+        .map_err(internal_error)?;
+    Ok(Json(missions))
+}
+
+/// Set mission mode (task or assistant).
+pub async fn set_mission_mode(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    Path(id): Path<Uuid>,
+    Json(req): Json<SetMissionModeRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    use super::mission_store::MissionMode;
+
+    let mode = match req.mode.as_str() {
+        "task" => MissionMode::Task,
+        "assistant" => MissionMode::Assistant,
+        other => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("Invalid mission mode: {other}. Must be 'task' or 'assistant'."),
+            ));
+        }
+    };
+
+    let control = control_for_user(&state, &user).await;
+    control
+        .mission_store
+        .update_mission_mode(id, mode)
+        .await
+        .map_err(internal_error)?;
+
+    Ok(ok_json())
+}
+
+#[derive(Deserialize)]
+pub struct SetMissionModeRequest {
+    pub mode: String,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Telegram Channel endpoints
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// List Telegram channels for a mission.
+pub async fn list_telegram_channels(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    Path(mission_id): Path<Uuid>,
+) -> Result<Json<Vec<super::mission_store::TelegramChannel>>, (StatusCode, String)> {
+    let control = control_for_user(&state, &user).await;
+    let channels = control
+        .mission_store
+        .list_telegram_channels(mission_id)
+        .await
+        .map_err(internal_error)?;
+    Ok(Json(channels))
+}
+
+/// Create a Telegram channel for a mission.
+pub async fn create_telegram_channel(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    Path(mission_id): Path<Uuid>,
+    Json(req): Json<CreateTelegramChannelRequest>,
+) -> Result<Json<super::mission_store::TelegramChannel>, (StatusCode, String)> {
+    use super::mission_store::{now_string, MissionMode, TelegramChannel};
+
+    let control = control_for_user(&state, &user).await;
+
+    // Verify mission exists
+    let mission = control
+        .mission_store
+        .get_mission(mission_id)
+        .await
+        .map_err(internal_error)?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                format!("Mission {} not found", mission_id),
+            )
+        })?;
+
+    // Auto-set mission to Assistant mode when adding a Telegram channel
+    if mission.mission_mode != MissionMode::Assistant {
+        if let Err(e) = control
+            .mission_store
+            .update_mission_mode(mission_id, MissionMode::Assistant)
+            .await
+        {
+            tracing::warn!(
+                "Failed to set assistant mode on mission {}: {}",
+                mission_id,
+                e
+            );
+        } else {
+            tracing::info!(
+                "Auto-set mission {} to Assistant mode (Telegram channel attached)",
+                mission_id
+            );
+        }
+    }
+
+    // Reject duplicate bot tokens to avoid webhook conflicts
+    let all_channels = control
+        .mission_store
+        .list_all_telegram_channels()
+        .await
+        .map_err(internal_error)?;
+    if all_channels.iter().any(|c| c.bot_token == req.bot_token) {
+        return Err((
+            StatusCode::CONFLICT,
+            "A channel with this bot token already exists".to_string(),
+        ));
+    }
+
+    let now = now_string();
+    let webhook_secret = Uuid::new_v4().to_string().replace('-', "");
+    let channel = TelegramChannel {
+        id: Uuid::new_v4(),
+        mission_id,
+        bot_token: req.bot_token,
+        bot_username: req.bot_username,
+        allowed_chat_ids: req.allowed_chat_ids.unwrap_or_default(),
+        trigger_mode: req.trigger_mode.unwrap_or_default(),
+        active: true,
+        webhook_secret: Some(webhook_secret),
+        instructions: req.instructions,
+        auto_create_missions: false,
+        default_backend: None,
+        default_model_override: None,
+        default_model_effort: None,
+        default_workspace_id: None,
+        default_config_profile: None,
+        default_agent: None,
+        created_at: now.clone(),
+        updated_at: now,
+    };
+
+    let created = control
+        .mission_store
+        .create_telegram_channel(channel)
+        .await
+        .map_err(internal_error)?;
+
+    // Register the webhook — roll back the channel if this fails
+    let public_url = std::env::var("SANDBOXED_PUBLIC_URL")
+        .unwrap_or_else(|_| format!("http://{}:{}", state.config.host, state.config.port));
+    if let Err(e) = state
+        .telegram_bridge
+        .start_channel(
+            created.clone(),
+            control.cmd_tx.clone(),
+            control.events_tx.clone(),
+            control.mission_store.clone(),
+            &public_url,
+        )
+        .await
+    {
+        let _ = control
+            .mission_store
+            .delete_telegram_channel(created.id)
+            .await;
+        return Err(internal_error(e));
+    }
+
+    tracing::info!(
+        "Created Telegram channel {} for mission {}",
+        created.id,
+        mission_id
+    );
+
+    Ok(Json(created))
+}
+
+#[derive(Deserialize)]
+pub struct CreateTelegramChannelRequest {
+    pub bot_token: String,
+    #[serde(default)]
+    pub bot_username: Option<String>,
+    #[serde(default)]
+    pub allowed_chat_ids: Option<Vec<i64>>,
+    #[serde(default)]
+    pub trigger_mode: Option<super::mission_store::TelegramTriggerMode>,
+    /// System instructions for the assistant (e.g. "Don't use markdown formatting")
+    #[serde(default)]
+    pub instructions: Option<String>,
+}
+
+/// Delete a Telegram channel.
+pub async fn delete_telegram_channel(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    Path(channel_id): Path<Uuid>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let control = control_for_user(&state, &user).await;
+
+    // Fetch channel first so we can clean up the placeholder mission for auto-create bots
+    let channel = control
+        .mission_store
+        .get_telegram_channel(channel_id)
+        .await
+        .map_err(internal_error)?;
+
+    // Delete from store first (verifies ownership), then stop the poller
+    let deleted = control
+        .mission_store
+        .delete_telegram_channel(channel_id)
+        .await
+        .map_err(internal_error)?;
+
+    if deleted {
+        state.telegram_bridge.stop_channel(channel_id).await;
+
+        // Clean up the placeholder mission for auto-create bots
+        if let Some(ch) = channel {
+            if ch.auto_create_missions {
+                let _ = control.mission_store.delete_mission(ch.mission_id).await;
+            }
+        }
+
+        tracing::info!("Deleted Telegram channel {}", channel_id);
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err((
+            StatusCode::NOT_FOUND,
+            format!("Telegram channel {} not found", channel_id),
+        ))
+    }
+}
+
+/// Toggle a Telegram channel's active state.
+pub async fn toggle_telegram_channel(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    Path(channel_id): Path<Uuid>,
+    Json(req): Json<ToggleTelegramChannelRequest>,
+) -> Result<Json<super::mission_store::TelegramChannel>, (StatusCode, String)> {
+    let control = control_for_user(&state, &user).await;
+
+    let mut channel = control
+        .mission_store
+        .get_telegram_channel(channel_id)
+        .await
+        .map_err(internal_error)?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                format!("Telegram channel {} not found", channel_id),
+            )
+        })?;
+
+    let previous_active = channel.active;
+    channel.active = req.active;
+    channel.updated_at = super::mission_store::now_string();
+
+    control
+        .mission_store
+        .update_telegram_channel(channel.clone())
+        .await
+        .map_err(internal_error)?;
+
+    if channel.active {
+        let public_url = std::env::var("SANDBOXED_PUBLIC_URL")
+            .unwrap_or_else(|_| format!("http://{}:{}", state.config.host, state.config.port));
+        if let Err(e) = state
+            .telegram_bridge
+            .start_channel(
+                channel.clone(),
+                control.cmd_tx.clone(),
+                control.events_tx.clone(),
+                control.mission_store.clone(),
+                &public_url,
+            )
+            .await
+        {
+            // Roll back active state
+            channel.active = previous_active;
+            channel.updated_at = super::mission_store::now_string();
+            let _ = control.mission_store.update_telegram_channel(channel).await;
+            return Err(internal_error(e));
+        }
+    } else {
+        state.telegram_bridge.stop_channel(channel_id).await;
+    }
+
+    Ok(Json(channel))
+}
+
+#[derive(Deserialize)]
+pub struct ToggleTelegramChannelRequest {
+    pub active: bool,
+}
+
+/// Update a Telegram channel's settings (PATCH).
+pub async fn update_telegram_channel(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    Path(channel_id): Path<Uuid>,
+    Json(req): Json<UpdateTelegramChannelRequest>,
+) -> Result<Json<super::mission_store::TelegramChannel>, (StatusCode, String)> {
+    let control = control_for_user(&state, &user).await;
+
+    let original_channel = control
+        .mission_store
+        .get_telegram_channel(channel_id)
+        .await
+        .map_err(internal_error)?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                format!("Telegram channel {} not found", channel_id),
+            )
+        })?;
+
+    let mut channel = original_channel.clone();
+
+    // Apply partial updates
+    if let Some(active) = req.active {
+        channel.active = active;
+    }
+    if let Some(trigger_mode) = req.trigger_mode {
+        channel.trigger_mode = trigger_mode;
+    }
+    if let Some(allowed_chat_ids) = req.allowed_chat_ids {
+        channel.allowed_chat_ids = allowed_chat_ids;
+    }
+    if let Some(instructions) = req.instructions {
+        channel.instructions = if instructions.is_empty() {
+            None
+        } else {
+            Some(instructions)
+        };
+    }
+    if let Some(backend) = req.default_backend {
+        channel.default_backend = if backend.is_empty() {
+            None
+        } else {
+            Some(backend)
+        };
+    }
+    if let Some(model) = req.default_model_override {
+        channel.default_model_override = if model.is_empty() { None } else { Some(model) };
+    }
+    if let Some(effort) = req.default_model_effort {
+        channel.default_model_effort = if effort.is_empty() {
+            None
+        } else {
+            Some(effort)
+        };
+    }
+    if let Some(ws_id) = req.default_workspace_id {
+        channel.default_workspace_id = if ws_id.is_empty() {
+            None
+        } else {
+            uuid::Uuid::parse_str(&ws_id).ok()
+        };
+    }
+    if let Some(profile) = req.default_config_profile {
+        channel.default_config_profile = if profile.is_empty() {
+            None
+        } else {
+            Some(profile)
+        };
+    }
+    if let Some(agent) = req.default_agent {
+        channel.default_agent = if agent.is_empty() { None } else { Some(agent) };
+    }
+    channel.updated_at = super::mission_store::now_string();
+
+    control
+        .mission_store
+        .update_telegram_channel(channel.clone())
+        .await
+        .map_err(internal_error)?;
+
+    // Re-register or stop webhook based on active state
+    if channel.active {
+        let public_url = std::env::var("SANDBOXED_PUBLIC_URL")
+            .unwrap_or_else(|_| format!("http://{}:{}", state.config.host, state.config.port));
+        if let Err(e) = state
+            .telegram_bridge
+            .start_channel(
+                channel.clone(),
+                control.cmd_tx.clone(),
+                control.events_tx.clone(),
+                control.mission_store.clone(),
+                &public_url,
+            )
+            .await
+        {
+            // Roll back to original channel state
+            let _ = control
+                .mission_store
+                .update_telegram_channel(original_channel)
+                .await;
+            return Err(internal_error(e));
+        }
+    } else {
+        state.telegram_bridge.stop_channel(channel_id).await;
+    }
+
+    Ok(Json(channel))
+}
+
+#[derive(Deserialize)]
+pub struct UpdateTelegramChannelRequest {
+    #[serde(default)]
+    pub active: Option<bool>,
+    #[serde(default)]
+    pub trigger_mode: Option<super::mission_store::TelegramTriggerMode>,
+    #[serde(default)]
+    pub allowed_chat_ids: Option<Vec<i64>>,
+    #[serde(default)]
+    pub instructions: Option<String>,
+    #[serde(default)]
+    pub default_backend: Option<String>,
+    #[serde(default)]
+    pub default_model_override: Option<String>,
+    #[serde(default)]
+    pub default_model_effort: Option<String>,
+    #[serde(default)]
+    pub default_workspace_id: Option<String>,
+    #[serde(default)]
+    pub default_config_profile: Option<String>,
+    #[serde(default)]
+    pub default_agent: Option<String>,
+}
+
+// === Standalone Telegram Bot endpoints (auto-create missions per chat) ===
+
+/// Create a standalone Telegram bot configuration (auto-creates missions per chat).
+pub async fn create_telegram_bot(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    Json(req): Json<CreateTelegramBotRequest>,
+) -> Result<Json<super::mission_store::TelegramChannel>, (StatusCode, String)> {
+    use super::mission_store::{now_string, MissionMode, TelegramChannel};
+
+    let control = control_for_user(&state, &user).await;
+
+    // Reject duplicate bot tokens to avoid webhook conflicts
+    let all_channels = control
+        .mission_store
+        .list_all_telegram_channels()
+        .await
+        .map_err(internal_error)?;
+    if all_channels.iter().any(|c| c.bot_token == req.bot_token) {
+        return Err((
+            StatusCode::CONFLICT,
+            "A bot with this token already exists".to_string(),
+        ));
+    }
+
+    // Create a placeholder mission so the FK constraint is satisfied.
+    // When auto_create_missions is true, individual chat missions are auto-created;
+    // this placeholder is only used to anchor the channel row.
+    let placeholder_mission = control
+        .mission_store
+        .create_mission(
+            Some("Telegram Bot (auto-create)"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .map_err(internal_error)?;
+    // Set placeholder to assistant mode
+    let _ = control
+        .mission_store
+        .update_mission_mode(placeholder_mission.id, MissionMode::Assistant)
+        .await;
+
+    let now = now_string();
+    let webhook_secret = Uuid::new_v4().to_string().replace('-', "");
+    let channel = TelegramChannel {
+        id: Uuid::new_v4(),
+        mission_id: placeholder_mission.id,
+        bot_token: req.bot_token,
+        bot_username: req.bot_username,
+        allowed_chat_ids: req.allowed_chat_ids.unwrap_or_default(),
+        trigger_mode: req.trigger_mode.unwrap_or_default(),
+        active: true,
+        webhook_secret: Some(webhook_secret),
+        instructions: req.instructions,
+        auto_create_missions: true,
+        default_backend: req.default_backend,
+        default_model_override: req.default_model_override,
+        default_model_effort: req.default_model_effort,
+        default_workspace_id: req.default_workspace_id,
+        default_config_profile: req.default_config_profile,
+        default_agent: req.default_agent,
+        created_at: now.clone(),
+        updated_at: now,
+    };
+
+    let created = match control.mission_store.create_telegram_channel(channel).await {
+        Ok(c) => c,
+        Err(e) => {
+            // Clean up placeholder mission
+            let _ = control
+                .mission_store
+                .delete_mission(placeholder_mission.id)
+                .await;
+            return Err(internal_error(e));
+        }
+    };
+
+    // Register the webhook — roll back channel + placeholder on failure
+    let public_url = std::env::var("SANDBOXED_PUBLIC_URL")
+        .unwrap_or_else(|_| format!("http://{}:{}", state.config.host, state.config.port));
+    if let Err(e) = state
+        .telegram_bridge
+        .start_channel(
+            created.clone(),
+            control.cmd_tx.clone(),
+            control.events_tx.clone(),
+            control.mission_store.clone(),
+            &public_url,
+        )
+        .await
+    {
+        let _ = control
+            .mission_store
+            .delete_telegram_channel(created.id)
+            .await;
+        let _ = control
+            .mission_store
+            .delete_mission(placeholder_mission.id)
+            .await;
+        return Err(internal_error(e));
+    }
+
+    tracing::info!("Created Telegram bot {} (auto-create missions)", created.id);
+
+    Ok(Json(created))
+}
+
+#[derive(Deserialize)]
+pub struct CreateTelegramBotRequest {
+    pub bot_token: String,
+    #[serde(default)]
+    pub bot_username: Option<String>,
+    #[serde(default)]
+    pub allowed_chat_ids: Option<Vec<i64>>,
+    #[serde(default)]
+    pub trigger_mode: Option<super::mission_store::TelegramTriggerMode>,
+    #[serde(default)]
+    pub instructions: Option<String>,
+    #[serde(default)]
+    pub default_backend: Option<String>,
+    #[serde(default)]
+    pub default_model_override: Option<String>,
+    #[serde(default)]
+    pub default_model_effort: Option<String>,
+    #[serde(default)]
+    pub default_workspace_id: Option<Uuid>,
+    #[serde(default)]
+    pub default_config_profile: Option<String>,
+    #[serde(default)]
+    pub default_agent: Option<String>,
+}
+
+/// List all Telegram bot configurations.
+pub async fn list_telegram_bots(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+) -> Result<Json<Vec<super::mission_store::TelegramChannel>>, (StatusCode, String)> {
+    let control = control_for_user(&state, &user).await;
+    let channels = control
+        .mission_store
+        .list_all_telegram_channels()
+        .await
+        .map_err(internal_error)?;
+    Ok(Json(channels))
+}
+
+/// List chat-to-mission mappings for a Telegram bot.
+pub async fn list_bot_chats(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    Path(channel_id): Path<Uuid>,
+) -> Result<Json<Vec<super::mission_store::TelegramChatMission>>, (StatusCode, String)> {
+    let control = control_for_user(&state, &user).await;
+    let mappings = control
+        .mission_store
+        .list_telegram_chat_missions(channel_id)
+        .await
+        .map_err(internal_error)?;
+    Ok(Json(mappings))
+}
+
+/// Telegram webhook receiver (unauthenticated — verified via secret token header).
+pub async fn telegram_webhook_receiver(
+    State(state): State<Arc<AppState>>,
+    Path(channel_id): Path<Uuid>,
+    headers: axum::http::HeaderMap,
+    Json(update): Json<super::telegram::Update>,
+) -> StatusCode {
+    // Look up the channel context in the bridge
+    let ctx = match state.telegram_bridge.get_channel_context(channel_id).await {
+        Some(ctx) => ctx,
+        None => {
+            tracing::debug!("Telegram webhook for unknown channel {}", channel_id);
+            return StatusCode::NOT_FOUND;
+        }
+    };
+
+    // Verify the secret token if one was set
+    if let Some(ref expected_secret) = ctx.channel.webhook_secret {
+        let header_secret = headers
+            .get("x-telegram-bot-api-secret-token")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        if header_secret != expected_secret {
+            tracing::warn!(
+                "Telegram webhook secret mismatch for channel {}",
+                channel_id
+            );
+            return StatusCode::FORBIDDEN;
+        }
+    }
+
+    // Process the message
+    if let Some(ref msg) = update.message {
+        let http = state.telegram_bridge.http().clone();
+        super::telegram::process_webhook_message(&ctx, msg, &http).await;
+    }
+
+    StatusCode::OK
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::mission_store::MissionMode;
     use std::sync::Arc;
 
     fn test_automation_with_mode(
@@ -11894,6 +12684,7 @@ And the report:
             terminal_reason: None,
             parent_mission_id: None,
             working_directory: None,
+            mission_mode: MissionMode::default(),
         };
         let weak = Mission {
             id: Uuid::new_v4(),
@@ -11921,6 +12712,7 @@ And the report:
             terminal_reason: None,
             parent_mission_id: None,
             working_directory: None,
+            mission_mode: MissionMode::default(),
         };
 
         let strong_score = mission_search_relevance_score(
@@ -11963,6 +12755,7 @@ And the report:
             terminal_reason: None,
             parent_mission_id: None,
             working_directory: None,
+            mission_mode: MissionMode::default(),
         };
 
         let score = mission_search_relevance_score(
@@ -12002,6 +12795,7 @@ And the report:
             terminal_reason: None,
             parent_mission_id: None,
             working_directory: None,
+            mission_mode: MissionMode::default(),
         };
 
         let score = mission_search_relevance_score(
@@ -12041,6 +12835,7 @@ And the report:
             terminal_reason: None,
             parent_mission_id: None,
             working_directory: None,
+            mission_mode: MissionMode::default(),
         };
 
         let score = mission_search_relevance_score(
@@ -12080,6 +12875,7 @@ And the report:
             terminal_reason: None,
             parent_mission_id: None,
             working_directory: None,
+            mission_mode: MissionMode::default(),
         };
 
         let score = mission_search_relevance_score(
@@ -12203,6 +12999,7 @@ And the report:
             terminal_reason: None,
             parent_mission_id: None,
             working_directory: None,
+            mission_mode: MissionMode::default(),
         };
         let before = mission_search_freshness_key(
             &[MissionSearchCandidate {

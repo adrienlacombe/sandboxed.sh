@@ -50,6 +50,7 @@ export interface Mission {
   resumable?: boolean;
   parent_mission_id?: string;
   working_directory?: string;
+  mission_mode?: "task" | "assistant";
 }
 
 export interface StoredEvent {

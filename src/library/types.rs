@@ -450,6 +450,10 @@ pub struct SandboxedConfig {
     /// Desktop session lifecycle configuration.
     #[serde(default)]
     pub desktop: DesktopConfig,
+    /// When true, use raw `opencode` CLI instead of oh-my-opencode wrapper.
+    /// This is useful for profiles that use builtin/* models directly.
+    #[serde(default)]
+    pub disable_oh_my_opencode: bool,
 }
 
 impl Default for SandboxedConfig {
@@ -469,6 +473,7 @@ impl Default for SandboxedConfig {
             ],
             default_agent: Some("Sisyphus".to_string()),
             desktop: DesktopConfig::default(),
+            disable_oh_my_opencode: false,
         }
     }
 }

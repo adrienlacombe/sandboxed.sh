@@ -230,7 +230,49 @@ impl McpRegistry {
         orchestrator.scope = McpScope::Workspace;
         orchestrator.default_enabled = true;
 
-        vec![workspace, desktop, playwright, orchestrator]
+        let automation_manager_command = {
+            let release = working_dir
+                .join("target")
+                .join("release")
+                .join("automation-manager-mcp");
+            let debug = working_dir
+                .join("target")
+                .join("debug")
+                .join("automation-manager-mcp");
+            if release.exists() {
+                release.to_string_lossy().to_string()
+            } else if debug.exists() {
+                debug.to_string_lossy().to_string()
+            } else {
+                "automation-manager-mcp".to_string()
+            }
+        };
+        let mut automation_manager = McpServerConfig::new_stdio(
+            "automation-manager".to_string(),
+            automation_manager_command,
+            Vec::new(),
+            HashMap::new(),
+        );
+        automation_manager.scope = McpScope::Workspace;
+        automation_manager.default_enabled = false;
+
+        let mut engram = McpServerConfig::new_stdio(
+            "engram".to_string(),
+            "engram".to_string(),
+            vec!["mcp".to_string()],
+            HashMap::new(),
+        );
+        engram.scope = McpScope::Workspace;
+        engram.default_enabled = false;
+
+        vec![
+            workspace,
+            desktop,
+            playwright,
+            orchestrator,
+            automation_manager,
+            engram,
+        ]
     }
 
     async fn ensure_defaults(

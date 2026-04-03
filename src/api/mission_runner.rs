@@ -1132,11 +1132,24 @@ fn parse_opencode_sse_event(
             if text.is_empty() {
                 None
             } else {
-                state.last_emitted_text = Some(text.to_string());
-                Some(AgentEvent::TextDelta {
-                    content: text.to_string(),
-                    mission_id: Some(mission_id),
-                })
+                // Strip <think>...</think> tags — emit clean text only
+                let clean = if let Some(end_pos) = text.find("</think>") {
+                    text[end_pos + 8..].trim()
+                } else if text.starts_with("<think>") {
+                    // Thinking-only block with no closing tag yet — skip
+                    ""
+                } else {
+                    text
+                };
+                if clean.is_empty() {
+                    None
+                } else {
+                    state.last_emitted_text = Some(clean.to_string());
+                    Some(AgentEvent::TextDelta {
+                        content: clean.to_string(),
+                        mission_id: Some(mission_id),
+                    })
+                }
             }
         }
         "step_start" => None,
@@ -1149,7 +1162,12 @@ fn parse_opencode_sse_event(
                     sse_usage = Some((input, output));
                 }
             }
-            message_complete = true;
+            // Only mark complete on reason=stop. Tool-call steps (reason=tool-calls)
+            // are followed by more steps; treating them as complete kills multi-step runs.
+            let reason = part.get("reason").and_then(|r| r.as_str()).unwrap_or("");
+            if reason == "stop" || reason.is_empty() {
+                message_complete = true;
+            }
             None
         }
         "tool_call" => {
@@ -2046,7 +2064,7 @@ async fn run_mission_turn(
     convo.push('\n');
 
     // Ensure mission workspace exists and is configured for OpenCode.
-    let workspace = workspace::resolve_workspace(&workspaces, &config, workspace_id).await;
+    let mut workspace = workspace::resolve_workspace(&workspaces, &config, workspace_id).await;
     if let Err(e) =
         workspace::sync_workspace_mcp_binaries_for_workspace(&config.working_dir, &workspace).await
     {
@@ -2442,6 +2460,22 @@ async fn run_mission_turn(
             result
         }
         "opencode" => {
+            // Check profile's sandboxed config for disable_oh_my_opencode flag
+            if let Some(ref profile) = effective_config_profile {
+                let lib_guard = library.read().await;
+                if let Some(lib) = lib_guard.as_ref() {
+                    if let Ok(profile_data) = lib.get_config_profile(profile).await {
+                        if profile_data.sandboxed_config.disable_oh_my_opencode {
+                            let mut obj = workspace.config.as_object().cloned().unwrap_or_default();
+                            obj.insert(
+                                "disable_oh_my_opencode".to_string(),
+                                serde_json::json!(true),
+                            );
+                            workspace.config = serde_json::Value::Object(obj);
+                        }
+                    }
+                }
+            }
             // Use per-workspace CLI execution for all workspace types to ensure
             // native bash + correct filesystem scope.
             run_opencode_turn(
@@ -4280,10 +4314,20 @@ pub fn run_claudecode_turn<'a>(
                                             _ => {}
                                         }
                                     }
-                                    // If no text content was produced this turn but we have
-                                    // thinking content, use it as the final result before
-                                    // clearing. Only do this when no tool calls are pending —
-                                    // otherwise a later tool result may produce the real output.
+                                    // If the Assistant event's ContentBlock::Text didn't
+                                    // populate final_result, fall back to the accumulated
+                                    // text_buffer from streaming deltas (text_delta events).
+                                    if final_result.trim().is_empty() && !text_buffer.is_empty() && pending_tools.is_empty() {
+                                        let mut sorted: Vec<_> = text_buffer.iter().collect();
+                                        sorted.sort_by_key(|(idx, _)| *idx);
+                                        final_result = sorted.into_iter().map(|(_, t)| t.clone()).collect::<Vec<_>>().join("");
+                                        tracing::info!(
+                                            mission_id = %mission_id,
+                                            "Using text delta buffer as final result ({} chars, ContentBlock::Text was empty)",
+                                            final_result.len()
+                                        );
+                                    }
+                                    // If still empty, try thinking buffer
                                     if final_result.trim().is_empty() && !thinking_buffer.is_empty() && pending_tools.is_empty() {
                                         let mut sorted: Vec<_> = thinking_buffer.iter().collect();
                                         sorted.sort_by_key(|(idx, _)| *idx);
@@ -9087,51 +9131,123 @@ pub async fn run_opencode_turn(
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
-    // When using plain opencode, always inject the builtin proxy provider since
-    // plain opencode lacks native provider credentials and routes through the proxy.
-    if use_plain_opencode {
-        ensure_opencode_provider_for_model(&opencode_config_dir_host, "builtin/fast");
-    }
+    tracing::info!(
+        mission_id = %mission_id,
+        use_plain_opencode = use_plain_opencode,
+        "OpenCode mode selection"
+    );
+
+    // When using plain opencode, inject the builtin proxy provider for the model
+    // and strip MCP servers (they hang during boot and aren't needed for simple
+    // assistant-mode chat).
+    let plain_opencode_model = if use_plain_opencode {
+        let m = resolved_model
+            .as_deref()
+            .filter(|m| m.starts_with("builtin/"))
+            .unwrap_or("builtin/fast");
+        ensure_opencode_provider_for_model(&opencode_config_dir_host, m);
+
+        // Replace workspace MCPs with profile-defined MCPs only.
+        // Workspace MCPs (desktop, playwright, cq) hang during boot.
+        // The profile's settings.json can define lightweight MCPs
+        // (e.g. orchestrator, automation-manager) that are useful.
+        let config_path = opencode_config_dir_host.join("opencode.json");
+        let profile_mcp_path = opencode_config_dir_host.join("oh-my-opencode.json");
+        if let Ok(content) = std::fs::read_to_string(&config_path) {
+            if let Ok(mut config) = serde_json::from_str::<serde_json::Value>(&content) {
+                if let Some(obj) = config.as_object_mut() {
+                    let profile_mcps = std::fs::read_to_string(&profile_mcp_path)
+                        .ok()
+                        .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
+                        .and_then(|v| v.get("mcp").cloned())
+                        .unwrap_or(serde_json::json!({}));
+                    let mcp_count = profile_mcps.as_object().map(|m| m.len()).unwrap_or(0);
+                    obj.insert("mcp".to_string(), profile_mcps);
+                    if let Ok(updated) = serde_json::to_string_pretty(&config) {
+                        let _ = std::fs::write(&config_path, updated);
+                        tracing::info!(
+                            mission_id = %mission_id,
+                            mcp_count = mcp_count,
+                            "Replaced workspace MCPs with profile MCPs for plain opencode mode"
+                        );
+                    }
+                }
+            }
+        }
+
+        m.to_string()
+    } else {
+        "builtin/fast".to_string()
+    };
 
     let mut shell_cmd = String::new();
     if runner_is_direct {
         shell_cmd.push_str(&shell_escape(&cli_runner));
         shell_cmd.push_str(" run");
     } else if use_plain_opencode {
-        // Use the opencode binary directly (installed via `bun install -g opencode-ai`).
-        // `bunx opencode` won't work because the `opencode` npm package is unpublished.
-        // Always route through builtin proxy since plain opencode lacks provider credentials.
-        // --format json produces structured events on stdout for the parser.
-        shell_cmd.push_str("/root/.bun/bin/opencode run --format json");
-        shell_cmd.push_str(" --model builtin/fast");
+        // For plain opencode, write the command to a temp script file to avoid
+        // shell quoting issues. The script is run inside `script -qe` for PTY.
+        let mut inner_cmd = String::from("#!/bin/sh\nopencode run --format json");
+        inner_cmd.push_str(" --model ");
+        inner_cmd.push_str(&shell_escape(&plain_opencode_model));
+        if let Some(a) = agent {
+            inner_cmd.push_str(" --agent ");
+            inner_cmd.push_str(&shell_escape(a));
+        }
+        inner_cmd.push_str(" --dir ");
+        inner_cmd.push_str(&shell_escape(&work_dir_arg));
+        inner_cmd.push_str(" \"$(cat ");
+        inner_cmd.push_str(&shell_escape(&prompt_file_arg));
+        inner_cmd.push_str(")\"");
+
+        // Write script to host filesystem (next to the prompt file)
+        let script_host_path = format!("{}/.sandboxed-sh-opencode-cmd.sh", work_dir.display());
+        let script_env_path = format!(
+            "{}/.sandboxed-sh-opencode-cmd.sh",
+            prompt_file_arg
+                .rsplit_once('/')
+                .map(|(dir, _)| dir)
+                .unwrap_or(".")
+        );
+        if let Err(e) = std::fs::write(&script_host_path, &inner_cmd) {
+            tracing::error!(mission_id = %mission_id, "Failed to write opencode command script: {}", e);
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ =
+                std::fs::set_permissions(&script_host_path, std::fs::Permissions::from_mode(0o755));
+        }
+
+        // Use script -qe to wrap in PTY, -e preserves exit code.
+        // Reference the script via its container-relative path.
+        shell_cmd.push_str("script -qe /dev/null -c ");
+        shell_cmd.push_str(&shell_escape(&script_env_path));
+        shell_cmd.push_str(" 2>/dev/null");
     } else {
         shell_cmd.push_str(&shell_escape(&cli_runner));
         shell_cmd.push_str(" oh-my-opencode run");
     }
 
-    if let Some(a) = agent {
-        if use_plain_opencode {
-            // plain opencode uses lowercase agent names directly
-            shell_cmd.push_str(" --agent ");
-            shell_cmd.push_str(&shell_escape(a));
-        } else {
+    if !use_plain_opencode || runner_is_direct {
+        // For non-plain opencode, add agent/dir/prompt args directly
+        if let Some(a) = agent {
             shell_cmd.push_str(" --agent ");
             shell_cmd.push_str(&shell_escape(a));
         }
-    }
 
-    // plain opencode uses --dir; oh-my-opencode uses --directory
-    if use_plain_opencode {
-        shell_cmd.push_str(" --dir ");
-    } else {
-        shell_cmd.push_str(" --directory ");
-    }
-    shell_cmd.push_str(&shell_escape(&work_dir_arg));
+        // oh-my-opencode uses --directory
+        if runner_is_direct {
+            shell_cmd.push_str(" --dir ");
+        } else {
+            shell_cmd.push_str(" --directory ");
+        }
+        shell_cmd.push_str(&shell_escape(&work_dir_arg));
 
-    // Read message from file via command substitution to guarantee a single argument
-    shell_cmd.push_str(" \"$(cat ");
-    shell_cmd.push_str(&shell_escape(&prompt_file_arg));
-    shell_cmd.push_str(")\"");
+        shell_cmd.push_str(" \"$(cat ");
+        shell_cmd.push_str(&shell_escape(&prompt_file_arg));
+        shell_cmd.push_str(")\"");
+    }
 
     let args = vec!["-c".to_string(), shell_cmd.clone()];
     let cli_runner_shell = "/bin/sh".to_string();
@@ -9172,10 +9288,15 @@ pub async fn run_opencode_turn(
         opencode_port = "4096".to_string();
     }
 
-    env.insert("OPENCODE_SERVER_PORT".to_string(), opencode_port.clone());
-    if let Ok(host) = std::env::var("SANDBOXED_SH_OPENCODE_SERVER_HOSTNAME") {
-        if !host.trim().is_empty() {
-            env.insert("OPENCODE_SERVER_HOSTNAME".to_string(), host);
+    // Plain opencode manages its own serve process; skip the port wrapper
+    // to avoid conflicts. Oh-my-opencode needs the port override to coexist
+    // with other instances.
+    if !use_plain_opencode {
+        env.insert("OPENCODE_SERVER_PORT".to_string(), opencode_port.clone());
+        if let Ok(host) = std::env::var("SANDBOXED_SH_OPENCODE_SERVER_HOSTNAME") {
+            if !host.trim().is_empty() {
+                env.insert("OPENCODE_SERVER_HOSTNAME".to_string(), host);
+            }
         }
     }
     tracing::info!(
@@ -9250,7 +9371,8 @@ pub async fn run_opencode_turn(
     // the real binary at ~/.opencode/bin/opencode.
     // oh-my-opencode v3+ is a compiled binary that spawns `opencode serve --port=4096`;
     // the wrapper intercepts this and overrides the port.
-    if opencode_port != "4096" {
+    // Skip for plain opencode — it manages its own serve process.
+    if !use_plain_opencode && opencode_port != "4096" {
         install_opencode_serve_port_wrapper(&mut env, workspace, &opencode_port);
     }
 
@@ -9560,7 +9682,10 @@ pub async fn run_opencode_turn(
                                 continue;
                             }
                         }
-                        Err(_) => break,
+                        Err(e) => {
+                            tracing::warn!(mission_id = %mission_id, error = %e, "SSE reader I/O error");
+                            break;
+                        }
                     }
                 }
 
@@ -10109,6 +10234,65 @@ pub async fn run_opencode_turn(
                                 }
                             }
 
+                            // Handle plain opencode --format json events.
+                            // Plain opencode emits: step_start, text, step_finish
+                            // (different from oh-my-opencode's message.part.updated/completion)
+                            if event_type == "text" {
+                                if let Some(part) = json.get("part") {
+                                    if let Some(text) =
+                                        part.get("text").and_then(|t| t.as_str())
+                                    {
+                                        // Strip <think>...</think> tags for final result
+                                        let clean_text =
+                                            if let Some(end_pos) = text.find("</think>") {
+                                                text[end_pos + 8..].trim().to_string()
+                                            } else {
+                                                text.to_string()
+                                            };
+                                        if !clean_text.is_empty() {
+                                            final_result = clean_text.clone();
+                                            let _ = text_output_tx.send(true);
+                                            // Emit text delta for Telegram streaming
+                                            let _ =
+                                                events_tx.send(AgentEvent::TextDelta {
+                                                    content: clean_text,
+                                                    mission_id: Some(mission_id),
+                                                });
+                                        }
+                                    }
+                                }
+                            } else if event_type == "step_finish" {
+                                // Only treat as completion if reason is "stop".
+                                // Tool-use steps have reason "tool_use" and are
+                                // followed by more steps — killing early would
+                                // abort the multi-step execution.
+                                let reason = json
+                                    .get("part")
+                                    .and_then(|p| p.get("reason"))
+                                    .and_then(|r| r.as_str())
+                                    .unwrap_or("");
+                                tracing::info!(
+                                    mission_id = %mission_id,
+                                    reason = %reason,
+                                    "OpenCode JSON step_finish event"
+                                );
+                                if reason == "stop" {
+                                    let _ = sse_complete_tx.send(true);
+                                }
+                            } else if event_type == "step_start" {
+                                // Extract session ID from step_start
+                                if let Some(sid) =
+                                    json.get("sessionID").and_then(|s| s.as_str())
+                                {
+                                    let mut guard = session_id_capture
+                                        .lock()
+                                        .unwrap_or_else(|e| e.into_inner());
+                                    if guard.is_none() {
+                                        *guard = Some(sid.to_string());
+                                    }
+                                }
+                            }
+
                             // Handle completion and error events from oh-my-opencode
                             if event_type == "completion" {
                                 tracing::info!(mission_id = %mission_id, "OpenCode JSON completion event");
@@ -10293,9 +10477,11 @@ pub async fn run_opencode_turn(
         .clone();
     let has_sse_error = sse_error.is_some();
 
-    // Check exit status
+    // Check exit status.
+    // When we intentionally killed the process after seeing step_finish/completion
+    // (sse_complete_seen), don't treat the SIGKILL as an error — we have the response.
     if let Ok(status) = exit_status {
-        if !status.success() {
+        if !status.success() && !sse_complete_seen {
             had_error = true;
             if opencode_output_needs_fallback(&final_result) {
                 if let Some(err_msg) = stderr_error_message.lock().unwrap().clone() {

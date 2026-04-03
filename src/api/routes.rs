@@ -114,6 +114,8 @@ pub struct AppState {
     pub proxy_api_keys: super::proxy_keys::SharedProxyApiKeyStore,
     /// Deferred queue for proxy requests that opt into async-on-rate-limit mode
     pub deferred_requests: Arc<deferred_proxy_api::DeferredRequestStore>,
+    /// Telegram bridge for assistant missions
+    pub telegram_bridge: super::telegram::SharedTelegramBridge,
 }
 
 /// Start the HTTP server.
@@ -385,8 +387,11 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         tracing::info!("Configuration library disabled (no remote configured)");
     }
 
+    // Create Telegram bridge (shared across all user sessions).
+    let telegram_bridge = Arc::new(super::telegram::TelegramBridge::new());
+
     // Spawn the single global control session actor.
-    let control_state = control::ControlHub::new(
+    let mut control_state = control::ControlHub::new(
         config.clone(),
         Arc::clone(&root_agent),
         Arc::clone(&mcp),
@@ -394,6 +399,7 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         Arc::clone(&library),
         secrets.clone(),
     );
+    control_state.set_telegram_bridge(Arc::clone(&telegram_bridge));
 
     let state = Arc::new(AppState {
         config: config.clone(),
@@ -434,6 +440,7 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
             }),
         proxy_api_keys,
         deferred_requests,
+        telegram_bridge,
     });
 
     // Initialize the metadata LLM client for AI-powered mission titles/descriptions
@@ -469,6 +476,28 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
     // Start deferred proxy queue worker.
     deferred_proxy_api::start_worker(Arc::clone(&state));
 
+    // Eagerly boot the control session so Telegram webhooks are re-registered
+    // immediately on server start (rather than waiting for the first
+    // authenticated API call). Use the same user ID that the auth middleware
+    // would assign — "dev" in dev mode, "default" otherwise — so that
+    // Telegram channels and missions are visible in the dashboard.
+    {
+        let state_clone = Arc::clone(&state);
+        let boot_user_id = if config.dev_mode {
+            "dev".to_string()
+        } else {
+            "default".to_string()
+        };
+        tokio::spawn(async move {
+            let default_user = super::auth::AuthUser {
+                id: boot_user_id.clone(),
+                username: boot_user_id,
+            };
+            let _ = state_clone.control.get_or_spawn(&default_user).await;
+            tracing::info!("Eagerly booted default control session (Telegram webhooks registered)");
+        });
+    }
+
     // Fetch model catalog from provider APIs in background
     {
         let catalog = Arc::clone(&state.model_catalog);
@@ -494,6 +523,11 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         .route(
             "/api/webhooks/:mission_id/:webhook_id",
             post(control::webhook_receiver),
+        )
+        // Telegram webhook receiver (no auth - uses Telegram secret_token header validation)
+        .route(
+            "/api/telegram/webhook/:channel_id",
+            post(control::telegram_webhook_receiver),
         )
         // WebSocket console uses subprotocol-based auth (browser can't set Authorization header)
         .route("/api/console/ws", get(console::console_ws))
@@ -590,6 +624,10 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
             post(control::set_mission_title),
         )
         .route(
+            "/api/control/missions/:id/mode",
+            post(control::set_mission_mode),
+        )
+        .route(
             "/api/control/missions/:id/cancel",
             post(control::cancel_mission),
         )
@@ -639,6 +677,38 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         .route(
             "/api/control/missions/:id/automation-executions",
             get(control::get_mission_automation_executions),
+        )
+        // Assistant missions
+        .route(
+            "/api/control/assistants",
+            get(control::list_assistant_missions),
+        )
+        // Telegram channel endpoints
+        .route(
+            "/api/control/missions/:id/telegram-channels",
+            get(control::list_telegram_channels),
+        )
+        .route(
+            "/api/control/missions/:id/telegram-channels",
+            post(control::create_telegram_channel),
+        )
+        .route(
+            "/api/control/telegram-channels/:id",
+            axum::routing::delete(control::delete_telegram_channel)
+                .patch(control::update_telegram_channel),
+        )
+        .route(
+            "/api/control/telegram-channels/:id/toggle",
+            post(control::toggle_telegram_channel),
+        )
+        // Standalone Telegram bot endpoints (auto-create missions per chat)
+        .route(
+            "/api/control/telegram/bots",
+            get(control::list_telegram_bots).post(control::create_telegram_bot),
+        )
+        .route(
+            "/api/control/telegram/bots/:id/chats",
+            get(control::list_bot_chats),
         )
         // Parallel execution endpoints
         .route("/api/control/running", get(control::list_running_missions))
