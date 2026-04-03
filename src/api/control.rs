@@ -5379,6 +5379,19 @@ async fn maybe_finalize_terminal_mission(
                 return;
             }
 
+            // Assistant missions (e.g. Telegram-linked) should stay active
+            // after each reply — they are long-lived by design.
+            if new_status == MissionStatus::Completed
+                && mission.mission_mode == super::mission_store::MissionMode::Assistant
+            {
+                tracing::debug!(
+                    mission_id = %mission_id,
+                    context = log_context,
+                    "Skipping mission completion for assistant-mode mission"
+                );
+                return;
+            }
+
             tracing::info!(
                 mission_id = %mission_id,
                 status = ?new_status,
@@ -9540,6 +9553,19 @@ pub async fn create_telegram_channel(
         }
     }
 
+    // Reject duplicate bot tokens to avoid webhook conflicts
+    let all_channels = control
+        .mission_store
+        .list_all_telegram_channels()
+        .await
+        .map_err(internal_error)?;
+    if all_channels.iter().any(|c| c.bot_token == req.bot_token) {
+        return Err((
+            StatusCode::CONFLICT,
+            "A channel with this bot token already exists".to_string(),
+        ));
+    }
+
     let now = now_string();
     let webhook_secret = Uuid::new_v4().to_string().replace('-', "");
     let channel = TelegramChannel {
@@ -9569,10 +9595,10 @@ pub async fn create_telegram_channel(
         .await
         .map_err(internal_error)?;
 
-    // Register the webhook
+    // Register the webhook — roll back the channel if this fails
     let public_url = std::env::var("SANDBOXED_PUBLIC_URL")
         .unwrap_or_else(|_| format!("http://{}:{}", state.config.host, state.config.port));
-    state
+    if let Err(e) = state
         .telegram_bridge
         .start_channel(
             created.clone(),
@@ -9582,7 +9608,13 @@ pub async fn create_telegram_channel(
             &public_url,
         )
         .await
-        .map_err(internal_error)?;
+    {
+        let _ = control
+            .mission_store
+            .delete_telegram_channel(created.id)
+            .await;
+        return Err(internal_error(e));
+    }
 
     tracing::info!(
         "Created Telegram channel {} for mission {}",
@@ -9615,6 +9647,13 @@ pub async fn delete_telegram_channel(
 ) -> Result<StatusCode, (StatusCode, String)> {
     let control = control_for_user(&state, &user).await;
 
+    // Fetch channel first so we can clean up the placeholder mission for auto-create bots
+    let channel = control
+        .mission_store
+        .get_telegram_channel(channel_id)
+        .await
+        .map_err(internal_error)?;
+
     // Delete from store first (verifies ownership), then stop the poller
     let deleted = control
         .mission_store
@@ -9624,6 +9663,14 @@ pub async fn delete_telegram_channel(
 
     if deleted {
         state.telegram_bridge.stop_channel(channel_id).await;
+
+        // Clean up the placeholder mission for auto-create bots
+        if let Some(ch) = channel {
+            if ch.auto_create_missions {
+                let _ = control.mission_store.delete_mission(ch.mission_id).await;
+            }
+        }
+
         tracing::info!("Deleted Telegram channel {}", channel_id);
         Ok(StatusCode::NO_CONTENT)
     } else {
@@ -9655,6 +9702,7 @@ pub async fn toggle_telegram_channel(
             )
         })?;
 
+    let previous_active = channel.active;
     channel.active = req.active;
     channel.updated_at = super::mission_store::now_string();
 
@@ -9667,7 +9715,7 @@ pub async fn toggle_telegram_channel(
     if channel.active {
         let public_url = std::env::var("SANDBOXED_PUBLIC_URL")
             .unwrap_or_else(|_| format!("http://{}:{}", state.config.host, state.config.port));
-        state
+        if let Err(e) = state
             .telegram_bridge
             .start_channel(
                 channel.clone(),
@@ -9677,7 +9725,13 @@ pub async fn toggle_telegram_channel(
                 &public_url,
             )
             .await
-            .map_err(internal_error)?;
+        {
+            // Roll back active state
+            channel.active = previous_active;
+            channel.updated_at = super::mission_store::now_string();
+            let _ = control.mission_store.update_telegram_channel(channel).await;
+            return Err(internal_error(e));
+        }
     } else {
         state.telegram_bridge.stop_channel(channel_id).await;
     }
@@ -9699,7 +9753,7 @@ pub async fn update_telegram_channel(
 ) -> Result<Json<super::mission_store::TelegramChannel>, (StatusCode, String)> {
     let control = control_for_user(&state, &user).await;
 
-    let mut channel = control
+    let original_channel = control
         .mission_store
         .get_telegram_channel(channel_id)
         .await
@@ -9710,6 +9764,8 @@ pub async fn update_telegram_channel(
                 format!("Telegram channel {} not found", channel_id),
             )
         })?;
+
+    let mut channel = original_channel.clone();
 
     // Apply partial updates
     if let Some(active) = req.active {
@@ -9774,7 +9830,7 @@ pub async fn update_telegram_channel(
     if channel.active {
         let public_url = std::env::var("SANDBOXED_PUBLIC_URL")
             .unwrap_or_else(|_| format!("http://{}:{}", state.config.host, state.config.port));
-        state
+        if let Err(e) = state
             .telegram_bridge
             .start_channel(
                 channel.clone(),
@@ -9784,7 +9840,14 @@ pub async fn update_telegram_channel(
                 &public_url,
             )
             .await
-            .map_err(internal_error)?;
+        {
+            // Roll back to original channel state
+            let _ = control
+                .mission_store
+                .update_telegram_channel(original_channel)
+                .await;
+            return Err(internal_error(e));
+        }
     } else {
         state.telegram_bridge.stop_channel(channel_id).await;
     }
@@ -9827,6 +9890,19 @@ pub async fn create_telegram_bot(
     use super::mission_store::{now_string, MissionMode, TelegramChannel};
 
     let control = control_for_user(&state, &user).await;
+
+    // Reject duplicate bot tokens to avoid webhook conflicts
+    let all_channels = control
+        .mission_store
+        .list_all_telegram_channels()
+        .await
+        .map_err(internal_error)?;
+    if all_channels.iter().any(|c| c.bot_token == req.bot_token) {
+        return Err((
+            StatusCode::CONFLICT,
+            "A bot with this token already exists".to_string(),
+        ));
+    }
 
     // Create a placeholder mission so the FK constraint is satisfied.
     // When auto_create_missions is true, individual chat missions are auto-created;
@@ -9873,16 +9949,22 @@ pub async fn create_telegram_bot(
         updated_at: now,
     };
 
-    let created = control
-        .mission_store
-        .create_telegram_channel(channel)
-        .await
-        .map_err(internal_error)?;
+    let created = match control.mission_store.create_telegram_channel(channel).await {
+        Ok(c) => c,
+        Err(e) => {
+            // Clean up placeholder mission
+            let _ = control
+                .mission_store
+                .delete_mission(placeholder_mission.id)
+                .await;
+            return Err(internal_error(e));
+        }
+    };
 
-    // Register the webhook
+    // Register the webhook — roll back channel + placeholder on failure
     let public_url = std::env::var("SANDBOXED_PUBLIC_URL")
         .unwrap_or_else(|_| format!("http://{}:{}", state.config.host, state.config.port));
-    state
+    if let Err(e) = state
         .telegram_bridge
         .start_channel(
             created.clone(),
@@ -9892,7 +9974,17 @@ pub async fn create_telegram_bot(
             &public_url,
         )
         .await
-        .map_err(internal_error)?;
+    {
+        let _ = control
+            .mission_store
+            .delete_telegram_channel(created.id)
+            .await;
+        let _ = control
+            .mission_store
+            .delete_mission(placeholder_mission.id)
+            .await;
+        return Err(internal_error(e));
+    }
 
     tracing::info!("Created Telegram bot {} (auto-create missions)", created.id);
 

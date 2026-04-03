@@ -379,10 +379,27 @@ async fn download_telegram_file(
             download_response.status()
         ));
     }
+    // Enforce a 50 MB size limit to prevent OOM from large files
+    const MAX_FILE_SIZE: u64 = 50 * 1024 * 1024;
+    if let Some(content_length) = download_response.content_length() {
+        if content_length > MAX_FILE_SIZE {
+            return Err(format!(
+                "File too large: {} bytes (limit: {} bytes)",
+                content_length, MAX_FILE_SIZE
+            ));
+        }
+    }
     let file_bytes = download_response
         .bytes()
         .await
         .map_err(|e| format!("File read failed: {}", e))?;
+    if file_bytes.len() as u64 > MAX_FILE_SIZE {
+        return Err(format!(
+            "File too large: {} bytes (limit: {} bytes)",
+            file_bytes.len(),
+            MAX_FILE_SIZE
+        ));
+    }
 
     // Step 3: Save to destination
     tokio::fs::create_dir_all(dest_dir)
@@ -1040,6 +1057,13 @@ async fn send_file_to_telegram(
             .send()
             .await
             .map_err(|e| format!("Failed to fetch file from URL: {}", e))?;
+        if !resp.status().is_success() {
+            return Err(format!(
+                "File fetch HTTP error {}: {}",
+                resp.status(),
+                file.url
+            ));
+        }
         let bytes = resp
             .bytes()
             .await
