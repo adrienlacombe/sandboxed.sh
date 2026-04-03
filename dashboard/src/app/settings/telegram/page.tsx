@@ -221,7 +221,7 @@ export default function TelegramSettingsPage() {
     setSaving(true);
     try {
       await updateTelegramChannel(editingBot.id, {
-        instructions: editInstructions.trim() || undefined,
+        instructions: editInstructions.trim() || '',
         trigger_mode: editTriggerMode,
         default_backend: editBackend || undefined,
         default_model_override: editModelOverride || undefined,
