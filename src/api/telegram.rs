@@ -571,12 +571,23 @@ async fn resolve_or_create_mission(
     let (tx, rx) = tokio::sync::oneshot::channel();
     let title = Some(format!("Telegram: {}", sender_name));
 
+    // Normalize agent name: strip parenthetical suffixes like "(Ultraworker)"
+    // and lowercase to get the config key (e.g. "Sisyphus (Ultraworker)" → "sisyphus")
+    let agent = ctx.channel.default_agent.as_ref().map(|a| {
+        let name = if let Some(idx) = a.find('(') {
+            a[..idx].trim()
+        } else {
+            a.trim()
+        };
+        name.to_lowercase()
+    });
+
     let _ = ctx
         .cmd_tx
         .send(ControlCommand::CreateMission {
             title,
             workspace_id: ctx.channel.default_workspace_id,
-            agent: ctx.channel.default_agent.clone(),
+            agent,
             model_override: ctx.channel.default_model_override.clone(),
             model_effort: ctx.channel.default_model_effort.clone(),
             backend: ctx.channel.default_backend.clone(),

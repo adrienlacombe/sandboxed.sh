@@ -3991,7 +3991,12 @@ async fn sync_workspace_mcp_binaries(
     container_root: &Path,
 ) -> anyhow::Result<()> {
     // Copy MCP binaries into the container so workspace-local MCP configs can run them directly.
-    for binary in ["workspace-mcp", "desktop-mcp", "orchestrator-mcp"] {
+    for binary in [
+        "workspace-mcp",
+        "desktop-mcp",
+        "orchestrator-mcp",
+        "automation-manager-mcp",
+    ] {
         if find_host_binary(binary, working_dir).is_none() {
             tracing::warn!(binary, "MCP binary not found on host; skipping copy");
             continue;
