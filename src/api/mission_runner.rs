@@ -1149,7 +1149,12 @@ fn parse_opencode_sse_event(
                     sse_usage = Some((input, output));
                 }
             }
-            message_complete = true;
+            // Only mark complete on reason=stop. Tool-call steps (reason=tool-calls)
+            // are followed by more steps; treating them as complete kills multi-step runs.
+            let reason = part.get("reason").and_then(|r| r.as_str()).unwrap_or("");
+            if reason == "stop" || reason.is_empty() {
+                message_complete = true;
+            }
             None
         }
         "tool_call" => {
