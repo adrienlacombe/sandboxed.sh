@@ -1132,11 +1132,24 @@ fn parse_opencode_sse_event(
             if text.is_empty() {
                 None
             } else {
-                state.last_emitted_text = Some(text.to_string());
-                Some(AgentEvent::TextDelta {
-                    content: text.to_string(),
-                    mission_id: Some(mission_id),
-                })
+                // Strip <think>...</think> tags — emit clean text only
+                let clean = if let Some(end_pos) = text.find("</think>") {
+                    text[end_pos + 8..].trim()
+                } else if text.starts_with("<think>") {
+                    // Thinking-only block with no closing tag yet — skip
+                    ""
+                } else {
+                    text
+                };
+                if clean.is_empty() {
+                    None
+                } else {
+                    state.last_emitted_text = Some(clean.to_string());
+                    Some(AgentEvent::TextDelta {
+                        content: clean.to_string(),
+                        mission_id: Some(mission_id),
+                    })
+                }
             }
         }
         "step_start" => None,
@@ -9155,9 +9168,12 @@ pub async fn run_opencode_turn(
         // Always route through builtin proxy since plain opencode lacks provider credentials.
         // --format json produces structured events on stdout for the parser.
         // opencode (Go binary) only outputs to stdout when connected to a TTY.
-        // `script -qc '...' /dev/null` wraps the command in a pseudo-TTY so
+        // `script -qec "..." /dev/null` wraps the command in a pseudo-TTY so
         // JSON events flow through our pipe reader.
-        shell_cmd.push_str("script -qc 'opencode run --format json");
+        // -e preserves the child process exit code.
+        // Use double quotes for the script -c argument so that inner single-quoted
+        // shell_escape values don't conflict with the wrapper quotes.
+        shell_cmd.push_str("script -qec \"opencode run --format json");
         shell_cmd.push_str(" --model ");
         shell_cmd.push_str(&shell_escape(&plain_opencode_model));
     } else {
@@ -9184,14 +9200,21 @@ pub async fn run_opencode_turn(
     }
     shell_cmd.push_str(&shell_escape(&work_dir_arg));
 
-    // Read message from file via command substitution to guarantee a single argument
-    shell_cmd.push_str(" \"$(cat ");
-    shell_cmd.push_str(&shell_escape(&prompt_file_arg));
-    shell_cmd.push_str(")\"");
+    // Read message from file via command substitution to guarantee a single argument.
+    // When inside script -c "...", use escaped double quotes for the $(cat ...) expansion.
+    if use_plain_opencode && !runner_is_direct {
+        shell_cmd.push_str(" \\\"$(cat ");
+        shell_cmd.push_str(&shell_escape(&prompt_file_arg));
+        shell_cmd.push_str(")\\\"");
+    } else {
+        shell_cmd.push_str(" \"$(cat ");
+        shell_cmd.push_str(&shell_escape(&prompt_file_arg));
+        shell_cmd.push_str(")\"");
+    }
 
     // Close the script wrapper for plain opencode mode
     if use_plain_opencode && !runner_is_direct {
-        shell_cmd.push_str("' /dev/null 2>/dev/null");
+        shell_cmd.push_str("\" /dev/null 2>/dev/null");
     }
 
     let args = vec!["-c".to_string(), shell_cmd.clone()];
