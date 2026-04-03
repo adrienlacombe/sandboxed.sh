@@ -9185,57 +9185,68 @@ pub async fn run_opencode_turn(
         shell_cmd.push_str(&shell_escape(&cli_runner));
         shell_cmd.push_str(" run");
     } else if use_plain_opencode {
-        // Use the opencode binary directly.
-        // Always route through builtin proxy since plain opencode lacks provider credentials.
-        // --format json produces structured events on stdout for the parser.
-        // opencode (Go binary) only outputs to stdout when connected to a TTY.
-        // `script -qec "..." /dev/null` wraps the command in a pseudo-TTY so
-        // JSON events flow through our pipe reader.
-        // -e preserves the child process exit code.
-        // Use double quotes for the script -c argument so that inner single-quoted
-        // shell_escape values don't conflict with the wrapper quotes.
-        shell_cmd.push_str("script -qec \"opencode run --format json");
-        shell_cmd.push_str(" --model ");
-        shell_cmd.push_str(&shell_escape(&plain_opencode_model));
+        // For plain opencode, write the command to a temp script file to avoid
+        // shell quoting issues. The script is run inside `script -qe` for PTY.
+        let mut inner_cmd = String::from("#!/bin/sh\nopencode run --format json");
+        inner_cmd.push_str(" --model ");
+        inner_cmd.push_str(&shell_escape(&plain_opencode_model));
+        if let Some(a) = agent {
+            inner_cmd.push_str(" --agent ");
+            inner_cmd.push_str(&shell_escape(a));
+        }
+        inner_cmd.push_str(" --dir ");
+        inner_cmd.push_str(&shell_escape(&work_dir_arg));
+        inner_cmd.push_str(" \"$(cat ");
+        inner_cmd.push_str(&shell_escape(&prompt_file_arg));
+        inner_cmd.push_str(")\"");
+
+        // Write script to host filesystem (next to the prompt file)
+        let script_host_path = format!("{}/.sandboxed-sh-opencode-cmd.sh", work_dir.display());
+        let script_env_path = format!(
+            "{}/.sandboxed-sh-opencode-cmd.sh",
+            prompt_file_arg
+                .rsplit_once('/')
+                .map(|(dir, _)| dir)
+                .unwrap_or(".")
+        );
+        if let Err(e) = std::fs::write(&script_host_path, &inner_cmd) {
+            tracing::error!(mission_id = %mission_id, "Failed to write opencode command script: {}", e);
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ =
+                std::fs::set_permissions(&script_host_path, std::fs::Permissions::from_mode(0o755));
+        }
+
+        // Use script -qe to wrap in PTY, -e preserves exit code.
+        // Reference the script via its container-relative path.
+        shell_cmd.push_str("script -qe /dev/null -c ");
+        shell_cmd.push_str(&shell_escape(&script_env_path));
+        shell_cmd.push_str(" 2>/dev/null");
     } else {
         shell_cmd.push_str(&shell_escape(&cli_runner));
         shell_cmd.push_str(" oh-my-opencode run");
     }
 
-    if let Some(a) = agent {
-        if use_plain_opencode {
-            // plain opencode uses lowercase agent names directly
-            shell_cmd.push_str(" --agent ");
-            shell_cmd.push_str(&shell_escape(a));
-        } else {
+    if !use_plain_opencode || runner_is_direct {
+        // For non-plain opencode, add agent/dir/prompt args directly
+        if let Some(a) = agent {
             shell_cmd.push_str(" --agent ");
             shell_cmd.push_str(&shell_escape(a));
         }
-    }
 
-    // plain opencode uses --dir; oh-my-opencode uses --directory
-    if use_plain_opencode {
-        shell_cmd.push_str(" --dir ");
-    } else {
-        shell_cmd.push_str(" --directory ");
-    }
-    shell_cmd.push_str(&shell_escape(&work_dir_arg));
+        // oh-my-opencode uses --directory
+        if runner_is_direct {
+            shell_cmd.push_str(" --dir ");
+        } else {
+            shell_cmd.push_str(" --directory ");
+        }
+        shell_cmd.push_str(&shell_escape(&work_dir_arg));
 
-    // Read message from file via command substitution to guarantee a single argument.
-    // When inside script -c "...", use escaped double quotes for the $(cat ...) expansion.
-    if use_plain_opencode && !runner_is_direct {
-        shell_cmd.push_str(" \\\"$(cat ");
-        shell_cmd.push_str(&shell_escape(&prompt_file_arg));
-        shell_cmd.push_str(")\\\"");
-    } else {
         shell_cmd.push_str(" \"$(cat ");
         shell_cmd.push_str(&shell_escape(&prompt_file_arg));
         shell_cmd.push_str(")\"");
-    }
-
-    // Close the script wrapper for plain opencode mode
-    if use_plain_opencode && !runner_is_direct {
-        shell_cmd.push_str("\" /dev/null 2>/dev/null");
     }
 
     let args = vec!["-c".to_string(), shell_cmd.clone()];
