@@ -176,9 +176,13 @@ pub struct WorkspaceTemplate {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tailscale_mode: Option<TailscaleMode>,
     /// MCP server names to enable for workspaces created from this template.
-    /// Empty = use default MCPs (those with `default_enabled = true`).
+    /// See `Workspace::mcps` for the full interaction with `mcps_replace_defaults`.
     #[serde(default)]
     pub mcps: Vec<String>,
+    /// Controls whether a non-empty `mcps` list fully replaces default MCPs.
+    /// `true` (default) = replace, `false` = additive. See `Workspace::mcps_replace_defaults`.
+    #[serde(default = "crate::workspace::default_true")]
+    pub mcps_replace_defaults: bool,
     /// Config profile to use for workspaces created from this template.
     /// Defaults to "default" if not specified.
     #[serde(default, skip_serializing_if = "Option::is_none")]

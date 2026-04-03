@@ -113,6 +113,11 @@ impl TailscaleMode {
     }
 }
 
+/// Serde default helper: returns `true`.
+pub fn default_true() -> bool {
+    true
+}
+
 /// A workspace definition.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Workspace {
@@ -165,10 +170,21 @@ pub struct Workspace {
     #[serde(default)]
     pub tailscale_mode: Option<TailscaleMode>,
     /// MCP server names to enable for this workspace.
-    /// Empty = use all MCPs with `default_enabled = true`.
-    /// Non-empty = allowlist of MCP names.
+    ///
+    /// - Empty + any `mcps_replace_defaults` → all MCPs with `default_enabled = true`
+    /// - Non-empty + `mcps_replace_defaults = true`  → **only** the listed MCPs
+    /// - Non-empty + `mcps_replace_defaults = false` → listed MCPs **plus** all `default_enabled` MCPs
     #[serde(default)]
     pub mcps: Vec<String>,
+    /// Controls whether a non-empty `mcps` list fully replaces default MCPs.
+    ///
+    /// - `true` (default): the `mcps` list is the complete set — default MCPs are excluded
+    ///   unless explicitly listed. This is the original behavior.
+    /// - `false`: the `mcps` list is additive — default MCPs stay active alongside custom ones.
+    ///
+    /// Has no effect when `mcps` is empty (defaults are always used in that case).
+    #[serde(default = "default_true")]
+    pub mcps_replace_defaults: bool,
     /// Config profile to use for this workspace (from workspace template).
     /// Defaults to "default" if not specified.
     #[serde(default)]
@@ -197,6 +213,7 @@ impl Workspace {
             shared_network: None,
             tailscale_mode: None,
             mcps: Vec::new(),
+            mcps_replace_defaults: true,
             config_profile: None,
         }
     }
@@ -223,6 +240,7 @@ impl Workspace {
             shared_network: None,
             tailscale_mode: None,
             mcps: Vec::new(),
+            mcps_replace_defaults: true,
         }
     }
 }
@@ -413,6 +431,7 @@ impl WorkspaceStore {
                     shared_network: None, // Default to shared network
                     tailscale_mode: None,
                     mcps: Vec::new(),
+                    mcps_replace_defaults: true,
                     config_profile: None,
                 };
 
@@ -3089,23 +3108,35 @@ async fn prepare_workspace_dir(path: &Path) -> anyhow::Result<PathBuf> {
 /// Filter MCP configs based on a workspace's MCP allowlist.
 ///
 /// - Empty `workspace_mcps` → include only MCPs with `default_enabled = true`
-/// - Non-empty `workspace_mcps` → include only MCPs whose name is in the list
+///   (`replace_defaults` is ignored in this case)
+/// - Non-empty `workspace_mcps` + `replace_defaults = true` → **only** the allowlist
+/// - Non-empty `workspace_mcps` + `replace_defaults = false` → allowlist **plus** `default_enabled` MCPs
 ///
-/// In both cases, globally disabled MCPs are excluded.
+/// In all cases, globally disabled MCPs (`enabled = false`) are excluded.
 fn filter_mcp_configs_for_workspace(
     configs: Vec<McpServerConfig>,
     workspace_mcps: &[String],
+    replace_defaults: bool,
 ) -> Vec<McpServerConfig> {
     configs
         .into_iter()
         .filter(|c| {
+            // Globally disabled MCPs are always excluded
             if !c.enabled {
                 return false;
             }
             if workspace_mcps.is_empty() {
+                // No explicit list → fall back to default MCPs
                 c.default_enabled
             } else {
-                workspace_mcps.iter().any(|name| name == &c.name)
+                let in_list = workspace_mcps.iter().any(|name| name == &c.name);
+                if replace_defaults {
+                    // Explicit list is the complete set — only listed MCPs
+                    in_list
+                } else {
+                    // Additive mode — listed MCPs + all default-enabled MCPs
+                    in_list || c.default_enabled
+                }
             }
         })
         .collect()
@@ -3156,7 +3187,11 @@ pub async fn prepare_mission_workspace_in(
     // can run concurrently without clobbering per-workspace config files.
     let dir = mission_workspace_dir_for_root(&workspace.path, mission_id);
     prepare_workspace_dir(&dir).await?;
-    let mcp_configs = filter_mcp_configs_for_workspace(mcp.list_configs().await, &workspace.mcps);
+    let mcp_configs = filter_mcp_configs_for_workspace(
+        mcp.list_configs().await,
+        &workspace.mcps,
+        workspace.mcps_replace_defaults,
+    );
     let skill_allowlist = if workspace.skills.is_empty() {
         None
     } else {
@@ -3257,7 +3292,11 @@ pub async fn prepare_mission_workspace_with_skills_backend(
             Some(providers_from_file.as_slice())
         }
     };
-    let mcp_configs = filter_mcp_configs_for_workspace(mcp.list_configs().await, &workspace.mcps);
+    let mcp_configs = filter_mcp_configs_for_workspace(
+        mcp.list_configs().await,
+        &workspace.mcps,
+        workspace.mcps_replace_defaults,
+    );
     let skill_allowlist = if workspace.skills.is_empty() {
         None
     } else {
