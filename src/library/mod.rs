@@ -57,6 +57,9 @@ struct WorkspaceTemplateConfig {
     /// MCP server names to enable for workspaces created from this template.
     #[serde(default)]
     mcps: Vec<String>,
+    /// `true` (default) = `mcps` list replaces defaults, `false` = additive.
+    #[serde(default = "crate::workspace::default_true")]
+    mcps_replace_defaults: bool,
     /// Config profile to use for workspaces created from this template.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     config_profile: Option<String>,
@@ -1243,6 +1246,7 @@ impl LibraryStore {
             shared_network: config.shared_network,
             tailscale_mode: config.tailscale_mode,
             mcps: config.mcps,
+            mcps_replace_defaults: config.mcps_replace_defaults,
             config_profile: config.config_profile,
         })
     }
@@ -1295,6 +1299,7 @@ impl LibraryStore {
             shared_network: template.shared_network,
             tailscale_mode: template.tailscale_mode,
             mcps: template.mcps.clone(),
+            mcps_replace_defaults: template.mcps_replace_defaults,
             config_profile: template.config_profile.clone(),
         };
 
