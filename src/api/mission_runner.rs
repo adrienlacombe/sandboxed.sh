@@ -4314,10 +4314,20 @@ pub fn run_claudecode_turn<'a>(
                                             _ => {}
                                         }
                                     }
-                                    // If no text content was produced this turn but we have
-                                    // thinking content, use it as the final result before
-                                    // clearing. Only do this when no tool calls are pending —
-                                    // otherwise a later tool result may produce the real output.
+                                    // If the Assistant event's ContentBlock::Text didn't
+                                    // populate final_result, fall back to the accumulated
+                                    // text_buffer from streaming deltas (text_delta events).
+                                    if final_result.trim().is_empty() && !text_buffer.is_empty() && pending_tools.is_empty() {
+                                        let mut sorted: Vec<_> = text_buffer.iter().collect();
+                                        sorted.sort_by_key(|(idx, _)| *idx);
+                                        final_result = sorted.into_iter().map(|(_, t)| t.clone()).collect::<Vec<_>>().join("");
+                                        tracing::info!(
+                                            mission_id = %mission_id,
+                                            "Using text delta buffer as final result ({} chars, ContentBlock::Text was empty)",
+                                            final_result.len()
+                                        );
+                                    }
+                                    // If still empty, try thinking buffer
                                     if final_result.trim().is_empty() && !thinking_buffer.is_empty() && pending_tools.is_empty() {
                                         let mut sorted: Vec<_> = thinking_buffer.iter().collect();
                                         sorted.sort_by_key(|(idx, _)| *idx);
