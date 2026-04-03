@@ -671,9 +671,7 @@ pub async fn process_webhook_message(ctx: &ChannelContext, msg: &Message, http: 
         return;
     }
 
-    if !should_process_message(&ctx.channel, msg, &ctx.bot_username) {
-        return;
-    }
+    let should_respond = should_process_message(&ctx.channel, msg, &ctx.bot_username);
 
     let sender_name = msg
         .from
@@ -692,20 +690,34 @@ pub async fn process_webhook_message(ctx: &ChannelContext, msg: &Message, http: 
     let clean_text = strip_bot_mention(text, &ctx.bot_username);
 
     // Resolve target mission: auto-create per chat or legacy single-mission
+    // For context-only messages (should_respond=false), only look up existing
+    // missions — don't create new ones just to store context.
     let target_mission_id = if ctx.channel.auto_create_missions {
-        match resolve_or_create_mission(ctx, msg.chat.id, &sender_name).await {
-            Some(id) => id,
-            None => {
-                let base_url = format!("https://api.telegram.org/bot{}", ctx.channel.bot_token);
-                let _ = send_message(
-                    http,
-                    &base_url,
-                    msg.chat.id,
-                    "Sorry, I couldn't start a new conversation. Please try again.",
-                    Some(msg.message_id),
-                )
-                .await;
-                return;
+        if should_respond {
+            match resolve_or_create_mission(ctx, msg.chat.id, &sender_name).await {
+                Some(id) => id,
+                None => {
+                    let base_url = format!("https://api.telegram.org/bot{}", ctx.channel.bot_token);
+                    let _ = send_message(
+                        http,
+                        &base_url,
+                        msg.chat.id,
+                        "Sorry, I couldn't start a new conversation. Please try again.",
+                        Some(msg.message_id),
+                    )
+                    .await;
+                    return;
+                }
+            }
+        } else {
+            // Context-only: look up existing mission for this chat, skip if none
+            match ctx
+                .mission_store
+                .get_telegram_chat_mission(ctx.channel.id, msg.chat.id)
+                .await
+            {
+                Ok(Some(mapping)) => mapping.mission_id,
+                _ => return, // No existing mission for this chat — nothing to store context in
             }
         }
     } else {
@@ -759,6 +771,30 @@ pub async fn process_webhook_message(ctx: &ChannelContext, msg: &Message, http: 
         parts.push(clean_text.clone());
     }
     let content = parts.join(" ");
+
+    if !should_respond {
+        // Context-only: store the message in mission history without triggering
+        // the agent. This lets the agent see full chat context when it IS triggered.
+        tracing::debug!(
+            "Storing Telegram context message for mission {} from {}: {}",
+            target_mission_id,
+            sender_name,
+            &clean_text[..clean_text.floor_char_boundary(100)]
+        );
+        let _ = ctx
+            .mission_store
+            .log_event(
+                target_mission_id,
+                &AgentEvent::UserMessage {
+                    id: Uuid::new_v4(),
+                    content: content.clone(),
+                    queued: false,
+                    mission_id: Some(target_mission_id),
+                },
+            )
+            .await;
+        return;
+    }
 
     tracing::info!(
         "Telegram webhook message for mission {} from {}: {}",
