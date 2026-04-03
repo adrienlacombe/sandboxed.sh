@@ -865,11 +865,13 @@ fn should_process_message(channel: &TelegramChannel, msg: &Message, bot_username
 fn strip_bot_mention(text: &str, bot_username: &str) -> String {
     let mention = format!("@{}", bot_username);
     let trimmed = text.trim();
-    if trimmed.len() >= mention.len() && trimmed[..mention.len()].eq_ignore_ascii_case(&mention) {
-        trimmed[mention.len()..].trim().to_string()
-    } else {
-        trimmed.to_string()
+    // Use char-aware comparison to avoid panics on non-ASCII usernames
+    if let Some(rest) = trimmed.get(..mention.len()) {
+        if rest.eq_ignore_ascii_case(&mention) {
+            return trimmed[mention.len()..].trim().to_string();
+        }
     }
+    trimmed.to_string()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1051,24 +1053,47 @@ async fn send_file_to_telegram(
 
     // Read the file from the URL (which could be a relative workspace path or absolute)
     let file_path = if file.url.starts_with("http://") || file.url.starts_with("https://") {
-        // Download from URL first
+        // Download from URL first (cap at 50MB to prevent OOM)
+        const MAX_DOWNLOAD: usize = 50 * 1024 * 1024;
         let resp = http
             .get(&file.url)
             .send()
             .await
             .map_err(|e| format!("Failed to fetch file from URL: {}", e))?;
         if !resp.status().is_success() {
-            return Err(format!(
-                "File fetch HTTP error {}: {}",
-                resp.status(),
-                file.url
-            ));
+            return Err(format!("File fetch HTTP error {}", resp.status(),));
+        }
+        if let Some(len) = resp.content_length() {
+            if len as usize > MAX_DOWNLOAD {
+                return Err(format!(
+                    "File too large: {} bytes (max {})",
+                    len, MAX_DOWNLOAD
+                ));
+            }
         }
         let bytes = resp
             .bytes()
             .await
             .map_err(|e| format!("Failed to read file bytes: {}", e))?;
-        let tmp_path = std::path::PathBuf::from("/tmp/telegram-outbound").join(&file.name);
+        if bytes.len() > MAX_DOWNLOAD {
+            return Err(format!(
+                "File too large: {} bytes (max {})",
+                bytes.len(),
+                MAX_DOWNLOAD
+            ));
+        }
+        // Sanitize filename to prevent path traversal
+        let safe_name = file
+            .name
+            .replace(['/', '\\', '\0'], "_")
+            .trim_start_matches('.')
+            .to_string();
+        let safe_name = if safe_name.is_empty() {
+            "file".to_string()
+        } else {
+            safe_name
+        };
+        let tmp_path = std::path::PathBuf::from("/tmp/telegram-outbound").join(&safe_name);
         if let Some(parent) = tmp_path.parent() {
             let _ = tokio::fs::create_dir_all(parent).await;
         }
@@ -1077,8 +1102,19 @@ async fn send_file_to_telegram(
             .map_err(|e| format!("Failed to write temp file: {}", e))?;
         tmp_path
     } else {
-        // Local file path (from workspace)
-        std::path::PathBuf::from(&file.url)
+        // Local file path — must be under a workspace directory
+        let path = std::path::PathBuf::from(&file.url);
+        let canonical = path
+            .canonicalize()
+            .map_err(|e| format!("Failed to resolve file path: {}", e))?;
+        let allowed_roots = ["/root/workspaces/", "/tmp/"];
+        if !allowed_roots.iter().any(|r| canonical.starts_with(r)) {
+            return Err(format!(
+                "File path outside allowed directories: {}",
+                canonical.display()
+            ));
+        }
+        canonical
     };
 
     if !file_path.exists() {
