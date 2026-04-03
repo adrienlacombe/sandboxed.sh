@@ -2204,6 +2204,43 @@ impl MissionStore for SqliteMissionStore {
         .map_err(|e| e.to_string())?
     }
 
+    async fn count_events(
+        &self,
+        mission_id: Uuid,
+        event_types: Option<&[&str]>,
+    ) -> Result<usize, String> {
+        let conn = self.conn.clone();
+        let mid = mission_id.to_string();
+        let types: Option<Vec<String>> =
+            event_types.map(|t| t.iter().map(|s| s.to_string()).collect());
+
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+
+            let count: i64 = if let Some(types) = types {
+                let types_json =
+                    serde_json::to_string(&types).unwrap_or_else(|_| "[]".to_string());
+                conn.query_row(
+                    "SELECT COUNT(*) FROM mission_events WHERE mission_id = ?1 AND event_type IN (SELECT value FROM json_each(?2))",
+                    params![&mid, &types_json],
+                    |row| row.get(0),
+                )
+                .map_err(|e| e.to_string())?
+            } else {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM mission_events WHERE mission_id = ?1",
+                    params![&mid],
+                    |row| row.get(0),
+                )
+                .map_err(|e| e.to_string())?
+            };
+
+            Ok(count as usize)
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
     async fn get_total_cost_cents(&self) -> Result<u64, String> {
         let conn = self.conn.lock().await;
 

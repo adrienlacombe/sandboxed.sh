@@ -591,6 +591,16 @@ pub trait MissionStore: Send + Sync {
         Ok(vec![])
     }
 
+    /// Count events for a mission, optionally filtered by type.
+    async fn count_events(
+        &self,
+        mission_id: Uuid,
+        event_types: Option<&[&str]>,
+    ) -> Result<usize, String> {
+        let _ = (mission_id, event_types);
+        Ok(0)
+    }
+
     /// Get total cost in cents across all missions.
     /// Aggregates assistant_message metadata cost across all events.
     async fn get_total_cost_cents(&self) -> Result<u64, String> {

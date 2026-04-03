@@ -166,7 +166,7 @@ final class APIService {
         return response.ok
     }
 
-    func getMissionEvents(id: String, types: [String]? = nil, limit: Int? = nil, offset: Int? = nil) async throws -> [StoredEvent] {
+    func getMissionEvents(id: String, types: [String]? = nil, limit: Int? = nil, offset: Int? = nil, latest: Bool = false) async throws -> [StoredEvent] {
         var queryItems: [URLQueryItem] = []
         if let types = types {
             queryItems.append(URLQueryItem(name: "types", value: types.joined(separator: ",")))
@@ -176,6 +176,9 @@ final class APIService {
         }
         if let offset = offset {
             queryItems.append(URLQueryItem(name: "offset", value: String(offset)))
+        }
+        if latest {
+            queryItems.append(URLQueryItem(name: "latest", value: "true"))
         }
 
         var urlString = "/api/control/missions/\(id)/events"

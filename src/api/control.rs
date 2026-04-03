@@ -4167,6 +4167,9 @@ pub struct GetEventsQuery {
     /// Offset for pagination
     #[serde(default)]
     pub offset: Option<usize>,
+    /// When true, return the latest N events (computes offset from total count)
+    #[serde(default)]
+    pub latest: Option<bool>,
 }
 
 /// Get events for a mission (for debugging/replay).
@@ -4195,9 +4198,25 @@ pub async fn get_mission_events(
         .as_ref()
         .map(|s| s.split(',').map(|t| t.trim()).collect());
 
+    // When latest=true with a limit, compute offset to return the last N events
+    let offset = if query.latest.unwrap_or(false) {
+        if let Some(limit) = query.limit {
+            let total = control
+                .mission_store
+                .count_events(mission_id, types.as_deref())
+                .await
+                .map_err(internal_error)?;
+            Some(total.saturating_sub(limit))
+        } else {
+            query.offset
+        }
+    } else {
+        query.offset
+    };
+
     let events = control
         .mission_store
-        .get_events(mission_id, types.as_deref(), query.limit, query.offset)
+        .get_events(mission_id, types.as_deref(), query.limit, offset)
         .await
         .map_err(internal_error)?;
 
