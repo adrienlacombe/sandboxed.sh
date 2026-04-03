@@ -4864,7 +4864,10 @@ async fn automation_scheduler_loop(
     // Check every 5 seconds for automations that need to run
     let check_interval = std::time::Duration::from_secs(5);
 
-    tracing::info!("Automation scheduler task started");
+    tracing::info!(
+        telegram_bridge_available = telegram_bridge.is_some(),
+        "Automation scheduler task started"
+    );
 
     let mut logged_unsupported = false;
 
