@@ -814,18 +814,23 @@ fn default_timeout_from_env() -> Duration {
 }
 
 fn parse_timeout(args: &Value) -> Duration {
-    if let Some(ms) = args.get("timeout_ms").and_then(|v| v.as_u64()) {
-        return Duration::from_millis(ms.max(1));
-    }
-    if let Some(secs) = args.get("timeout_secs").and_then(|v| v.as_u64()) {
-        return Duration::from_secs(secs.max(1));
-    }
-    if let Some(secs) = args.get("timeout").and_then(|v| v.as_f64()) {
+    // Cap at 1 hour to prevent near-infinite timeouts
+    const MAX_TIMEOUT: Duration = Duration::from_secs(3600);
+
+    let timeout = if let Some(ms) = args.get("timeout_ms").and_then(|v| v.as_u64()) {
+        Duration::from_millis(ms.max(1))
+    } else if let Some(secs) = args.get("timeout_secs").and_then(|v| v.as_u64()) {
+        Duration::from_secs(secs.max(1))
+    } else if let Some(secs) = args.get("timeout").and_then(|v| v.as_f64()) {
         if secs > 0.0 {
-            return Duration::from_secs_f64(secs);
+            Duration::from_secs_f64(secs)
+        } else {
+            return default_timeout_from_env();
         }
-    }
-    default_timeout_from_env()
+    } else {
+        return default_timeout_from_env();
+    };
+    timeout.min(MAX_TIMEOUT)
 }
 
 fn parse_env(args: &Value) -> HashMap<String, String> {

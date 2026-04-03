@@ -9661,7 +9661,10 @@ pub async fn run_opencode_turn(
                                 continue;
                             }
                         }
-                        Err(_) => break,
+                        Err(e) => {
+                            tracing::warn!(mission_id = %mission_id, error = %e, "SSE reader I/O error");
+                            break;
+                        }
                     }
                 }
 
