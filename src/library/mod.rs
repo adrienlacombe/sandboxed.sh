@@ -85,6 +85,11 @@ pub struct LibraryStore {
 
 impl LibraryStore {
     /// Create a new LibraryStore, cloning the repo if needed.
+    /// Get the filesystem path to a config profile directory.
+    pub fn config_profile_path(&self, name: &str) -> PathBuf {
+        self.path.join(CONFIGS_DIR).join(name)
+    }
+
     pub async fn new(path: PathBuf, remote: &str) -> Result<Self> {
         // Clone if the repo doesn't exist
         git::clone_if_needed(&path, remote).await?;
