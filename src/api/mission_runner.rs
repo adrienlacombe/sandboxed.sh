@@ -9137,17 +9137,28 @@ pub async fn run_opencode_turn(
             .unwrap_or("builtin/fast");
         ensure_opencode_provider_for_model(&opencode_config_dir_host, m);
 
-        // Strip MCP servers from opencode.json to avoid long boot hangs
+        // Replace workspace MCPs with profile-defined MCPs only.
+        // Workspace MCPs (desktop, playwright, cq) hang during boot.
+        // The profile's settings.json can define lightweight MCPs
+        // (e.g. orchestrator, automation-manager) that are useful.
         let config_path = opencode_config_dir_host.join("opencode.json");
+        let profile_mcp_path = opencode_config_dir_host.join("oh-my-opencode.json");
         if let Ok(content) = std::fs::read_to_string(&config_path) {
             if let Ok(mut config) = serde_json::from_str::<serde_json::Value>(&content) {
                 if let Some(obj) = config.as_object_mut() {
-                    obj.insert("mcp".to_string(), serde_json::json!({}));
+                    let profile_mcps = std::fs::read_to_string(&profile_mcp_path)
+                        .ok()
+                        .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
+                        .and_then(|v| v.get("mcp").cloned())
+                        .unwrap_or(serde_json::json!({}));
+                    let mcp_count = profile_mcps.as_object().map(|m| m.len()).unwrap_or(0);
+                    obj.insert("mcp".to_string(), profile_mcps);
                     if let Ok(updated) = serde_json::to_string_pretty(&config) {
                         let _ = std::fs::write(&config_path, updated);
                         tracing::info!(
                             mission_id = %mission_id,
-                            "Stripped MCP servers from opencode.json for plain opencode mode"
+                            mcp_count = mcp_count,
+                            "Replaced workspace MCPs with profile MCPs for plain opencode mode"
                         );
                     }
                 }
