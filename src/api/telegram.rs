@@ -980,7 +980,13 @@ pub async fn stream_response(
                             if last_edit.elapsed() >= edit_interval {
                                 // Throttled edit
                                 let display = truncate_for_telegram(&accumulated_text);
-                                let _ = edit_message(http, &base_url, chat_id, msg_id, &display).await;
+                                if let Err(e) = edit_message(http, &base_url, chat_id, msg_id, &display).await {
+                                    tracing::warn!(
+                                        mission_id = %mission_id,
+                                        "Failed to edit Telegram message during streaming: {}",
+                                        e
+                                    );
+                                }
                                 last_edit = tokio::time::Instant::now();
                             }
                         } else {
@@ -1007,7 +1013,15 @@ pub async fn stream_response(
                         if let Some(msg_id) = sent_message_id {
                             // Edit existing message with final content
                             let display = truncate_for_telegram(&content);
-                            let _ = edit_message(http, &base_url, chat_id, msg_id, &display).await;
+                            if let Err(e) = edit_message(http, &base_url, chat_id, msg_id, &display).await {
+                                tracing::warn!(
+                                    mission_id = %mission_id,
+                                    "Failed to edit Telegram message with final response, sending as new message: {}",
+                                    e
+                                );
+                                // Fallback: send as a new message if edit fails
+                                let _ = send_chunked_message(http, &base_url, chat_id, &content, None).await;
+                            }
                             // If content exceeds 4096 chars, send overflow as new messages
                             send_overflow_chunks(http, &base_url, chat_id, &content).await;
                         } else {
