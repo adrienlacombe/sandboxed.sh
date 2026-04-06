@@ -1236,7 +1236,7 @@ async fn send_file_to_telegram(
 }
 
 /// Public API for sending a text message to a Telegram chat.
-/// Handles markdown-to-HTML conversion, truncation, and chunking for long messages.
+/// Handles markdown-to-HTML conversion and chunking for long messages.
 pub async fn send_telegram_text(
     http: &Client,
     base_url: &str,
@@ -1244,7 +1244,13 @@ pub async fn send_telegram_text(
     text: &str,
     reply_to: Option<i64>,
 ) -> Result<i64, String> {
-    send_message(http, base_url, chat_id, text, reply_to).await
+    let msg_id = send_message(http, base_url, chat_id, text, reply_to).await?;
+    // Send overflow chunks for content beyond the first 4096 chars
+    let display = truncate_for_telegram(text);
+    if display.source_boundary < text.len() {
+        send_overflow_chunks(http, base_url, chat_id, text, display.source_boundary).await;
+    }
+    Ok(msg_id)
 }
 
 /// Send a message and return the message_id.
