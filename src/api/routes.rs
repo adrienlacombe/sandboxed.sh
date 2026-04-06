@@ -710,6 +710,10 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
             "/api/control/telegram/bots/:id/chats",
             get(control::list_bot_chats),
         )
+        .route(
+            "/api/control/telegram/send",
+            post(control::send_telegram_message_api),
+        )
         // Parallel execution endpoints
         .route("/api/control/running", get(control::list_running_missions))
         .route(

@@ -9412,6 +9412,7 @@ pub async fn run_opencode_turn(
     let mut final_result = String::new();
     let mut had_error = false;
     let mut final_result_from_nonzero_exit = false;
+    let mut tool_call_step_count: u32 = 0;
     let session_id_capture: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let stderr_text_buffer: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
     let stderr_recent_lines: Arc<Mutex<VecDeque<String>>> =
@@ -10262,10 +10263,6 @@ pub async fn run_opencode_turn(
                                     }
                                 }
                             } else if event_type == "step_finish" {
-                                // Only treat as completion if reason is "stop".
-                                // Tool-use steps have reason "tool_use" and are
-                                // followed by more steps — killing early would
-                                // abort the multi-step execution.
                                 let reason = json
                                     .get("part")
                                     .and_then(|p| p.get("reason"))
@@ -10274,10 +10271,23 @@ pub async fn run_opencode_turn(
                                 tracing::info!(
                                     mission_id = %mission_id,
                                     reason = %reason,
+                                    tool_call_steps = tool_call_step_count,
                                     "OpenCode JSON step_finish event"
                                 );
                                 if reason == "stop" {
                                     let _ = sse_complete_tx.send(true);
+                                } else {
+                                    // Track consecutive tool-call steps to detect runaway loops
+                                    tool_call_step_count += 1;
+                                    const MAX_TOOL_CALL_STEPS: u32 = 15;
+                                    if tool_call_step_count >= MAX_TOOL_CALL_STEPS {
+                                        tracing::warn!(
+                                            mission_id = %mission_id,
+                                            steps = tool_call_step_count,
+                                            "OpenCode tool-call step limit reached, forcing completion"
+                                        );
+                                        let _ = sse_complete_tx.send(true);
+                                    }
                                 }
                             } else if event_type == "step_start" {
                                 // Extract session ID from step_start
@@ -10309,8 +10319,13 @@ pub async fn run_opencode_turn(
                                 }
                             }
 
-                            // Route through SSE event parser for thinking/tool events
+                            // Route through SSE event parser for thinking/tool events.
+                            // Skip events already handled inline to avoid double processing
+                            // (e.g. step_finish would set message_complete in the SSE parser
+                            // even for tool-call steps, conflicting with the inline handler).
+                            let skip_sse = matches!(event_type, "step_finish" | "step_start" | "text");
                             let current_session = session_id_capture.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                            if !skip_sse {
                             if let Some(parsed) = parse_opencode_sse_event(
                                 trimmed,
                                 None,
@@ -10390,6 +10405,7 @@ pub async fn run_opencode_turn(
                                     sse_retry_tx.send_modify(|v| *v += 1);
                                 }
                             }
+                            } // !skip_sse
                         } else {
                             // Non-JSON line - this is the expected output format without --format json
                             tracing::debug!(mission_id = %mission_id, line = %trimmed, "OpenCode stdout");

@@ -4583,6 +4583,7 @@ pub async fn stream(
 }
 
 /// Spawn the global control session actor.
+#[allow(clippy::too_many_arguments)]
 fn spawn_control_session(
     config: Config,
     root_agent: AgentRef,
@@ -10113,6 +10114,97 @@ pub async fn list_bot_chats(
         .await
         .map_err(internal_error)?;
     Ok(Json(mappings))
+}
+
+/// Send a message to a Telegram chat via the bot and optionally dispatch it to
+/// the associated mission. Used by agents (e.g. Ana) to proactively message users.
+#[derive(Debug, Deserialize)]
+pub struct SendTelegramMessageRequest {
+    /// Telegram chat ID to send to
+    pub chat_id: i64,
+    /// Message text
+    pub text: String,
+    /// Bot channel ID (if omitted, uses the first active bot)
+    #[serde(default)]
+    pub channel_id: Option<Uuid>,
+    /// Also dispatch as a user message to the chat's associated mission
+    #[serde(default)]
+    pub dispatch_to_mission: bool,
+}
+
+pub async fn send_telegram_message_api(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    Json(req): Json<SendTelegramMessageRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let control = control_for_user(&state, &user).await;
+
+    // Resolve which bot to use
+    let channel = if let Some(channel_id) = req.channel_id {
+        control
+            .mission_store
+            .get_telegram_channel(channel_id)
+            .await
+            .map_err(internal_error)?
+            .ok_or_else(|| {
+                (
+                    StatusCode::NOT_FOUND,
+                    format!("Telegram channel {} not found", channel_id),
+                )
+            })?
+    } else {
+        // Use first active bot
+        let channels = control
+            .mission_store
+            .list_all_telegram_channels()
+            .await
+            .map_err(internal_error)?;
+        channels.into_iter().find(|c| c.active).ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                "No active Telegram bot found".to_string(),
+            )
+        })?
+    };
+
+    // Send the message via Telegram Bot API with HTML rendering and chunking
+    let base_url = format!("https://api.telegram.org/bot{}", channel.bot_token);
+    let http = reqwest::Client::new();
+    let msg_id =
+        super::telegram::send_telegram_text(&http, &base_url, req.chat_id, &req.text, None)
+            .await
+            .map_err(|e| (StatusCode::BAD_GATEWAY, e))?;
+    let resp_body = serde_json::json!({"ok": true, "message_id": msg_id});
+
+    // Optionally dispatch to the associated mission
+    if req.dispatch_to_mission {
+        if let Ok(Some(mapping)) = control
+            .mission_store
+            .get_telegram_chat_mission(channel.id, req.chat_id)
+            .await
+        {
+            let msg_id = Uuid::new_v4();
+            let (tx, _rx) = tokio::sync::oneshot::channel();
+            let content = format!(
+                "[Telegram from @{} in chat {}] {}",
+                channel.bot_username.as_deref().unwrap_or("bot"),
+                req.chat_id,
+                req.text
+            );
+            let _ = control
+                .cmd_tx
+                .send(ControlCommand::UserMessage {
+                    id: msg_id,
+                    content,
+                    agent: None,
+                    target_mission_id: Some(mapping.mission_id),
+                    respond: tx,
+                })
+                .await;
+        }
+    }
+
+    Ok(Json(resp_body))
 }
 
 /// Telegram webhook receiver (unauthenticated — verified via secret token header).
