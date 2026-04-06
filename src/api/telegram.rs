@@ -1313,12 +1313,60 @@ fn char_boundary_at(text: &str, max_chars: usize) -> usize {
 }
 
 /// Truncate text to fit Telegram's 4096 character limit.
+/// Strip common markdown syntax that looks ugly in plain Telegram messages.
+fn strip_markdown_for_telegram(text: &str) -> String {
+    let mut result = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        match ch {
+            // Strip **bold** and *italic* markers
+            '*' => {
+                if chars.peek() == Some(&'*') {
+                    chars.next(); // consume second *
+                } // drop the asterisk(s)
+            }
+            // Strip `code` and ```code blocks``` backticks
+            '`' => {
+                if chars.peek() == Some(&'`') {
+                    chars.next();
+                    if chars.peek() == Some(&'`') {
+                        chars.next();
+                        // Skip optional language tag after ```
+                        while chars.peek().map(|c| *c != '\n').unwrap_or(false) {
+                            chars.next();
+                        }
+                    }
+                } // drop backtick(s)
+            }
+            // Strip markdown headers: lines starting with # or ##
+            '#' if result.ends_with('\n') || result.is_empty() => {
+                while chars.peek() == Some(&'#') {
+                    chars.next();
+                }
+                // Skip the space after ###
+                if chars.peek() == Some(&' ') {
+                    chars.next();
+                }
+            }
+            // Replace "- " bullet lists at start of line with "  "
+            '-' if (result.ends_with('\n') || result.is_empty()) && chars.peek() == Some(&' ') => {
+                result.push_str("  ");
+                chars.next(); // consume the space
+            }
+            _ => result.push(ch),
+        }
+    }
+    result
+}
+
 fn truncate_for_telegram(text: &str) -> String {
-    if text.chars().count() <= 4096 {
-        text.to_string()
+    let cleaned = strip_markdown_for_telegram(text);
+    if cleaned.chars().count() <= 4096 {
+        cleaned
     } else {
-        let boundary = char_boundary_at(text, 4090);
-        format!("{}...", &text[..boundary])
+        let boundary = char_boundary_at(&cleaned, 4090);
+        format!("{}...", &cleaned[..boundary])
     }
 }
 
