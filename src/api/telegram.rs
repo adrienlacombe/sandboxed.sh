@@ -1022,18 +1022,20 @@ pub async fn stream_response(
                                     "Failed to edit Telegram message with final response, sending as new message: {}",
                                     e
                                 );
-                                // Fallback: send as a new message if edit fails
+                                // Fallback: send entire content as new chunked messages.
+                                // Skip overflow below since chunked send handles the full content.
                                 let _ = send_chunked_message(http, &base_url, chat_id, &content, None).await;
+                            } else {
+                                // Edit succeeded — send overflow chunks for content beyond the first 4096 chars
+                                send_overflow_chunks(
+                                    http,
+                                    &base_url,
+                                    chat_id,
+                                    &content,
+                                    display.source_boundary,
+                                )
+                                .await;
                             }
-                            // If content exceeds 4096 chars, send overflow as new messages
-                            send_overflow_chunks(
-                                http,
-                                &base_url,
-                                chat_id,
-                                &content,
-                                display.source_boundary,
-                            )
-                            .await;
                         } else {
                             // No streaming happened, send the full response directly
                             send_chunked_message(http, &base_url, chat_id, &content, Some(reply_to)).await?;
@@ -1231,6 +1233,18 @@ async fn send_file_to_telegram(
 
     tracing::info!("Sent file {} to Telegram chat {}", file.name, chat_id);
     Ok(())
+}
+
+/// Public API for sending a text message to a Telegram chat.
+/// Handles markdown-to-HTML conversion, truncation, and chunking for long messages.
+pub async fn send_telegram_text(
+    http: &Client,
+    base_url: &str,
+    chat_id: i64,
+    text: &str,
+    reply_to: Option<i64>,
+) -> Result<i64, String> {
+    send_message(http, base_url, chat_id, text, reply_to).await
 }
 
 /// Send a message and return the message_id.
@@ -1456,7 +1470,7 @@ pub fn markdown_to_telegram_html(text: &str) -> String {
                                 url.push(c);
                             }
                             result.push_str("<a href=\"");
-                            result.push_str(&url);
+                            result.push_str(&url.replace('"', "&quot;"));
                             result.push_str("\">");
                             result.push_str(&link_text);
                             result.push_str("</a>");

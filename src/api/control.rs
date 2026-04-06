@@ -10167,39 +10167,14 @@ pub async fn send_telegram_message_api(
         })?
     };
 
-    // Send the message via Telegram Bot API with HTML rendering
-    let html_text = super::telegram::markdown_to_telegram_html(&req.text);
+    // Send the message via Telegram Bot API with HTML rendering and chunking
     let base_url = format!("https://api.telegram.org/bot{}", channel.bot_token);
     let http = reqwest::Client::new();
-    let body = serde_json::json!({
-        "chat_id": req.chat_id,
-        "text": html_text,
-        "parse_mode": "HTML",
-    });
-    let response = http
-        .post(format!("{}/sendMessage", base_url))
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::BAD_GATEWAY,
-                format!("Telegram API error: {}", e),
-            )
-        })?;
-
-    let status = response.status();
-    let resp_body: serde_json::Value = response
-        .json()
-        .await
-        .unwrap_or(serde_json::json!({"ok": false}));
-
-    if !status.is_success() {
-        return Err((
-            StatusCode::BAD_GATEWAY,
-            format!("Telegram sendMessage failed: {}", resp_body),
-        ));
-    }
+    let msg_id =
+        super::telegram::send_telegram_text(&http, &base_url, req.chat_id, &req.text, None)
+            .await
+            .map_err(|e| (StatusCode::BAD_GATEWAY, e))?;
+    let resp_body = serde_json::json!({"ok": true, "message_id": msg_id});
 
     // Optionally dispatch to the associated mission
     if req.dispatch_to_mission {
