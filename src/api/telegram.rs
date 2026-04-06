@@ -962,7 +962,8 @@ pub async fn stream_response(
             if let Some(msg_id) = sent_message_id {
                 if !accumulated_text.is_empty() {
                     let final_text = format!("{}...\n\n_(timed out)_", accumulated_text);
-                    let _ = edit_message(http, &base_url, chat_id, msg_id, &final_text).await;
+                    let display = truncate_for_telegram(&final_text);
+                    let _ = edit_message(http, &base_url, chat_id, msg_id, &display.html).await;
                 }
             }
             return Err("Timeout waiting for agent response".to_string());
@@ -982,7 +983,7 @@ pub async fn stream_response(
                             if last_edit.elapsed() >= edit_interval {
                                 // Throttled edit
                                 let display = truncate_for_telegram(&accumulated_text);
-                                if let Err(e) = edit_message(http, &base_url, chat_id, msg_id, &display).await {
+                                if let Err(e) = edit_message(http, &base_url, chat_id, msg_id, &display.html).await {
                                     tracing::warn!(
                                         mission_id = %mission_id,
                                         "Failed to edit Telegram message during streaming: {}",
@@ -1015,7 +1016,7 @@ pub async fn stream_response(
                         if let Some(msg_id) = sent_message_id {
                             // Edit existing message with final content
                             let display = truncate_for_telegram(&content);
-                            if let Err(e) = edit_message(http, &base_url, chat_id, msg_id, &display).await {
+                            if let Err(e) = edit_message(http, &base_url, chat_id, msg_id, &display.html).await {
                                 tracing::warn!(
                                     mission_id = %mission_id,
                                     "Failed to edit Telegram message with final response, sending as new message: {}",
@@ -1025,7 +1026,14 @@ pub async fn stream_response(
                                 let _ = send_chunked_message(http, &base_url, chat_id, &content, None).await;
                             }
                             // If content exceeds 4096 chars, send overflow as new messages
-                            send_overflow_chunks(http, &base_url, chat_id, &content).await;
+                            send_overflow_chunks(
+                                http,
+                                &base_url,
+                                chat_id,
+                                &content,
+                                display.source_boundary,
+                            )
+                            .await;
                         } else {
                             // No streaming happened, send the full response directly
                             send_chunked_message(http, &base_url, chat_id, &content, Some(reply_to)).await?;
@@ -1054,7 +1062,8 @@ pub async fn stream_response(
                             } else {
                                 format!("{}\n\n_{}_", accumulated_text, error_msg)
                             };
-                            let _ = edit_message(http, &base_url, chat_id, msg_id, &final_text).await;
+                            let display = truncate_for_telegram(&final_text);
+                            let _ = edit_message(http, &base_url, chat_id, msg_id, &display.html).await;
                         } else {
                             let _ = send_message(http, &base_url, chat_id, &error_msg, Some(reply_to)).await;
                         }
@@ -1235,7 +1244,7 @@ async fn send_message(
     let display = truncate_for_telegram(text);
     let body = SendMessageRequest {
         chat_id,
-        text: &display,
+        text: &display.html,
         reply_to_message_id: reply_to,
         parse_mode: Some("HTML"),
     };
@@ -1271,16 +1280,15 @@ async fn edit_message(
     base_url: &str,
     chat_id: i64,
     message_id: i64,
-    text: &str,
+    html: &str,
 ) -> Result<(), String> {
-    if text.is_empty() {
+    if html.is_empty() {
         return Ok(());
     }
-    let html = markdown_to_telegram_html(text);
     let body = EditMessageRequest {
         chat_id,
         message_id,
-        text: &html,
+        text: html,
         parse_mode: Some("HTML"),
     };
 
@@ -1478,24 +1486,73 @@ pub fn markdown_to_telegram_html(text: &str) -> String {
     result
 }
 
-fn truncate_for_telegram(text: &str) -> String {
+struct TelegramRenderChunk {
+    html: String,
+    source_boundary: usize,
+}
+
+fn render_telegram_chunk(
+    text: &str,
+    max_chars: usize,
+    truncated_suffix: Option<&str>,
+) -> TelegramRenderChunk {
     let html = markdown_to_telegram_html(text);
-    if html.chars().count() <= 4096 {
-        html
-    } else {
-        let boundary = char_boundary_at(&html, 4090);
-        format!("{}...", &html[..boundary])
+    if html.chars().count() <= max_chars {
+        return TelegramRenderChunk {
+            html,
+            source_boundary: text.len(),
+        };
+    }
+
+    let suffix = truncated_suffix.unwrap_or("");
+    let suffix_chars = suffix.chars().count();
+    let available_chars = max_chars.saturating_sub(suffix_chars);
+    let total_chars = text.chars().count();
+    let mut low = 0usize;
+    let mut high = total_chars;
+    let mut best_chars = 0usize;
+
+    while low <= high {
+        let mid = (low + high) / 2;
+        let boundary = char_boundary_at(text, mid);
+        let candidate = markdown_to_telegram_html(&text[..boundary]);
+
+        if candidate.chars().count() <= available_chars {
+            best_chars = mid;
+            low = mid.saturating_add(1);
+        } else if mid == 0 {
+            break;
+        } else {
+            high = mid - 1;
+        }
+    }
+
+    let source_boundary = char_boundary_at(text, best_chars);
+    let mut html = markdown_to_telegram_html(&text[..source_boundary]);
+    html.push_str(suffix);
+
+    TelegramRenderChunk {
+        html,
+        source_boundary,
     }
 }
 
+fn truncate_for_telegram(text: &str) -> TelegramRenderChunk {
+    render_telegram_chunk(text, 4096, Some("..."))
+}
+
 /// Send overflow chunks (content beyond 4096 chars) as separate messages.
-async fn send_overflow_chunks(http: &Client, base_url: &str, chat_id: i64, text: &str) {
-    if text.chars().count() <= 4096 {
+async fn send_overflow_chunks(
+    http: &Client,
+    base_url: &str,
+    chat_id: i64,
+    text: &str,
+    source_boundary: usize,
+) {
+    if source_boundary >= text.len() {
         return;
     }
-    // The first 4096 chars were already sent via edit. Send the rest in chunks.
-    let boundary = char_boundary_at(text, 4090);
-    let rest = &text[boundary..];
+    let rest = &text[source_boundary..];
     if rest.is_empty() {
         return;
     }
@@ -1510,31 +1567,58 @@ async fn send_chunked_message(
     text: &str,
     reply_to: Option<i64>,
 ) -> Result<(), String> {
-    let max_chars = 4000;
-    if text.chars().count() <= max_chars {
-        send_message(http, base_url, chat_id, text, reply_to).await?;
-        return Ok(());
-    }
-
     let mut remaining = text;
     let mut first = true;
     while !remaining.is_empty() {
-        let boundary = {
-            let char_count = remaining.chars().count();
-            if char_count <= max_chars {
-                remaining.len()
-            } else {
-                char_boundary_at(remaining, max_chars)
-            }
-        };
-        let chunk = &remaining[..boundary];
-        remaining = &remaining[boundary..];
-
+        let rendered = render_telegram_chunk(remaining, 4096, None);
         let reply = if first { reply_to } else { None };
         first = false;
-        send_message(http, base_url, chat_id, chunk, reply).await?;
+        send_message(
+            http,
+            base_url,
+            chat_id,
+            &remaining[..rendered.source_boundary],
+            reply,
+        )
+        .await?;
+        remaining = &remaining[rendered.source_boundary..];
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{markdown_to_telegram_html, render_telegram_chunk, truncate_for_telegram};
+
+    #[test]
+    fn truncate_for_telegram_preserves_valid_html_boundaries() {
+        let text = "**bold** ".repeat(700);
+        let rendered = truncate_for_telegram(&text);
+
+        assert!(rendered.html.chars().count() <= 4096);
+        assert!(rendered.source_boundary < text.len());
+        assert!(
+            rendered.html.ends_with("...</b>...")
+                || rendered.html.ends_with("</b>...")
+                || rendered.html.ends_with("...")
+        );
+        assert!(!rendered.html.contains("&lt;b&gt;"));
+    }
+
+    #[test]
+    fn render_chunk_tracks_consumed_source_before_html_limit() {
+        let text = "[label](https://example.com) ".repeat(300);
+        let rendered = render_telegram_chunk(&text, 4096, None);
+        let full_html = markdown_to_telegram_html(&text);
+
+        assert!(rendered.html.chars().count() <= 4096);
+        assert!(rendered.source_boundary < text.len());
+        assert!(full_html.chars().count() > 4096);
+        assert_eq!(
+            rendered.html,
+            markdown_to_telegram_html(&text[..rendered.source_boundary])
+        );
+    }
 }
 
 /// Fetch the bot's username via getMe.
