@@ -4583,6 +4583,7 @@ pub async fn stream(
 }
 
 /// Spawn the global control session actor.
+#[allow(clippy::too_many_arguments)]
 fn spawn_control_session(
     config: Config,
     root_agent: AgentRef,

@@ -1324,9 +1324,9 @@ fn char_boundary_at(text: &str, max_chars: usize) -> usize {
         .unwrap_or(text.len())
 }
 
-/// Truncate text to fit Telegram's 4096 character limit.
 /// Convert markdown to Telegram HTML for rich rendering.
 /// Handles **bold**, *italic*, `code`, ```blocks```, # headers, [links](url).
+#[allow(clippy::while_let_on_iterator)]
 pub fn markdown_to_telegram_html(text: &str) -> String {
     // Escape HTML special chars first
     let escaped = text
