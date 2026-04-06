@@ -10166,12 +10166,14 @@ pub async fn send_telegram_message_api(
         })?
     };
 
-    // Send the message via Telegram Bot API
+    // Send the message via Telegram Bot API with HTML rendering
+    let html_text = super::telegram::markdown_to_telegram_html(&req.text);
     let base_url = format!("https://api.telegram.org/bot{}", channel.bot_token);
     let http = reqwest::Client::new();
     let body = serde_json::json!({
         "chat_id": req.chat_id,
-        "text": req.text,
+        "text": html_text,
+        "parse_mode": "HTML",
     });
     let response = http
         .post(format!("{}/sendMessage", base_url))
