@@ -10319,8 +10319,13 @@ pub async fn run_opencode_turn(
                                 }
                             }
 
-                            // Route through SSE event parser for thinking/tool events
+                            // Route through SSE event parser for thinking/tool events.
+                            // Skip events already handled inline to avoid double processing
+                            // (e.g. step_finish would set message_complete in the SSE parser
+                            // even for tool-call steps, conflicting with the inline handler).
+                            let skip_sse = matches!(event_type, "step_finish" | "step_start" | "text");
                             let current_session = session_id_capture.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                            if !skip_sse {
                             if let Some(parsed) = parse_opencode_sse_event(
                                 trimmed,
                                 None,
@@ -10400,6 +10405,7 @@ pub async fn run_opencode_turn(
                                     sse_retry_tx.send_modify(|v| *v += 1);
                                 }
                             }
+                            } // !skip_sse
                         } else {
                             // Non-JSON line - this is the expected output format without --format json
                             tracing::debug!(mission_id = %mission_id, line = %trimmed, "OpenCode stdout");

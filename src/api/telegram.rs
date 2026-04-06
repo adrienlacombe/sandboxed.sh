@@ -1237,6 +1237,8 @@ async fn send_file_to_telegram(
 
 /// Public API for sending a text message to a Telegram chat.
 /// Handles markdown-to-HTML conversion and chunking for long messages.
+/// Public API for sending a text message to a Telegram chat.
+/// Handles markdown-to-HTML conversion and chunking for long messages.
 pub async fn send_telegram_text(
     http: &Client,
     base_url: &str,
@@ -1244,16 +1246,15 @@ pub async fn send_telegram_text(
     text: &str,
     reply_to: Option<i64>,
 ) -> Result<i64, String> {
-    let msg_id = send_message(http, base_url, chat_id, text, reply_to).await?;
-    // Send overflow chunks for content beyond the first 4096 chars
     let display = truncate_for_telegram(text);
+    let msg_id = send_message_html(http, base_url, chat_id, &display.html, reply_to).await?;
     if display.source_boundary < text.len() {
         send_overflow_chunks(http, base_url, chat_id, text, display.source_boundary).await;
     }
     Ok(msg_id)
 }
 
-/// Send a message and return the message_id.
+/// Send a message and return the message_id. Truncates to first 4096 HTML chars.
 async fn send_message(
     http: &Client,
     base_url: &str,
@@ -1262,9 +1263,20 @@ async fn send_message(
     reply_to: Option<i64>,
 ) -> Result<i64, String> {
     let display = truncate_for_telegram(text);
+    send_message_html(http, base_url, chat_id, &display.html, reply_to).await
+}
+
+/// Send pre-rendered HTML text.
+async fn send_message_html(
+    http: &Client,
+    base_url: &str,
+    chat_id: i64,
+    html: &str,
+    reply_to: Option<i64>,
+) -> Result<i64, String> {
     let body = SendMessageRequest {
         chat_id,
-        text: &display.html,
+        text: html,
         reply_to_message_id: reply_to,
         parse_mode: Some("HTML"),
     };
@@ -1469,11 +1481,20 @@ pub fn markdown_to_telegram_html(text: &str) -> String {
                         if chars.peek() == Some(&'(') {
                             chars.next();
                             let mut url = String::new();
+                            let mut paren_depth = 1u32;
                             while let Some(c) = chars.next() {
-                                if c == ')' {
-                                    break;
+                                if c == '(' {
+                                    paren_depth += 1;
+                                    url.push(c);
+                                } else if c == ')' {
+                                    paren_depth -= 1;
+                                    if paren_depth == 0 {
+                                        break;
+                                    }
+                                    url.push(c);
+                                } else {
+                                    url.push(c);
                                 }
-                                url.push(c);
                             }
                             result.push_str("<a href=\"");
                             result.push_str(&url.replace('"', "&quot;"));
