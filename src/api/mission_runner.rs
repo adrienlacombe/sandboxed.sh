@@ -2331,6 +2331,32 @@ async fn run_mission_turn(
                 }
             }
 
+            // Proactive auth refresh for SIGKILL'd processes: when Claude Code is
+            // killed mid-turn (signal: Killed, no terminal result), the cause is often
+            // an expired OAuth token that caused Node.js to crash. Even if we can't
+            // detect "auth error" in the output, preemptively refresh credentials so
+            // the transport recovery retry (above) uses fresh tokens. This is cheap
+            // (just a token validity check) and prevents cascading auth failures.
+            if !cancel.is_cancelled()
+                && result.terminal_reason == Some(TerminalReason::LlmError)
+                && result.output.contains("signal: Some(\"Killed\")")
+            {
+                tracing::info!(
+                    mission_id = %mission_id,
+                    "SIGKILL detected — preemptively refreshing OAuth credentials"
+                );
+                let mission_creds = mission_work_dir.join(".claude").join(".credentials.json");
+                if mission_creds.exists() {
+                    let _ = std::fs::remove_file(&mission_creds);
+                }
+                if let Err(e) = super::ai_providers::force_refresh_anthropic_oauth_token().await {
+                    tracing::debug!(
+                        "Preemptive OAuth refresh after SIGKILL failed (non-fatal): {}",
+                        e
+                    );
+                }
+            }
+
             // Auth error recovery: if the token was revoked server-side but the
             // local expiry hadn't passed yet, invalidate stale credentials, force
             // an OAuth refresh, and retry once.
@@ -4634,9 +4660,19 @@ pub fn run_claudecode_turn<'a>(
             // We check for specific Anthropic error types and HTTP status codes.
             // Using "overloaded_error" rather than bare "overloaded" to avoid
             // false positives from tool output or user content.
-            let reason = if is_rate_limited_error(&final_result) {
+            //
+            // Check both the final result text and non-JSON output (stderr) for
+            // auth/rate-limit markers. When Claude Code is SIGKILL'd mid-turn, the
+            // final_result is a generic "did not emit terminal result" message, but
+            // stderr may contain the actual auth error from the Anthropic API.
+            let combined_for_detection = if non_json_output.is_empty() {
+                final_result.clone()
+            } else {
+                format!("{}\n{}", final_result, non_json_output.join("\n"))
+            };
+            let reason = if is_rate_limited_error(&combined_for_detection) {
                 TerminalReason::RateLimited
-            } else if is_auth_error(&final_result) {
+            } else if is_auth_error(&combined_for_detection) {
                 TerminalReason::AuthError
             } else {
                 TerminalReason::LlmError
