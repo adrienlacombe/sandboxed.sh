@@ -8640,6 +8640,67 @@ async fn run_single_control_turn(
                 }
             }
 
+            // Auth error recovery: if the token was revoked server-side but the
+            // local expiry hadn't passed yet, invalidate stale credentials, force
+            // an OAuth refresh, and retry once.
+            if result.terminal_reason == Some(TerminalReason::AuthError) && !cancel.is_cancelled() {
+                tracing::warn!(
+                    mission_id = %mid,
+                    "Auth error detected — invalidating stale credentials and retrying"
+                );
+
+                // Delete the per-mission CLI credentials (they have a stale access token)
+                let mission_creds = ctx.working_dir.join(".claude").join(".credentials.json");
+                if mission_creds.exists() {
+                    let _ = std::fs::remove_file(&mission_creds);
+                    tracing::info!(
+                        path = %mission_creds.display(),
+                        "Removed stale per-mission CLI credentials"
+                    );
+                }
+
+                // Also invalidate the host CLI credentials so they aren't copied again
+                for host_path in &[
+                    std::path::PathBuf::from("/var/lib/opencode/.claude/.credentials.json"),
+                    std::path::PathBuf::from("/root/.claude/.credentials.json"),
+                ] {
+                    if host_path.exists() {
+                        let _ = std::fs::remove_file(host_path);
+                        tracing::info!(
+                            path = %host_path.display(),
+                            "Removed stale host CLI credentials"
+                        );
+                    }
+                }
+
+                // Force OAuth token refresh (bypasses local expiry check since
+                // the token was revoked server-side despite not being locally expired)
+                if let Err(e) = super::ai_providers::force_refresh_anthropic_oauth_token().await {
+                    tracing::warn!("OAuth refresh after auth error failed: {}", e);
+                }
+
+                // Retry with fresh credentials
+                result = Box::pin(super::mission_runner::run_claudecode_turn(
+                    exec_workspace,
+                    &ctx.working_dir,
+                    &effective_message,
+                    config.default_model.as_deref(),
+                    requested_model_effort.as_deref(),
+                    config.opencode_agent.as_deref(),
+                    mid,
+                    events_tx.clone(),
+                    cancel.clone(),
+                    None,
+                    &config.working_dir,
+                    effective_session_id.as_deref(),
+                    is_continuation,
+                    Some(tool_hub.clone()),
+                    Some(status.clone()),
+                    None,
+                ))
+                .await;
+            }
+
             result
         }
         Some("amp") => {
