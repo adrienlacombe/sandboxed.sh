@@ -3405,25 +3405,46 @@ pub fn run_claudecode_turn<'a>(
         // to allow --dangerously-skip-permissions even when running as root.
         args.push("--dangerously-skip-permissions".to_string());
 
-        // Ensure per-workspace Claude settings are loaded (Claude CLI may not auto-load .claude in --print mode).
+        // Claude Code settings and MCP config are loaded via CLAUDE_CONFIG_DIR
+        // which points to the per-mission .claude directory. Claude Code auto-discovers
+        // settings.local.json and mcp.json from that directory.
         //
-        // Important: `--mcp-config` expects MCP server definitions, but Claude Code 2.1+ treats raw
-        // paths (e.g. "/root/work...") as JSON strings and can hang after a parse error. `--settings`
-        // reliably loads our `.claude/settings.local.json` file (which includes mcpServers + permissions).
-        //
-        // For container workspaces, we must translate the path to be relative to the container filesystem.
+        // Note: --settings and --mcp-config flags are NOT used because Claude Code 2.1.77+
+        // changed these to expect inline JSON content rather than file paths, causing
+        // SyntaxError ("Unexpected token '/'") at startup when a path is passed.
         let settings_path = work_dir.join(".claude").join("settings.local.json");
         if settings_path.exists() {
-            args.push("--settings".to_string());
-            // Translate the path for container execution (host path -> container-relative path)
-            let translated_path = workspace_exec.translate_path_for_container(&settings_path);
-            args.push(translated_path);
+            match std::fs::read_to_string(&settings_path) {
+                Ok(json_content) => {
+                    args.push("--settings".to_string());
+                    args.push(json_content);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        mission_id = %mission_id,
+                        path = %settings_path.display(),
+                        error = %e,
+                        "Failed to read settings file for --settings flag"
+                    );
+                }
+            }
         }
         let mcp_config_path = work_dir.join(".claude").join("mcp.json");
         if mcp_config_path.exists() {
-            args.push("--mcp-config".to_string());
-            let translated_path = workspace_exec.translate_path_for_container(&mcp_config_path);
-            args.push(translated_path);
+            match std::fs::read_to_string(&mcp_config_path) {
+                Ok(json_content) => {
+                    args.push("--mcp-config".to_string());
+                    args.push(json_content);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        mission_id = %mission_id,
+                        path = %mcp_config_path.display(),
+                        error = %e,
+                        "Failed to read MCP config file for --mcp-config flag"
+                    );
+                }
+            }
         }
 
         if let Some(m) = model {
@@ -3602,8 +3623,9 @@ pub fn run_claudecode_turn<'a>(
         let claude_config_dir =
             workspace_exec.translate_path_for_container(&work_dir.join(".claude"));
         env.insert("CLAUDE_CONFIG_DIR".to_string(), claude_config_dir.clone());
-        let claude_config_path = format!("{}/settings.json", claude_config_dir);
-        env.insert("CLAUDE_CONFIG".to_string(), claude_config_path);
+        // Note: CLAUDE_CONFIG is NOT set. Recent Claude Code versions interpret it
+        // as inline JSON (not a file path), causing a SyntaxError at startup.
+        // CLAUDE_CONFIG_DIR + --settings flag are sufficient.
 
         // Set effort level via environment variable.
         // Claude Code reads CLAUDE_CODE_EFFORT_LEVEL to control adaptive reasoning depth.
