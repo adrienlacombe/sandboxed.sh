@@ -2836,6 +2836,10 @@ fn acquire_oauth_refresh_lock(provider_type: ProviderType) -> Result<std::fs::Fi
 /// Updates auth.json with the new access token and expiry.
 /// Uses file-based locking to prevent concurrent refresh attempts.
 pub async fn refresh_anthropic_oauth_token() -> Result<(), String> {
+    refresh_anthropic_oauth_token_inner(false).await
+}
+
+async fn refresh_anthropic_oauth_token_inner(force: bool) -> Result<(), String> {
     // Acquire exclusive lock to prevent race conditions
     let _lock = match acquire_oauth_refresh_lock(ProviderType::Anthropic) {
         Ok(lock) => lock,
@@ -2867,7 +2871,7 @@ pub async fn refresh_anthropic_oauth_token() -> Result<(), String> {
     let entry = read_oauth_token_entry(ProviderType::Anthropic)
         .ok_or_else(|| "No Anthropic OAuth entry found".to_string())?;
 
-    if !oauth_token_expired(entry.expires_at) {
+    if !force && !oauth_token_expired(entry.expires_at) {
         tracing::info!("Token is no longer expired, skipping refresh");
         return Ok(());
     }
@@ -3018,7 +3022,7 @@ pub async fn ensure_anthropic_oauth_token_valid() -> Result<(), String> {
 /// (e.g., token was revoked server-side or rotated by another process).
 pub async fn force_refresh_anthropic_oauth_token() -> Result<(), String> {
     tracing::info!("Force-refreshing Anthropic OAuth token (server-side revocation suspected)");
-    refresh_anthropic_oauth_token().await
+    refresh_anthropic_oauth_token_inner(true).await
 }
 
 /// Refresh the OpenAI OAuth token using the refresh token.
