@@ -7636,11 +7636,21 @@ async fn control_actor_loop(
                     }
 
                     // If the mission is idle now, enqueue any agent_finished automations after a short delay.
+                    // Skip automations for transient infrastructure failures (auth errors,
+                    // rate limits, capacity limits) — these aren't "the agent finished work",
+                    // they're transient failures that the retry/recovery logic handles.
+                    // Firing automations on these creates noisy retry loops.
                     if let Some(mission_id) = completed_mission_id {
+                        let is_transient_infra_failure = matches!(
+                            completed_terminal_reason,
+                            Some(TerminalReason::AuthError)
+                                | Some(TerminalReason::RateLimited)
+                                | Some(TerminalReason::CapacityLimited)
+                        );
                         let already_queued_for_mission = queue
                             .iter()
                             .any(|(_id, _msg, _agent, target_mid)| *target_mid == Some(mission_id));
-                        if !already_queued_for_mission {
+                        if !already_queued_for_mission && !is_transient_infra_failure {
                             // Small delay so the UI can display the completion before restarting.
                             tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
                             let messages = agent_finished_automation_messages(
@@ -7887,9 +7897,17 @@ async fn control_actor_loop(
                             )
                             .await;
 
-                            // Check if we should enqueue agent_finished automations
+                            // Check if we should enqueue agent_finished automations.
+                            // Skip for transient infrastructure failures (auth, rate limit,
+                            // capacity) to avoid noisy retry loops.
+                            let is_transient_infra_failure = matches!(
+                                result.terminal_reason,
+                                Some(TerminalReason::AuthError)
+                                    | Some(TerminalReason::RateLimited)
+                                    | Some(TerminalReason::CapacityLimited)
+                            );
                             let was_queue_empty = runner.queue.is_empty();
-                            if was_queue_empty {
+                            if was_queue_empty && !is_transient_infra_failure {
                                 // Small delay so the UI can display the completion before restarting.
                                 tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
                                 let messages = agent_finished_automation_messages(
