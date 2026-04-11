@@ -7739,6 +7739,21 @@ async fn ensure_claudecode_cli_available(
         }
     }
 
+    // Fallback: bun 1.3.12 has a bug where `bun install -g @anthropic-ai/claude-code`
+    // reports success but doesn't create the /root/.bun/bin/claude symlink. The
+    // package IS installed; we just need to run cli.js directly with node.
+    const BUN_GLOBAL_CLAUDE_CLI_JS: &str =
+        "/root/.bun/install/global/node_modules/@anthropic-ai/claude-code/cli.js";
+    if command_available(workspace_exec, cwd, BUN_GLOBAL_CLAUDE_CLI_JS).await
+        && command_available(workspace_exec, cwd, "node").await
+    {
+        tracing::debug!(
+            "Found Claude Code cli.js at {} (using node; bun symlink missing)",
+            BUN_GLOBAL_CLAUDE_CLI_JS
+        );
+        return Ok(format!("node {}", BUN_GLOBAL_CLAUDE_CLI_JS));
+    }
+
     let auto_install = env_var_bool("SANDBOXED_SH_AUTO_INSTALL_CLAUDECODE", true);
     if !auto_install {
         return Err(format!(
@@ -7817,6 +7832,17 @@ async fn ensure_claudecode_cli_available(
             // Bun is in PATH
             return Ok(format!("bun {}", BUN_GLOBAL_CLAUDE_PATH));
         }
+    }
+    // Bun 1.3.12 bug: install reports success but the /root/.bun/bin/claude symlink
+    // is never created. The cli.js is still present — run it via node directly.
+    if command_available(workspace_exec, cwd, BUN_GLOBAL_CLAUDE_CLI_JS).await
+        && command_available(workspace_exec, cwd, "node").await
+    {
+        tracing::debug!(
+            "Claude Code cli.js found at {} after install (bun symlink missing); using node",
+            BUN_GLOBAL_CLAUDE_CLI_JS
+        );
+        return Ok(format!("node {}", BUN_GLOBAL_CLAUDE_CLI_JS));
     }
 
     Err(format!(
