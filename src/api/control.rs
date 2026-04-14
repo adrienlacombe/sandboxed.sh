@@ -2697,6 +2697,18 @@ pub enum AgentEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         mission_id: Option<Uuid>,
     },
+    /// FIDO signing approval request forwarded to the mobile app
+    FidoSignRequest {
+        request_id: Uuid,
+        key_type: String,
+        key_fingerprint: String,
+        origin: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        hostname: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        workspace: Option<String>,
+        expires_at: String,
+    },
 }
 
 /// A node in the agent tree (for visualization)
@@ -2779,6 +2791,7 @@ impl AgentEvent {
             AgentEvent::MissionActivity { .. } => "mission_activity",
             AgentEvent::MissionTitleChanged { .. } => "mission_title_changed",
             AgentEvent::MissionMetadataUpdated { .. } => "mission_metadata_updated",
+            AgentEvent::FidoSignRequest { .. } => "fido_sign_request",
         }
     }
 
@@ -2800,6 +2813,7 @@ impl AgentEvent {
             AgentEvent::MissionActivity { mission_id, .. } => *mission_id,
             AgentEvent::MissionTitleChanged { mission_id, .. } => Some(*mission_id),
             AgentEvent::MissionMetadataUpdated { mission_id, .. } => Some(*mission_id),
+            AgentEvent::FidoSignRequest { .. } => None,
         }
     }
 }
@@ -3108,6 +3122,15 @@ impl ControlHub {
         self.telegram_bridge = Some(bridge);
     }
 
+    /// Get the events broadcast sender from any active session.
+    /// Used by the FIDO signing hub to broadcast signing requests to all
+    /// connected SSE clients regardless of which user session they belong to.
+    pub fn get_any_session_events_tx(&self) -> Option<broadcast::Sender<AgentEvent>> {
+        // Try to read without blocking — best-effort for the FIDO relay.
+        let sessions = self.sessions.try_read().ok()?;
+        sessions.values().next().map(|s| s.events_tx.clone())
+    }
+
     pub async fn get_or_spawn(&self, user: &AuthUser) -> ControlState {
         if let Some(existing) = self.sessions.read().await.get(&user.id).cloned() {
             return existing;
@@ -3152,19 +3175,23 @@ impl ControlHub {
         );
         sessions.insert(user.id.clone(), state.clone());
 
-        // Boot Telegram channels for this user's missions
+        // Drop the write lock before performing async I/O so concurrent
+        // callers of get_or_spawn / all_sessions are not blocked.
+        drop(sessions);
+
+        // Boot Telegram channels for this user's missions — ensures channels
+        // are registered before we start serving requests.
         if let Some(ref bridge) = self.telegram_bridge {
-            let bridge = Arc::clone(bridge);
-            let store = Arc::clone(&state.mission_store);
-            let cmd_tx = state.cmd_tx.clone();
-            let events_tx = state.events_tx.clone();
             let public_url = std::env::var("SANDBOXED_PUBLIC_URL")
                 .unwrap_or_else(|_| format!("http://{}:{}", self.config.host, self.config.port));
-            tokio::spawn(async move {
-                bridge
-                    .boot_from_store(&store, cmd_tx, events_tx, &public_url)
-                    .await;
-            });
+            bridge
+                .boot_from_store(
+                    &state.mission_store,
+                    state.cmd_tx.clone(),
+                    state.events_tx.clone(),
+                    &public_url,
+                )
+                .await;
         }
 
         state
@@ -3193,7 +3220,8 @@ impl ControlHub {
             .join(".sandboxed-sh")
             .join("missions");
 
-        match create_mission_store(store_type, base_dir, "default").await {
+        let user = crate::api::auth::implicit_single_tenant_user(&self.config);
+        match create_mission_store(store_type, base_dir, &user.id).await {
             Ok(store) => Arc::from(store),
             Err(err) => {
                 tracing::warn!(
@@ -4850,6 +4878,59 @@ async fn stale_mission_cleanup_loop(
     }
 }
 
+/// Resolve an IANA timezone string to a chrono::FixedOffset at a given UTC instant.
+///
+/// Falls back to UTC if the timezone is unknown.  We use a simple lookup table for
+/// common timezones to avoid pulling in chrono-tz (heavy dependency).  The offset is
+/// evaluated at `now_utc` to account for DST — though the lookup table doesn't model
+/// DST transitions, the most common use-case (Europe/Paris, America/New_York, etc.)
+/// is close enough for a 5-second poll cadence.
+/// Map a timezone string to a `chrono_tz::Tz`, handling common abbreviations
+/// and IANA names.  Returns `None` for fixed-offset strings like "+02:00".
+fn resolve_tz(tz: &str) -> Option<chrono_tz::Tz> {
+    // Fixed-offset strings ("+02:00", "-05:00") are not IANA timezones.
+    if tz.starts_with('+') || tz.starts_with('-') {
+        return None;
+    }
+
+    // Handle common abbreviations that chrono-tz doesn't know about.
+    let canonical = match tz {
+        "UTC" | "GMT" => "Etc/UTC",
+        "EST" => "America/New_York",
+        "CST" => "America/Chicago",
+        "MST" => "America/Denver",
+        "PST" => "America/Los_Angeles",
+        "CET" => "Europe/Paris",
+        "JST" => "Asia/Tokyo",
+        "AEST" => "Australia/Sydney",
+        other => other,
+    };
+
+    match canonical.parse::<chrono_tz::Tz>() {
+        Ok(timezone) => Some(timezone),
+        Err(_) => {
+            tracing::warn!(timezone = %tz, "Unknown timezone, rejecting");
+            None
+        }
+    }
+}
+
+fn resolve_tz_offset(tz: &str, now_utc: chrono::DateTime<chrono::Utc>) -> chrono::FixedOffset {
+    // Try to parse as a fixed offset first (e.g. "+02:00", "-05:00").
+    if let Ok(fo) = tz.parse::<chrono::FixedOffset>() {
+        return fo;
+    }
+
+    use chrono::Offset;
+    match resolve_tz(tz) {
+        Some(timezone) => {
+            let local_dt = now_utc.with_timezone(&timezone);
+            local_dt.offset().fix()
+        }
+        None => chrono::FixedOffset::east_opt(0).unwrap(),
+    }
+}
+
 /// Background task that checks for automations and triggers them at their intervals.
 async fn automation_scheduler_loop(
     mission_store: Arc<dyn MissionStore>,
@@ -4871,9 +4952,56 @@ async fn automation_scheduler_loop(
     );
 
     let mut logged_unsupported = false;
+    let mut tick_count: u64 = 0;
 
     loop {
         tokio::time::sleep(check_interval).await;
+        tick_count += 1;
+
+        // Every ~60 seconds (12 ticks × 5s), run housekeeping sweeps.
+        if tick_count.is_multiple_of(12) {
+            // Timeout stale WaitingExternal workflows (older than 30 minutes).
+            match mission_store
+                .timeout_stale_telegram_workflows(30 * 60)
+                .await
+            {
+                Ok(n) if n > 0 => {
+                    tracing::info!("Timed out {} stale WaitingExternal Telegram workflows", n);
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to timeout stale Telegram workflows: {}", e);
+                }
+                _ => {}
+            }
+
+            // Recover stale 'sending' scheduled messages (stuck >5 min after crash).
+            match mission_store
+                .recover_stale_sending_scheduled_messages(5 * 60)
+                .await
+            {
+                Ok(n) if n > 0 => {
+                    tracing::info!(
+                        "Recovered {} stale 'sending' scheduled messages back to 'pending'",
+                        n
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to recover stale sending messages: {}", e);
+                }
+                _ => {}
+            }
+
+            // Clean up old webhook dedup entries (older than 15 minutes).
+            match mission_store.cleanup_webhook_dedup(15 * 60).await {
+                Ok(n) if n > 0 => {
+                    tracing::debug!("Cleaned up {} expired webhook dedup entries", n);
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to cleanup webhook dedup entries: {}", e);
+                }
+                _ => {}
+            }
+        }
 
         let automations = match mission_store.list_active_automations().await {
             Ok(automations) => automations,
@@ -4887,21 +5015,28 @@ async fn automation_scheduler_loop(
         };
 
         for automation in automations {
-            // Only trigger interval-based automations (webhooks are triggered via HTTP endpoint)
-            let interval_seconds = match &automation.trigger {
-                TriggerType::Interval { seconds } => *seconds,
-                TriggerType::Webhook { .. } => {
-                    // Skip webhook automations - they're triggered via HTTP
-                    continue;
-                }
-                TriggerType::AgentFinished => {
-                    // Skip agent_finished automations - they're triggered when a turn completes.
-                    continue;
-                }
-                TriggerType::Telegram { .. } => {
-                    // Skip Telegram automations - they're triggered via the Telegram bridge.
-                    continue;
-                }
+            // Only trigger interval-based and cron-based automations.
+            // Webhooks are triggered via HTTP, agent_finished via turn completion,
+            // Telegram via the Telegram bridge.
+            enum ScheduleKind {
+                Interval(u64),
+                Cron {
+                    expression: String,
+                    timezone: String,
+                },
+            }
+            let schedule = match &automation.trigger {
+                TriggerType::Interval { seconds } => ScheduleKind::Interval(*seconds),
+                TriggerType::Cron {
+                    expression,
+                    timezone,
+                } => ScheduleKind::Cron {
+                    expression: expression.clone(),
+                    timezone: timezone.clone(),
+                },
+                TriggerType::Webhook { .. } => continue,
+                TriggerType::AgentFinished => continue,
+                TriggerType::Telegram { .. } => continue,
             };
 
             let mission = match mission_store.get_mission(automation.mission_id).await {
@@ -4954,19 +5089,81 @@ async fn automation_scheduler_loop(
                 continue;
             }
 
-            // Check if enough time has passed since last trigger
-            let should_trigger = if let Some(ref last_triggered) = automation.last_triggered_at {
-                match chrono::DateTime::parse_from_rfc3339(last_triggered) {
-                    Ok(last_time) => {
-                        let elapsed = chrono::Utc::now()
-                            .signed_duration_since(last_time.with_timezone(&chrono::Utc));
-                        elapsed.num_seconds() >= interval_seconds as i64
+            // Check if it's time to trigger based on schedule type.
+            let should_trigger = match &schedule {
+                ScheduleKind::Interval(interval_seconds) => {
+                    if let Some(ref last_triggered) = automation.last_triggered_at {
+                        match chrono::DateTime::parse_from_rfc3339(last_triggered) {
+                            Ok(last_time) => {
+                                let elapsed = chrono::Utc::now()
+                                    .signed_duration_since(last_time.with_timezone(&chrono::Utc));
+                                elapsed.num_seconds() >= *interval_seconds as i64
+                            }
+                            Err(_) => true,
+                        }
+                    } else {
+                        true // Never triggered before
                     }
-                    Err(_) => true, // If we can't parse, trigger anyway
                 }
-            } else {
-                // Never triggered before, should trigger now
-                true
+                ScheduleKind::Cron {
+                    expression,
+                    timezone,
+                } => {
+                    match croner::Cron::new(expression).parse() {
+                        Ok(cron) => {
+                            // Determine "now" in the configured timezone.
+                            let now_utc = chrono::Utc::now();
+
+                            // If we've never triggered (start_immediately=true sets
+                            // last_triggered_at to None), fire right away.
+                            let reference = if let Some(ref lt) = automation.last_triggered_at {
+                                match chrono::DateTime::parse_from_rfc3339(lt) {
+                                    Ok(t) => t.with_timezone(&chrono::Utc),
+                                    Err(_) => now_utc - chrono::Duration::seconds(10),
+                                }
+                            } else {
+                                // Never triggered → fire immediately on next tick.
+                                // Using a very large lookback ensures the next cron
+                                // occurrence after this reference is in the past.
+                                now_utc - chrono::Duration::days(366)
+                            };
+
+                            // Find the next occurrence after the last trigger.
+                            // If that occurrence is <= now, it's time to fire.
+                            // Use real timezone (not a FixedOffset snapshot) so DST
+                            // transitions are evaluated correctly by croner.
+                            if let Some(tz) = resolve_tz(timezone) {
+                                let ref_with_tz = reference.with_timezone(&tz);
+                                match cron.find_next_occurrence(&ref_with_tz, false) {
+                                    Ok(next) => {
+                                        let next_utc = next.with_timezone(&chrono::Utc);
+                                        next_utc <= now_utc
+                                    }
+                                    Err(_) => false,
+                                }
+                            } else {
+                                // Fixed-offset timezone string (e.g. "+02:00")
+                                let tz_offset = resolve_tz_offset(timezone, now_utc);
+                                let ref_with_tz = reference.with_timezone(&tz_offset);
+                                match cron.find_next_occurrence(&ref_with_tz, false) {
+                                    Ok(next) => {
+                                        let next_utc = next.with_timezone(&chrono::Utc);
+                                        next_utc <= now_utc
+                                    }
+                                    Err(_) => false,
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                automation_id = %automation.id,
+                                expression = %expression,
+                                "Invalid cron expression, skipping: {}", e
+                            );
+                            false
+                        }
+                    }
+                }
             };
 
             if !should_trigger {
@@ -5194,7 +5391,11 @@ async fn automation_scheduler_loop(
                                             &ctx.channel.bot_token,
                                             mapping.chat_id,
                                             0, // no reply_to for proactive messages
+                                            None,
                                             mission_id,
+                                            Some(Arc::clone(&bridge)),
+                                            Some(mapping.channel_id),
+                                            Some(Arc::clone(&store)),
                                         )
                                         .await
                                         {
@@ -5375,13 +5576,19 @@ fn mission_status_summary_for_terminal_reason(reason: TerminalReason) -> Option<
     }
 }
 
-/// If the turn ended with `LlmError` but the agent produced substantive output,
-/// downgrade the reason to `TurnComplete` so the mission stays active and can
-/// be picked up by the next automation cycle or user message. This prevents
-/// transient backend errors (e.g. Codex "Failed to shutdown rollout recorder")
-/// from killing missions that actually completed their work.
+/// If the turn ended with `LlmError` or `AuthError` but the agent produced
+/// substantive output, downgrade the reason to `TurnComplete` so the mission
+/// stays active and can be picked up by the next automation cycle or user
+/// message.  This prevents transient backend errors (e.g. Codex "Failed to
+/// shutdown rollout recorder", or Claude Code exiting with code 1 after a
+/// successful turn that happens to contain an auth-error string in its
+/// output) from killing missions that actually completed their work.
 fn maybe_recover_soft_llm_error(result: &mut crate::agents::AgentResult) {
-    if result.terminal_reason != Some(TerminalReason::LlmError) {
+    let is_recoverable = matches!(
+        result.terminal_reason,
+        Some(TerminalReason::LlmError) | Some(TerminalReason::AuthError)
+    );
+    if !is_recoverable {
         return;
     }
     let output = result.output.trim();
@@ -5391,10 +5598,12 @@ fn maybe_recover_soft_llm_error(result: &mut crate::agents::AgentResult) {
         && !output.starts_with("Codex produced no output")
         && !output.starts_with("Codex CLI produced no JSON")
         && !output.starts_with("No response from")
+        && !output.starts_with("Claude Code error:")
     {
         tracing::info!(
             output_len = output.len(),
-            "Recovering from soft LlmError: agent produced valid output, upgrading to TurnComplete"
+            reason = ?result.terminal_reason,
+            "Recovering from soft error: agent produced valid output, upgrading to TurnComplete"
         );
         result.success = true;
         result.terminal_reason = Some(TerminalReason::TurnComplete);
@@ -8457,6 +8666,32 @@ async fn run_single_control_turn(
         }
     }
 
+    // For Telegram missions, append channel instructions and memory awareness
+    // to CLAUDE.md so the backend LLM adopts the bot persona.
+    if user_message.contains("[Telegram from ") {
+        let claude_md_path = working_dir_path.join("CLAUDE.md");
+        tracing::info!(
+            mission_id = ?mission_id,
+            claude_md_path = %claude_md_path.display(),
+            claude_md_exists = claude_md_path.exists(),
+            "Telegram message detected in control path, attempting CLAUDE.md injection"
+        );
+        // Create the file if it doesn't exist so that non-Claude-Code
+        // backends (e.g. opencode) also get the identity injection.
+        if !claude_md_path.exists() {
+            let _ = std::fs::write(&claude_md_path, "");
+        }
+        let actions_available = mission_id
+            .and_then(crate::api::telegram::build_internal_telegram_action_token)
+            .is_some()
+            && super::mission_runner::localhost_api_base_url_from_env().is_some();
+        super::mission_runner::inject_telegram_identity_into_claude_md(
+            &claude_md_path,
+            &user_message,
+            actions_available,
+        );
+    }
+
     // Build a task prompt that includes conversation context with size limits.
     let history_for_prompt = match history.last() {
         Some((role, content)) if role == "user" && content == &user_message => {
@@ -8943,16 +9178,29 @@ pub async fn create_automation(
         other => other,
     };
 
+    // Validate cron expression before persisting
+    if let mission_store::TriggerType::Cron { ref expression, .. } = trigger {
+        if croner::Cron::new(expression).parse().is_err() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("Invalid cron expression: {}", expression),
+            ));
+        }
+    }
+
     let start_immediately = req.start_immediately;
 
-    // For interval-based triggers, if start_immediately is false, set last_triggered_at
-    // to now so the scheduler waits for the full interval before the first trigger.
-    let last_triggered_at =
-        if !start_immediately && matches!(trigger, mission_store::TriggerType::Interval { .. }) {
-            Some(mission_store::now_string())
-        } else {
-            None
-        };
+    // For interval/cron triggers, if start_immediately is false, set last_triggered_at
+    // to now so the scheduler waits for the next occurrence before the first trigger.
+    let last_triggered_at = if !start_immediately
+        && matches!(
+            trigger,
+            mission_store::TriggerType::Interval { .. } | mission_store::TriggerType::Cron { .. }
+        ) {
+        Some(mission_store::now_string())
+    } else {
+        None
+    };
 
     // Build the complete Automation struct
     let fresh_session = req
@@ -10195,8 +10443,192 @@ pub async fn list_bot_chats(
     Ok(Json(mappings))
 }
 
+#[derive(Debug, Deserialize)]
+pub struct TelegramBotListQuery {
+    #[serde(default = "default_telegram_limit")]
+    pub limit: usize,
+    #[serde(default)]
+    pub chat_id: Option<i64>,
+}
+
+fn default_telegram_limit() -> usize {
+    20
+}
+
+pub async fn list_bot_scheduled_messages(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    Path(channel_id): Path<Uuid>,
+    Query(query): Query<TelegramBotListQuery>,
+) -> Result<Json<Vec<super::mission_store::TelegramScheduledMessage>>, (StatusCode, String)> {
+    let control = control_for_user(&state, &user).await;
+    let messages = control
+        .mission_store
+        .list_telegram_scheduled_messages(channel_id, query.chat_id, query.limit.clamp(1, 100))
+        .await
+        .map_err(internal_error)?;
+    Ok(Json(messages))
+}
+
+pub async fn list_bot_action_executions(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    Path(channel_id): Path<Uuid>,
+    Query(query): Query<TelegramBotListQuery>,
+) -> Result<Json<Vec<super::mission_store::TelegramActionExecution>>, (StatusCode, String)> {
+    let control = control_for_user(&state, &user).await;
+    let executions = control
+        .mission_store
+        .list_telegram_action_executions(channel_id, query.chat_id, query.limit.clamp(1, 100))
+        .await
+        .map_err(internal_error)?;
+    Ok(Json(executions))
+}
+
+pub async fn list_bot_conversations(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    Path(channel_id): Path<Uuid>,
+    Query(query): Query<TelegramBotListQuery>,
+) -> Result<Json<Vec<super::mission_store::TelegramConversation>>, (StatusCode, String)> {
+    let control = control_for_user(&state, &user).await;
+    let conversations = control
+        .mission_store
+        .list_telegram_conversations(channel_id, query.limit.clamp(1, 100))
+        .await
+        .map_err(internal_error)?;
+    Ok(Json(conversations))
+}
+
+pub async fn list_bot_workflows(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    Path(channel_id): Path<Uuid>,
+    Query(query): Query<TelegramBotListQuery>,
+) -> Result<Json<Vec<super::mission_store::TelegramWorkflow>>, (StatusCode, String)> {
+    let control = control_for_user(&state, &user).await;
+    let workflows = control
+        .mission_store
+        .list_telegram_workflows(channel_id, query.limit.clamp(1, 100))
+        .await
+        .map_err(internal_error)?;
+    Ok(Json(workflows))
+}
+
+pub async fn list_telegram_conversation_messages(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    Path(conversation_id): Path<Uuid>,
+    Query(query): Query<TelegramBotListQuery>,
+) -> Result<Json<Vec<super::mission_store::TelegramConversationMessage>>, (StatusCode, String)> {
+    let control = control_for_user(&state, &user).await;
+    let messages = control
+        .mission_store
+        .list_telegram_conversation_messages(conversation_id, query.limit.clamp(1, 200))
+        .await
+        .map_err(internal_error)?;
+    Ok(Json(messages))
+}
+
+pub async fn list_telegram_workflow_events(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    Path(workflow_id): Path<Uuid>,
+    Query(query): Query<TelegramBotListQuery>,
+) -> Result<Json<Vec<super::mission_store::TelegramWorkflowEvent>>, (StatusCode, String)> {
+    let control = control_for_user(&state, &user).await;
+    let events = control
+        .mission_store
+        .list_telegram_workflow_events(workflow_id, query.limit.clamp(1, 200))
+        .await
+        .map_err(internal_error)?;
+    Ok(Json(events))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TelegramMemoryQuery {
+    #[serde(default = "default_telegram_limit")]
+    pub limit: usize,
+    #[serde(default)]
+    pub chat_id: Option<i64>,
+    #[serde(default)]
+    pub subject_user_id: Option<i64>,
+    #[serde(default)]
+    pub q: Option<String>,
+}
+
+pub async fn list_bot_structured_memory(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    Path(channel_id): Path<Uuid>,
+    Query(query): Query<TelegramMemoryQuery>,
+) -> Result<Json<Vec<super::mission_store::TelegramStructuredMemoryEntry>>, (StatusCode, String)> {
+    let control = control_for_user(&state, &user).await;
+    let limit = query.limit.clamp(1, 100);
+    let entries = if let Some(q) = query.q.as_deref().filter(|q| !q.trim().is_empty()) {
+        let mut entries = control
+            .mission_store
+            .search_telegram_structured_memory_hybrid(
+                channel_id,
+                query.chat_id,
+                query.subject_user_id,
+                q,
+                limit,
+            )
+            .await
+            .map_err(internal_error)?
+            .into_iter()
+            .map(|hit| hit.entry)
+            .collect::<Vec<_>>();
+        if let Some(subject_user_id) = query.subject_user_id {
+            entries.retain(|entry| entry.subject_user_id == Some(subject_user_id));
+        }
+        entries
+    } else {
+        control
+            .mission_store
+            .list_telegram_structured_memory(
+                channel_id,
+                query.chat_id,
+                query.subject_user_id,
+                limit,
+            )
+            .await
+            .map_err(internal_error)?
+    };
+    Ok(Json(entries))
+}
+
+pub async fn search_bot_structured_memory(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    Path(channel_id): Path<Uuid>,
+    Query(query): Query<TelegramMemoryQuery>,
+) -> Result<Json<Vec<super::mission_store::TelegramStructuredMemorySearchHit>>, (StatusCode, String)>
+{
+    let control = control_for_user(&state, &user).await;
+    let Some(q) = query.q.as_deref().filter(|q| !q.trim().is_empty()) else {
+        return Ok(Json(Vec::new()));
+    };
+    let mut hits = control
+        .mission_store
+        .search_telegram_structured_memory_hybrid(
+            channel_id,
+            query.chat_id,
+            query.subject_user_id,
+            q,
+            query.limit.clamp(1, 100),
+        )
+        .await
+        .map_err(internal_error)?;
+    if let Some(subject_user_id) = query.subject_user_id {
+        hits.retain(|hit| hit.entry.subject_user_id == Some(subject_user_id));
+    }
+    Ok(Json(hits))
+}
+
 /// Send a message to a Telegram chat via the bot and optionally dispatch it to
-/// the associated mission. Used by agents (e.g. Ana) to proactively message users.
+/// the associated mission. Used by agents (e.g. Paloma) to proactively message users.
 #[derive(Debug, Deserialize)]
 pub struct SendTelegramMessageRequest {
     /// Telegram chat ID to send to
@@ -10209,6 +10641,192 @@ pub struct SendTelegramMessageRequest {
     /// Also dispatch as a user message to the chat's associated mission
     #[serde(default)]
     pub dispatch_to_mission: bool,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TelegramActionRequest {
+    pub mission_id: Uuid,
+    pub text: String,
+    #[serde(default)]
+    pub delay_seconds: Option<u64>,
+    #[serde(default)]
+    pub target: Option<super::telegram::TelegramActionTarget>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TelegramWorkflowRequest {
+    pub mission_id: Uuid,
+    pub text: String,
+    #[serde(default)]
+    pub target: Option<super::telegram::TelegramActionTarget>,
+}
+
+pub async fn execute_telegram_action_api(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    Json(req): Json<TelegramActionRequest>,
+) -> Result<Json<super::telegram::TelegramActionExecutionResult>, (StatusCode, String)> {
+    let control = control_for_user(&state, &user).await;
+    let result = super::telegram::execute_native_telegram_action(
+        &state.telegram_bridge,
+        &control.mission_store,
+        req.mission_id,
+        req.target
+            .unwrap_or(super::telegram::TelegramActionTarget::Current),
+        &req.text,
+        req.delay_seconds.unwrap_or(0),
+    )
+    .await
+    .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
+    Ok(Json(result))
+}
+
+pub async fn execute_telegram_workflow_request_api(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    Json(req): Json<TelegramWorkflowRequest>,
+) -> Result<Json<super::telegram::TelegramWorkflowRequestResult>, (StatusCode, String)> {
+    let control = control_for_user(&state, &user).await;
+    let result = super::telegram::execute_native_telegram_request_workflow(
+        &state.telegram_bridge,
+        &control.mission_store,
+        req.mission_id,
+        req.target
+            .unwrap_or(super::telegram::TelegramActionTarget::Current),
+        &req.text,
+    )
+    .await
+    .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
+    Ok(Json(result))
+}
+
+fn internal_telegram_action_token(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get("x-sandboxed-mission-token")
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            headers
+                .get(axum::http::header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.strip_prefix("Bearer "))
+                .filter(|value| !value.trim().is_empty())
+        })
+}
+
+async fn mission_store_for_telegram_mission(
+    state: &Arc<AppState>,
+    mission_id: Uuid,
+) -> Option<Arc<dyn MissionStore>> {
+    let sessions = state.control.all_sessions().await;
+    for session in sessions {
+        let has_chat_mapping = session
+            .mission_store
+            .get_telegram_chat_mission_by_mission_id(mission_id)
+            .await
+            .ok()
+            .flatten()
+            .is_some();
+        let has_attached_channel = session
+            .mission_store
+            .list_telegram_channels(mission_id)
+            .await
+            .map(|channels| !channels.is_empty())
+            .unwrap_or(false);
+        if has_chat_mapping || has_attached_channel {
+            return Some(Arc::clone(&session.mission_store));
+        }
+    }
+    None
+}
+
+pub async fn execute_telegram_action_internal_api(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<TelegramActionRequest>,
+) -> Result<Json<super::telegram::TelegramActionExecutionResult>, (StatusCode, String)> {
+    let token = internal_telegram_action_token(&headers).ok_or_else(|| {
+        (
+            StatusCode::UNAUTHORIZED,
+            "Missing mission token".to_string(),
+        )
+    })?;
+    if !super::telegram::verify_internal_telegram_action_token(req.mission_id, token) {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            "Invalid mission token".to_string(),
+        ));
+    }
+
+    let mission_store = mission_store_for_telegram_mission(&state, req.mission_id)
+        .await
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                format!(
+                    "Mission {} is not linked to an active Telegram conversation",
+                    req.mission_id
+                ),
+            )
+        })?;
+
+    let result = super::telegram::execute_native_telegram_action(
+        &state.telegram_bridge,
+        &mission_store,
+        req.mission_id,
+        req.target
+            .unwrap_or(super::telegram::TelegramActionTarget::Current),
+        &req.text,
+        req.delay_seconds.unwrap_or(0),
+    )
+    .await
+    .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
+
+    Ok(Json(result))
+}
+
+pub async fn execute_telegram_workflow_request_internal_api(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<TelegramWorkflowRequest>,
+) -> Result<Json<super::telegram::TelegramWorkflowRequestResult>, (StatusCode, String)> {
+    let token = internal_telegram_action_token(&headers).ok_or_else(|| {
+        (
+            StatusCode::UNAUTHORIZED,
+            "Missing mission token".to_string(),
+        )
+    })?;
+    if !super::telegram::verify_internal_telegram_action_token(req.mission_id, token) {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            "Invalid mission token".to_string(),
+        ));
+    }
+
+    let mission_store = mission_store_for_telegram_mission(&state, req.mission_id)
+        .await
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                format!(
+                    "Mission {} is not linked to an active Telegram conversation",
+                    req.mission_id
+                ),
+            )
+        })?;
+
+    let result = super::telegram::execute_native_telegram_request_workflow(
+        &state.telegram_bridge,
+        &mission_store,
+        req.mission_id,
+        req.target
+            .unwrap_or(super::telegram::TelegramActionTarget::Current),
+        &req.text,
+    )
+    .await
+    .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
+
+    Ok(Json(result))
 }
 
 pub async fn send_telegram_message_api(
@@ -10317,10 +10935,44 @@ pub async fn telegram_webhook_receiver(
         }
     }
 
-    // Process the message
+    // Deduplicate using the channel's own SQLite-backed store (survives restarts).
+    // Falls back to in-memory dedup if the mission store is unavailable.
+    let is_new = match ctx
+        .mission_store
+        .register_webhook_update(channel_id, update.update_id)
+        .await
+    {
+        Ok(new) => {
+            if new {
+                // Keep in-memory map in sync so a later SQLite failure
+                // doesn't cause duplicate processing.
+                state
+                    .telegram_bridge
+                    .register_update_once(channel_id, update.update_id)
+                    .await;
+            }
+            new
+        }
+        Err(_) => {
+            // Fallback to in-memory dedup if SQLite fails
+            state
+                .telegram_bridge
+                .register_update_once(channel_id, update.update_id)
+                .await
+        }
+    };
+    if !is_new {
+        tracing::info!(
+            channel_id = %channel_id,
+            update_id = update.update_id,
+            "Ignoring duplicate Telegram webhook update"
+        );
+        return StatusCode::OK;
+    }
+
     if let Some(ref msg) = update.message {
         let http = state.telegram_bridge.http().clone();
-        super::telegram::process_webhook_message(&ctx, msg, &http).await;
+        super::telegram::process_webhook_message(&ctx, msg, &http, &state.telegram_bridge).await;
     }
 
     StatusCode::OK

@@ -1161,7 +1161,7 @@ fn get_all_amp_keys_from_ai_providers(working_dir: &Path) -> Vec<String> {
 ///     "accessToken": "sk-ant-oat01-...",
 ///     "expiresAt": 1769395897294,
 ///     "refreshToken": "sk-ant-ort01-...",
-///     "scopes": ["user:inference", "user:profile"]
+///     "scopes": ["user:inference", "user:profile", "user:sessions:claude_code"]
 ///   }
 /// }
 /// ```
@@ -1725,6 +1725,8 @@ pub struct UpdateProviderRequest {
     pub enabled: Option<bool>,
     /// Which backends this provider is used for (e.g., ["opencode", "claudecode"])
     pub use_for_backends: Option<Vec<String>>,
+    /// Account identifier (email) — set by frontend when server-side userinfo fails
+    pub account_email: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -2308,7 +2310,7 @@ pub(crate) fn write_claudecode_credentials_from_entry(
         "accessToken": access_token,
         "refreshToken": refresh_token,
         "expiresAt": expires_at,
-        "scopes": ["user:inference", "user:profile"]
+        "scopes": ["user:inference", "user:profile", "user:sessions:claude_code"]
     });
 
     let contents = serde_json::to_string_pretty(&credentials)
@@ -3343,7 +3345,7 @@ pub async fn ensure_google_oauth_token_valid() -> Result<(), String> {
 ///     "accessToken": "sk-ant-oat01-...",
 ///     "refreshToken": "sk-ant-ort01-...",
 ///     "expiresAt": 1748658860401,
-///     "scopes": ["user:inference", "user:profile"]
+///     "scopes": ["user:inference", "user:profile", "user:sessions:claude_code"]
 ///   }
 /// }
 /// ```
@@ -3374,7 +3376,7 @@ pub fn write_claudecode_credentials_to_path(
         "accessToken": entry.access_token,
         "refreshToken": entry.refresh_token,
         "expiresAt": entry.expires_at,
-        "scopes": ["user:inference", "user:profile"]
+        "scopes": ["user:inference", "user:profile", "user:sessions:claude_code"]
     });
 
     let contents = serde_json::to_string_pretty(&credentials)
@@ -4050,29 +4052,70 @@ fn extract_email_from_jwt(token: &str) -> Option<String> {
 /// Anthropic's OAuth token response doesn't include an `id_token` or email claim.
 pub async fn fetch_anthropic_account_email(access_token: &str) -> Option<String> {
     let client = reqwest::Client::new();
-    let resp = client
-        .get("https://console.anthropic.com/v1/oauth/userinfo")
-        .header("Authorization", format!("Bearer {}", access_token))
-        .send()
-        .await
-        .ok()?;
-    if !resp.status().is_success() {
-        tracing::debug!(
-            status = %resp.status(),
-            "Anthropic userinfo endpoint returned non-success"
-        );
-        return None;
+
+    // Try GET first, then POST if Cloudflare blocks GET
+    for method in &["GET", "POST"] {
+        let req = if *method == "GET" {
+            client
+                .get("https://console.anthropic.com/v1/oauth/userinfo")
+                .header("Authorization", format!("Bearer {}", access_token))
+        } else {
+            client
+                .post("https://console.anthropic.com/v1/oauth/userinfo")
+                .header("Authorization", format!("Bearer {}", access_token))
+                .header("Content-Type", "application/json")
+                .body("{}")
+        };
+
+        let resp = match req.send().await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(
+                    method = method,
+                    error = %e,
+                    "Anthropic userinfo request failed (network error)"
+                );
+                continue;
+            }
+        };
+        let status = resp.status();
+        if !status.is_success() {
+            let body_preview = resp
+                .text()
+                .await
+                .unwrap_or_default()
+                .chars()
+                .take(200)
+                .collect::<String>();
+            tracing::warn!(
+                method = method,
+                status = %status,
+                body_preview = %body_preview,
+                "Anthropic userinfo endpoint returned non-success (Cloudflare block?)"
+            );
+            continue;
+        }
+        let data: serde_json::Value = match resp.json().await {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::warn!(method = method, error = %e, "Failed to parse userinfo response");
+                continue;
+            }
+        };
+        let email = data
+            .get("email")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .or_else(|| {
+                data.get("name")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+            });
+        if email.is_some() {
+            return email;
+        }
     }
-    let data: serde_json::Value = resp.json().await.ok()?;
-    data.get("email")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
-        .or_else(|| {
-            // Some providers use "name" or "id" as fallback identifier
-            data.get("name")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string())
-        })
+    None
 }
 
 /// Fetch account email from Google's userinfo endpoint using an access token.
@@ -4125,6 +4168,14 @@ fn extract_and_save_account_email(
         .or_else(|| {
             token_data
                 .get("email")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        })
+        .or_else(|| {
+            // Anthropic token responses include account.email_address
+            token_data
+                .get("account")
+                .and_then(|a| a.get("email_address"))
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string())
         });
@@ -5609,6 +5660,19 @@ async fn update_provider(
     if let Some(ref backends) = req.use_for_backends {
         updated.use_for_backends = Some(backends.clone());
     }
+    if let Some(ref email) = req.account_email {
+        updated.account_email = Some(email.clone());
+        // Also persist to provider_accounts.json for list endpoint
+        if let Err(e) =
+            update_provider_account(&state.config.working_dir, &uuid.to_string(), email.clone())
+        {
+            tracing::warn!(
+                provider = %uuid,
+                error = %e,
+                "Failed to persist provider account email"
+            );
+        }
+    }
 
     let result = state
         .ai_providers
@@ -6349,7 +6413,7 @@ async fn oauth_callback_inner(
                     Some(AuthKind::ApiKey),
                     default_provider,
                     backends,
-                    account_email,
+                    account_email.clone(),
                 );
 
                 tracing::info!("Created API key for provider: {} ({})", response.name, id);
@@ -6470,7 +6534,7 @@ async fn oauth_callback_inner(
                     Some(AuthKind::OAuth),
                     default_provider,
                     backends,
-                    account_email,
+                    account_email.clone(),
                 );
 
                 Ok(Json(response))

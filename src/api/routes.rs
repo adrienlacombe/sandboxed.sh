@@ -116,6 +116,8 @@ pub struct AppState {
     pub deferred_requests: Arc<deferred_proxy_api::DeferredRequestStore>,
     /// Telegram bridge for assistant missions
     pub telegram_bridge: super::telegram::SharedTelegramBridge,
+    /// FIDO signing relay hub (pending approval requests)
+    pub fido_hub: Arc<super::fido::FidoSigningHub>,
 }
 
 /// Start the HTTP server.
@@ -441,6 +443,7 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         proxy_api_keys,
         deferred_requests,
         telegram_bridge,
+        fido_hub: Arc::new(super::fido::FidoSigningHub::new()),
     });
 
     // Initialize the metadata LLM client for AI-powered mission titles/descriptions
@@ -478,21 +481,13 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
 
     // Eagerly boot the control session so Telegram webhooks are re-registered
     // immediately on server start (rather than waiting for the first
-    // authenticated API call). Use the same user ID that the auth middleware
-    // would assign — "dev" in dev mode, "default" otherwise — so that
-    // Telegram channels and missions are visible in the dashboard.
+    // authenticated API call). Use the same implicit single-tenant identity
+    // that the auth middleware would assign so Telegram channels and missions
+    // are visible in the dashboard.
     {
         let state_clone = Arc::clone(&state);
-        let boot_user_id = if config.dev_mode {
-            "dev".to_string()
-        } else {
-            "default".to_string()
-        };
         tokio::spawn(async move {
-            let default_user = super::auth::AuthUser {
-                id: boot_user_id.clone(),
-                username: boot_user_id,
-            };
+            let default_user = super::auth::implicit_single_tenant_user(&state_clone.config);
             let _ = state_clone.control.get_or_spawn(&default_user).await;
             tracing::info!("Eagerly booted default control session (Telegram webhooks registered)");
         });
@@ -529,6 +524,14 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
             "/api/telegram/webhook/:channel_id",
             post(control::telegram_webhook_receiver),
         )
+        .route(
+            "/api/control/telegram/actions/internal",
+            post(control::execute_telegram_action_internal_api),
+        )
+        .route(
+            "/api/control/telegram/workflows/request/internal",
+            post(control::execute_telegram_workflow_request_internal_api),
+        )
         // WebSocket console uses subprotocol-based auth (browser can't set Authorization header)
         .route("/api/console/ws", get(console::console_ws))
         // WebSocket workspace shell uses subprotocol-based auth
@@ -564,6 +567,9 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         .route("/api/task/:id/stop", post(stop_task))
         .route("/api/task/:id/stream", get(stream_task))
         .route("/api/tasks", get(list_tasks))
+        // FIDO signing relay endpoints
+        .route("/api/fido/request", post(super::fido::post_fido_request))
+        .route("/api/fido/respond", post(super::fido::post_fido_respond))
         // Global control session endpoints
         .route("/api/control/message", post(control::post_message))
         .route("/api/control/tool_result", post(control::post_tool_result))
@@ -711,8 +717,48 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
             get(control::list_bot_chats),
         )
         .route(
+            "/api/control/telegram/bots/:id/scheduled",
+            get(control::list_bot_scheduled_messages),
+        )
+        .route(
+            "/api/control/telegram/bots/:id/actions",
+            get(control::list_bot_action_executions),
+        )
+        .route(
+            "/api/control/telegram/bots/:id/conversations",
+            get(control::list_bot_conversations),
+        )
+        .route(
+            "/api/control/telegram/bots/:id/workflows",
+            get(control::list_bot_workflows),
+        )
+        .route(
+            "/api/control/telegram/bots/:id/memory",
+            get(control::list_bot_structured_memory),
+        )
+        .route(
+            "/api/control/telegram/bots/:id/memory-search",
+            get(control::search_bot_structured_memory),
+        )
+        .route(
+            "/api/control/telegram/conversations/:id/messages",
+            get(control::list_telegram_conversation_messages),
+        )
+        .route(
+            "/api/control/telegram/workflows/:id/events",
+            get(control::list_telegram_workflow_events),
+        )
+        .route(
             "/api/control/telegram/send",
             post(control::send_telegram_message_api),
+        )
+        .route(
+            "/api/control/telegram/actions",
+            post(control::execute_telegram_action_api),
+        )
+        .route(
+            "/api/control/telegram/workflows/request",
+            post(control::execute_telegram_workflow_request_api),
         )
         // Parallel execution endpoints
         .route("/api/control/running", get(control::list_running_missions))

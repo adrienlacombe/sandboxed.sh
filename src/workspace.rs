@@ -1560,7 +1560,13 @@ async fn write_claudecode_config(
     tokio::fs::write(&settings_json_path, &settings_content).await?;
 
     // Write a dedicated MCP config for CLI flags like --mcp-config.
-    let mcp_only = json!({ "mcpServers": mcp_servers });
+    // Use mcpServers from the merged settings (includes profile overlay MCPs)
+    // rather than only the RTK-generated MCPs.
+    let final_mcp_servers = settings
+        .get("mcpServers")
+        .cloned()
+        .unwrap_or_else(|| json!(mcp_servers));
+    let mcp_only = json!({ "mcpServers": final_mcp_servers });
     let mcp_content = serde_json::to_string_pretty(&mcp_only)?;
     let mcp_config_path = claude_dir.join("mcp.json");
     tokio::fs::write(&mcp_config_path, &mcp_content).await?;
@@ -3448,10 +3454,10 @@ pub async fn prepare_mission_workspace_with_skills_backend(
                     env.entry("API_URL".to_string())
                         .or_insert_with(|| format!("http://127.0.0.1:{}", port));
                 }
-                // Only forward JWT_SECRET to the orchestrator MCP so it can
+                // Forward JWT_SECRET to trusted internal MCPs so they can
                 // mint service tokens.  Other MCPs (including third-party ones)
                 // must not receive this secret.
-                if cfg.name == "orchestrator" {
+                if cfg.name == "orchestrator" || cfg.name == "automation-manager" {
                     if let Ok(secret) = std::env::var("JWT_SECRET") {
                         env.entry("JWT_SECRET".to_string()).or_insert(secret);
                     }
