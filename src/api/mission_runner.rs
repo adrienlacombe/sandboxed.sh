@@ -479,6 +479,28 @@ pub(crate) fn codex_chatgpt_fallback_for_result(
     codex_chatgpt_fallback_model(requested_model)
 }
 
+fn is_generic_gpt_codex_model(model: &str) -> bool {
+    let normalized = model.trim().to_ascii_lowercase();
+    normalized.starts_with("gpt-") && !normalized.contains("codex")
+}
+
+pub(crate) fn codex_tool_stall_should_retry_with_default_model(
+    requested_model: Option<&str>,
+    result: &AgentResult,
+) -> bool {
+    const CODEX_TOOL_STALL_PREFIX: &str =
+        "Codex stopped before completing required workspace/tool steps.";
+
+    if !matches!(result.terminal_reason, Some(TerminalReason::Stalled)) {
+        return false;
+    }
+    if !result.output.starts_with(CODEX_TOOL_STALL_PREFIX) {
+        return false;
+    }
+
+    requested_model.is_some_and(is_generic_gpt_codex_model)
+}
+
 fn codex_account_semaphore_for_key(api_key: &str) -> Arc<Semaphore> {
     let mut pool = CODEX_ACCOUNT_POOL
         .lock()
@@ -1727,7 +1749,7 @@ pub struct MissionRunner {
     /// Model override for this mission (e.g. "zai/glm-5")
     pub model_override: Option<String>,
 
-    /// Model effort override for this mission (e.g. low/medium/high)
+    /// Model effort override for this mission (e.g. low/medium/high/xhigh/max)
     pub model_effort: Option<String>,
 
     /// Message queue for this mission
@@ -2348,7 +2370,7 @@ async fn run_mission_turn(
         // models take precedence instead of being overridden.
         config.default_model = None;
     } else if backend_id == "codex" && model_override.is_none() {
-        // The global DEFAULT_MODEL (e.g. claude-opus-4-6) is not valid for
+        // The global DEFAULT_MODEL (e.g. claude-opus-4-7) is not valid for
         // Codex.  Clear it so Codex uses its own CLI default.
         config.default_model = None;
     } else if backend_id == "gemini" && model_override.is_none() {
@@ -2751,35 +2773,11 @@ async fn run_mission_turn(
                     "Auth error detected — invalidating stale credentials and retrying"
                 );
 
-                // Delete the per-mission CLI credentials (they have a stale access token)
-                let mission_creds = mission_work_dir.join(".claude").join(".credentials.json");
-                if mission_creds.exists() {
-                    let _ = std::fs::remove_file(&mission_creds);
-                    tracing::info!(
-                        path = %mission_creds.display(),
-                        "Removed stale per-mission CLI credentials"
-                    );
-                }
-
-                // Also invalidate the host CLI credentials so they aren't copied again
-                for host_path in &[
-                    std::path::PathBuf::from("/var/lib/opencode/.claude/.credentials.json"),
-                    std::path::PathBuf::from("/root/.claude/.credentials.json"),
-                ] {
-                    if host_path.exists() {
-                        let _ = std::fs::remove_file(host_path);
-                        tracing::info!(
-                            path = %host_path.display(),
-                            "Removed stale host CLI credentials"
-                        );
-                    }
-                }
-
-                // Force OAuth token refresh (bypasses local expiry check since
-                // the token was revoked server-side despite not being locally expired)
-                if let Err(e) = super::ai_providers::force_refresh_anthropic_oauth_token().await {
-                    tracing::warn!("OAuth refresh after auth error failed: {}", e);
-                }
+                refresh_claude_credentials_after_auth_error(
+                    &mission_work_dir,
+                    "mission_runner_initial_auth_error",
+                )
+                .await;
 
                 // Retry with fresh credentials (override_auth=None forces re-resolution)
                 result = run_claudecode_turn(
@@ -2807,23 +2805,26 @@ async fn run_mission_turn(
             // The first entry in the list is the highest-priority credential, which
             // is almost certainly what the initial (override_auth=None) call used.
             // Skip it to avoid a guaranteed duplicate rate-limit failure.
+            let mut rotated_anthropic_account = false;
             if result.terminal_reason == Some(TerminalReason::RateLimited) {
-                let alt_accounts =
-                    super::ai_providers::get_all_anthropic_auth_for_claudecode(&config.working_dir);
-                let alt_accounts: Vec<_> = alt_accounts.into_iter().skip(1).collect();
-                if !alt_accounts.is_empty() {
+                let rotation_accounts =
+                    anthropic_rotation_accounts(&workspace, &mission_work_dir, &config.working_dir);
+                if !rotation_accounts.accounts.is_empty() {
                     tracing::info!(
                         mission_id = %mission_id,
-                        total_accounts = alt_accounts.len(),
+                        total_accounts = rotation_accounts.total_accounts,
+                        alternate_accounts = rotation_accounts.accounts.len(),
+                        skipped_current = rotation_accounts.skipped_current,
                         "Rate limited on primary account; trying alternate credentials"
                     );
-                    for (idx, alt_auth) in alt_accounts.into_iter().enumerate() {
+                    for (idx, alt_auth) in rotation_accounts.accounts.into_iter().enumerate() {
                         if cancel.is_cancelled() {
                             break;
                         }
+                        rotated_anthropic_account = true;
                         tracing::info!(
                             mission_id = %mission_id,
-                            attempt = idx + 2,
+                            rotation_attempt = idx + 1,
                             auth_type = match &alt_auth {
                                 super::ai_providers::ClaudeCodeAuth::ApiKey(_) => "api_key",
                                 super::ai_providers::ClaudeCodeAuth::OAuthToken(_) => "oauth_token",
@@ -2857,7 +2858,7 @@ async fn run_mission_turn(
                             Some(TerminalReason::RateLimited) => {
                                 tracing::info!(
                                     mission_id = %mission_id,
-                                    attempt = idx + 2,
+                                    rotation_attempt = idx + 1,
                                     "Rate limited; rotating to next account"
                                 );
                                 continue;
@@ -2866,6 +2867,45 @@ async fn run_mission_turn(
                         }
                     }
                 }
+            }
+
+            // If an alternate OAuth credential is revoked, rotation returns
+            // AuthError. Refresh stale Claude credentials and retry once with
+            // freshly resolved auth instead of surfacing a raw 401.
+            if rotated_anthropic_account
+                && result.terminal_reason == Some(TerminalReason::AuthError)
+                && !cancel.is_cancelled()
+            {
+                tracing::warn!(
+                    mission_id = %mission_id,
+                    "Auth error detected after credential rotation - invalidating stale credentials and retrying"
+                );
+
+                refresh_claude_credentials_after_auth_error(
+                    &mission_work_dir,
+                    "mission_runner_rotated_auth_error",
+                )
+                .await;
+
+                result = run_claudecode_turn(
+                    &workspace,
+                    &mission_work_dir,
+                    &effective_msg,
+                    config.default_model.as_deref(),
+                    model_effort.as_deref(),
+                    effective_agent.as_deref(),
+                    mission_id,
+                    events_tx.clone(),
+                    cancel.clone(),
+                    secrets.clone(),
+                    &config.working_dir,
+                    effective_sid.as_deref(),
+                    is_continuation,
+                    Some(Arc::clone(&tool_hub)),
+                    Some(Arc::clone(&status)),
+                    None,
+                )
+                .await;
             }
 
             result
@@ -3022,6 +3062,28 @@ async fn run_mission_turn(
                         None,
                     )
                     .await;
+                } else if codex_tool_stall_should_retry_with_default_model(requested_model, &result)
+                {
+                    tracing::warn!(
+                        mission_id = %mission_id,
+                        requested_model = ?requested_model,
+                        "Retrying Codex turn with CLI default model after generic GPT model stopped before tool use"
+                    );
+                    result = run_codex_turn(
+                        &workspace,
+                        &mission_work_dir,
+                        &convo,
+                        None,
+                        model_effort.as_deref(),
+                        effective_agent.as_deref(),
+                        mission_id,
+                        events_tx.clone(),
+                        cancel.clone(),
+                        &config.working_dir,
+                        session_id.as_deref(),
+                        None,
+                    )
+                    .await;
                 }
 
                 result
@@ -3096,6 +3158,32 @@ async fn run_mission_turn(
                             &mission_work_dir,
                             &convo,
                             Some(fallback_model),
+                            model_effort.as_deref(),
+                            effective_agent.as_deref(),
+                            mission_id,
+                            events_tx.clone(),
+                            cancel.clone(),
+                            &config.working_dir,
+                            session_id.as_deref(),
+                            Some(&lease.key),
+                        )
+                        .await;
+                    } else if codex_tool_stall_should_retry_with_default_model(
+                        requested_model,
+                        &result,
+                    ) {
+                        tracing::warn!(
+                            mission_id = %mission_id,
+                            attempt = attempt_idx,
+                            requested_model = ?requested_model,
+                            key = %key_fingerprint,
+                            "Retrying Codex turn with CLI default model after generic GPT model stopped before tool use"
+                        );
+                        result = run_codex_turn(
+                            &workspace,
+                            &mission_work_dir,
+                            &convo,
+                            None,
                             model_effort.as_deref(),
                             effective_agent.as_deref(),
                             mission_id,
@@ -3436,8 +3524,30 @@ pub fn run_claudecode_turn<'a>(
         // credentials file. We run each mission with a per-mission HOME, and copy the
         // host credentials into the mission directory if needed.
         let mission_creds_path = work_dir.join(".claude").join(".credentials.json");
+        let using_override_auth = override_auth.is_some();
+        if using_override_auth && mission_creds_path.exists() {
+            match std::fs::remove_file(&mission_creds_path) {
+                Ok(_) => {
+                    tracing::info!(
+                        mission_id = %mission_id,
+                        path = %mission_creds_path.display(),
+                        "Removed mission Claude CLI credentials so override auth can take precedence"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        mission_id = %mission_id,
+                        path = %mission_creds_path.display(),
+                        error = %e,
+                        "Failed to remove mission Claude CLI credentials before override auth"
+                    );
+                }
+            }
+        }
         // Copy host credentials if missing OR if the existing ones are expired/near-expiry.
-        let needs_copy = if !looks_like_claude_cli_credentials(&mission_creds_path) {
+        let needs_copy = if using_override_auth {
+            false
+        } else if !looks_like_claude_cli_credentials(&mission_creds_path) {
             true
         } else if let Some((expires_at, _)) = claude_cli_credentials_info(&mission_creds_path) {
             let now_ms = chrono::Utc::now().timestamp_millis();
@@ -3520,7 +3630,8 @@ pub fn run_claudecode_turn<'a>(
                 }
             }
         }
-        let mut has_cli_creds = looks_like_claude_cli_credentials(&mission_creds_path);
+        let mut has_cli_creds =
+            !using_override_auth && looks_like_claude_cli_credentials(&mission_creds_path);
         if let Some((expires_at, has_refresh)) = claude_cli_credentials_info(&mission_creds_path) {
             let now_ms = chrono::Utc::now().timestamp_millis();
             let is_expired = expires_at < now_ms;
@@ -3900,8 +4011,8 @@ pub fn run_claudecode_turn<'a>(
         }
 
         if let Some(m) = model {
-            // Claude Code expects bare model IDs (e.g. "claude-opus-4-6"),
-            // not provider-prefixed ones (e.g. "anthropic/claude-opus-4-6").
+            // Claude Code expects bare model IDs (e.g. "claude-opus-4-7"),
+            // not provider-prefixed ones (e.g. "anthropic/claude-opus-4-7").
             let bare = m.strip_prefix("anthropic/").unwrap_or(m);
             args.push("--model".to_string());
             args.push(bare.to_string());
@@ -4690,16 +4801,22 @@ pub fn run_claudecode_turn<'a>(
                                             }
                                             // Ignore other delta types (e.g., input_json_delta for tool use)
                                         }
-                                        StreamEvent::ContentBlockStart { index, content_block } => {
+                                        StreamEvent::ContentBlockStart { index, content_block }
+                                            if content_block.block_type == "tool_use" =>
+                                        {
                                             // Track the block type so we know how to handle deltas
                                             block_types.insert(index, content_block.block_type.clone());
 
-                                            if content_block.block_type == "tool_use" {
-                                                if let (Some(id), Some(name)) = (content_block.id, content_block.name) {
-                                                    pending_tools.insert(id, name);
-                                                    turn_wait_state = ClaudeTurnWaitState::AwaitingToolResults;
-                                                }
+                                            if let (Some(id), Some(name)) =
+                                                (content_block.id, content_block.name)
+                                            {
+                                                pending_tools.insert(id, name);
+                                                turn_wait_state =
+                                                    ClaudeTurnWaitState::AwaitingToolResults;
                                             }
+                                        }
+                                        StreamEvent::ContentBlockStart { index, content_block } => {
+                                            block_types.insert(index, content_block.block_type);
                                         }
                                         _ => {}
                                     }
@@ -4719,29 +4836,26 @@ pub fn run_claudecode_turn<'a>(
                                     for (content_idx, block) in evt.message.content.into_iter().enumerate() {
                                         let content_idx = content_idx as u32;
                                         match block {
-                                            ContentBlock::Text { text } => {
+                                            ContentBlock::Text { text } if !text.is_empty() => {
                                                 // Text content is the final assistant response
                                                 // Don't send as Thinking - it will be in the final AssistantMessage
-                                                if !text.is_empty() {
-                                                    if !thinking_emitted {
-                                                        if let Some((thought, cleaned)) =
-                                                            extract_thought_line(&text)
-                                                        {
-                                                            let _ = events_tx.send(
-                                                                AgentEvent::Thinking {
-                                                                    content: thought,
-                                                                    done: true,
-                                                                    mission_id: Some(mission_id),
-                                                                },
-                                                            );
-                                                            thinking_emitted = true;
-                                                            final_result = cleaned;
-                                                        } else {
-                                                            final_result = text;
-                                                        }
+                                                if !thinking_emitted {
+                                                    if let Some((thought, cleaned)) =
+                                                        extract_thought_line(&text)
+                                                    {
+                                                        let _ =
+                                                            events_tx.send(AgentEvent::Thinking {
+                                                                content: thought,
+                                                                done: true,
+                                                                mission_id: Some(mission_id),
+                                                            });
+                                                        thinking_emitted = true;
+                                                        final_result = cleaned;
                                                     } else {
                                                         final_result = text;
                                                     }
+                                                } else {
+                                                    final_result = text;
                                                 }
                                             }
                                             ContentBlock::ToolUse { id, name, input } => {
@@ -4860,19 +4974,21 @@ pub fn run_claudecode_turn<'a>(
                                                     }
                                                 }
                                             }
-                                            ContentBlock::Thinking { thinking } => {
+                                            ContentBlock::Thinking { thinking }
+                                                if !thinking.is_empty()
+                                                    && !finalized_thinking_indices
+                                                        .contains(&content_idx) =>
+                                            {
                                                 // Only send done:true for the last active thinking block.
                                                 // Earlier blocks were already finalized during streaming
                                                 // (via the block-transition mechanism) and re-sending them
                                                 // causes duplicate items in the frontend thinking panel.
-                                                if !thinking.is_empty() && !finalized_thinking_indices.contains(&content_idx) {
-                                                    let _ = events_tx.send(AgentEvent::Thinking {
-                                                        content: thinking,
-                                                        done: true,
-                                                        mission_id: Some(mission_id),
-                                                    });
-                                                    thinking_emitted = true;
-                                                }
+                                                let _ = events_tx.send(AgentEvent::Thinking {
+                                                    content: thinking,
+                                                    done: true,
+                                                    mission_id: Some(mission_id),
+                                                });
+                                                thinking_emitted = true;
                                             }
                                             _ => {}
                                         }
@@ -5215,6 +5331,39 @@ pub fn run_claudecode_turn<'a>(
                 TerminalReason::LlmError
             };
             AgentResult::failure(final_result, cost_cents).with_terminal_reason(reason)
+        } else if is_success_path_rate_limited_error(&final_result) {
+            // Claude Code sometimes surfaces subscription quota exhaustion as a
+            // normal assistant message (e.g. "You've hit your limit · resets
+            // 9pm") and exits with code 0. Without this check the turn would be
+            // treated as TurnComplete and account rotation would never trigger.
+            tracing::warn!(
+                mission_id = %mission_id,
+                "Claude Code returned a rate-limit message as a successful turn; marking as RateLimited for account rotation"
+            );
+            AgentResult::failure(final_result, cost_cents)
+                .with_terminal_reason(TerminalReason::RateLimited)
+        } else if is_success_path_auth_error(&final_result) {
+            // Claude Code can surface revoked/expired credential failures as a
+            // normal assistant message while exiting successfully. Treat that
+            // as AuthError so the caller invalidates stale credentials, refreshes
+            // OAuth, and retries instead of completing the mission with the error
+            // text as if it were the agent's answer.
+            tracing::warn!(
+                mission_id = %mission_id,
+                "Claude Code returned an auth error as a successful turn; marking as AuthError for credential refresh"
+            );
+            AgentResult::failure(final_result, cost_cents)
+                .with_terminal_reason(TerminalReason::AuthError)
+        } else if is_success_path_provider_payload_error(&final_result) {
+            // Claude Code can surface provider request validation errors as
+            // ordinary assistant text while exiting successfully. Treat them as
+            // LLM failures so the mission does not falsely complete.
+            tracing::warn!(
+                mission_id = %mission_id,
+                "Claude Code returned a provider payload error as a successful turn; marking as LlmError"
+            );
+            AgentResult::failure(final_result, cost_cents)
+                .with_terminal_reason(TerminalReason::LlmError)
         } else {
             AgentResult::success(final_result, cost_cents)
                 .with_terminal_reason(TerminalReason::TurnComplete)
@@ -5610,7 +5759,7 @@ fn is_auth_error(message: &str) -> bool {
 }
 
 fn is_rate_limited_error(message: &str) -> bool {
-    const RATE_LIMIT_MARKERS: [&str; 11] = [
+    const RATE_LIMIT_MARKERS: [&str; 12] = [
         "overloaded_error",
         "rate limit",
         "rate_limit",
@@ -5622,11 +5771,208 @@ fn is_rate_limited_error(message: &str) -> bool {
         "status code: 529",
         "out of extra usage",
         "out of regular usage",
+        // Claude Code CLI surfaces subscription quota exhaustion with this
+        // phrasing (e.g. "You've hit your limit · resets 9pm"). Treat it
+        // as a rate-limit signal so account rotation kicks in.
+        "hit your limit",
     ];
 
     RATE_LIMIT_MARKERS
         .iter()
         .any(|needle| contains_ascii_case_insensitive(message, needle))
+}
+
+fn looks_like_explicit_provider_error_output(message: &str) -> bool {
+    let trimmed = message.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    let compact_lower = lower
+        .chars()
+        .filter(|c| !c.is_ascii_whitespace())
+        .collect::<String>();
+    let starts_with_error_payload = compact_lower.starts_with("{\"error\":")
+        || compact_lower.starts_with("[{\"error\":")
+        || compact_lower.starts_with("{\"type\":\"error\"");
+    let structured_provider_error = starts_with_error_payload
+        && (compact_lower.contains("\"error\":{")
+            || compact_lower.contains("\"message\":")
+            || compact_lower.contains("\"code\":")
+            || compact_lower.contains("authentication_error")
+            || compact_lower.contains("invalid_request_error")
+            || compact_lower.contains("permission_error")
+            || compact_lower.contains("rate_limit_error")
+            || compact_lower.contains("overloaded_error"));
+
+    trimmed.starts_with("API Error:")
+        || lower.starts_with("error:")
+        || lower.starts_with("anthropic api error:")
+        || lower.starts_with("claude code error:")
+        || structured_provider_error
+        || lower.contains("status code: 401")
+        || lower.contains("status code: 429")
+        || lower.contains("status code: 529")
+}
+
+fn is_standalone_invalid_credentials_message(message: &str) -> bool {
+    let normalized = message
+        .trim()
+        .trim_matches(|c: char| matches!(c, '.' | '!' | '"' | '\''))
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase();
+    normalized == "invalid authentication credentials"
+}
+
+fn is_success_path_rate_limited_error(message: &str) -> bool {
+    let lower = message.trim().replace('\u{2019}', "'").to_ascii_lowercase();
+    lower.starts_with("you've hit your limit")
+        || lower.starts_with("you have hit your limit")
+        || (looks_like_explicit_provider_error_output(message) && is_rate_limited_error(message))
+}
+
+fn is_success_path_auth_error(message: &str) -> bool {
+    is_standalone_invalid_credentials_message(message)
+        || (looks_like_explicit_provider_error_output(message) && is_auth_error(message))
+}
+
+fn is_success_path_provider_payload_error(message: &str) -> bool {
+    (looks_like_explicit_provider_error_output(message)
+        || message.trim_start().starts_with("messages."))
+        && is_provider_payload_error(message)
+}
+
+fn opencode_idle_timeout_result_message(partial_output: &str) -> String {
+    let partial_output = partial_output.trim();
+    if partial_output.is_empty() {
+        return "OpenCode idle timeout: the model stopped producing output before finishing the turn. No response was generated.".to_string();
+    }
+
+    format!(
+        "OpenCode idle timeout: the model stopped producing output before finishing the turn. Partial output was discarded because it was incomplete.\n\nPartial output:\n{}",
+        partial_output
+    )
+}
+
+pub(crate) fn is_provider_payload_error(message: &str) -> bool {
+    const PROVIDER_PAYLOAD_MARKERS: [&str; 3] = [
+        "image.source.base64.data",
+        "image dimensions exceed max allowed size",
+        "many-image requests: 2000 pixels",
+    ];
+
+    PROVIDER_PAYLOAD_MARKERS
+        .iter()
+        .any(|needle| contains_ascii_case_insensitive(message, needle))
+}
+
+pub(crate) struct AnthropicRotationAccounts {
+    pub total_accounts: usize,
+    pub skipped_current: bool,
+    pub accounts: Vec<super::ai_providers::ClaudeCodeAuth>,
+}
+
+fn current_anthropic_auth_for_rotation(
+    workspace: &Workspace,
+    mission_work_dir: &Path,
+    app_working_dir: &Path,
+) -> Option<super::ai_providers::ClaudeCodeAuth> {
+    let mission_creds = mission_work_dir.join(".claude").join(".credentials.json");
+    if mission_creds.exists() {
+        return None;
+    }
+
+    let workspace_auth = if workspace.workspace_type == WorkspaceType::Container {
+        super::ai_providers::get_anthropic_auth_from_workspace(&workspace.path)
+    } else {
+        None
+    };
+    let host_auth = super::ai_providers::get_anthropic_auth_from_host_with_expiry();
+    let now = chrono::Utc::now().timestamp_millis();
+
+    match (&workspace_auth, &host_auth) {
+        (Some(ws), Some(host)) => {
+            let ws_expiry = ws.expires_at.unwrap_or(i64::MAX);
+            let host_expiry = host.expires_at.unwrap_or(i64::MAX);
+            let ws_expired = ws_expiry < now;
+            let host_expired = host_expiry < now;
+            if (ws_expired && !host_expired) || host_expiry > ws_expiry {
+                Some(host.auth.clone())
+            } else {
+                Some(ws.auth.clone())
+            }
+        }
+        (Some(ws), None) => Some(ws.auth.clone()),
+        (None, Some(host)) => Some(host.auth.clone()),
+        (None, None) => super::ai_providers::get_anthropic_auth_for_claudecode(app_working_dir),
+    }
+}
+
+pub(crate) fn anthropic_rotation_accounts(
+    workspace: &Workspace,
+    mission_work_dir: &Path,
+    app_working_dir: &Path,
+) -> AnthropicRotationAccounts {
+    let current = current_anthropic_auth_for_rotation(workspace, mission_work_dir, app_working_dir);
+    let all_accounts = super::ai_providers::get_all_anthropic_auth_for_claudecode(app_working_dir);
+    let total_accounts = all_accounts.len();
+    let mut skipped_current = false;
+    let accounts = all_accounts
+        .into_iter()
+        .filter(|account| {
+            let is_current = current
+                .as_ref()
+                .is_some_and(|candidate| candidate == account);
+            if is_current {
+                skipped_current = true;
+                false
+            } else {
+                true
+            }
+        })
+        .collect();
+
+    AnthropicRotationAccounts {
+        total_accounts,
+        skipped_current,
+        accounts,
+    }
+}
+
+pub(crate) async fn refresh_claude_credentials_after_auth_error(
+    mission_work_dir: &Path,
+    log_context: &str,
+) {
+    let mission_creds = mission_work_dir.join(".claude").join(".credentials.json");
+    if mission_creds.exists() {
+        let _ = std::fs::remove_file(&mission_creds);
+        tracing::info!(
+            path = %mission_creds.display(),
+            context = log_context,
+            "Removed stale per-mission CLI credentials"
+        );
+    }
+
+    for host_path in &[
+        std::path::PathBuf::from("/var/lib/opencode/.claude/.credentials.json"),
+        std::path::PathBuf::from("/root/.claude/.credentials.json"),
+    ] {
+        if host_path.exists() {
+            let _ = std::fs::remove_file(host_path);
+            tracing::info!(
+                path = %host_path.display(),
+                context = log_context,
+                "Removed stale host CLI credentials"
+            );
+        }
+    }
+
+    if let Err(e) = super::ai_providers::force_refresh_anthropic_oauth_token().await {
+        tracing::warn!(
+            context = log_context,
+            "OAuth refresh after auth error failed: {}",
+            e
+        );
+    }
 }
 
 fn is_capacity_limited_error(message: &str) -> bool {
@@ -7739,6 +8085,69 @@ async fn command_available(
     false
 }
 
+async fn available_bun_command(
+    workspace_exec: &WorkspaceExec,
+    cwd: &std::path::Path,
+) -> Option<String> {
+    for candidate in [
+        "bun",
+        "/usr/local/bin/bun",
+        "/usr/bin/bun",
+        "/root/.bun/bin/bun",
+        "/root/.cache/.bun/bin/bun",
+    ] {
+        if command_available(workspace_exec, cwd, candidate).await {
+            return Some(candidate.to_string());
+        }
+    }
+
+    None
+}
+
+async fn seed_container_bun_from_host(
+    workspace_exec: &WorkspaceExec,
+    cwd: &std::path::Path,
+) -> Option<String> {
+    if workspace_exec.workspace.workspace_type != WorkspaceType::Container {
+        return None;
+    }
+
+    let host_bun = resolve_host_executable("bun").or_else(|| {
+        ["/usr/local/bin/bun", "/usr/bin/bun"]
+            .iter()
+            .map(std::path::PathBuf::from)
+            .find(|path| path.is_file())
+    })?;
+
+    match copy_host_executable_into_container(&workspace_exec.workspace, &host_bun) {
+        Ok(container_bun) => {
+            if command_available(workspace_exec, cwd, &container_bun).await {
+                tracing::info!(
+                    host_source = %host_bun.display(),
+                    container_path = %container_bun,
+                    "Copied Bun into container workspace for harness bootstrap"
+                );
+                Some(container_bun)
+            } else {
+                tracing::warn!(
+                    host_source = %host_bun.display(),
+                    container_path = %container_bun,
+                    "Copied Bun into container, but it is not executable in workspace"
+                );
+                None
+            }
+        }
+        Err(err) => {
+            tracing::warn!(
+                host_source = %host_bun.display(),
+                error = %err,
+                "Failed to copy Bun into container workspace"
+            );
+            None
+        }
+    }
+}
+
 async fn resolve_command_path_in_workspace(
     workspace_exec: &WorkspaceExec,
     cwd: &std::path::Path,
@@ -8220,6 +8629,12 @@ async fn ensure_claudecode_cli_available(
         }
     }
 
+    for direct_claude_path in ["/usr/local/bin/claude", "/usr/bin/claude"] {
+        if command_available(workspace_exec, cwd, direct_claude_path).await {
+            return Ok(direct_claude_path.to_string());
+        }
+    }
+
     // Check bun's global bin directories. Depending on bun version and config,
     // globals may be in ~/.bun/bin/ or ~/.cache/.bun/bin/.
     const BUN_GLOBAL_CLAUDE_PATHS: &[&str] =
@@ -8251,16 +8666,8 @@ async fn ensure_claudecode_cli_available(
                     cmd
                 );
                 return Ok(cmd);
-            } else if command_available(workspace_exec, cwd, "/root/.bun/bin/bun").await {
-                let bun_cmd = format!("/root/.bun/bin/bun {}", bun_claude_path);
-                tracing::debug!(
-                    "Found Claude Code at {} (using bun to run it: {})",
-                    bun_claude_path,
-                    bun_cmd
-                );
-                return Ok(bun_cmd);
-            } else if command_available(workspace_exec, cwd, "bun").await {
-                let bun_cmd = format!("bun {}", bun_claude_path);
+            } else if let Some(bun) = available_bun_command(workspace_exec, cwd).await {
+                let bun_cmd = format!("{} {}", bun, bun_claude_path);
                 tracing::debug!(
                     "Found Claude Code at {} (using bun to run it: {})",
                     bun_claude_path,
@@ -8288,13 +8695,14 @@ async fn ensure_claudecode_cli_available(
     let has_npm = command_available(workspace_exec, cwd, "npm").await;
     tracing::debug!("Claude Code auto-install: npm available = {}", has_npm);
 
-    let bun_in_path = command_available(workspace_exec, cwd, "bun").await;
-    let bun_direct = command_available(workspace_exec, cwd, "/root/.bun/bin/bun").await;
-    let has_bun = bun_in_path || bun_direct;
+    let mut bun_command = available_bun_command(workspace_exec, cwd).await;
+    if bun_command.is_none() {
+        bun_command = seed_container_bun_from_host(workspace_exec, cwd).await;
+    }
+    let has_bun = bun_command.is_some();
     tracing::debug!(
-        "Claude Code auto-install: bun in PATH = {}, bun at /root/.bun/bin/bun = {}, has_bun = {}",
-        bun_in_path,
-        bun_direct,
+        "Claude Code auto-install: bun command = {:?}, has_bun = {}",
+        bun_command,
         has_bun
     );
 
@@ -8309,10 +8717,13 @@ async fn ensure_claudecode_cli_available(
     // Bun installs globals to ~/.bun/install/global/ with bin symlinks in ~/.bun/bin/.
     // Some bun versions (e.g. 1.3.x) report success but silently fail to create
     // the bin symlink, so we manually link it as a workaround.
-    let install_cmd = if has_bun {
-        r#"export PATH="/root/.bun/bin:/root/.cache/.bun/bin:$PATH" && bun install -g @anthropic-ai/claude-code@latest && { test -x /root/.bun/bin/claude || test -x /root/.cache/.bun/bin/claude || ln -sf ../install/global/node_modules/@anthropic-ai/claude-code/cli.js /root/.bun/bin/claude 2>/dev/null || true; }"#
+    let install_cmd = if let Some(bun) = bun_command.as_deref() {
+        format!(
+            r#"export PATH="/usr/local/bin:/root/.bun/bin:/root/.cache/.bun/bin:$PATH" && {} install -g @anthropic-ai/claude-code@latest && {{ test -x /root/.bun/bin/claude || test -x /root/.cache/.bun/bin/claude || ln -sf ../install/global/node_modules/@anthropic-ai/claude-code/cli.js /root/.bun/bin/claude 2>/dev/null || true; }}"#,
+            shell_quote(bun)
+        )
     } else {
-        "npm install -g @anthropic-ai/claude-code@latest"
+        "npm install -g @anthropic-ai/claude-code@latest".to_string()
     };
 
     let args = vec!["-lc".to_string(), install_cmd.to_string()];
@@ -8357,10 +8768,8 @@ async fn ensure_claudecode_cli_available(
                 } else {
                     bun_claude_path.to_string()
                 });
-            } else if command_available(workspace_exec, cwd, "/root/.bun/bin/bun").await {
-                return Ok(format!("/root/.bun/bin/bun {}", bun_claude_path));
-            } else if command_available(workspace_exec, cwd, "bun").await {
-                return Ok(format!("bun {}", bun_claude_path));
+            } else if let Some(bun) = available_bun_command(workspace_exec, cwd).await {
+                return Ok(format!("{} {}", bun, bun_claude_path));
             }
         }
     }
@@ -8961,6 +9370,8 @@ async fn check_claudecode_prerequisites(
     let program = cli_path.split_whitespace().next().unwrap_or(cli_path);
 
     let cli_available = command_available(workspace_exec, cwd, program).await
+        || command_available(workspace_exec, cwd, "/usr/local/bin/claude").await
+        || command_available(workspace_exec, cwd, "/usr/bin/claude").await
         || command_available(workspace_exec, cwd, "/root/.cache/.bun/bin/claude").await
         || command_available(workspace_exec, cwd, "/root/.bun/bin/claude").await;
 
@@ -8976,8 +9387,9 @@ async fn check_claudecode_prerequisites(
     }
 
     let has_npm = command_available(workspace_exec, cwd, "npm").await;
-    let has_bun = command_available(workspace_exec, cwd, "bun").await
-        || command_available(workspace_exec, cwd, "/root/.bun/bin/bun").await;
+    let has_bun = available_bun_command(workspace_exec, cwd).await.is_some()
+        || (workspace_exec.workspace.workspace_type == WorkspaceType::Container
+            && resolve_host_executable("bun").is_some());
 
     if !has_npm && !has_bun {
         missing.push("npm or bun".to_string());
@@ -10595,6 +11007,11 @@ pub async fn run_opencode_turn(
     let mut consecutive_retries: u32 = 0;
     let mut last_seen_total_retries: u32 = 0;
     let max_consecutive_retries: u32 = 5;
+    // OpenCode can legitimately spend more than 30s in the next provider call
+    // after emitting an initial acknowledgement and finishing a tool-call step.
+    // A short timeout turns that acknowledgement into a false successful answer
+    // for Telegram. Let the global inactivity timeout handle truly stuck turns.
+    const OPENCODE_TEXT_IDLE_TIMEOUT_SECS: u64 = 120;
 
     loop {
         tokio::select! {
@@ -10767,7 +11184,7 @@ pub async fn run_opencode_turn(
                     }
                 }
                 if let Some(last_text) = text_output_at {
-                    if last_text.elapsed() >= std::time::Duration::from_secs(30) {
+                    if last_text.elapsed() >= std::time::Duration::from_secs(OPENCODE_TEXT_IDLE_TIMEOUT_SECS) {
                         // Only kill if there's also no recent SSE/stderr activity
                         // AND no tools are actively running.  A long tool execution
                         // (build, test, sleep) may produce no text output for >30s;
@@ -10787,7 +11204,7 @@ pub async fn run_opencode_turn(
                         let recent_activity = last_activity
                             .lock()
                             .ok()
-                            .map(|g| g.elapsed() < std::time::Duration::from_secs(30))
+                            .map(|g| g.elapsed() < std::time::Duration::from_secs(OPENCODE_TEXT_IDLE_TIMEOUT_SECS))
                             .unwrap_or(false);
                         if !recent_activity && !tools_active {
                             tracing::info!(
@@ -11424,19 +11841,18 @@ pub async fn run_opencode_turn(
         });
     }
 
-    // When the process was killed by idle timeout, append a notice so the user
-    // knows the response was truncated.  This is especially important for
-    // Telegram where the user sees partial output and then silence.
-    if killed_by_idle_timeout && !had_error && !final_result.trim().is_empty() {
+    // A timeout-killed OpenCode process is not a successful turn, even when it
+    // emitted partial text first. Returning partial text as TurnComplete caused
+    // Telegram to send "Je m'en occupe" followed by a warning while the actual
+    // tool-backed work never finished.
+    if killed_by_idle_timeout {
         tracing::warn!(
             mission_id = %mission_id,
             result_len = final_result.len(),
-            "OpenCode idle timeout killed process with partial output; appending truncation notice"
+            "OpenCode idle timeout killed process; marking turn as stalled"
         );
-        final_result.push_str("\n\n⚠️ [La réponse a été interrompue par un timeout — le modèle a mis trop de temps à répondre pendant l'exécution d'un outil. La réponse ci-dessus est incomplète.]");
-    } else if killed_by_idle_timeout && final_result.trim().is_empty() {
         had_error = true;
-        final_result = "OpenCode idle timeout: the model stopped producing output while executing tool calls. No response was generated.".to_string();
+        final_result = opencode_idle_timeout_result_message(&final_result);
     }
 
     tracing::info!(
@@ -11450,6 +11866,8 @@ pub async fn run_opencode_turn(
         // Use RateLimited terminal reason when rate limit was detected
         let reason = if rate_limit_detected.load(std::sync::atomic::Ordering::SeqCst) {
             TerminalReason::RateLimited
+        } else if killed_by_idle_timeout {
+            TerminalReason::Stalled
         } else {
             TerminalReason::LlmError
         };
@@ -11925,14 +12343,19 @@ pub async fn run_amp_turn(
                                             }
                                         }
                                     }
-                                    StreamEvent::ContentBlockStart { index, content_block } => {
+                                    StreamEvent::ContentBlockStart { index, content_block }
+                                        if content_block.block_type == "tool_use" =>
+                                    {
                                         block_types.insert(index, content_block.block_type.clone());
 
-                                        if content_block.block_type == "tool_use" {
-                                            if let (Some(id), Some(name)) = (content_block.id, content_block.name) {
-                                                pending_tools.insert(id, name);
-                                            }
+                                        if let (Some(id), Some(name)) =
+                                            (content_block.id, content_block.name)
+                                        {
+                                            pending_tools.insert(id, name);
                                         }
+                                    }
+                                    StreamEvent::ContentBlockStart { index, content_block } => {
+                                        block_types.insert(index, content_block.block_type);
                                     }
                                     _ => {}
                                 }
@@ -11954,27 +12377,23 @@ pub async fn run_amp_turn(
                                 for (content_idx, block) in evt.message.content.into_iter().enumerate() {
                                     let content_idx = content_idx as u32;
                                     match block {
-                                        ContentBlock::Text { text } => {
-                                            if !text.is_empty() {
-                                                if !thinking_streamed {
-                                                    if let Some((thought, cleaned)) =
-                                                        extract_thought_line(&text)
-                                                    {
-                                                        let _ = events_tx.send(
-                                                            AgentEvent::Thinking {
-                                                                content: thought,
-                                                                done: true,
-                                                                mission_id: Some(mission_id),
-                                                            },
-                                                        );
-                                                        thinking_streamed = true;
-                                                        final_result = cleaned;
-                                                    } else {
-                                                        final_result = text;
-                                                    }
+                                        ContentBlock::Text { text } if !text.is_empty() => {
+                                            if !thinking_streamed {
+                                                if let Some((thought, cleaned)) =
+                                                    extract_thought_line(&text)
+                                                {
+                                                    let _ = events_tx.send(AgentEvent::Thinking {
+                                                        content: thought,
+                                                        done: true,
+                                                        mission_id: Some(mission_id),
+                                                    });
+                                                    thinking_streamed = true;
+                                                    final_result = cleaned;
                                                 } else {
                                                     final_result = text;
                                                 }
+                                            } else {
+                                                final_result = text;
                                             }
                                         }
                                         ContentBlock::ToolUse { id, name, input } => {
@@ -12281,6 +12700,198 @@ impl From<&MissionRunner> for RunningMissionInfo {
     }
 }
 
+fn codex_turn_requires_tool_activity(user_message: &str, assistant_message: &str) -> bool {
+    let user_request = current_user_request_for_tool_activity(user_message);
+    let user = user_request.to_ascii_lowercase();
+    let assistant = assistant_message.trim().to_ascii_lowercase();
+
+    let deferred_action_prefixes = [
+        "i'll perform",
+        "i’ll perform",
+        "i will perform",
+        "i'll run",
+        "i’ll run",
+        "i will run",
+        "i'll execute",
+        "i’ll execute",
+        "i will execute",
+        "i'll create",
+        "i’ll create",
+        "i will create",
+        "i'll inspect",
+        "i’ll inspect",
+        "i will inspect",
+        "i'll review",
+        "i’ll review",
+        "i will review",
+    ];
+    if deferred_action_prefixes
+        .iter()
+        .any(|prefix| assistant.starts_with(prefix))
+    {
+        return true;
+    }
+
+    let explicit_tool_markers = [
+        "```bash",
+        "shell command",
+        "using shell",
+        "run ",
+        " run ",
+        "execute ",
+        " execute ",
+        "test ",
+        " test ",
+        "debug ",
+        " debug ",
+        "fix ",
+        " fix ",
+        "implement ",
+        " implement ",
+        "edit ",
+        " edit ",
+        "modify ",
+        " modify ",
+        "inspect ",
+        " inspect ",
+        "search ",
+        " search ",
+        " grep ",
+        " rg ",
+        " ls ",
+        " cat ",
+        " wc ",
+        " curl ",
+        " git ",
+        " npm ",
+        " bun ",
+        " cargo ",
+        " python ",
+        " pytest ",
+    ];
+    if explicit_tool_markers
+        .iter()
+        .any(|marker| user.contains(marker))
+    {
+        return true;
+    }
+
+    let action_markers = [
+        "create", "write", "read", "open", "access", "review", "inspect", "check", "update",
+        "change", "debug", "fix",
+    ];
+    let object_markers = [
+        " file",
+        " files",
+        " directory",
+        " folder",
+        " workspace",
+        " pull request",
+        " pr #",
+        " github.com/",
+        ".rs",
+        ".ts",
+        ".tsx",
+        ".js",
+        ".json",
+        ".toml",
+        ".md",
+        ".pdf",
+        "http://",
+        "https://",
+        "localhost",
+    ];
+
+    action_markers
+        .iter()
+        .any(|action| contains_ascii_word(&user, action))
+        && object_markers.iter().any(|object| user.contains(object))
+}
+
+fn codex_final_message_looks_like_progress_update(assistant_message: &str) -> bool {
+    let assistant = assistant_message.trim().to_ascii_lowercase();
+    if assistant.is_empty() {
+        return false;
+    }
+
+    let progress_prefixes = [
+        "i'm reading",
+        "i’m reading",
+        "i am reading",
+        "i'm checking",
+        "i’m checking",
+        "i am checking",
+        "i'm inspecting",
+        "i’m inspecting",
+        "i am inspecting",
+        "i'm pulling",
+        "i’m pulling",
+        "i am pulling",
+        "i'm running",
+        "i’m running",
+        "i am running",
+        "i'll run",
+        "i’ll run",
+        "i will run",
+        "i'll execute",
+        "i’ll execute",
+        "i will execute",
+        "next i'm",
+        "next i’m",
+        "next i'll",
+        "next i’ll",
+        "now i'm",
+        "now i’m",
+    ];
+    if progress_prefixes
+        .iter()
+        .any(|prefix| assistant.starts_with(prefix))
+    {
+        return true;
+    }
+
+    assistant.contains(" i'm reading ")
+        || assistant.contains(" i’m reading ")
+        || assistant.contains(" i'm checking ")
+        || assistant.contains(" i’m checking ")
+        || assistant.contains(" i'm running ")
+        || assistant.contains(" i’m running ")
+}
+
+fn current_user_request_for_tool_activity(prompt: &str) -> &str {
+    let Some((_, after_user)) = prompt.rsplit_once("User:\n") else {
+        return prompt;
+    };
+    after_user
+        .split_once("\n\nInstructions:")
+        .map(|(current, _)| current)
+        .unwrap_or(after_user)
+}
+
+fn contains_ascii_word(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return false;
+    }
+    let haystack = haystack.as_bytes();
+    let needle = needle.as_bytes();
+    if haystack.len() < needle.len() {
+        return false;
+    }
+    for idx in 0..=haystack.len() - needle.len() {
+        if &haystack[idx..idx + needle.len()] != needle {
+            continue;
+        }
+        let before = idx.checked_sub(1).and_then(|prev| haystack.get(prev));
+        let after = haystack.get(idx + needle.len());
+        if before.is_none_or(|byte| !byte.is_ascii_alphanumeric() && *byte != b'_')
+            && after.is_none_or(|byte| !byte.is_ascii_alphanumeric() && *byte != b'_')
+        {
+            return true;
+        }
+    }
+    false
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn run_codex_turn(
     workspace: &Workspace,
@@ -12410,6 +13021,7 @@ pub async fn run_codex_turn(
     let mut last_summary: Option<String> = None;
     let mut total_input_tokens: u64 = 0;
     let mut total_output_tokens: u64 = 0;
+    let mut tool_events_seen: usize = 0;
 
     loop {
         tokio::select! {
@@ -12447,6 +13059,7 @@ pub async fn run_codex_turn(
                         thinking_emitted = true;
                     }
                     ExecutionEvent::ToolCall { id, name, args } => {
+                        tool_events_seen = tool_events_seen.saturating_add(1);
                         // Flush accumulated thinking as done before tool call,
                         // so the event logger persists the full thought block.
                         if !thinking_accumulated.is_empty() {
@@ -12466,6 +13079,7 @@ pub async fn run_codex_turn(
                         });
                     }
                     ExecutionEvent::ToolResult { id, name, result } => {
+                        tool_events_seen = tool_events_seen.saturating_add(1);
                         pending_tools.remove(&id);
                         let _ = events_tx.send(AgentEvent::ToolResult {
                             tool_call_id: id,
@@ -12488,7 +13102,9 @@ pub async fn run_codex_turn(
                         // "Failed to shutdown rollout recorder") after the agent has
                         // already produced a valid response. Ignore these if we
                         // already have assistant output.
-                        if assistant_message.trim().is_empty() {
+                        let fatal_process_exit =
+                            message.contains("Codex CLI exited before completing the turn");
+                        if assistant_message.trim().is_empty() || fatal_process_exit {
                             error_message = Some(message.clone());
                             tracing::error!("Codex error: {}", message);
                         } else {
@@ -12554,6 +13170,26 @@ pub async fn run_codex_turn(
         "No response from Codex".to_string()
     };
 
+    let tool_activity_required = codex_turn_requires_tool_activity(user_message, &final_message);
+    let stopped_before_required_tools = success && tool_events_seen == 0 && tool_activity_required;
+    let stopped_on_progress_update = success
+        && tool_activity_required
+        && codex_final_message_looks_like_progress_update(&final_message);
+    if stopped_before_required_tools || stopped_on_progress_update {
+        tracing::warn!(
+            mission_id = %mission_id,
+            output_len = final_message.len(),
+            tool_events_seen = tool_events_seen,
+            stopped_on_progress_update = stopped_on_progress_update,
+            "Codex turn completed before satisfying a tool-required prompt"
+        );
+        success = false;
+        final_message = format!(
+            "Codex stopped before completing required workspace/tool steps. Last response:\n\n{}",
+            final_message.trim()
+        );
+    }
+
     let lower_final = final_message.to_lowercase();
     if lower_final.contains("does not exist or you do not have access")
         || lower_final.contains("model_not_found")
@@ -12582,7 +13218,9 @@ Update it to the latest version (`npm install -g @openai/codex@latest`) and retr
             .with_terminal_reason(TerminalReason::TurnComplete)
     } else {
         // Distinguish provider concurrency exhaustion from classic rate limits.
-        let reason = if is_capacity_limited_error(&final_message) {
+        let reason = if stopped_before_required_tools || stopped_on_progress_update {
+            TerminalReason::Stalled
+        } else if is_capacity_limited_error(&final_message) {
             TerminalReason::CapacityLimited
         } else if is_rate_limited_error(&final_message) {
             TerminalReason::RateLimited
@@ -13335,10 +13973,14 @@ mod tests {
         claudecode_resume_current_session_message, claudecode_transport_failure_data,
         claudecode_transport_failure_stage, claudecode_transport_failure_stage_for_incomplete_turn,
         claudecode_transport_recovery_strategy, codex_chatgpt_fallback_for_result,
-        codex_chatgpt_fallback_model, codex_key_fingerprint, extract_model_from_message,
-        extract_opencode_session_id, extract_part_text, extract_str, extract_thought_line,
-        is_capacity_limited_error, is_codex_chatgpt_account_model_blocked, is_codex_node_wrapper,
-        is_rate_limited_error, is_session_corruption_error, is_tool_call_only_output,
+        codex_chatgpt_fallback_model, codex_final_message_looks_like_progress_update,
+        codex_key_fingerprint, codex_tool_stall_should_retry_with_default_model,
+        codex_turn_requires_tool_activity, extract_model_from_message, extract_opencode_session_id,
+        extract_part_text, extract_str, extract_thought_line, is_capacity_limited_error,
+        is_codex_chatgpt_account_model_blocked, is_codex_node_wrapper, is_provider_payload_error,
+        is_rate_limited_error, is_session_corruption_error, is_success_path_auth_error,
+        is_success_path_provider_payload_error, is_success_path_rate_limited_error,
+        is_tool_call_only_output, opencode_idle_timeout_result_message,
         opencode_output_needs_fallback, opencode_session_token_from_line,
         parse_opencode_session_token, parse_opencode_sse_event, parse_opencode_stderr_text_part,
         preferred_model_for_cost, resolve_cost_cents_and_source, running_health,
@@ -13359,6 +14001,77 @@ mod tests {
     use std::fs;
     use std::time::Duration;
     use uuid::Uuid;
+
+    #[test]
+    fn codex_turn_requires_tool_activity_for_file_shell_prompt() {
+        assert!(codex_turn_requires_tool_activity(
+            "Create directory codex_probe, write files, run ls -la, wc -c, and cat them.",
+            "ALL_STEPS_DONE"
+        ));
+    }
+
+    #[test]
+    fn codex_turn_requires_tool_activity_for_deferred_action_response() {
+        assert!(codex_turn_requires_tool_activity(
+            "Please handle this task.",
+            "I’ll perform the filesystem probe exactly as requested."
+        ));
+    }
+
+    #[test]
+    fn codex_turn_requires_tool_activity_allows_plain_text_question() {
+        assert!(!codex_turn_requires_tool_activity(
+            "Explain three possible reasons for this architecture issue.",
+            "Here are three likely reasons."
+        ));
+        assert!(!codex_turn_requires_tool_activity(
+            "How do I create a repository on GitHub?",
+            "Here is how to create a repository on GitHub."
+        ));
+    }
+
+    #[test]
+    fn codex_turn_requires_tool_activity_detects_concrete_repo_work() {
+        assert!(codex_turn_requires_tool_activity(
+            "Run https://github.com/lfglabs-dev/verity-benchmark with the interactive harness.",
+            "The repo includes a harness directory. I’m reading those entrypoints and configs now."
+        ));
+    }
+
+    #[test]
+    fn codex_turn_requires_tool_activity_uses_word_boundaries() {
+        assert!(!codex_turn_requires_tool_activity(
+            "I already updated the README.md and can summarize it.",
+            "The README.md is already updated."
+        ));
+        assert!(!codex_turn_requires_tool_activity(
+            "The checkbox in settings.md is already enabled.",
+            "The checkbox is enabled."
+        ));
+    }
+
+    #[test]
+    fn codex_turn_requires_tool_activity_uses_latest_user_request_from_prompt() {
+        let prompt = "Previous conversation:\nUser:\nPlease edit src/lib.rs and run tests.\n\nAssistant:\nDone.\n\nUser:\nSummarize what changed.\n\nInstructions:\n- Continue helpfully.";
+
+        assert!(!codex_turn_requires_tool_activity(
+            prompt,
+            "The previous change updated src/lib.rs and tests passed."
+        ));
+    }
+
+    #[test]
+    fn codex_progress_update_is_not_terminal_answer() {
+        assert!(codex_final_message_looks_like_progress_update(
+            "The repo includes a harness directory and preconfigured interactive agent JSON files. I’m reading those entrypoints and configs now."
+        ));
+        assert!(codex_final_message_looks_like_progress_update(
+            "Next I’ll run the small smoke task for both model aliases."
+        ));
+        assert!(!codex_final_message_looks_like_progress_update(
+            "I ran the smoke task for both model aliases. opus-6 succeeded and opus failed with a timeout."
+        ));
+    }
 
     #[test]
     fn sync_opencode_agent_config_removes_overrides_when_plugin_enabled() {
@@ -13508,8 +14221,73 @@ mod tests {
         assert!(is_rate_limited_error("Error: 429 Too Many Requests"));
         assert!(is_rate_limited_error("resource_exhausted: slow down"));
         assert!(is_rate_limited_error("Overloaded_Error occurred"));
+        assert!(is_rate_limited_error("You've hit your limit · resets 9pm"));
         assert!(!is_rate_limited_error("Model finished successfully"));
         assert!(!is_rate_limited_error("error: 123"));
+        assert!(!is_rate_limited_error(
+            "You've hit your target for this sprint."
+        ));
+    }
+
+    #[test]
+    fn success_path_error_detection_requires_explicit_provider_failures() {
+        assert!(is_success_path_rate_limited_error(
+            "You've hit your limit · resets 9pm"
+        ));
+        assert!(!is_success_path_rate_limited_error(
+            "I can explain how rate limits work without needing tools."
+        ));
+        assert!(!is_success_path_rate_limited_error(
+            "A provider response might look like {\"error\":\"rate limit\"}, but this turn is only explaining the shape."
+        ));
+        assert!(is_success_path_rate_limited_error(
+            "{\"error\":{\"message\":\"rate limit exceeded\",\"type\":\"rate_limit_error\"}}"
+        ));
+        assert!(is_success_path_auth_error(
+            "Invalid authentication credentials"
+        ));
+        assert!(!is_success_path_auth_error(
+            "The docs mention an invalid api key as an example."
+        ));
+        assert!(!is_success_path_auth_error(
+            "For example, {\"error\":\"Invalid authentication credentials\"} means the key is bad."
+        ));
+        assert!(is_success_path_provider_payload_error(
+            "messages.13.content.88.image.source.base64.data: At least one of the image dimensions exceed max allowed size for many-image requests: 2000 pixels"
+        ));
+        assert!(!is_success_path_provider_payload_error(
+            "I resized the image because image dimensions exceed max allowed size in many-image requests."
+        ));
+    }
+
+    #[test]
+    fn is_auth_error_detects_bare_invalid_credentials() {
+        use super::is_auth_error;
+
+        assert!(is_auth_error("Invalid authentication credentials"));
+        assert!(is_auth_error("authentication_error from provider"));
+        assert!(!is_auth_error("The agent authenticated successfully"));
+    }
+
+    #[test]
+    fn is_provider_payload_error_detects_oversized_many_image_marker() {
+        assert!(is_provider_payload_error(
+            "messages.13.content.88.image.source.base64.data: At least one of the image dimensions exceed max allowed size for many-image requests: 2000 pixels"
+        ));
+        assert!(!is_provider_payload_error(
+            "I resized the screenshots to fit the image request limits"
+        ));
+    }
+
+    #[test]
+    fn opencode_idle_timeout_result_discards_partial_success_text() {
+        let message =
+            opencode_idle_timeout_result_message("Je m'en occupe ! Je te fais ça en parallèle.");
+
+        assert!(message.starts_with("OpenCode idle timeout:"));
+        assert!(message.contains("Partial output was discarded"));
+        assert!(message.contains("Je m'en occupe"));
+        assert!(!message.contains("La réponse a été interrompue"));
     }
 
     #[test]
@@ -13565,6 +14343,28 @@ mod tests {
             codex_chatgpt_fallback_for_result(Some("gpt-5.4-codex"), &rate_limited),
             None
         );
+    }
+
+    #[test]
+    fn codex_tool_stall_retries_generic_gpt_model_with_default() {
+        let stalled = AgentResult::failure(
+            "Codex stopped before completing required workspace/tool steps. Last response:\n\nI’ll run it."
+                .to_string(),
+            0,
+        )
+        .with_terminal_reason(TerminalReason::Stalled);
+
+        assert!(codex_tool_stall_should_retry_with_default_model(
+            Some("gpt-5.4"),
+            &stalled
+        ));
+        assert!(!codex_tool_stall_should_retry_with_default_model(
+            Some("gpt-5-codex"),
+            &stalled
+        ));
+        assert!(!codex_tool_stall_should_retry_with_default_model(
+            None, &stalled
+        ));
     }
 
     #[test]

@@ -129,7 +129,10 @@ fn load_providers_config(working_dir: &str) -> ProvidersConfig {
 
     match std::fs::read_to_string(&config_path) {
         Ok(contents) => match serde_json::from_str(&contents) {
-            Ok(config) => config,
+            Ok(mut config) => {
+                merge_default_provider_models(&mut config);
+                config
+            }
             Err(e) => {
                 tracing::warn!("Failed to parse providers.json: {}. Using defaults.", e);
                 default_providers_config()
@@ -141,6 +144,45 @@ fn load_providers_config(working_dir: &str) -> ProvidersConfig {
                 config_path
             );
             default_providers_config()
+        }
+    }
+}
+
+fn merge_default_provider_models(config: &mut ProvidersConfig) {
+    let defaults = default_providers_config();
+    for default_provider in defaults.providers {
+        if let Some(existing) = config
+            .providers
+            .iter_mut()
+            .find(|provider| provider.id == default_provider.id)
+        {
+            merge_provider_models(&mut existing.models, default_provider.models);
+            continue;
+        }
+
+        config.providers.push(default_provider);
+    }
+}
+
+fn merge_provider_models(
+    models: &mut Vec<ProviderModel>,
+    incoming: impl IntoIterator<Item = ProviderModel>,
+) {
+    let mut seen: HashSet<String> = models.iter().map(|model| model.id.clone()).collect();
+    for model in incoming {
+        if seen.insert(model.id.clone()) {
+            models.push(model);
+        }
+    }
+}
+
+fn merge_cached_provider_models(
+    config: &mut ProvidersConfig,
+    cached: &HashMap<String, Vec<ProviderModel>>,
+) {
+    for provider in &mut config.providers {
+        if let Some(models) = cached.get(&provider.id) {
+            merge_provider_models(&mut provider.models, models.iter().cloned());
         }
     }
 }
@@ -369,6 +411,14 @@ fn default_providers_config() -> ProvidersConfig {
                 billing: "subscription".to_string(),
                 description: "Included in Claude Max".to_string(),
                 models: vec![
+                    ProviderModel {
+                        id: "claude-opus-4-7".to_string(),
+                        name: "Claude Opus 4.7".to_string(),
+                        description: Some(
+                            "Latest Opus model, recommended for hard coding and agentic tasks"
+                                .to_string(),
+                        ),
+                    },
                     ProviderModel {
                         id: "claude-opus-4-6".to_string(),
                         name: "Claude Opus 4.6".to_string(),
@@ -1076,13 +1126,11 @@ pub async fn list_providers(
     let working_dir = state.config.working_dir.to_string_lossy().to_string();
     let mut config = load_providers_config(&working_dir);
 
-    // Merge cached models from dynamic catalog (replaces hardcoded model lists)
+    // Extend hardcoded defaults with the dynamic catalog. Some subscription
+    // catalog probes can return only a currently-selected model, so replacing
+    // the defaults would hide valid choices such as newly released Claude Opus.
     let cached = state.model_catalog.read().await;
-    for provider in &mut config.providers {
-        if let Some(models) = cached.get(&provider.id) {
-            provider.models = models.clone();
-        }
-    }
+    merge_cached_provider_models(&mut config, &cached);
     drop(cached);
 
     // Get the set of configured provider IDs
@@ -1115,13 +1163,9 @@ pub async fn list_backend_model_options(
     let working_dir = state.config.working_dir.to_string_lossy().to_string();
     let mut config = load_providers_config(&working_dir);
 
-    // Merge cached models from dynamic catalog
+    // Extend hardcoded defaults with the dynamic catalog.
     let cached = state.model_catalog.read().await;
-    for provider in &mut config.providers {
-        if let Some(models) = cached.get(&provider.id) {
-            provider.models = models.clone();
-        }
-    }
+    merge_cached_provider_models(&mut config, &cached);
     drop(cached);
 
     let configured = get_configured_provider_ids(state.config.working_dir.as_path());
@@ -1253,13 +1297,9 @@ pub async fn validate_model_override(
     let working_dir = state.config.working_dir.to_string_lossy().to_string();
     let mut config = load_providers_config(&working_dir);
 
-    // Merge cached models from dynamic catalog
+    // Extend hardcoded defaults with the dynamic catalog.
     let cached = state.model_catalog.read().await;
-    for provider in &mut config.providers {
-        if let Some(models) = cached.get(&provider.id) {
-            provider.models = models.clone();
-        }
-    }
+    merge_cached_provider_models(&mut config, &cached);
     drop(cached);
 
     // Load all providers (including configured and non-default)
@@ -1333,7 +1373,7 @@ pub async fn validate_model_override(
                     Ok(())
                 } else {
                     Err(format!(
-                        "Anthropic provider not configured. Expected a Claude model ID (e.g., 'claude-opus-4-6'), got '{}'",
+                        "Anthropic provider not configured. Expected a Claude model ID (e.g., 'claude-opus-4-7'), got '{}'",
                         model_override
                     ))
                 }
@@ -1441,6 +1481,83 @@ mod tests {
         // Acronyms <= 3 chars get uppercased
         assert_eq!(model_id_to_display_name("gpt-4"), "GPT 4");
         assert_eq!(model_id_to_display_name("glm-4.6v-flash"), "GLM 4.6v Flash");
+    }
+
+    #[test]
+    fn default_anthropic_catalog_includes_opus_47() {
+        let defaults = default_providers_config();
+        let anthropic = defaults
+            .providers
+            .iter()
+            .find(|provider| provider.id == "anthropic")
+            .expect("anthropic provider");
+        assert!(anthropic
+            .models
+            .iter()
+            .any(|model| model.id == "claude-opus-4-7"));
+    }
+
+    #[test]
+    fn merge_default_provider_models_adds_new_builtin_models_to_stale_config() {
+        let mut config = ProvidersConfig {
+            providers: vec![Provider {
+                id: "anthropic".to_string(),
+                name: "Claude (Subscription)".to_string(),
+                billing: "subscription".to_string(),
+                description: "Included in Claude Max".to_string(),
+                models: vec![ProviderModel {
+                    id: "claude-opus-4-6".to_string(),
+                    name: "Claude Opus 4.6".to_string(),
+                    description: None,
+                }],
+            }],
+        };
+
+        merge_default_provider_models(&mut config);
+
+        let anthropic = config
+            .providers
+            .iter()
+            .find(|provider| provider.id == "anthropic")
+            .expect("anthropic provider");
+        assert!(anthropic
+            .models
+            .iter()
+            .any(|model| model.id == "claude-opus-4-7"));
+    }
+
+    #[test]
+    fn merge_cached_provider_models_keeps_builtin_subscription_models() {
+        let mut config = default_providers_config();
+        let mut cached = HashMap::new();
+        cached.insert(
+            "anthropic".to_string(),
+            vec![ProviderModel {
+                id: "claude-opus-4-6".to_string(),
+                name: "Claude Opus 4.6".to_string(),
+                description: None,
+            }],
+        );
+
+        merge_cached_provider_models(&mut config, &cached);
+
+        let anthropic = config
+            .providers
+            .iter()
+            .find(|provider| provider.id == "anthropic")
+            .expect("anthropic provider");
+        assert!(anthropic
+            .models
+            .iter()
+            .any(|model| model.id == "claude-opus-4-7"));
+        assert_eq!(
+            anthropic
+                .models
+                .iter()
+                .filter(|model| model.id == "claude-opus-4-6")
+                .count(),
+            1
+        );
     }
 
     /// Fetch models from all provider APIs that have credentials available,

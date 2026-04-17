@@ -21,6 +21,7 @@ use axum::{
     Json,
 };
 use futures::stream::Stream;
+use serde::Deserializer;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc, oneshot, Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
@@ -2646,6 +2647,17 @@ pub enum AgentEvent {
         metadata_model: Option<String>,
         metadata_version: Option<String>,
     },
+    /// Mission run settings changed (backend/model/agent/config profile)
+    MissionSettingsUpdated {
+        mission_id: Uuid,
+        backend: String,
+        agent: Option<String>,
+        model_override: Option<String>,
+        model_effort: Option<String>,
+        config_profile: Option<String>,
+        session_id: Option<String>,
+        updated_at: String,
+    },
     /// Agent phase update (for showing preparation steps)
     AgentPhase {
         /// Phase name: "executing", "delegating", etc.
@@ -2791,6 +2803,7 @@ impl AgentEvent {
             AgentEvent::MissionActivity { .. } => "mission_activity",
             AgentEvent::MissionTitleChanged { .. } => "mission_title_changed",
             AgentEvent::MissionMetadataUpdated { .. } => "mission_metadata_updated",
+            AgentEvent::MissionSettingsUpdated { .. } => "mission_settings_updated",
             AgentEvent::FidoSignRequest { .. } => "fido_sign_request",
         }
     }
@@ -2813,6 +2826,7 @@ impl AgentEvent {
             AgentEvent::MissionActivity { mission_id, .. } => *mission_id,
             AgentEvent::MissionTitleChanged { mission_id, .. } => Some(*mission_id),
             AgentEvent::MissionMetadataUpdated { mission_id, .. } => Some(*mission_id),
+            AgentEvent::MissionSettingsUpdated { mission_id, .. } => Some(*mission_id),
             AgentEvent::FidoSignRequest { .. } => None,
         }
     }
@@ -2850,7 +2864,7 @@ pub enum ControlCommand {
         agent: Option<String>,
         /// Optional model override (provider/model)
         model_override: Option<String>,
-        /// Optional model effort override (e.g. low/medium/high)
+        /// Optional model effort override (e.g. low/medium/high/xhigh/max)
         model_effort: Option<String>,
         /// Backend to use for this mission ("opencode" or "claudecode")
         backend: Option<String>,
@@ -2873,6 +2887,17 @@ pub enum ControlCommand {
         id: Uuid,
         title: String,
         respond: oneshot::Sender<Result<(), String>>,
+    },
+    /// Update mission run settings
+    UpdateMissionSettings {
+        id: Uuid,
+        backend: Option<String>,
+        agent: Option<Option<String>>,
+        model_override: Option<Option<String>>,
+        model_effort: Option<Option<String>>,
+        config_profile: Option<Option<String>>,
+        session_id: String,
+        respond: oneshot::Sender<Result<Mission, String>>,
     },
     /// Start a mission in parallel (if slots available)
     StartParallel {
@@ -3841,7 +3866,7 @@ pub struct CreateMissionRequest {
     pub agent: Option<String>,
     /// Optional model override (provider/model) - deprecated, use config_profile instead
     pub model_override: Option<String>,
-    /// Optional model effort override (supports: low, medium, high)
+    /// Optional model effort override (supports: low, medium, high, xhigh, max)
     pub model_effort: Option<String>,
     /// Config profile to use for this mission (overrides workspace's default profile)
     pub config_profile: Option<String>,
@@ -3853,13 +3878,70 @@ pub struct CreateMissionRequest {
     pub working_directory: Option<String>,
 }
 
+fn deserialize_string_patch<'de, D>(deserializer: D) -> Result<Option<Option<String>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Option::<String>::deserialize(deserializer).map(Some)
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UpdateMissionSettingsRequest {
+    /// Backend to use on the next turn ("opencode", "claudecode", "codex", etc.).
+    pub backend: Option<String>,
+    /// Agent name. Omit to leave unchanged, null/empty string to clear.
+    #[serde(default, deserialize_with = "deserialize_string_patch")]
+    pub agent: Option<Option<String>>,
+    /// Model override. Omit to leave unchanged, null/empty string to clear.
+    #[serde(default, deserialize_with = "deserialize_string_patch")]
+    pub model_override: Option<Option<String>>,
+    /// Model effort. Omit to leave unchanged, null/empty string to clear.
+    #[serde(default, deserialize_with = "deserialize_string_patch")]
+    pub model_effort: Option<Option<String>>,
+    /// Config profile. Omit to leave unchanged, null/empty string to clear.
+    #[serde(default, deserialize_with = "deserialize_string_patch")]
+    pub config_profile: Option<Option<String>>,
+}
+
 fn normalize_model_effort(raw: &str) -> Option<String> {
     match raw.trim().to_ascii_lowercase().as_str() {
         "low" => Some("low".to_string()),
         "medium" => Some("medium".to_string()),
         "high" => Some("high".to_string()),
+        "xhigh" => Some("xhigh".to_string()),
+        "max" => Some("max".to_string()),
         _ => None,
     }
+}
+
+fn normalize_model_effort_for_backend(backend: Option<&str>, raw: &str) -> Option<String> {
+    let normalized = normalize_model_effort(raw)?;
+    match (backend, normalized.as_str()) {
+        (Some("claudecode"), "low" | "medium" | "high" | "xhigh" | "max") => Some(normalized),
+        (Some("codex"), "low" | "medium" | "high") => Some(normalized),
+        _ => None,
+    }
+}
+
+fn supported_model_efforts_for_backend(backend: Option<&str>) -> &'static str {
+    match backend {
+        Some("claudecode") => "low, medium, high, xhigh, max",
+        Some("codex") => "low, medium, high",
+        _ => "none",
+    }
+}
+
+fn normalize_string_patch(value: Option<Option<String>>) -> Option<Option<String>> {
+    value.map(|inner| {
+        inner.and_then(|value| {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        })
+    })
 }
 
 fn normalize_model_override_for_backend(backend: Option<&str>, raw_model: &str) -> Option<String> {
@@ -3914,14 +3996,6 @@ pub async fn create_mission(
     if let Some(value) = model_effort.as_ref() {
         if value.trim().is_empty() {
             model_effort = None;
-        } else {
-            model_effort = normalize_model_effort(value);
-            if model_effort.is_none() {
-                return Err((
-                    StatusCode::BAD_REQUEST,
-                    "Invalid model_effort. Supported values: low, medium, high".to_string(),
-                ));
-            }
         }
     }
 
@@ -3935,6 +4009,18 @@ pub async fn create_mission(
     // Model effort is supported for Codex and Claude Code missions.
     if !matches!(backend.as_deref(), Some("codex") | Some("claudecode")) {
         model_effort = None;
+    } else if let Some(value) = model_effort.as_ref() {
+        model_effort = normalize_model_effort_for_backend(backend.as_deref(), value);
+        if model_effort.is_none() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "Invalid model_effort for backend '{}'. Supported values: {}",
+                    backend.as_deref().unwrap_or("unknown"),
+                    supported_model_efforts_for_backend(backend.as_deref())
+                ),
+            ));
+        }
     }
 
     // Normalize model override based on backend expectations.
@@ -4026,6 +4112,171 @@ pub async fn create_mission(
         .map_err(recv_failed)?
         .map(Json)
         .map_err(internal_error)
+}
+
+/// Update mission run settings for future turns.
+pub async fn update_mission_settings(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    Path(id): Path<Uuid>,
+    Json(req): Json<UpdateMissionSettingsRequest>,
+) -> Result<Json<Mission>, (StatusCode, String)> {
+    let control = control_for_user(&state, &user).await;
+    let current = control
+        .mission_store
+        .get_mission(id)
+        .await
+        .map_err(internal_error)?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Mission {} not found", id)))?;
+
+    let backend = req.backend.as_ref().and_then(|backend| {
+        let trimmed = backend.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    });
+    let backend_changed = backend
+        .as_deref()
+        .is_some_and(|backend| backend != current.backend);
+    let effective_backend = backend.clone().unwrap_or_else(|| current.backend.clone());
+
+    {
+        let registry = state.backend_registry.read().await;
+        if registry.get(&effective_backend).is_none() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("Unknown backend: {}", effective_backend),
+            ));
+        }
+    }
+
+    let agent = normalize_string_patch(req.agent);
+    let mut model_override = normalize_string_patch(req.model_override);
+    let mut model_effort = normalize_string_patch(req.model_effort);
+    let config_profile = normalize_string_patch(req.config_profile);
+
+    if backend_changed && model_override.is_none() {
+        model_override = Some(None);
+    }
+    if backend_changed && model_effort.is_none() {
+        model_effort = Some(None);
+    }
+    if effective_backend == "amp" {
+        model_override = Some(None);
+    }
+    if !matches!(effective_backend.as_str(), "codex" | "claudecode") {
+        model_effort = Some(None);
+    }
+
+    let workspace_config_profile = state
+        .workspaces
+        .get(current.workspace_id)
+        .await
+        .and_then(|ws| ws.config_profile);
+    let effective_config_profile = match &config_profile {
+        Some(Some(profile)) => Some(profile.clone()),
+        Some(None) => workspace_config_profile.clone(),
+        None => current
+            .config_profile
+            .clone()
+            .or_else(|| workspace_config_profile.clone()),
+    };
+
+    let effective_agent = match &agent {
+        Some(Some(agent)) => Some(agent.clone()),
+        Some(None) => None,
+        None => current.agent.clone(),
+    };
+    if let Some(ref agent_name) = effective_agent {
+        let skip_validation = matches!(
+            effective_backend.as_str(),
+            "claudecode" | "amp" | "codex" | "gemini"
+        );
+        if !skip_validation {
+            super::library::validate_agent_exists(
+                &state,
+                agent_name,
+                effective_config_profile.as_deref(),
+            )
+            .await
+            .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+        }
+    }
+
+    if let Some(Some(raw_effort)) = model_effort.as_ref() {
+        let normalized = normalize_model_effort_for_backend(Some(&effective_backend), raw_effort)
+            .ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "Invalid model_effort for backend '{}'. Supported values: {}",
+                    effective_backend,
+                    supported_model_efforts_for_backend(Some(&effective_backend))
+                ),
+            )
+        })?;
+        model_effort = Some(Some(normalized));
+    }
+
+    let mut effective_model = match &model_override {
+        Some(Some(model)) => normalize_model_override_for_backend(Some(&effective_backend), model),
+        Some(None) => None,
+        None => current.model_override.as_deref().and_then(|model| {
+            normalize_model_override_for_backend(Some(&effective_backend), model)
+        }),
+    };
+    if let Some(ref model) = effective_model {
+        if model_override.as_ref().and_then(|value| value.as_ref()) != Some(model) {
+            model_override = Some(Some(model.clone()));
+        }
+    }
+
+    if effective_backend == "claudecode" && effective_model.is_none() {
+        if let Some(default_model) =
+            resolve_claudecode_default_model(&state.library, effective_config_profile.as_deref())
+                .await
+        {
+            effective_model = Some(default_model.clone());
+            model_override = Some(Some(default_model));
+        }
+    }
+
+    if let Some(ref model) = effective_model {
+        if let Err(e) =
+            super::providers::validate_model_override(&state, &effective_backend, model).await
+        {
+            return Err((StatusCode::BAD_REQUEST, e));
+        }
+    }
+
+    let (tx, rx) = oneshot::channel();
+    let session_id = Uuid::new_v4().to_string();
+    control
+        .cmd_tx
+        .send(ControlCommand::UpdateMissionSettings {
+            id,
+            backend,
+            agent,
+            model_override,
+            model_effort,
+            config_profile,
+            session_id,
+            respond: tx,
+        })
+        .await
+        .map_err(session_unavailable)?;
+
+    rx.await.map_err(recv_failed)?.map(Json).map_err(|e| {
+        if e.contains("not found") {
+            (StatusCode::NOT_FOUND, e)
+        } else if e.contains("running") {
+            (StatusCode::CONFLICT, e)
+        } else {
+            internal_error(e)
+        }
+    })
 }
 
 /// Load/switch to a mission.
@@ -5597,8 +5848,10 @@ fn maybe_recover_soft_llm_error(result: &mut crate::agents::AgentResult) {
     if output.len() >= 20
         && !output.starts_with("Codex produced no output")
         && !output.starts_with("Codex CLI produced no JSON")
+        && !output.starts_with("Codex CLI exited before completing the turn")
         && !output.starts_with("No response from")
         && !output.starts_with("Claude Code error:")
+        && !is_bare_llm_error_output(output)
     {
         tracing::info!(
             output_len = output.len(),
@@ -5608,6 +5861,68 @@ fn maybe_recover_soft_llm_error(result: &mut crate::agents::AgentResult) {
         result.success = true;
         result.terminal_reason = Some(TerminalReason::TurnComplete);
     }
+}
+
+fn is_bare_llm_error_output(output: &str) -> bool {
+    if looks_like_structured_provider_error(output) {
+        return true;
+    }
+    if super::mission_runner::is_provider_payload_error(output) {
+        return true;
+    }
+
+    let normalized = output
+        .trim()
+        .trim_matches(|c: char| matches!(c, '.' | '!' | '"' | '\''))
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase();
+
+    if normalized.is_empty() {
+        return false;
+    }
+
+    matches!(
+        normalized.as_str(),
+        "internal server error"
+            | "invalid authentication credentials"
+            | "unknown error"
+            | "service unavailable"
+            | "bad gateway"
+            | "gateway timeout"
+            | "request timeout"
+            | "upstream error"
+            | "model error"
+    ) || normalized.starts_with("api error:")
+        || normalized.starts_with("anthropic api error:")
+        || normalized.starts_with("claude code error:")
+}
+
+fn looks_like_structured_provider_error(output: &str) -> bool {
+    let trimmed = output.trim();
+    if !(trimmed.starts_with('{') && trimmed.ends_with('}')) {
+        return false;
+    }
+
+    let lower = trimmed.to_ascii_lowercase();
+    let has_error_shape = lower.contains("\"detail\"")
+        || lower.contains("\"error\"")
+        || lower.contains("\"message\"")
+        || lower.contains("\"type\"");
+    if !has_error_shape {
+        return false;
+    }
+
+    lower.contains("invalid_request_error")
+        || lower.contains("model is not supported")
+        || lower.contains("not supported when using codex")
+        || lower.contains("does not exist or you do not have access")
+        || lower.contains("invalid authentication credentials")
+        || lower.contains("rate limit")
+        || lower.contains("capacity")
+        || lower.contains("service unavailable")
+        || lower.contains("internal server error")
 }
 
 async fn maybe_finalize_terminal_mission(
@@ -6985,6 +7300,46 @@ async fn control_actor_loop(
                         }
                         let _ = respond.send(result);
                     }
+                    ControlCommand::UpdateMissionSettings { id, backend, agent, model_override, model_effort, config_profile, session_id, respond } => {
+                        let main_running = running.is_some() && running_mission_id == Some(id);
+                        let parallel_running = parallel_runners
+                            .get(&id)
+                            .is_some_and(|runner| runner.is_running());
+                        if main_running || parallel_running {
+                            let _ = respond.send(Err(
+                                "Cannot update mission settings while the mission is running"
+                                    .to_string(),
+                            ));
+                            continue;
+                        }
+
+                        let result = mission_store
+                            .update_mission_run_settings(
+                                id,
+                                backend.as_deref(),
+                                agent.as_ref().map(|value| value.as_deref()),
+                                model_override.as_ref().map(|value| value.as_deref()),
+                                model_effort.as_ref().map(|value| value.as_deref()),
+                                config_profile.as_ref().map(|value| value.as_deref()),
+                                &session_id,
+                            )
+                            .await;
+
+                        if let Ok(updated) = result.as_ref() {
+                            let _ = events_tx.send(AgentEvent::MissionSettingsUpdated {
+                                mission_id: id,
+                                backend: updated.backend.clone(),
+                                agent: updated.agent.clone(),
+                                model_override: updated.model_override.clone(),
+                                model_effort: updated.model_effort.clone(),
+                                config_profile: updated.config_profile.clone(),
+                                session_id: updated.session_id.clone(),
+                                updated_at: updated.updated_at.clone(),
+                            });
+                        }
+
+                        let _ = respond.send(result);
+                    }
                     ControlCommand::StartParallel { mission_id, content, respond } => {
                         tracing::info!("StartParallel requested for mission {}", mission_id);
 
@@ -7048,6 +7403,29 @@ async fn control_actor_loop(
                             );
 
                             if started {
+                                if mission.status != MissionStatus::Active {
+                                    tracing::info!(
+                                        "Activating parallel mission {} (was {})",
+                                        mission_id,
+                                        mission.status
+                                    );
+                                    if let Err(e) = mission_store
+                                        .update_mission_status(mission_id, MissionStatus::Active)
+                                        .await
+                                    {
+                                        tracing::warn!(
+                                            "Failed to activate parallel mission {}: {}",
+                                            mission_id,
+                                            e
+                                        );
+                                    } else {
+                                        let _ = events_tx.send(AgentEvent::MissionStatusChanged {
+                                            mission_id,
+                                            status: MissionStatus::Active,
+                                            summary: None,
+                                        });
+                                    }
+                                }
                                 tracing::info!("Mission {} started in parallel", mission_id);
                                 entry.insert(runner);
                                 let _ = respond.send(Ok(()));
@@ -8884,37 +9262,123 @@ async fn run_single_control_turn(
                     "Auth error detected — invalidating stale credentials and retrying"
                 );
 
-                // Delete the per-mission CLI credentials (they have a stale access token)
-                let mission_creds = ctx.working_dir.join(".claude").join(".credentials.json");
-                if mission_creds.exists() {
-                    let _ = std::fs::remove_file(&mission_creds);
-                    tracing::info!(
-                        path = %mission_creds.display(),
-                        "Removed stale per-mission CLI credentials"
-                    );
-                }
-
-                // Also invalidate the host CLI credentials so they aren't copied again
-                for host_path in &[
-                    std::path::PathBuf::from("/var/lib/opencode/.claude/.credentials.json"),
-                    std::path::PathBuf::from("/root/.claude/.credentials.json"),
-                ] {
-                    if host_path.exists() {
-                        let _ = std::fs::remove_file(host_path);
-                        tracing::info!(
-                            path = %host_path.display(),
-                            "Removed stale host CLI credentials"
-                        );
-                    }
-                }
-
-                // Force OAuth token refresh (bypasses local expiry check since
-                // the token was revoked server-side despite not being locally expired)
-                if let Err(e) = super::ai_providers::force_refresh_anthropic_oauth_token().await {
-                    tracing::warn!("OAuth refresh after auth error failed: {}", e);
-                }
+                super::mission_runner::refresh_claude_credentials_after_auth_error(
+                    &ctx.working_dir,
+                    "control_initial_auth_error",
+                )
+                .await;
 
                 // Retry with fresh credentials
+                result = Box::pin(super::mission_runner::run_claudecode_turn(
+                    exec_workspace,
+                    &ctx.working_dir,
+                    &effective_message,
+                    config.default_model.as_deref(),
+                    requested_model_effort.as_deref(),
+                    config.opencode_agent.as_deref(),
+                    mid,
+                    events_tx.clone(),
+                    cancel.clone(),
+                    None,
+                    &config.working_dir,
+                    effective_session_id.as_deref(),
+                    is_continuation,
+                    Some(tool_hub.clone()),
+                    Some(status.clone()),
+                    None,
+                ))
+                .await;
+            }
+
+            // Account rotation: if rate-limited, try alternate Anthropic credentials.
+            // The first entry in the list is the highest-priority credential, which
+            // is almost certainly what the initial (override_auth=None) call used.
+            // Skip it to avoid a guaranteed duplicate rate-limit failure.
+            let mut rotated_anthropic_account = false;
+            if result.terminal_reason == Some(TerminalReason::RateLimited) && !cancel.is_cancelled()
+            {
+                let rotation_accounts = super::mission_runner::anthropic_rotation_accounts(
+                    exec_workspace,
+                    &ctx.working_dir,
+                    &config.working_dir,
+                );
+                if !rotation_accounts.accounts.is_empty() {
+                    tracing::info!(
+                        mission_id = %mid,
+                        total_accounts = rotation_accounts.total_accounts,
+                        alternate_accounts = rotation_accounts.accounts.len(),
+                        skipped_current = rotation_accounts.skipped_current,
+                        "Rate limited on primary account; trying alternate Anthropic credentials"
+                    );
+                    for (idx, alt_auth) in rotation_accounts.accounts.into_iter().enumerate() {
+                        if cancel.is_cancelled() {
+                            break;
+                        }
+                        rotated_anthropic_account = true;
+                        tracing::info!(
+                            mission_id = %mid,
+                            rotation_attempt = idx + 1,
+                            auth_type = match &alt_auth {
+                                super::ai_providers::ClaudeCodeAuth::ApiKey(_) => "api_key",
+                                super::ai_providers::ClaudeCodeAuth::OAuthToken(_) =>
+                                    "oauth_token",
+                            },
+                            "Rotating to alternate Anthropic account"
+                        );
+                        result = Box::pin(super::mission_runner::run_claudecode_turn(
+                            exec_workspace,
+                            &ctx.working_dir,
+                            &effective_message,
+                            config.default_model.as_deref(),
+                            requested_model_effort.as_deref(),
+                            config.opencode_agent.as_deref(),
+                            mid,
+                            events_tx.clone(),
+                            cancel.clone(),
+                            None,
+                            &config.working_dir,
+                            effective_session_id.as_deref(),
+                            is_continuation,
+                            Some(tool_hub.clone()),
+                            Some(status.clone()),
+                            Some(alt_auth),
+                        ))
+                        .await;
+                        // Only continue rotating on rate-limit errors.
+                        match result.terminal_reason {
+                            Some(TerminalReason::RateLimited) => {
+                                tracing::info!(
+                                    mission_id = %mid,
+                                    rotation_attempt = idx + 1,
+                                    "Rate limited; rotating to next account"
+                                );
+                                continue;
+                            }
+                            _ => break,
+                        }
+                    }
+                }
+            }
+
+            // Account rotation can surface a revoked/expired alternate OAuth
+            // credential. Run the same stale-credential recovery after rotation
+            // so the mission retries with freshly refreshed host credentials
+            // instead of stopping on "Invalid authentication credentials".
+            if rotated_anthropic_account
+                && result.terminal_reason == Some(TerminalReason::AuthError)
+                && !cancel.is_cancelled()
+            {
+                tracing::warn!(
+                    mission_id = %mid,
+                    "Auth error detected after credential rotation - invalidating stale credentials and retrying"
+                );
+
+                super::mission_runner::refresh_claude_credentials_after_auth_error(
+                    &ctx.working_dir,
+                    "control_rotated_auth_error",
+                )
+                .await;
+
                 result = Box::pin(super::mission_runner::run_claudecode_turn(
                     exec_workspace,
                     &ctx.working_dir,
@@ -9000,6 +9464,30 @@ async fn run_single_control_turn(
                     &ctx.working_dir,
                     &convo,
                     Some(fallback_model),
+                    requested_model_effort.as_deref(),
+                    config.opencode_agent.as_deref(),
+                    mid,
+                    events_tx.clone(),
+                    cancel,
+                    &config.working_dir,
+                    session_id.as_deref(),
+                    None,
+                ))
+                .await;
+            } else if super::mission_runner::codex_tool_stall_should_retry_with_default_model(
+                requested_codex_model,
+                &result,
+            ) {
+                tracing::warn!(
+                    mission_id = %mid,
+                    requested_model = ?requested_codex_model,
+                    "Retrying Codex turn with CLI default model after generic GPT model stopped before tool use (control path)"
+                );
+                result = Box::pin(super::mission_runner::run_codex_turn(
+                    exec_workspace,
+                    &ctx.working_dir,
+                    &convo,
+                    None,
                     requested_model_effort.as_deref(),
                     config.opencode_agent.as_deref(),
                     mid,
@@ -13444,6 +13932,24 @@ And the report:
             Some("medium".to_string())
         );
         assert_eq!(normalize_model_effort("HIGH"), Some("high".to_string()));
+        assert_eq!(normalize_model_effort("xhigh"), Some("xhigh".to_string()));
+        assert_eq!(normalize_model_effort("MAX"), Some("max".to_string()));
+    }
+
+    #[test]
+    fn test_normalize_model_effort_for_backend_rejects_codex_max() {
+        assert_eq!(
+            normalize_model_effort_for_backend(Some("codex"), "high"),
+            Some("high".to_string())
+        );
+        assert_eq!(
+            normalize_model_effort_for_backend(Some("codex"), "max"),
+            None
+        );
+        assert_eq!(
+            normalize_model_effort_for_backend(Some("claudecode"), "max"),
+            Some("max".to_string())
+        );
     }
 
     #[test]
@@ -13467,8 +13973,8 @@ And the report:
             Some("gpt-5-codex".to_string())
         );
         assert_eq!(
-            normalize_model_override_for_backend(Some("claudecode"), "anthropic/claude-opus-4-6"),
-            Some("claude-opus-4-6".to_string())
+            normalize_model_override_for_backend(Some("claudecode"), "anthropic/claude-opus-4-7"),
+            Some("claude-opus-4-7".to_string())
         );
         assert_eq!(
             normalize_model_override_for_backend(Some("codex"), "   "),
@@ -14033,6 +14539,77 @@ Investigate <service/> failures.
             mission_status_for_terminal_reason(TerminalReason::TurnComplete, true),
             Some((MissionStatus::Completed, "completed"))
         );
+    }
+
+    #[test]
+    fn maybe_recover_soft_llm_error_does_not_recover_bare_internal_server_error() {
+        let mut result =
+            crate::agents::AgentResult::failure("Internal server error".to_string(), 0)
+                .with_terminal_reason(TerminalReason::LlmError);
+
+        maybe_recover_soft_llm_error(&mut result);
+
+        assert!(!result.success);
+        assert_eq!(result.terminal_reason, Some(TerminalReason::LlmError));
+    }
+
+    #[test]
+    fn maybe_recover_soft_llm_error_does_not_recover_structured_codex_model_error() {
+        let mut result = crate::agents::AgentResult::failure(
+            r#"{"detail":"The 'gpt-5-codex' model is not supported when using Codex with a ChatGPT account."}"#
+                .to_string(),
+            0,
+        )
+        .with_terminal_reason(TerminalReason::LlmError);
+
+        maybe_recover_soft_llm_error(&mut result);
+
+        assert!(!result.success);
+        assert_eq!(result.terminal_reason, Some(TerminalReason::LlmError));
+    }
+
+    #[test]
+    fn maybe_recover_soft_llm_error_does_not_recover_provider_payload_error() {
+        let mut result = crate::agents::AgentResult::failure(
+            "messages.13.content.88.image.source.base64.data: At least one of the image dimensions exceed max allowed size for many-image requests: 2000 pixels"
+                .to_string(),
+            0,
+        )
+        .with_terminal_reason(TerminalReason::LlmError);
+
+        maybe_recover_soft_llm_error(&mut result);
+
+        assert!(!result.success);
+        assert_eq!(result.terminal_reason, Some(TerminalReason::LlmError));
+    }
+
+    #[test]
+    fn maybe_recover_soft_llm_error_does_not_recover_codex_process_exit() {
+        let mut result = crate::agents::AgentResult::failure(
+            "Codex CLI exited before completing the turn (exit_status: signal: 9 (SIGKILL)). Stderr: <empty> | Stdout: <empty>"
+                .to_string(),
+            0,
+        )
+        .with_terminal_reason(TerminalReason::LlmError);
+
+        maybe_recover_soft_llm_error(&mut result);
+
+        assert!(!result.success);
+        assert_eq!(result.terminal_reason, Some(TerminalReason::LlmError));
+    }
+
+    #[test]
+    fn maybe_recover_soft_llm_error_recovers_substantive_output() {
+        let mut result = crate::agents::AgentResult::failure(
+            "I completed the implementation and verified the focused build.".to_string(),
+            0,
+        )
+        .with_terminal_reason(TerminalReason::LlmError);
+
+        maybe_recover_soft_llm_error(&mut result);
+
+        assert!(result.success);
+        assert_eq!(result.terminal_reason, Some(TerminalReason::TurnComplete));
     }
 
     #[tokio::test]

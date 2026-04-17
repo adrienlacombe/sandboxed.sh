@@ -33,11 +33,13 @@ export {
 // Missions
 export {
   type MissionStatus,
+  type ModelEffort,
   type MissionHistoryEntry,
   type DesktopSessionInfo,
   type Mission,
   type StoredEvent,
   type CreateMissionOptions,
+  type UpdateMissionSettingsOptions,
   type RunningMissionInfo,
   type MissionSearchResult,
   type MissionMomentSearchResult,
@@ -52,6 +54,7 @@ export {
   getRunningMissions,
   startMissionParallel,
   cancelMission,
+  updateMissionSettings,
   setMissionStatus,
   deleteMission,
   cleanupEmptyMissions,
