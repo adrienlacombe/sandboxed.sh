@@ -2801,12 +2801,17 @@ async fn run_mission_turn(
                 .await;
             }
 
-            // Account rotation: if rate-limited, try alternate Anthropic credentials.
+            // Account rotation: if rate-limited, or if auth still fails after
+            // one refresh attempt, try alternate Anthropic credentials.
             // The first entry in the list is the highest-priority credential, which
             // is almost certainly what the initial (override_auth=None) call used.
-            // Skip it to avoid a guaranteed duplicate rate-limit failure.
+            // Skip it to avoid a guaranteed duplicate failure.
             let mut rotated_anthropic_account = false;
-            if result.terminal_reason == Some(TerminalReason::RateLimited) {
+            if matches!(
+                result.terminal_reason,
+                Some(TerminalReason::RateLimited | TerminalReason::AuthError)
+            ) {
+                let rotation_reason = result.terminal_reason;
                 let rotation_accounts =
                     anthropic_rotation_accounts(&workspace, &mission_work_dir, &config.working_dir);
                 if !rotation_accounts.accounts.is_empty() {
@@ -2815,7 +2820,8 @@ async fn run_mission_turn(
                         total_accounts = rotation_accounts.total_accounts,
                         alternate_accounts = rotation_accounts.accounts.len(),
                         skipped_current = rotation_accounts.skipped_current,
-                        "Rate limited on primary account; trying alternate credentials"
+                        ?rotation_reason,
+                        "Primary Anthropic credential failed; trying alternate credentials"
                     );
                     for (idx, alt_auth) in rotation_accounts.accounts.into_iter().enumerate() {
                         if cancel.is_cancelled() {
@@ -2850,16 +2856,17 @@ async fn run_mission_turn(
                             Some(alt_auth),
                         )
                         .await;
-                        // Only continue rotating on rate-limit errors.
-                        // Non-rate-limit LLM errors (model errors, context
-                        // limit, etc.) would fail on every account, so stop
-                        // early to avoid masking the real failure.
+                        // Continue rotating on account-specific failures.
+                        // Other LLM errors (model errors, context limit, etc.)
+                        // would fail on every account, so stop early to avoid
+                        // masking the real failure.
                         match result.terminal_reason {
-                            Some(TerminalReason::RateLimited) => {
+                            Some(TerminalReason::RateLimited | TerminalReason::AuthError) => {
                                 tracing::info!(
                                     mission_id = %mission_id,
                                     rotation_attempt = idx + 1,
-                                    "Rate limited; rotating to next account"
+                                    ?result.terminal_reason,
+                                    "Anthropic credential failed; rotating to next account"
                                 );
                                 continue;
                             }
@@ -3416,9 +3423,10 @@ pub fn run_claudecode_turn<'a>(
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = AgentResult> + Send + 'a>> {
     Box::pin(async move {
         use super::ai_providers::{
-            ensure_anthropic_oauth_token_valid, get_anthropic_auth_for_claudecode,
-            get_anthropic_auth_from_host_with_expiry, get_anthropic_auth_from_workspace,
-            get_workspace_auth_path, refresh_workspace_anthropic_auth, ClaudeCodeAuth,
+            anthropic_cli_proxy_account_available, ensure_anthropic_oauth_token_valid,
+            get_anthropic_auth_for_claudecode, get_anthropic_auth_from_host_with_expiry,
+            get_anthropic_auth_from_workspace, get_workspace_auth_path,
+            refresh_workspace_anthropic_auth, ClaudeCodeAuth,
         };
         use std::collections::HashMap;
         use tokio::time::{Duration, Instant};
@@ -3442,6 +3450,43 @@ pub fn run_claudecode_turn<'a>(
             } else {
                 ClaudeCodeAuth::ApiKey(value)
             }
+        }
+
+        #[derive(Debug, Clone)]
+        struct ClaudeCodeProxyConfig {
+            base_url: String,
+            api_key: String,
+        }
+
+        fn claudecode_cli_proxy_config() -> Option<ClaudeCodeProxyConfig> {
+            // Only fall back to the CLI proxy when it is actually configured —
+            // either via explicit env vars or a fresh CLI-proxy-api account.
+            // Without this gate we would hijack any ANTHROPIC_* setup on hosts
+            // that never opted into the proxy and inject the synthetic key.
+            if !anthropic_cli_proxy_account_available() {
+                return None;
+            }
+
+            // Note: ANTHROPIC_BASE_URL is intentionally *not* consulted here;
+            // it is a standard Anthropic SDK variable and users set it for
+            // unrelated API proxies. The aliases used here are the same ones
+            // listed in `util::CLI_PROXY_BASE_URL_ENV_VARS` so every CLI-proxy
+            // code path agrees.
+            let base_url = crate::util::cli_proxy_base_url_from_env()
+                .unwrap_or_else(|| "http://127.0.0.1:8317".to_string());
+            let base_url = base_url.trim_end_matches('/').to_string();
+            if base_url.is_empty() {
+                return None;
+            }
+
+            // The CLI Proxy API commonly runs unauthenticated on localhost, but
+            // Claude Code still requires a non-empty ANTHROPIC_API_KEY when an
+            // Anthropic base URL is configured. If the proxy needs auth, pass
+            // through the configured proxy key; otherwise use an inert value.
+            let api_key = crate::util::cli_proxy_api_key_from_env()
+                .unwrap_or_else(|| "sandboxed-sh-cli-proxy".to_string());
+
+            Some(ClaudeCodeProxyConfig { base_url, api_key })
         }
 
         fn claude_cli_credentials_info(path: &std::path::Path) -> Option<(i64, bool)> {
@@ -3673,11 +3718,27 @@ pub fn run_claudecode_turn<'a>(
             );
         }
 
+        let proxy_auth = if !using_override_auth && !has_cli_creds {
+            let config = claudecode_cli_proxy_config();
+            if let Some(ref proxy) = config {
+                tracing::info!(
+                    mission_id = %mission_id,
+                    base_url = %proxy.base_url,
+                    "Using Claude Code via CLI Proxy API fallback"
+                );
+            }
+            config
+        } else {
+            None
+        };
+
         // Only refresh OpenCode/Anthropic OAuth tokens if we plan to inject them.
-        let oauth_refresh_result = if has_cli_creds {
+        let oauth_refresh_result = if has_cli_creds || proxy_auth.is_some() {
             tracing::info!(
                 mission_id = %mission_id,
-                "Using Claude CLI credentials for mission; skipping OAuth refresh injection"
+                has_cli_creds = has_cli_creds,
+                using_cli_proxy = proxy_auth.is_some(),
+                "Using non-OAuth-refresh Claude Code auth path; skipping OAuth refresh injection"
             );
             Ok(())
         } else {
@@ -3707,13 +3768,15 @@ pub fn run_claudecode_turn<'a>(
                 "Using override credential for account rotation"
             );
             Some(auth)
-        } else
-        // Try to get API key/OAuth token from Anthropic provider configured for Claude Code backend.
-        // For container workspaces, compare workspace auth vs host auth and use the fresher one.
-        // If workspace auth is expired, try to refresh it using the refresh token.
-        if has_cli_creds {
+        } else if proxy_auth.is_some() || has_cli_creds {
+            // CLI-proxy runs get credentials injected via `proxy_auth` env vars,
+            // and CLI credentials come from the mirrored `.credentials.json`.
+            // Either way, there's nothing to select here.
             None
         } else {
+            // Try to get API key/OAuth token from Anthropic provider configured for Claude Code backend.
+            // For container workspaces, compare workspace auth vs host auth and use the fresher one.
+            // If workspace auth is expired, try to refresh it using the refresh token.
             // For container workspaces, get both workspace and host auth with expiry info
             let mut workspace_auth = if workspace.workspace_type == WorkspaceType::Container {
                 get_anthropic_auth_from_workspace(&workspace.path)
@@ -3877,7 +3940,7 @@ pub fn run_claudecode_turn<'a>(
         // Fail fast only if neither:
         // - Claude CLI credentials are available (copied into the mission directory), nor
         // - We have explicit API auth to inject via env vars.
-        if api_auth.is_none() && !has_cli_creds {
+        if api_auth.is_none() && !has_cli_creds && proxy_auth.is_none() {
             let err_msg = "No Claude Code credentials detected. Either run `claude /login` on the host, or authenticate in Settings → AI Providers / set CLAUDE_CODE_OAUTH_TOKEN/ANTHROPIC_API_KEY.";
             tracing::warn!(mission_id = %mission_id, "{}", err_msg);
             return AgentResult::failure(err_msg.to_string(), 0)
@@ -3917,10 +3980,16 @@ pub fn run_claudecode_turn<'a>(
             };
 
         // Proactive network connectivity check - fail fast if API is unreachable
-        // This catches DNS/network issues immediately instead of waiting for a timeout
-        if let Err(err_msg) = check_claudecode_connectivity(&workspace_exec, work_dir).await {
-            tracing::error!(mission_id = %mission_id, "{}", err_msg);
-            return AgentResult::failure(err_msg, 0).with_terminal_reason(TerminalReason::LlmError);
+        // This catches DNS/network issues immediately instead of waiting for a timeout.
+        // When the CLI proxy is the auth source, skip this probe: it hits
+        // `api.anthropic.com` directly, and environments that rely on the CLI
+        // proxy may intentionally block direct Anthropic egress.
+        if proxy_auth.is_none() {
+            if let Err(err_msg) = check_claudecode_connectivity(&workspace_exec, work_dir).await {
+                tracing::error!(mission_id = %mission_id, "{}", err_msg);
+                return AgentResult::failure(err_msg, 0)
+                    .with_terminal_reason(TerminalReason::LlmError);
+            }
         }
 
         tracing::info!(
@@ -4224,7 +4293,15 @@ pub fn run_claudecode_turn<'a>(
         env.insert("NO_COLOR".to_string(), "1".to_string());
         env.insert("GH_PROMPT_DISABLED".to_string(), "1".to_string());
 
-        if let Some(ref auth) = api_auth {
+        if let Some(ref proxy) = proxy_auth {
+            env.insert("ANTHROPIC_BASE_URL".to_string(), proxy.base_url.clone());
+            env.insert("ANTHROPIC_API_KEY".to_string(), proxy.api_key.clone());
+            tracing::info!(
+                mission_id = %mission_id,
+                base_url = %proxy.base_url,
+                "Injecting Claude Code CLI Proxy API environment"
+            );
+        } else if let Some(ref auth) = api_auth {
             match auth {
                 ClaudeCodeAuth::OAuthToken(token) => {
                     env.insert("CLAUDE_CODE_OAUTH_TOKEN".to_string(), token.clone());
@@ -12732,6 +12809,19 @@ fn codex_turn_requires_tool_activity(user_message: &str, assistant_message: &str
         return true;
     }
 
+    // Advisory prompts ("how do I run tests?", "explain what cargo does")
+    // contain verbs like "run" or "test" but don't ask us to execute them.
+    // If we classified those as tool-required, a perfectly good text-only
+    // answer from Codex would get converted into a `Stalled` failure.
+    //
+    // Mixed prompts like "How do I run these tests? Please run them and
+    // fix failures." still request execution; the advisory heuristic
+    // must not bypass the imperative half. Only short-circuit when no
+    // explicit imperative follow-up is present.
+    if user_looks_advisory(&user) && !user_has_imperative_execution_request(&user) {
+        return false;
+    }
+
     let explicit_tool_markers = [
         "```bash",
         "shell command",
@@ -12806,6 +12896,102 @@ fn codex_turn_requires_tool_activity(user_message: &str, assistant_message: &str
         .iter()
         .any(|action| contains_ascii_word(&user, action))
         && object_markers.iter().any(|object| user.contains(object))
+}
+
+/// Does the user message read as a question or request-for-explanation,
+/// rather than an imperative "go do this"? Used to suppress the
+/// `explicit_tool_markers` heuristic so advisory questions that mention
+/// common verbs ("how do I run tests", "explain cargo") don't get
+/// mis-classified as tool-required.
+fn user_looks_advisory(user_lower: &str) -> bool {
+    let trimmed = user_lower.trim_start();
+    const ADVISORY_PREFIXES: &[&str] = &[
+        "how do i ",
+        "how do you ",
+        "how to ",
+        "how can i ",
+        "how does ",
+        "how should ",
+        "how would ",
+        "how is ",
+        "how are ",
+        "what is ",
+        "what are ",
+        "what does ",
+        "what do ",
+        "what would ",
+        "what happens ",
+        "what's ",
+        "why does ",
+        "why is ",
+        "why are ",
+        "why do ",
+        "when should ",
+        "when does ",
+        "when do ",
+        "where does ",
+        "where is ",
+        "where are ",
+        "explain ",
+        "describe ",
+        "summarize ",
+        "tell me about ",
+        "tell me how ",
+        "tell me why ",
+        "can you explain ",
+        "can you describe ",
+        "could you explain ",
+        "would you explain ",
+    ];
+    ADVISORY_PREFIXES
+        .iter()
+        .any(|prefix| trimmed.starts_with(prefix))
+}
+
+/// Detects explicit imperative execution requests that override the
+/// advisory heuristic. Input is expected to be ASCII-lowercased.
+///
+/// Entries must be **unambiguous** — they should never match a purely
+/// explanatory question. Phrases like `run this` / `run it` are not
+/// safe to include (they appear inside questions such as "How do I
+/// run this locally?"); rely on explicit imperative framing
+/// (`please`, `actually`, `go ahead`, `then`, `now`) or on
+/// direct-object coupling with verbs that can't occur mid-question
+/// without being a command (`fix failures`, `apply the fix`).
+fn user_has_imperative_execution_request(user_lower: &str) -> bool {
+    const IMPERATIVE_PHRASES: &[&str] = &[
+        // Explicit politeness prefix — only present when the user is
+        // directing us to act.
+        "please run",
+        "please execute",
+        "please apply",
+        "please fix",
+        "please implement",
+        "please do ",
+        // "Actually" framing is also unambiguous: "actually run" only
+        // shows up as a follow-up command.
+        "actually run",
+        "actually execute",
+        "go ahead and ",
+        // Sequencing markers — if the user says "then run" or "now
+        // run" after a question, they're asking us to do it next.
+        "then run",
+        "then execute",
+        "now run",
+        "now execute",
+        "and run them",
+        "and execute them",
+        "and fix",
+        // Direct-object phrases that don't fit neatly inside an
+        // advisory question.
+        "run the tests",
+        "fix failures",
+        "fix the failures",
+        "apply the fix",
+    ];
+    IMPERATIVE_PHRASES
+        .iter()
+        .any(|phrase| user_lower.contains(phrase))
 }
 
 fn codex_final_message_looks_like_progress_update(assistant_message: &str) -> bool {
@@ -13194,8 +13380,11 @@ pub async fn run_codex_turn(
     if lower_final.contains("does not exist or you do not have access")
         || lower_final.contains("model_not_found")
     {
-        final_message.push_str("\n\nTry model `gpt-5.4` or `gpt-5-codex` for Codex missions.");
-        if matches!(model, Some("gpt-5.3-codex" | "gpt-5.4-codex")) {
+        final_message.push_str("\n\nTry model `gpt-5.5` or `gpt-5-codex` for Codex missions.");
+        if matches!(
+            model,
+            Some("gpt-5.3-codex" | "gpt-5.4-codex" | "gpt-5.5-codex")
+        ) {
             final_message.push_str(
                 "\n\nIf you expected this Codex model to work, your Codex CLI may be outdated. \
 Update it to the latest version (`npm install -g @openai/codex@latest`) and retry.",
@@ -14027,6 +14216,61 @@ mod tests {
         assert!(!codex_turn_requires_tool_activity(
             "How do I create a repository on GitHub?",
             "Here is how to create a repository on GitHub."
+        ));
+    }
+
+    #[test]
+    fn codex_turn_requires_tool_activity_allows_advisory_verbs() {
+        // User asks "how to run tests" — advisory, even though "run " appears.
+        assert!(!codex_turn_requires_tool_activity(
+            "How do I run the test suite locally?",
+            "You can invoke the test runner with cargo test."
+        ));
+        // "explain what X does" contains "debug"/"run" etc but is a Q.
+        assert!(!codex_turn_requires_tool_activity(
+            "Explain what cargo test does under the hood.",
+            "It compiles the crate in test mode and runs the harness."
+        ));
+        assert!(!codex_turn_requires_tool_activity(
+            "What happens when you run npm install in a monorepo?",
+            "It walks the package.json and installs the dependency graph."
+        ));
+    }
+
+    #[test]
+    fn codex_turn_requires_tool_activity_detects_imperative_follow_up_in_advisory_prompt() {
+        // Advisory question followed by an explicit imperative request.
+        // The short-circuit must NOT fire — the user is asking us to
+        // execute after explaining.
+        assert!(codex_turn_requires_tool_activity(
+            "How do I run these tests? Please run them and fix failures.",
+            "Here's how you would run them."
+        ));
+        assert!(codex_turn_requires_tool_activity(
+            "What is cargo test? Now run it and fix any failures.",
+            "cargo test runs the harness."
+        ));
+        // But a pure advisory prompt without imperative still short-circuits.
+        assert!(!codex_turn_requires_tool_activity(
+            "How do I run the test suite in this repo?",
+            "You would run cargo test from the crate root."
+        ));
+    }
+
+    #[test]
+    fn codex_turn_requires_tool_activity_does_not_fire_on_advisory_run_this_question() {
+        // Regression: `run this` used to be listed as an imperative
+        // override, which flipped plain advisory questions that happen
+        // to contain the substring ("How do I run this locally?") into
+        // tool-required and then Stalled a perfectly valid text-only
+        // answer. The imperative list must stay unambiguous.
+        assert!(!codex_turn_requires_tool_activity(
+            "How do I run this locally?",
+            "You can run it with `cargo run` from the crate root.",
+        ));
+        assert!(!codex_turn_requires_tool_activity(
+            "How can I execute this script on my machine?",
+            "Invoke it with `bash ./script.sh`.",
         ));
     }
 
