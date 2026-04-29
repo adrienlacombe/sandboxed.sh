@@ -23,7 +23,14 @@ struct ControlView: View {
     @State private var isLoading = true
     @State private var streamTask: Task<Void, Never>?
     @State private var showMissionMenu = false
-    @State private var shouldScrollToBottom = false
+    /// Monotonic counter — each increment is a request to scroll to the bottom.
+    /// Counter rather than a Bool because the conversation `ScrollView` is
+    /// conditionally mounted (only when `messages` is non-empty). A Bool flag
+    /// can get stuck `true` if it's set while the ScrollView is unmounted —
+    /// the resetter inside `.onChange` never runs, and subsequent re-arms to
+    /// `true` are no-ops because the value didn't change. A counter always
+    /// advances, so `.onChange` fires reliably on every request.
+    @State private var scrollToBottomTick = 0
     @State private var progress: ExecutionProgress?
     @State private var isAtBottom = true
     @State private var copiedMessageId: String?
@@ -35,6 +42,13 @@ struct ControlView: View {
     @State private var hasMoreHistory = false
     @State private var isLoadingEarlier = false
     @State private var loadedEventCount = 0  // How many events we've loaded so far
+
+    /// Per-mission high-water mark for `sequence`. When non-nil, reload paths
+    /// pass it as `since_seq` to `/events` so the server returns only the tail
+    /// that arrived while we were disconnected, not the whole history. Seeded
+    /// from the `X-Max-Sequence` response header — backends that don't set the
+    /// header leave this `nil` and callers fall back to full reload.
+    @State private var missionMaxSeq: [String: Int64] = [:]
 
     // Cached grouped items (recomputed only when messages change)
     @State private var groupedItems: [GroupedChatItem] = []
@@ -388,9 +402,6 @@ struct ControlView: View {
         .onChange(of: viewingMissionId) { _, newId in
             UserDefaults.standard.set(newId, forKey: Self.lastMissionIdKey)
         }
-        .onChange(of: showThoughts) { _, _ in
-            recomputeGroupedItems()
-        }
         .onChange(of: inputText) { _, newText in
             // Debounced save: persist draft after 1 second of inactivity
             draftSaveTask?.cancel()
@@ -572,155 +583,180 @@ struct ControlView: View {
     
     private var messagesView: some View {
         ZStack(alignment: .bottom) {
-            ScrollViewReader { proxy in
-                ScrollView {
-                    LazyVStack(spacing: 20) {
-                        // "Load earlier messages" button when history is truncated
-                        if hasMoreHistory {
-                            Button {
-                                Task { await loadEarlierMessages() }
-                            } label: {
-                                HStack(spacing: 6) {
-                                    if isLoadingEarlier {
-                                        ProgressView()
-                                            .controlSize(.small)
-                                            .tint(Theme.accent)
-                                    } else {
-                                        Image(systemName: "arrow.up.circle")
-                                    }
-                                    Text("Load earlier messages")
-                                }
-                                .font(.subheadline.weight(.medium))
-                                .foregroundStyle(Theme.accent)
-                                .frame(maxWidth: .infinity)
-                                .padding(.vertical, 12)
-                                .background(Theme.accent.opacity(0.08))
-                                .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-                            }
-                            .disabled(isLoadingEarlier)
-                        }
+            // Mount the ScrollView only once we have content. ScrollView's
+            // `.defaultScrollAnchor(.bottom)` only takes effect on initial
+            // layout — mounting it with empty content would make the anchor a
+            // no-op once messages stream in, and we'd have to chase the
+            // bottom with explicit scrollTo's. Holding the ScrollView until
+            // `messages` is non-empty means its very first layout already has
+            // the conversation in it, so the bottom anchor lands the user at
+            // the most recent message naturally with no animation, no race.
+            if messages.isEmpty {
+                if isLoading {
+                    LoadingView(message: "Loading conversation...")
+                } else if viewingMissionIsRunning {
+                    agentWorkingIndicator
+                } else {
+                    emptyStateView
+                }
+            } else {
+                conversationScrollView
+            }
+        }
+    }
 
-                        if messages.isEmpty && !isLoading {
-                            // Show working indicator when this specific mission is running but no messages yet
-                            if viewingMissionIsRunning {
-                                agentWorkingIndicator
-                            } else {
-                                emptyStateView
-                            }
-                        } else if isLoading {
-                            LoadingView(message: "Loading conversation...")
-                                .frame(height: 200)
-                        } else {
-                            ForEach(groupedItems) { item in
-                                switch item {
-                                case .single(let message):
-                                    MessageBubble(
-                                        message: message,
-                                        isCopied: copiedMessageId == message.id,
-                                        onCopy: { copyMessage(message) }
-                                    )
-                                    .id(message.id)
-                                case .toolGroup(let groupId, let tools):
-                                    ToolGroupView(
-                                        groupId: groupId,
-                                        tools: tools,
-                                        expandedGroups: $expandedToolGroups
-                                    )
-                                    .id(item.id)
-                                }
-                            }
-
-                            // Show working indicator after messages when this mission is running but no active streaming item
-                            if viewingMissionIsRunning && !hasActiveStreamingItem {
-                                agentWorkingIndicator
-                            }
-                        }
-                        
-                        // Bottom anchor for scrolling past last message
-                        Color.clear
-                            .frame(height: 1)
-                            .id(bottomAnchorId)
-                    }
-                    .padding()
-                    .background(
-                        GeometryReader { geo in
-                            Color.clear.preference(
-                                key: ScrollOffsetPreferenceKey.self,
-                                value: geo.frame(in: .named("scroll")).maxY
-                            )
-                        }
-                    )
-                }
-                .defaultScrollAnchor(.bottom)
-                .coordinateSpace(name: "scroll")
-                .onPreferenceChange(ScrollOffsetPreferenceKey.self) { maxY in
-                    // Check if we're at the bottom (within 200 points for less flicker)
-                    isAtBottom = maxY < UIScreen.main.bounds.height + 200
-                }
-                .onTapGesture {
-                    // Dismiss keyboard when tapping on messages area
-                    isInputFocused = false
-                }
-                .onChange(of: messages.count) { _, _ in
-                    if let pendingFocusedMessageId {
-                        scheduleMessageFocusRetry(proxy: proxy, targetId: pendingFocusedMessageId)
-                    }
-                    // Only auto-scroll on message count change if we're at bottom AND not loading historical messages
-                    // This prevents the jarring animated scroll when loading cached/historical conversations
-                    if isAtBottom && !isLoadingHistory {
-                        scrollToBottom(proxy: proxy)
-                    }
-                }
-                .onChange(of: shouldScrollToBottom) { _, shouldScroll in
-                    if shouldScroll {
-                        scrollToBottom(proxy: proxy, immediate: shouldScrollImmediately)
-                        shouldScrollToBottom = false
-                        shouldScrollImmediately = false
-                    }
-                }
-                .onChange(of: pendingFocusedMessageId) { _, targetId in
-                    guard let targetId else { return }
-                    scheduleMessageFocusRetry(proxy: proxy, targetId: targetId)
-                }
-                .overlay(alignment: .bottom) {
-                    // Scroll to bottom button
-                    if !isAtBottom && !messages.isEmpty {
+    private var conversationScrollView: some View {
+        ScrollViewReader { proxy in
+            ScrollView {
+                LazyVStack(spacing: 20) {
+                    // "Load earlier messages" button when history is truncated
+                    if hasMoreHistory {
                         Button {
-                            withAnimation(.spring(duration: 0.3)) {
-                                proxy.scrollTo(bottomAnchorId, anchor: .bottom)
-                            }
-                            isAtBottom = true
+                            Task { await loadEarlierMessages() }
                         } label: {
-                            Image(systemName: "arrow.down")
-                                .font(.system(size: 14, weight: .semibold))
-                                .foregroundStyle(.white)
-                                .frame(width: 36, height: 36)
-                                .background(.ultraThinMaterial)
-                                .clipShape(Circle())
-                                .overlay(
-                                    Circle()
-                                        .stroke(Theme.border, lineWidth: 1)
-                                )
-                                .shadow(color: .black.opacity(0.2), radius: 8, y: 4)
+                            HStack(spacing: 6) {
+                                if isLoadingEarlier {
+                                    ProgressView()
+                                        .controlSize(.small)
+                                        .tint(Theme.accent)
+                                } else {
+                                    Image(systemName: "arrow.up.circle")
+                                }
+                                Text("Load earlier messages")
+                            }
+                            .font(.subheadline.weight(.medium))
+                            .foregroundStyle(Theme.accent)
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 12)
+                            .background(Theme.accent.opacity(0.08))
+                            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
                         }
-                        .padding(.bottom, 16)
-                        .transition(.scale.combined(with: .opacity))
+                        .disabled(isLoadingEarlier)
                     }
+
+                    ForEach(groupedItems) { item in
+                        switch item {
+                        case .single(let message):
+                            MessageBubble(
+                                message: message,
+                                isCopied: copiedMessageId == message.id,
+                                onCopy: { copyMessage(message) }
+                            )
+                            .id(message.id)
+                        case .toolGroup(let groupId, let tools):
+                            ToolGroupView(
+                                groupId: groupId,
+                                tools: tools,
+                                expandedGroups: $expandedToolGroups
+                            )
+                            .id(item.id)
+                        }
+                    }
+
+                    // Show working indicator after messages when this mission is running but no active streaming item
+                    if viewingMissionIsRunning && !hasActiveStreamingItem {
+                        agentWorkingIndicator
+                    }
+
+                    // Bottom anchor for scrolling past last message
+                    Color.clear
+                        .frame(height: 1)
+                        .id(bottomAnchorId)
+                }
+                .padding()
+                .background(
+                    GeometryReader { geo in
+                        Color.clear.preference(
+                            key: ScrollOffsetPreferenceKey.self,
+                            value: geo.frame(in: .named("scroll")).maxY
+                        )
+                    }
+                )
+            }
+            .defaultScrollAnchor(.bottom)
+            .coordinateSpace(name: "scroll")
+            .onPreferenceChange(ScrollOffsetPreferenceKey.self) { maxY in
+                // Check if we're at the bottom (within 200 points for less flicker)
+                isAtBottom = maxY < UIScreen.main.bounds.height + 200
+            }
+            .onTapGesture {
+                // Dismiss keyboard when tapping on messages area
+                isInputFocused = false
+            }
+            .onChange(of: messages.count) { _, _ in
+                if let pendingFocusedMessageId {
+                    scheduleMessageFocusRetry(proxy: proxy, targetId: pendingFocusedMessageId)
+                }
+                // Only auto-scroll on message count change if we're at bottom AND not loading historical messages
+                // This prevents the jarring animated scroll when loading cached/historical conversations
+                if isAtBottom && !isLoadingHistory {
+                    scrollToBottom(proxy: proxy)
+                }
+            }
+            .onChange(of: scrollToBottomTick) { _, _ in
+                let immediate = shouldScrollImmediately
+                shouldScrollImmediately = false
+                // Used when the ScrollView is already mounted and the
+                // mission's content has been swapped wholesale (mission
+                // switch from cache, "load earlier", etc.). The first
+                // mount-with-content case relies on `.defaultScrollAnchor`
+                // and skips this path entirely. We defer one frame so the
+                // LazyVStack has had a tick to lay out the new rows before
+                // measuring the anchor.
+                Task { @MainActor in
+                    try? await Task.sleep(nanoseconds: 16_000_000)
+                    scrollToBottom(proxy: proxy, immediate: immediate)
+                }
+            }
+            .onChange(of: pendingFocusedMessageId) { _, targetId in
+                guard let targetId else { return }
+                scheduleMessageFocusRetry(proxy: proxy, targetId: targetId)
+            }
+            .overlay(alignment: .bottom) {
+                // Scroll to bottom button
+                if !isAtBottom && !messages.isEmpty {
+                    Button {
+                        withAnimation(.spring(duration: 0.3)) {
+                            proxy.scrollTo(bottomAnchorId, anchor: .bottom)
+                        }
+                        isAtBottom = true
+                    } label: {
+                        Image(systemName: "arrow.down")
+                            .font(.system(size: 14, weight: .semibold))
+                            .foregroundStyle(.white)
+                            .frame(width: 36, height: 36)
+                            .background(.ultraThinMaterial)
+                            .clipShape(Circle())
+                            .overlay(
+                                Circle()
+                                    .stroke(Theme.border, lineWidth: 1)
+                            )
+                            .shadow(color: .black.opacity(0.2), radius: 8, y: 4)
+                    }
+                    .padding(.bottom, 16)
+                    .transition(.scale.combined(with: .opacity))
                 }
             }
         }
     }
     
     private var hasActiveStreamingItem: Bool {
+        // Thinking messages don't render in the main content pane any more
+        // (they live exclusively in the thoughts sheet), so a live thinking
+        // event isn't a "visible streaming item". Without this exclusion the
+        // "Agent is working…" indicator would be suppressed while the agent
+        // is thinking, leaving the main pane silent.
         messages.contains { msg in
-            (msg.isThinking && !msg.thinkingDone) || msg.isPhase || (msg.isToolCall && msg.isActiveToolCall)
+            msg.isPhase || (msg.isToolCall && msg.isActiveToolCall)
         }
     }
 
     // MARK: - Message Grouping
 
-    /// Groups consecutive tool calls together for collapsed display (like dashboard)
-    private static func buildGroupedItems(from messages: [ChatMessage], showThoughts: Bool) -> [GroupedChatItem] {
+    /// Groups consecutive tool calls together for collapsed display (like dashboard).
+    /// Thinking messages are always elided here — they live in the thoughts sheet
+    /// only. Showing them inline duplicated the same content twice on screen.
+    private static func buildGroupedItems(from messages: [ChatMessage]) -> [GroupedChatItem] {
         var result: [GroupedChatItem] = []
         var currentToolGroup: [ChatMessage] = []
 
@@ -736,8 +772,8 @@ struct ControlView: View {
         }
 
         for message in messages {
-            // Skip thinking messages when thoughts panel is open (they're shown in the panel)
-            if message.isThinking && showThoughts {
+            // Thinking renders only in the thoughts sheet, never in the main pane.
+            if message.isThinking {
                 flushToolGroup()
                 continue
             }
@@ -758,7 +794,7 @@ struct ControlView: View {
     }
 
     private func recomputeGroupedItems() {
-        groupedItems = Self.buildGroupedItems(from: messages, showThoughts: showThoughts)
+        groupedItems = Self.buildGroupedItems(from: messages)
     }
 
     /// Check if the currently viewed mission is running (not just any mission)
@@ -1055,7 +1091,7 @@ struct ControlView: View {
     }
 
     private func applyViewingMission(_ mission: Mission, scrollToBottom: Bool = true) {
-        isLoadingHistory = true  // Prevent animated scroll during history load
+        isLoadingHistory = true  // Suppress animated auto-scroll during history load
 
         viewingMission = mission
         viewingMissionId = mission.id
@@ -1072,20 +1108,15 @@ struct ControlView: View {
 
         if scrollToBottom {
             shouldScrollImmediately = true
-            shouldScrollToBottom = true
+            scrollToBottomTick += 1
         }
-
-        // Reset flag after SwiftUI has processed the state change
-        Task { @MainActor in
-            try? await Task.sleep(nanoseconds: 100_000_000) // 100ms
-            isLoadingHistory = false
-        }
+        clearLoadingHistoryAfterRender()
     }
 
     private static let initialEventLimit = 50
 
     private func applyViewingMissionWithEvents(_ mission: Mission, events: [StoredEvent], scrollToBottom: Bool = true) {
-        isLoadingHistory = true  // Prevent animated scroll during history load
+        isLoadingHistory = true  // Suppress animated auto-scroll during history load
 
         viewingMission = mission
         viewingMissionId = mission.id
@@ -1137,14 +1168,60 @@ struct ControlView: View {
 
         if scrollToBottom {
             shouldScrollImmediately = true
-            shouldScrollToBottom = true
+            scrollToBottomTick += 1
         }
+        clearLoadingHistoryAfterRender()
+    }
 
-        // Reset flag after SwiftUI has processed the state change
+    /// Clear `isLoadingHistory` on the next runloop tick. Setting it to `false`
+    /// in the same synchronous block where it was set to `true` would coalesce
+    /// into a single observed value, defeating the `messages.count` onChange
+    /// guard that is supposed to suppress an animated auto-scroll during
+    /// content replacement. Deferring lets the count-change handler observe
+    /// `isLoadingHistory == true`, after which the explicit scroll path wins.
+    private func clearLoadingHistoryAfterRender() {
         Task { @MainActor in
-            try? await Task.sleep(nanoseconds: 100_000_000) // 100ms
+            try? await Task.sleep(nanoseconds: 16_000_000)
             isLoadingHistory = false
         }
+    }
+
+    /// Append delta events to the existing conversation without clearing.
+    ///
+    /// Used by the SSE-reconnect / scene-phase-active resume path: the server
+    /// returns only events with `sequence > knownMaxSeq`, so they must be
+    /// appended (not replayed-from-empty). Each event is fed through
+    /// `handleStreamEvent` as a historical replay — the request includes
+    /// `text_delta` events, so without the historical flag the live-only
+    /// `upsertStreamingFallbackThought` path would synthesize duplicate
+    /// thinking content from already-finalized text. Per-id dedup guards on
+    /// `user_message`, `assistant_message`, and `tool_call` further protect
+    /// against overlap with events we already rendered live.
+    private func applyDeltaEvents(_ events: [StoredEvent]) {
+        guard !events.isEmpty else { return }
+
+        let orderedEvents = events.sorted { lhs, rhs in
+            if lhs.sequence != rhs.sequence { return lhs.sequence < rhs.sequence }
+            if lhs.timestamp != rhs.timestamp { return lhs.timestamp < rhs.timestamp }
+            return lhs.id < rhs.id
+        }
+
+        for event in orderedEvents {
+            var data: [String: Any] = [:]
+            for (key, value) in event.metadata {
+                data[key] = value.value
+            }
+            data["mission_id"] = event.missionId
+            data["content"] = event.content
+            if let eventId = event.eventId { data["id"] = eventId }
+            if let toolCallId = event.toolCallId { data["tool_call_id"] = toolCallId }
+            if let toolName = event.toolName { data["name"] = toolName }
+
+            handleStreamEvent(type: event.eventType, data: data, isHistoricalReplay: true)
+        }
+
+        loadedEventCount += orderedEvents.count
+        recomputeGroupedItems()
     }
 
     private func loadCurrentMission(updateViewing: Bool) async {
@@ -1174,7 +1251,8 @@ struct ControlView: View {
                 if updateViewing || viewingMissionId == nil || viewingMissionId == mission.id {
                     do {
                         let eventTypes = ["user_message", "assistant_message", "tool_call", "tool_result", "text_delta", "thinking"]
-                        let events = try await api.getMissionEvents(id: mission.id, types: eventTypes, limit: Self.initialEventLimit, latest: true)
+                        let result = try await api.getMissionEventsWithMeta(id: mission.id, types: eventTypes, limit: Self.initialEventLimit, latest: true)
+                        let events = result.events
 
                         if events.isEmpty {
                             // Clear stale cache when events are empty
@@ -1183,6 +1261,12 @@ struct ControlView: View {
                         } else {
                             hasMoreHistory = events.count >= Self.initialEventLimit
                             applyViewingMissionWithEvents(mission, events: events)
+                            // Seed delta cursor only when the backend advertises support
+                            // via X-Max-Sequence — otherwise a delta call would be
+                            // ignored and return offset=0 rows.
+                            if let maxSeq = result.maxSequence, maxSeq > 0 {
+                                missionMaxSeq[mission.id] = maxSeq
+                            }
                             // Update cache with fresh data
                             cacheMissionWithEvents(mission, events: events)
                         }
@@ -1244,7 +1328,8 @@ struct ControlView: View {
             // Try to fetch full event history (optional - fall back to basic history if it fails)
             do {
                 // Fetch all relevant event types including thinking events (matching web dashboard behavior)
-                let events = try await api.getMissionEvents(id: id, types: historyEventTypes, limit: Self.initialEventLimit, latest: true)
+                let result = try await api.getMissionEventsWithMeta(id: id, types: historyEventTypes, limit: Self.initialEventLimit, latest: true)
+                let events = result.events
 
                 // Race condition guard after the second await
                 guard fetchingMissionId == id else {
@@ -1258,6 +1343,9 @@ struct ControlView: View {
                 } else {
                     hasMoreHistory = events.count >= Self.initialEventLimit
                     applyViewingMissionWithEvents(mission, events: events)
+                    if let maxSeq = result.maxSequence, maxSeq > 0 {
+                        missionMaxSeq[id] = maxSeq
+                    }
                     // Cache the mission with events for next time
                     cacheMissionWithEvents(mission, events: events)
                 }
@@ -1327,41 +1415,136 @@ struct ControlView: View {
         }
     }
 
-    // Reload mission from server without showing loading state or cache
-    // Used when app becomes active to catch missed SSE events (like web's visibility change handler)
-    private func reloadMissionFromServer(id: String) async {
-        // Guard against race conditions - only apply if user is still viewing this mission
+    /// Hard cap on the number of events per delta page. Mirrors the web client.
+    private static let deltaResumePageLimit = 5000
+
+    /// Outcome of a `tryDeltaResume` attempt.
+    private enum DeltaResumeOutcome {
+        case applied      // backend supports resume, events applied, cursor advanced
+        case viewChanged  // user navigated away mid-request; nothing applied, no
+                          // fallback should run (the new view will refetch on its own)
+        case unsupported  // backend stripped `X-Max-Sequence` — cursor dropped
+        case noCursor     // no high-water mark recorded; nothing attempted
+        case failed       // network/server error; cursor untouched
+    }
+
+    /// Try to fetch and apply only the events that arrived after our recorded
+    /// high-water mark for this mission. Shared between `resumeMissionAfterReconnect`
+    /// (post SSE reconnect) and `reloadMissionFromServer` (post scene-phase active).
+    /// Caller is responsible for the fallback path when this returns anything
+    /// other than `.applied`.
+    private func tryDeltaResume(missionId id: String) async -> DeltaResumeOutcome {
+        guard let knownSeq = missionMaxSeq[id] else { return .noCursor }
+        do {
+            let result = try await api.getMissionEventsWithMeta(
+                id: id,
+                types: historyEventTypes,
+                limit: Self.deltaResumePageLimit,
+                sinceSeq: knownSeq
+            )
+            guard viewingMissionId == id else { return .viewChanged }
+            guard let maxSeq = result.maxSequence else {
+                // Backend stripped `X-Max-Sequence` — drop the cursor so the
+                // delta path is disabled until the next header-bearing fetch.
+                missionMaxSeq.removeValue(forKey: id)
+                return .unsupported
+            }
+            applyDeltaEvents(result.events)
+            // If the page was capped by the limit, advance the cursor to the
+            // largest sequence we actually saw so the next call resumes from
+            // there — otherwise we'd skip rows between this page and the
+            // true max. Use `max()` rather than `last`: the API contract is
+            // ASC-by-sequence but defensive callers shouldn't trust input
+            // ordering.
+            let pageMax = result.events.map { $0.sequence }.max() ?? knownSeq
+            let cursor = (result.events.count >= Self.deltaResumePageLimit && pageMax < maxSeq) ? pageMax : maxSeq
+            missionMaxSeq[id] = cursor
+            return .applied
+        } catch {
+            print("Delta resume failed: \(error)")
+            return .failed
+        }
+    }
+
+    // Reload mission from server without showing loading state or cache.
+    // Called when the scene becomes active to catch missed SSE events (mirrors
+    // the web's visibility-change handler). Prefers the `since_seq` delta path
+    // when supported; falls back to a tail reload only when no high-water mark
+    // is recorded for this mission yet. `skipDeltaAttempt=true` is used by
+    // callers that just tried delta and got `.failed` — no point hammering
+    // the same flaky network for the same answer twice.
+    private func reloadMissionFromServer(id: String, skipDeltaAttempt: Bool = false) async {
         guard viewingMissionId == id else { return }
 
         do {
             let mission = try await api.getMission(id: id)
-
-            // Check again after async operation
             guard viewingMissionId == id else { return }
 
-            // Update current mission if it matches
             if currentMission?.id == mission.id {
                 currentMission = mission
             }
 
-            // Fetch events to get the updated history (use pagination if we haven't loaded full history)
+            if !skipDeltaAttempt {
+                switch await tryDeltaResume(missionId: id) {
+                case .applied, .viewChanged:
+                    return
+                case .noCursor, .unsupported, .failed:
+                    break  // fall through to full tail reload below
+                }
+            }
+
+            // Fallback / first-time path: fetch the recent tail. Distinguish
+            // a *failed* fetch (network/server error) from a *successful but
+            // empty* response. On failure we keep the currently rendered
+            // conversation — silently downgrading to `applyViewingMission`
+            // (which uses the basic `mission.history` payload) would erase
+            // the event-rendered chat under flaky networks. On empty we
+            // clear the cache and fall back, since the mission really does
+            // have no events.
             let limit = hasMoreHistory ? Self.initialEventLimit : nil
             let latest = hasMoreHistory
-            if let events = try? await api.getMissionEvents(id: id, types: historyEventTypes, limit: limit, latest: latest), !events.isEmpty {
-                // Final check before applying
+            do {
+                let result = try await api.getMissionEventsWithMeta(id: id, types: historyEventTypes, limit: limit, latest: latest)
                 guard viewingMissionId == id else { return }
-                applyViewingMissionWithEvents(mission, events: events, scrollToBottom: false)
-                // Update cache with fresh data
-                cacheMissionWithEvents(mission, events: events)
-            } else {
-                // Final check before applying
-                guard viewingMissionId == id else { return }
-                // Clear stale cache when events are empty or fetch fails to prevent visual flashing
-                removeMissionFromCache(mission.id)
-                applyViewingMission(mission, scrollToBottom: false)
+                if result.events.isEmpty {
+                    removeMissionFromCache(mission.id)
+                    applyViewingMission(mission, scrollToBottom: false)
+                } else {
+                    applyViewingMissionWithEvents(mission, events: result.events, scrollToBottom: false)
+                    if let maxSeq = result.maxSequence, maxSeq > 0 {
+                        missionMaxSeq[id] = maxSeq
+                    }
+                    cacheMissionWithEvents(mission, events: result.events)
+                }
+            } catch {
+                // Tail fetch failed — keep the existing rendered conversation.
+                // SSE will deliver any new events; next active/visible cycle
+                // will retry the fetch.
+                print("Tail reload fetch failed, keeping current view: \(error)")
             }
         } catch {
             print("Failed to reload mission from server: \(error)")
+        }
+    }
+
+    /// Resume a viewing mission after an SSE reconnect. Same delta-first logic
+    /// as `reloadMissionFromServer` but without the mission-metadata refetch
+    /// (the SSE stream itself will deliver any metadata changes). Keeps the
+    /// reconnect catch-up fast even on missions with thousands of events.
+    private func resumeMissionAfterReconnect(id: String) async {
+        guard viewingMissionId == id else { return }
+        switch await tryDeltaResume(missionId: id) {
+        case .applied, .viewChanged:
+            return
+        case .noCursor, .unsupported:
+            // Cursor wasn't usable — fall back to a tail reload. Skip its
+            // delta retry since the cursor state is what just told us the
+            // delta path isn't available right now.
+            await reloadMissionFromServer(id: id, skipDeltaAttempt: true)
+        case .failed:
+            // Transient network/server error — same skip rationale, plus
+            // avoid hammering a flaky connection with the identical request.
+            await reloadMissionFromServer(id: id, skipDeltaAttempt: true)
         }
     }
 
@@ -1723,7 +1906,7 @@ struct ControlView: View {
         let tempMessage = ChatMessage(id: tempId, type: .user, content: content)
         messages.append(tempMessage)
         recomputeGroupedItems()
-        shouldScrollToBottom = true
+        scrollToBottomTick += 1
 
         Task { @MainActor in
             do {
@@ -1842,21 +2025,14 @@ struct ControlView: View {
                                 self.connectionState = .connected
                                 self.reconnectAttempt = 0
 
-                                // If we just reconnected, refresh the viewed mission's history to catch missed events
+                                // Just reconnected — catch up on events we missed while disconnected.
+                                // Prefer the delta path (since_seq) when the backend supports it
+                                // and we have a high-water mark for this mission. Falls back to a
+                                // full reload only if the backend doesn't advertise X-Max-Sequence
+                                // or we never recorded a cursor for this mission.
                                 if wasReconnecting, let viewingId = self.viewingMissionId {
                                     Task {
-                                        do {
-                                            let mission = try await self.api.getMission(id: viewingId)
-                                            let events = try await self.api.getMissionEvents(
-                                                id: viewingId,
-                                                types: self.historyEventTypes
-                                            )
-                                            await MainActor.run {
-                                                self.applyViewingMissionWithEvents(mission, events: events)
-                                            }
-                                        } catch {
-                                            // Ignore errors - we'll get updates via stream
-                                        }
+                                        await self.resumeMissionAfterReconnect(id: viewingId)
                                     }
                                 }
                             }
@@ -1996,10 +2172,16 @@ struct ControlView: View {
             }
 
             // Fetch full event history to avoid partial history rendering.
-            if let events = try? await api.getMissionEvents(id: id, types: historyEventTypes), !events.isEmpty {
+            // Use the meta variant so the `X-Max-Sequence` header seeds the
+            // delta-resume cursor — otherwise missions loaded via the switcher
+            // would always fall back to a full tail reload on reconnect.
+            if let result = try? await api.getMissionEventsWithMeta(id: id, types: historyEventTypes), !result.events.isEmpty {
                 guard fetchingMissionId == id else { return }
-                applyViewingMissionWithEvents(mission, events: events)
-                cacheMissionWithEvents(mission, events: events)
+                applyViewingMissionWithEvents(mission, events: result.events)
+                if let maxSeq = result.maxSequence, maxSeq > 0 {
+                    missionMaxSeq[id] = maxSeq
+                }
+                cacheMissionWithEvents(mission, events: result.events)
             } else {
                 guard fetchingMissionId == id else { return }
                 removeMissionFromCache(mission.id)
@@ -2229,6 +2411,9 @@ struct ControlView: View {
         case "assistant_message":
             if let content = data["content"] as? String,
                let id = data["id"] as? String {
+                // Skip if already present — historical replay or delta resume
+                // can re-deliver an assistant_message we already saw via SSE.
+                guard !messages.contains(where: { $0.id == id }) else { break }
                 let success = data["success"] as? Bool ?? true
                 let costObj = data["cost"] as? [String: Any]
                 let costCents = data["cost_cents"] as? Int
@@ -2370,6 +2555,13 @@ struct ControlView: View {
             if let toolCallId = data["tool_call_id"] as? String,
                let name = data["name"] as? String,
                let args = data["args"] as? [String: Any] {
+                // Skip if already present — historical replay or delta resume
+                // can re-deliver a tool_call we already saw via SSE. The
+                // per-row id depends on the path (toolUI vs toolCall), so
+                // check both forms.
+                if messages.contains(where: { $0.id == toolCallId || $0.id == "tool-\(toolCallId)" }) {
+                    break
+                }
                 finalizeActiveThinkingMessages()
                 // Parse UI tool calls
                 if let toolUI = ToolUIContent.parse(name: name, args: args) {
