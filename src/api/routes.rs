@@ -206,6 +206,34 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
     let settings = Arc::new(crate::settings::SettingsStore::new(&config.working_dir).await);
     settings.init_cached_values();
 
+    // Sweep orphaned command-task nspawn containers from a previous process lifetime.
+    // Containers are named task-{uuid} via --machine=, so machinectl can find them.
+    tokio::spawn(async {
+        match tokio::process::Command::new("machinectl")
+            .args(["list", "--no-legend", "--no-pager"])
+            .output()
+            .await
+        {
+            Ok(output) => {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                for line in stdout.lines() {
+                    if let Some(name) = line.split_whitespace().next() {
+                        if name.starts_with("task-") {
+                            tracing::warn!(machine = %name, "Terminating orphaned task container from previous process");
+                            let _ = tokio::process::Command::new("machinectl")
+                                .args(["terminate", name])
+                                .output()
+                                .await;
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::debug!("machinectl not available for orphan sweep: {}", e);
+            }
+        }
+    });
+
     // Initialize backend config store (persisted settings).
     // Probe each CLI binary so backends whose CLI is missing default to disabled.
     // Persisted configs are preserved — this only affects fresh installs or new backends.
@@ -1239,15 +1267,26 @@ async fn get_stats(
 async fn list_tasks(
     State(state): State<Arc<AppState>>,
     Extension(user): Extension<AuthUser>,
-) -> Json<Vec<TaskState>> {
+) -> Json<serde_json::Value> {
     let tasks = state.tasks.read().await;
-    let mut task_list: Vec<_> = tasks
+    let mut task_list: Vec<(Uuid, serde_json::Value)> = tasks
         .get(&user.id)
-        .map(|t| t.values().cloned().collect())
+        .map(|t| {
+            t.iter()
+                .filter_map(|(id, ts)| match serde_json::to_value(ts) {
+                    Ok(v) => Some((*id, v)),
+                    Err(e) => {
+                        tracing::error!("Failed to serialize task {}: {}", id, e);
+                        None
+                    }
+                })
+                .collect()
+        })
         .unwrap_or_default();
     // Sort by most recent first (by ID since UUIDs are time-ordered)
-    task_list.sort_by_key(|task| Reverse(task.id));
-    Json(task_list)
+    task_list.sort_by_key(|(id, _)| Reverse(*id));
+    let values: Vec<_> = task_list.into_iter().map(|(_, v)| v).collect();
+    Json(serde_json::Value::Array(values))
 }
 
 /// Stop a running task.
@@ -1261,6 +1300,11 @@ async fn stop_task(
 
     if let Some(task) = user_tasks.get_mut(&id) {
         if task.status == TaskStatus::Running {
+            // For command-mode tasks, fire the cancel channel so run_command_task
+            // can abort the child process cleanly via tokio::select!.
+            if let Some(tx) = task.cancel_tx.take() {
+                let _ = tx.send(());
+            }
             task.status = TaskStatus::Cancelled;
             task.result = Some("Task was cancelled by user".to_string());
             Ok(Json(serde_json::json!({
@@ -1278,6 +1322,362 @@ async fn stop_task(
     }
 }
 
+/// Maximum log entries per task. Prevents unbounded memory growth from verbose scripts.
+const LOG_MAX_ENTRIES: usize = 10_000;
+
+/// Maximum completed tasks to retain per user. Oldest are evicted first on completion.
+const MAX_COMPLETED_TASKS: usize = 500;
+
+/// Append a log entry to a task. Shared by agent-mode and command-mode paths.
+/// Silently drops entries beyond LOG_MAX_ENTRIES (with a sentinel at the cap).
+async fn append_log(
+    state: &Arc<AppState>,
+    user_id: &str,
+    task_id: Uuid,
+    entry_type: LogEntryType,
+    content: &str,
+) {
+    let timestamp = chrono::Utc::now().to_rfc3339();
+    let mut tasks = state.tasks.write().await;
+    if let Some(user_tasks) = tasks.get_mut(user_id) {
+        if let Some(task_state) = user_tasks.get_mut(&task_id) {
+            let len = task_state.log.len();
+            if len < LOG_MAX_ENTRIES {
+                task_state.log.push(TaskLogEntry {
+                    timestamp,
+                    entry_type,
+                    content: content.to_string(),
+                });
+            } else if len == LOG_MAX_ENTRIES {
+                task_state.log.push(TaskLogEntry {
+                    timestamp,
+                    entry_type: LogEntryType::Error,
+                    content: "[log truncated — 10,000 line limit reached]".to_string(),
+                });
+            }
+            // Beyond the cap: drop silently
+        }
+    }
+}
+
+/// Run a shell command as a background task inside a workspace container.
+#[allow(clippy::too_many_arguments)]
+async fn run_command_task(
+    state: Arc<AppState>,
+    user_id: String,
+    task_id: Uuid,
+    command: String,
+    workspace: crate::workspace::Workspace,
+    working_dir: Option<String>,
+    timeout: Option<std::time::Duration>,
+    cancel_rx: tokio::sync::oneshot::Receiver<()>,
+) {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+
+    // Check container readiness
+    if workspace.workspace_type == crate::workspace::WorkspaceType::Container
+        && workspace.status != crate::workspace::WorkspaceStatus::Ready
+    {
+        let msg = format!(
+            "Workspace '{}' is not ready (status: {:?}). Build it first.",
+            workspace.name, workspace.status
+        );
+        append_log(&state, &user_id, task_id, LogEntryType::Error, &msg).await;
+        let mut tasks = state.tasks.write().await;
+        if let Some(ut) = tasks.get_mut(&user_id) {
+            if let Some(ts) = ut.get_mut(&task_id) {
+                ts.status = TaskStatus::Failed;
+                ts.result = Some(msg);
+            }
+        }
+        return;
+    }
+
+    // Transition to Running
+    let task_start = chrono::Utc::now();
+    {
+        let mut tasks = state.tasks.write().await;
+        if let Some(ut) = tasks.get_mut(&user_id) {
+            if let Some(ts) = ut.get_mut(&task_id) {
+                ts.status = TaskStatus::Running;
+                ts.started_at = Some(task_start.to_rfc3339());
+            }
+        }
+    }
+    tracing::info!(
+        task_id = %task_id,
+        workspace = %workspace.name,
+        "Command task started"
+    );
+
+    // Claude auth for command tasks:
+    //
+    // Missions run claude on the HOST — it reads ~/.claude/.credentials.json on every API call
+    // and always sees the current token, even after the 15-min OAuth refresher rotates it.
+    //
+    // Command tasks run inside nspawn. Bind-mount the host credentials file read-only so
+    // claude CLI reads it on every call. The refresher rewrites the file in-place (same
+    // inode via std::fs::write), so the bind-ro always reflects the current token.
+    let (program, mut args) =
+        super::workspaces::build_nspawn_command(&workspace, &command, None, working_dir.as_deref());
+
+    // Give the nspawn process a unique machine name so orphaned processes (e.g. after
+    // a sandboxed restart mid-task) are identifiable by name and can be terminated:
+    //   machinectl terminate task-<uuid>
+    // Also insert the credentials bind-ro before the shell invocation.
+    // We insert before the last 3 args ("/bin/bash", "-c", command) to stay robust
+    // against future changes to the nspawn option list built by build_nspawn_command.
+    let insert_pos = args.len().saturating_sub(3);
+    args.insert(insert_pos, format!("--machine=task-{}", task_id));
+
+    let host_creds = std::path::Path::new("/root/.claude/.credentials.json");
+    if host_creds.exists() {
+        let container_creds_dir = workspace.path.join("root/.claude");
+        if !container_creds_dir.exists() {
+            if let Err(e) = std::fs::create_dir_all(&container_creds_dir) {
+                tracing::warn!(
+                    "Failed to create container .claude dir: {} — claude -p may fail",
+                    e
+                );
+            }
+        }
+        // Insert before the machine name (order doesn't matter to nspawn)
+        args.insert(
+            insert_pos,
+            "--bind-ro=/root/.claude/.credentials.json:/root/.claude/.credentials.json".to_string(),
+        );
+    } else {
+        tracing::warn!(
+            "No Claude credentials file at /root/.claude/.credentials.json — claude -p will fail"
+        );
+    }
+
+    let mut cmd = tokio::process::Command::new(&program);
+    cmd.args(&args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            let msg = format!("Failed to spawn command: {}", e);
+            append_log(&state, &user_id, task_id, LogEntryType::Error, &msg).await;
+            let task_end = chrono::Utc::now();
+            let mut tasks = state.tasks.write().await;
+            if let Some(ut) = tasks.get_mut(&user_id) {
+                if let Some(ts) = ut.get_mut(&task_id) {
+                    ts.status = TaskStatus::Failed;
+                    ts.result = Some(msg);
+                    ts.completed_at = Some(task_end.to_rfc3339());
+                    ts.duration_secs =
+                        Some((task_end - task_start).num_milliseconds() as f64 / 1000.0);
+                }
+            }
+            return;
+        }
+    };
+
+    // Stream stdout line-by-line; parse JSON step annotations.
+    // Readers are kept as joinable handles so we can drain them after the child exits/is killed,
+    // preventing post-cancel log entries from appearing after the terminal status is written.
+    let stdout_handle: Option<tokio::task::JoinHandle<()>> = if let Some(stdout) =
+        child.stdout.take()
+    {
+        let reader = BufReader::new(stdout);
+        let mut lines = reader.lines();
+        let state_clone = Arc::clone(&state);
+        let user_id_clone = user_id.clone();
+        Some(tokio::spawn(async move {
+            while let Ok(Some(line)) = lines.next_line().await {
+                // Try to parse JSON step annotations; emit readable summary and skip raw line.
+                if line.trim_start().starts_with('{') {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
+                        if v.get("step").is_some() {
+                            let now = chrono::Utc::now().to_rfc3339();
+                            let status = v["status"].as_str().unwrap_or("unknown").to_string();
+                            let step = TaskStep {
+                                name: v["step"].as_str().unwrap_or("").to_string(),
+                                iteration: v
+                                    .get("iteration")
+                                    .and_then(|x| x.as_u64())
+                                    .map(|x| x as u32),
+                                status: status.clone(),
+                                started_at: if status == "started" {
+                                    Some(now.clone())
+                                } else {
+                                    None
+                                },
+                                completed_at: if status != "started" { Some(now) } else { None },
+                                duration_s: v.get("duration_s").and_then(|x| x.as_f64()),
+                                metadata: v.get("metadata").cloned(),
+                            };
+                            {
+                                let mut tasks = state_clone.tasks.write().await;
+                                if let Some(ut) = tasks.get_mut(&user_id_clone) {
+                                    if let Some(ts) = ut.get_mut(&task_id) {
+                                        ts.steps.push(step);
+                                    }
+                                }
+                            }
+                            // Emit a readable one-liner instead of the raw JSON blob
+                            let label = format!(
+                                "[step] {} {}{}",
+                                v["step"].as_str().unwrap_or("?"),
+                                v["status"].as_str().unwrap_or("?"),
+                                v.get("iteration")
+                                    .and_then(|x| x.as_u64())
+                                    .map(|i| format!(" (iter {})", i))
+                                    .unwrap_or_default(),
+                            );
+                            append_log(
+                                &state_clone,
+                                &user_id_clone,
+                                task_id,
+                                LogEntryType::Response,
+                                &label,
+                            )
+                            .await;
+                            continue; // skip plain-line branch
+                        }
+                    }
+                }
+                // Plain stdout line — emit as-is
+                append_log(
+                    &state_clone,
+                    &user_id_clone,
+                    task_id,
+                    LogEntryType::Response,
+                    &line,
+                )
+                .await;
+            }
+        }))
+    } else {
+        None
+    };
+
+    // Stream stderr to log as errors
+    let stderr_handle: Option<tokio::task::JoinHandle<()>> =
+        if let Some(stderr) = child.stderr.take() {
+            let reader = BufReader::new(stderr);
+            let mut lines = reader.lines();
+            let state_clone = Arc::clone(&state);
+            let user_id_clone = user_id.clone();
+            Some(tokio::spawn(async move {
+                while let Ok(Some(line)) = lines.next_line().await {
+                    append_log(
+                        &state_clone,
+                        &user_id_clone,
+                        task_id,
+                        LogEntryType::Error,
+                        &line,
+                    )
+                    .await;
+                }
+            }))
+        } else {
+            None
+        };
+
+    // Wait for child exit, optional timeout, or cancel signal.
+    // Duration::MAX (~584 years) serves as "no timeout" — avoids duplicate select! blocks.
+    let effective_timeout = timeout.unwrap_or(std::time::Duration::MAX);
+    let exit_result: Result<std::process::ExitStatus, String> = tokio::select! {
+        r = tokio::time::timeout(effective_timeout, child.wait()) => {
+            match r {
+                Ok(Ok(status)) => Ok(status),
+                Ok(Err(e)) => Err(e.to_string()),
+                Err(_) => {
+                    let _ = child.kill().await;
+                    Err(format!("Timed out after {}s", effective_timeout.as_secs()))
+                }
+            }
+        }
+        _ = cancel_rx => {
+            let _ = child.kill().await;
+            Err("Cancelled".to_string())
+        }
+    };
+
+    // Drain reader tasks before writing terminal status.
+    // After kill/exit the pipe closes and readers exit naturally; 2-second guard covers
+    // the edge case of a grandchild process that inherited the pipe descriptor.
+    let drain = std::time::Duration::from_secs(2);
+    if let Some(h) = stdout_handle {
+        let _ = tokio::time::timeout(drain, h).await;
+    }
+    if let Some(h) = stderr_handle {
+        let _ = tokio::time::timeout(drain, h).await;
+    }
+
+    // Update final task status
+    let task_end = chrono::Utc::now();
+    let duration_secs = (task_end - task_start).num_milliseconds() as f64 / 1000.0;
+
+    let final_status;
+    let mut tasks = state.tasks.write().await;
+    if let Some(ut) = tasks.get_mut(&user_id) {
+        if let Some(ts) = ut.get_mut(&task_id) {
+            // Don't overwrite if already marked Cancelled by stop_task.
+            // The Err("Cancelled") case is handled by the outer guard — stop_task
+            // sets status=Cancelled before firing the channel, so by the time we
+            // reach here the condition is already false.
+            if ts.status != TaskStatus::Cancelled {
+                match exit_result {
+                    Ok(status) if status.success() => {
+                        ts.status = TaskStatus::Completed;
+                        ts.result = Some("exit 0".to_string());
+                    }
+                    Ok(status) => {
+                        ts.status = TaskStatus::Failed;
+                        ts.result = Some(format!("exit {}", status.code().unwrap_or(-1)));
+                    }
+                    Err(msg) => {
+                        ts.status = TaskStatus::Failed;
+                        ts.result = Some(msg);
+                    }
+                }
+            }
+            ts.completed_at = Some(task_end.to_rfc3339());
+            ts.duration_secs = Some(duration_secs);
+            final_status = ts.status.clone();
+        } else {
+            final_status = TaskStatus::Failed;
+        }
+
+        // Evict oldest completed tasks if over the retention cap (single pass).
+        let mut completed: Vec<(Uuid, String)> = ut
+            .iter()
+            .filter(|(_, t)| !matches!(t.status, TaskStatus::Running | TaskStatus::Pending))
+            .map(|(id, t)| (*id, t.completed_at.clone().unwrap_or_default()))
+            .collect();
+        if completed.len() > MAX_COMPLETED_TASKS {
+            // Sort oldest-first by completed_at (ISO 8601 sorts lexicographically).
+            completed.sort_unstable_by(|a, b| a.1.cmp(&b.1));
+            let to_remove = completed.len() - MAX_COMPLETED_TASKS;
+            for (evict_id, _) in completed.into_iter().take(to_remove) {
+                ut.remove(&evict_id);
+            }
+            tracing::debug!(
+                user_id = %user_id,
+                evicted = to_remove,
+                cap = MAX_COMPLETED_TASKS,
+                "Evicted oldest completed tasks"
+            );
+        }
+    } else {
+        final_status = TaskStatus::Failed;
+    }
+
+    tracing::info!(
+        task_id = %task_id,
+        status = ?final_status,
+        duration_secs = duration_secs,
+        "Command task finished"
+    );
+}
+
 /// Create a new task.
 async fn create_task(
     State(state): State<Arc<AppState>>,
@@ -1285,6 +1685,106 @@ async fn create_task(
     Json(req): Json<CreateTaskRequest>,
 ) -> Result<Json<CreateTaskResponse>, (StatusCode, String)> {
     let id = Uuid::new_v4();
+
+    // --- Command mode ---
+    if let Some(command) = req.command.clone() {
+        let workspace_id = req.workspace_id.ok_or((
+            StatusCode::BAD_REQUEST,
+            "workspace_id is required when command is set".to_string(),
+        ))?;
+
+        let workspace = state.workspaces.get(workspace_id).await.ok_or((
+            StatusCode::NOT_FOUND,
+            format!("Workspace {} not found", workspace_id),
+        ))?;
+
+        // Command mode runs inside nspawn containers. Host workspaces execute directly
+        // on the host as root — too broad a security surface for arbitrary commands.
+        if workspace.workspace_type == crate::workspace::WorkspaceType::Host {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "Command-mode tasks are not supported for Host workspaces".to_string(),
+            ));
+        }
+
+        let timeout = match req.timeout_secs {
+            Some(s) if s > 0 => Some(std::time::Duration::from_secs(s)),
+            _ => Some(std::time::Duration::from_secs(1800)), // 30 min default
+        };
+
+        let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
+
+        let task_state = TaskState {
+            id,
+            status: TaskStatus::Pending,
+            task: req.task.clone(),
+            mode: crate::api::types::TaskMode::Command,
+            model: String::new(),
+            iterations: 0,
+            workspace_id: Some(workspace_id),
+            workspace_name: Some(workspace.name.clone()),
+            result: None,
+            log: Vec::new(),
+            steps: Vec::new(),
+            created_at: Some(chrono::Utc::now().to_rfc3339()),
+            started_at: None,
+            completed_at: None,
+            duration_secs: None,
+            cancel_tx: Some(cancel_tx),
+        };
+
+        // Check concurrent limit and insert atomically under one write lock
+        // to prevent TOCTOU races where multiple requests pass the check simultaneously.
+        {
+            let max_concurrent =
+                crate::settings::max_concurrent_tasks_cached_or(state.config.max_concurrent_tasks);
+            let mut tasks = state.tasks.write().await;
+            let user_tasks = tasks.entry(user.id.clone()).or_default();
+            let running = user_tasks
+                .values()
+                .filter(|t| matches!(t.status, TaskStatus::Running | TaskStatus::Pending))
+                .count();
+            if running >= max_concurrent {
+                tracing::warn!(
+                    user_id = %user.id,
+                    running = running,
+                    limit = max_concurrent,
+                    "Command task rejected: concurrent limit reached"
+                );
+                return Err((
+                    StatusCode::TOO_MANY_REQUESTS,
+                    format!(
+                        "Too many concurrent tasks ({}/{}). Stop a running task or wait for one to finish.",
+                        running, max_concurrent
+                    ),
+                ));
+            }
+            user_tasks.insert(id, task_state);
+        }
+
+        let state_clone = Arc::clone(&state);
+        let working_dir = req.working_dir.clone();
+        tokio::spawn(async move {
+            run_command_task(
+                state_clone,
+                user.id,
+                id,
+                command,
+                workspace,
+                working_dir,
+                timeout,
+                cancel_rx,
+            )
+            .await;
+        });
+
+        return Ok(Json(CreateTaskResponse {
+            id,
+            status: TaskStatus::Pending,
+        }));
+    }
+
+    // --- Agent mode (existing behaviour) ---
     let model = req
         .model
         .or(state.config.default_model.clone())
@@ -1294,13 +1794,21 @@ async fn create_task(
         id,
         status: TaskStatus::Pending,
         task: req.task.clone(),
+        mode: crate::api::types::TaskMode::Agent,
         model: model.clone(),
         iterations: 0,
+        workspace_id: None,
+        workspace_name: None,
         result: None,
         log: Vec::new(),
+        steps: Vec::new(),
+        created_at: Some(chrono::Utc::now().to_rfc3339()),
+        started_at: None,
+        completed_at: None,
+        duration_secs: None,
+        cancel_tx: None,
     };
 
-    // Store task
     {
         let mut tasks = state.tasks.write().await;
         tasks
@@ -1309,7 +1817,6 @@ async fn create_task(
             .insert(id, task_state);
     }
 
-    // Spawn background task to run the agent
     let state_clone = Arc::clone(&state);
     let task_description = req.task.clone();
     let budget_cents = req.budget_cents;
@@ -1467,13 +1974,21 @@ async fn get_task(
     State(state): State<Arc<AppState>>,
     Extension(user): Extension<AuthUser>,
     Path(id): Path<Uuid>,
-) -> Result<Json<TaskState>, (StatusCode, String)> {
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let tasks = state.tasks.read().await;
     tasks
         .get(&user.id)
-        .and_then(|t| t.get(&id).cloned())
-        .map(Json)
+        .and_then(|t| t.get(&id))
         .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Task {} not found", id)))
+        .and_then(|ts| {
+            serde_json::to_value(ts).map(Json).map_err(|e| {
+                tracing::error!("Failed to serialize task {}: {}", id, e);
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Failed to serialize task".to_string(),
+                )
+            })
+        })
 }
 
 /// Stream task progress via SSE.

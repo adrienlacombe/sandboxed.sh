@@ -153,6 +153,21 @@ export {
   getMissionAutomationExecutions,
 } from "./automations";
 
+// Tasks
+export {
+  type Task,
+  type TaskStatus,
+  type TaskMode,
+  type TaskLogEntry,
+  type TaskStep,
+  type CreateCommandTaskRequest,
+  type CreateAgentTaskRequest,
+  listTasks,
+  getTask,
+  createTask,
+  stopTask,
+} from "./tasks";
+
 // Telegram
 export {
   type TelegramTriggerMode,
