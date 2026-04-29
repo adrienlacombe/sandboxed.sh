@@ -458,6 +458,10 @@ CREATE INDEX IF NOT EXISTS idx_events_mission ON mission_events(mission_id, sequ
 CREATE INDEX IF NOT EXISTS idx_events_type ON mission_events(mission_id, event_type);
 CREATE INDEX IF NOT EXISTS idx_events_tool_call ON mission_events(tool_call_id) WHERE tool_call_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_events_event_type ON mission_events(event_type);
+-- Stale-mission detection takes MAX(timestamp) per mission. Sequence ordering
+-- doesn't help here because in-place updates (e.g. text_delta_latest rewriting
+-- an existing event_id row) bump `timestamp` without changing `sequence`.
+CREATE INDEX IF NOT EXISTS idx_events_mission_timestamp ON mission_events(mission_id, timestamp DESC);
 
 CREATE TABLE IF NOT EXISTS mission_summaries (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -774,6 +778,38 @@ impl SqliteMissionStore {
         })
     }
 
+    /// Test-only: force-set a mission's `updated_at` and (if any) the timestamp
+    /// of every persisted event for that mission. Lets tests exercise the
+    /// stale-cleanup path with deterministic clock values without sleeping or
+    /// stubbing `now`.
+    #[cfg(test)]
+    pub(super) async fn force_backdate_for_test(
+        &self,
+        mission_id: Uuid,
+        timestamp: &str,
+    ) -> Result<(), String> {
+        let conn = self.conn.clone();
+        let mid = mission_id.to_string();
+        let ts = timestamp.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "UPDATE missions SET updated_at = ?1 WHERE id = ?2",
+                rusqlite::params![ts, mid],
+            )
+            .map_err(|e| e.to_string())?;
+            conn.execute(
+                "UPDATE mission_events SET timestamp = ?1 WHERE mission_id = ?2",
+                rusqlite::params![ts, mid],
+            )
+            .map_err(|e| e.to_string())?;
+            Ok::<_, String>(())
+        })
+        .await
+        .map_err(|e| e.to_string())??;
+        Ok(())
+    }
+
     /// Store content, either inline or in a file if too large.
     fn store_content(
         content_dir: &std::path::Path,
@@ -1048,7 +1084,8 @@ impl SqliteMissionStore {
         // Add performance indexes if they don't exist (idempotent)
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_missions_status_updated ON missions(status, updated_at);
-             CREATE INDEX IF NOT EXISTS idx_events_event_type ON mission_events(event_type);",
+             CREATE INDEX IF NOT EXISTS idx_events_event_type ON mission_events(event_type);
+             CREATE INDEX IF NOT EXISTS idx_events_mission_timestamp ON mission_events(mission_id, timestamp DESC);",
         )
         .map_err(|e| format!("Failed to create performance indexes: {}", e))?;
 
@@ -2617,6 +2654,26 @@ impl MissionStore for SqliteMissionStore {
         let cutoff = Utc::now() - chrono::Duration::hours(stale_hours as i64);
         let cutoff_str = cutoff.to_rfc3339();
 
+        // A mission is stale only when *both* its metadata `updated_at` and
+        // its newest event are older than the cutoff. Previously the query
+        // looked at `updated_at` alone, but `updated_at` is bumped by
+        // `update_mission_history` (assistant-turn boundary) and metadata
+        // writes — not by individual `tool_call` / `tool_result` events. A
+        // long agent run that's actively producing tool calls but no
+        // assistant turns for >2h (e.g. waiting on a CI build via repeated
+        // `gh run watch` invocations) would falsely trip this scan. Joining
+        // against `mission_events.timestamp` ties the stale signal to real
+        // activity.
+        //
+        // We compute `MAX(timestamp)` rather than the timestamp of the row
+        // with the highest `sequence`: `log_event` updates an existing row
+        // in-place when it sees a duplicate `event_id` (e.g. the
+        // `text_delta_latest` row gets its `timestamp` rewritten on every
+        // streamed delta), so a higher-sequence row can carry an *older*
+        // timestamp than a refreshed lower-sequence row. The query is backed
+        // by `idx_events_mission_timestamp(mission_id, timestamp DESC)` so
+        // the per-mission MAX is an O(log n) seek; missions with no events
+        // fall back to `updated_at` via COALESCE.
         tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
             let mut stmt = conn
@@ -2624,8 +2681,16 @@ impl MissionStore for SqliteMissionStore {
                     "SELECT id, status, title, workspace_id, workspace_name, agent, model_override,
                             created_at, updated_at, interrupted_at, resumable, desktop_sessions,
                             COALESCE(backend, 'opencode') as backend
-                     FROM missions
-                     WHERE status = 'active' AND updated_at < ?1",
+                     FROM missions m
+                     WHERE status = 'active'
+                       AND max(
+                             m.updated_at,
+                             COALESCE(
+                               (SELECT MAX(timestamp) FROM mission_events
+                                WHERE mission_id = m.id),
+                               m.updated_at
+                             )
+                           ) < ?1",
                 )
                 .map_err(|e| e.to_string())?;
 
@@ -7923,5 +7988,209 @@ mod tests {
             .expect("mission");
         let max = store.max_event_sequence(mission.id).await.expect("max seq");
         assert_eq!(max, 0);
+    }
+
+    #[tokio::test]
+    async fn stale_query_uses_event_timestamp_when_newer_than_updated_at() {
+        // Regression: a long agent run that's actively producing tool_call /
+        // tool_result events but no assistant turns leaves `mission.updated_at`
+        // frozen at the last turn boundary. The stale-cleanup query used to
+        // look at `updated_at` alone and would auto-close such missions even
+        // though they were demonstrably still active. With the events-aware
+        // query, a recent event must keep the mission out of the result set.
+        use crate::api::control::AgentEvent;
+        use crate::api::mission_store::MissionStatus;
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let store = SqliteMissionStore::new(temp_dir.path().to_path_buf(), "test-user")
+            .await
+            .expect("sqlite store");
+        let mission = store
+            .create_mission(
+                Some("active-with-tool-calls"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("mission");
+        store
+            .update_mission_status(mission.id, MissionStatus::Active)
+            .await
+            .expect("set active");
+
+        // Back-date both metadata and any pre-existing events to 3 hours ago,
+        // *then* log a fresh tool_call event so the events tail is current.
+        let three_hours_ago = (chrono::Utc::now() - chrono::Duration::hours(3)).to_rfc3339();
+        store
+            .force_backdate_for_test(mission.id, &three_hours_ago)
+            .await
+            .expect("backdate");
+
+        store
+            .log_event(
+                mission.id,
+                &AgentEvent::ToolCall {
+                    tool_call_id: "tc-1".to_string(),
+                    name: "bash".to_string(),
+                    args: serde_json::json!({"command": "gh run watch 12345"}),
+                    mission_id: Some(mission.id),
+                },
+            )
+            .await
+            .expect("log fresh tool_call");
+
+        // 2-hour staleness cutoff: even though `updated_at` is 3h old, the
+        // fresh event must keep the mission out of the stale set.
+        let stale = store
+            .get_stale_active_missions(2)
+            .await
+            .expect("query stale");
+        assert!(
+            stale.iter().all(|m| m.id != mission.id),
+            "mission with a recent tool_call must not be flagged stale (updated_at \
+             alone is no longer the stale signal)"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_query_flags_truly_idle_active_missions() {
+        // Counterpart to the regression: a mission whose metadata *and* event
+        // tail are both older than the cutoff is genuinely stale.
+        use crate::api::mission_store::MissionStatus;
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let store = SqliteMissionStore::new(temp_dir.path().to_path_buf(), "test-user")
+            .await
+            .expect("sqlite store");
+        let mission = store
+            .create_mission(Some("idle"), None, None, None, None, None, None)
+            .await
+            .expect("mission");
+        store
+            .update_mission_status(mission.id, MissionStatus::Active)
+            .await
+            .expect("set active");
+        let three_hours_ago = (chrono::Utc::now() - chrono::Duration::hours(3)).to_rfc3339();
+        store
+            .force_backdate_for_test(mission.id, &three_hours_ago)
+            .await
+            .expect("backdate");
+
+        let stale = store
+            .get_stale_active_missions(2)
+            .await
+            .expect("query stale");
+        assert!(
+            stale.iter().any(|m| m.id == mission.id),
+            "mission with no recent events and old updated_at must still be flagged"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_query_uses_max_timestamp_not_max_sequence() {
+        // Regression for a subtler variant: `log_event` updates an existing
+        // row in-place when it sees a duplicate `event_id` (e.g. a
+        // `text_delta_latest` row gets its `timestamp` rewritten on every
+        // streamed delta), so the row with the highest `sequence` can carry
+        // an *older* timestamp than a refreshed lower-sequence row. A query
+        // that reads `ORDER BY sequence DESC LIMIT 1` would then miss the
+        // refreshed row and falsely flag the mission stale. We force this
+        // ordering by hand and confirm `MAX(timestamp)` recovers correctly.
+        use crate::api::mission_store::MissionStatus;
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let store = SqliteMissionStore::new(temp_dir.path().to_path_buf(), "test-user")
+            .await
+            .expect("sqlite store");
+        let mission = store
+            .create_mission(Some("inplace-update"), None, None, None, None, None, None)
+            .await
+            .expect("mission");
+        store
+            .update_mission_status(mission.id, MissionStatus::Active)
+            .await
+            .expect("set active");
+
+        let now = chrono::Utc::now();
+        let three_hours_ago = (now - chrono::Duration::hours(3)).to_rfc3339();
+        let one_minute_ago = (now - chrono::Duration::minutes(1)).to_rfc3339();
+        let mid = mission.id.to_string();
+
+        // Drive raw inserts so we can pin (sequence, timestamp) independently.
+        // Highest sequence carries an old timestamp; a lower-sequence row
+        // carries the recent one — exactly the in-place-update layout that
+        // a sequence-based MAX would mishandle.
+        store
+            .force_backdate_for_test(mission.id, &three_hours_ago)
+            .await
+            .expect("backdate metadata");
+        let conn = store.conn.clone();
+        let three_hours_ago_clone = three_hours_ago.clone();
+        let one_minute_ago_clone = one_minute_ago.clone();
+        let mid_clone = mid.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            // Lower sequence, recent timestamp (the "refreshed" row)
+            conn.execute(
+                "INSERT INTO mission_events (mission_id, sequence, event_type, timestamp, content)
+                 VALUES (?1, 1, 'text_delta', ?2, 'streaming…')",
+                rusqlite::params![mid_clone, one_minute_ago_clone],
+            )
+            .expect("insert refreshed row");
+            // Higher sequence, old timestamp (would be the row picked by ORDER BY sequence DESC)
+            conn.execute(
+                "INSERT INTO mission_events (mission_id, sequence, event_type, timestamp, content)
+                 VALUES (?1, 2, 'tool_call', ?2, 'cmd')",
+                rusqlite::params![mid_clone, three_hours_ago_clone],
+            )
+            .expect("insert old high-seq row");
+        })
+        .await
+        .expect("raw inserts");
+
+        let stale = store
+            .get_stale_active_missions(2)
+            .await
+            .expect("query stale");
+        assert!(
+            stale.iter().all(|m| m.id != mission.id),
+            "mission whose newest activity lives on a *lower* sequence row than \
+             the highest sequence must NOT be flagged stale"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_query_handles_missions_with_no_events() {
+        // A freshly-created active mission with no events at all should fall
+        // back to `updated_at` (via COALESCE in the query). When `updated_at`
+        // is fresh, the mission is not stale.
+        use crate::api::mission_store::MissionStatus;
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let store = SqliteMissionStore::new(temp_dir.path().to_path_buf(), "test-user")
+            .await
+            .expect("sqlite store");
+        let mission = store
+            .create_mission(Some("brand new"), None, None, None, None, None, None)
+            .await
+            .expect("mission");
+        store
+            .update_mission_status(mission.id, MissionStatus::Active)
+            .await
+            .expect("set active");
+
+        let stale = store
+            .get_stale_active_missions(2)
+            .await
+            .expect("query stale");
+        assert!(
+            stale.iter().all(|m| m.id != mission.id),
+            "freshly-created mission with current updated_at and no events \
+             must not be flagged stale"
+        );
     }
 }
