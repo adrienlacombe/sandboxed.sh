@@ -110,6 +110,15 @@ struct ControlView: View {
             backgroundGlows
             
             VStack(spacing: 0) {
+                // Persistent connection banner. The 9pt wifi-slash glyph in
+                // the principal toolbar is too easy to miss when the SSE
+                // stream drops; a sticky strip across the top keeps the
+                // disconnected state in peripheral vision until reconnect.
+                if !connectionState.isConnected {
+                    connectionBanner
+                        .transition(.move(edge: .top).combined(with: .opacity))
+                }
+
                 // Messages
                 ZStack(alignment: .bottom) {
                     messagesView
@@ -133,69 +142,90 @@ struct ControlView: View {
                 // Input area
                 inputView
             }
+            .animation(.easeInOut(duration: 0.2), value: connectionState.isConnected)
         }
         .navigationTitle(viewingMission?.displayTitle ?? "Control")
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
             ToolbarItem(placement: .principal) {
                 VStack(spacing: 2) {
-                    Text(viewingMission?.displayTitle ?? "Control")
+                    // Use the raw title with `.lineLimit(1)` rather than the
+                    // pre-truncated `displayTitle` (which silently slices at
+                    // 60 chars with no escape hatch). SwiftUI handles tail
+                    // truncation against the actual nav-bar width, and the
+                    // context menu lets the user pull up the full string.
+                    //
+                    // Fall back to "Untitled Mission" — not "Control" — when a
+                    // mission is being viewed but its title is empty. Showing
+                    // "Control" would falsely imply no mission is active and
+                    // diverges from `.navigationTitle` (which uses
+                    // `displayTitle`, returning "Untitled Mission").
+                    let fullTitle: String = {
+                        if let mission = viewingMission {
+                            let trimmed = mission.title?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                            return trimmed.isEmpty ? "Untitled Mission" : trimmed
+                        }
+                        return "Control"
+                    }()
+                    Text(fullTitle)
                         .font(.headline)
                         .foregroundStyle(Theme.textPrimary)
-
-                    HStack(spacing: 4) {
-                        // Show connection state or run state
-                        if !connectionState.isConnected {
-                            // Connection issue - show reconnecting/disconnected state
-                            Image(systemName: connectionState.icon)
-                                .font(.system(size: 9))
-                                .foregroundStyle(Theme.warning)
-                                .symbolEffect(.pulse, options: .repeating)
-                            Text(connectionState.label)
-                                .font(.caption2)
-                                .foregroundStyle(Theme.warning)
-                        } else {
-                            // Show backend/agent info if available
-                            if let mission = viewingMission {
-                                let backendColor = missionBackendColor(mission)
-                                if let agent = mission.agent, !agent.isEmpty {
-                                    Image(systemName: missionBackendIcon(mission))
-                                        .font(.system(size: 9))
-                                        .foregroundStyle(backendColor)
-                                    Text(agent)
-                                        .font(.caption2)
-                                        .foregroundStyle(backendColor)
-                                    Text("•")
-                                        .foregroundStyle(Theme.textMuted)
-                                }
-                            }
-                            
-                            // Connected - show normal run state
-                            StatusDot(status: runState.statusType, size: 5)
-                            Text(runState.label)
-                                .font(.caption2)
-                                .foregroundStyle(Theme.textSecondary)
-
-                            if queueLength > 0 {
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                        .contextMenu {
+                            if viewingMission != nil {
+                                Section(fullTitle) {}
                                 Button {
-                                    Task { await loadQueueItems() }
-                                    showQueueSheet = true
+                                    UIPasteboard.general.string = fullTitle
                                     HapticService.lightTap()
                                 } label: {
-                                    Text("• \(queueLength) queued")
-                                        .font(.caption2)
-                                        .foregroundStyle(Theme.warning)
+                                    Label("Copy title", systemImage: "doc.on.doc")
                                 }
                             }
+                        }
 
-                            // Progress indicator
-                            if let progress = progress, progress.total > 0 {
+                    HStack(spacing: 4) {
+                        // Connection state moved to a persistent banner above the
+                        // conversation; this row always shows backend + run state
+                        // so a disconnect doesn't blank out the run-state context.
+                        if let mission = viewingMission {
+                            let backendColor = missionBackendColor(mission)
+                            if let agent = mission.agent, !agent.isEmpty {
+                                Image(systemName: missionBackendIcon(mission))
+                                    .font(.system(size: 9))
+                                    .foregroundStyle(backendColor)
+                                Text(agent)
+                                    .font(.caption2)
+                                    .foregroundStyle(backendColor)
                                 Text("•")
                                     .foregroundStyle(Theme.textMuted)
-                                Text(progress.displayText)
-                                    .font(.caption2.weight(.medium))
-                                    .foregroundStyle(Theme.success)
                             }
+                        }
+
+                        StatusDot(status: runState.statusType, size: 5)
+                        Text(runState.label)
+                            .font(.caption2)
+                            .foregroundStyle(Theme.textSecondary)
+
+                        if queueLength > 0 {
+                            Button {
+                                Task { await loadQueueItems() }
+                                showQueueSheet = true
+                                HapticService.lightTap()
+                            } label: {
+                                Text("• \(queueLength) queued")
+                                    .font(.caption2)
+                                    .foregroundStyle(Theme.warning)
+                            }
+                        }
+
+                        // Progress indicator
+                        if let progress, progress.total > 0 {
+                            Text("•")
+                                .foregroundStyle(Theme.textMuted)
+                            Text(progress.displayText)
+                                .font(.caption2.weight(.medium))
+                                .foregroundStyle(Theme.success)
                         }
                     }
                 }
@@ -574,11 +604,36 @@ struct ControlView: View {
     }
     
     // MARK: - Header (now in toolbar)
-    
+
     private var headerView: some View {
         EmptyView() // Moved to navigation bar
     }
-    
+
+    // MARK: - Connection banner
+
+    /// Sticky strip rendered above the conversation when the SSE stream is
+    /// down. The toolbar already shows a small wifi-slash glyph, but it's
+    /// easy to miss on a long page; this strip stays in peripheral vision.
+    private var connectionBanner: some View {
+        HStack(spacing: 8) {
+            Image(systemName: connectionState.icon)
+                .font(.system(size: 11, weight: .semibold))
+                .symbolEffect(.pulse, options: .repeating)
+            Text(connectionState.label)
+                .font(.caption.weight(.medium))
+            Spacer()
+        }
+        .foregroundStyle(Theme.warning)
+        .padding(.horizontal, 16)
+        .padding(.vertical, 6)
+        .background(Theme.warning.opacity(0.12))
+        .overlay(alignment: .bottom) {
+            Rectangle()
+                .fill(Theme.warning.opacity(0.25))
+                .frame(height: 0.5)
+        }
+    }
+
     // MARK: - Messages
     
     private var messagesView: some View {
@@ -880,12 +935,18 @@ struct ControlView: View {
                     .font(.title2.bold())
                     .foregroundStyle(Theme.textPrimary)
 
-                Text(emptyStateSubtitle)
+                Text("Send a message to start a new mission")
                     .font(.subheadline)
                     .foregroundStyle(Theme.textSecondary)
                     .multilineTextAlignment(.center)
                     .lineSpacing(4)
             }
+
+            // Context chips: gives a first-run user visual confirmation of
+            // *where* the next message lands and *which* agent will pick it
+            // up. Without these, the empty state hides this state behind
+            // the toolbar — easy to miss on a fresh install.
+            emptyStateContextChips
 
             Spacer()
             Spacer()
@@ -893,15 +954,58 @@ struct ControlView: View {
         .padding(.horizontal, 32)
     }
 
-    private var emptyStateSubtitle: String {
-        if let workspace = workspaceState.selectedWorkspace {
-            if workspace.isDefault {
-                return "Send a message to start working\non the host environment"
-            } else {
-                return "Send a message to start working\nin \(workspace.name)"
+    private var emptyStateContextChips: some View {
+        HStack(spacing: 8) {
+            if let workspace = workspaceState.selectedWorkspace {
+                emptyStateChip(
+                    icon: workspace.isDefault ? "macbook" : "shippingbox",
+                    label: workspace.isDefault ? "Host" : workspace.name,
+                    tint: Theme.accent
+                )
+            }
+            if let agentChip = defaultAgentChipInfo {
+                emptyStateChip(
+                    icon: agentChip.icon,
+                    label: agentChip.label,
+                    tint: agentChip.tint
+                )
             }
         }
-        return "Send a message to start working\nwith the AI agent"
+    }
+
+    private func emptyStateChip(icon: String, label: String, tint: Color) -> some View {
+        HStack(spacing: 6) {
+            Image(systemName: icon)
+                .font(.system(size: 11, weight: .semibold))
+            Text(label)
+                .font(.caption.weight(.medium))
+                .lineLimit(1)
+        }
+        .foregroundStyle(tint)
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
+        .background(tint.opacity(0.12))
+        .clipShape(Capsule())
+        .overlay(
+            Capsule().stroke(tint.opacity(0.25), lineWidth: 0.5)
+        )
+    }
+
+    /// Resolve the saved default agent into a chip, or `nil` if the user
+    /// hasn't saved one (in which case the picker fires on first send).
+    private var defaultAgentChipInfo: (icon: String, label: String, tint: Color)? {
+        guard
+            let saved = UserDefaults.standard.string(forKey: "default_agent"),
+            !saved.isEmpty,
+            let parsed = CombinedAgent.parse(saved)
+        else {
+            return nil
+        }
+        return (
+            BackendAgentService.icon(for: parsed.backend),
+            parsed.agent,
+            BackendAgentService.color(for: parsed.backend)
+        )
     }
     
     private func suggestionChip(_ text: String) -> some View {
@@ -1873,23 +1977,13 @@ struct ControlView: View {
     }
     
     // MARK: - Backend Helpers
-    
+
     private func missionBackendColor(_ mission: Mission) -> Color {
-        switch mission.backend {
-        case "opencode": return Theme.success
-        case "claudecode": return Theme.accent
-        case "amp": return .orange
-        default: return Theme.accent
-        }
+        BackendAgentService.color(for: mission.backend)
     }
-    
+
     private func missionBackendIcon(_ mission: Mission) -> String {
-        switch mission.backend {
-        case "opencode": return "terminal"
-        case "claudecode": return "brain"
-        case "amp": return "bolt.fill"
-        default: return "cpu"
-        }
+        BackendAgentService.icon(for: mission.backend)
     }
     
     private func sendMessage() {
@@ -2872,6 +2966,13 @@ private struct MessageBubble: View {
                             topTrailingRadius: 20
                         )
                     )
+                    .contextMenu {
+                        Button {
+                            onCopy?()
+                        } label: {
+                            Label("Copy", systemImage: "doc.on.doc")
+                        }
+                    }
 
                 // Timestamp
                 Text(message.timestamp, style: .time)
@@ -2880,7 +2981,7 @@ private struct MessageBubble: View {
             }
         }
     }
-    
+
     private var assistantBubble: some View {
         HStack(alignment: .top, spacing: 8) {
             VStack(alignment: .leading, spacing: 8) {
@@ -2900,19 +3001,18 @@ private struct MessageBubble: View {
                         if let cost = message.costFormatted {
                             Text("•")
                                 .foregroundStyle(Theme.textMuted)
-                            Text(cost)
-                                .font(.caption2.monospaced())
-                                .foregroundStyle(message.costIsEstimated ? Theme.textSecondary : Theme.success)
-                            if let badge = message.costSourceLabel {
-                                Text(badge)
-                                    .font(.system(size: 8, weight: .medium))
-                                    .textCase(.uppercase)
-                                    .tracking(0.4)
-                                    .foregroundStyle(Theme.textMuted)
-                                    .padding(.horizontal, 4)
-                                    .padding(.vertical, 2)
-                                    .background(Color.white.opacity(0.08))
-                                    .clipShape(RoundedRectangle(cornerRadius: 3))
+                            // Cost + source as one calm chip: "$4.22 actual" — the
+                            // ALL-CAPS pill version of "ACTUAL" was visually shouting
+                            // louder than the cost itself.
+                            HStack(spacing: 4) {
+                                Text(cost)
+                                    .font(.caption2.monospaced())
+                                    .foregroundStyle(message.costIsEstimated ? Theme.textSecondary : Theme.success)
+                                if let badge = message.costSourceLabel {
+                                    Text(badge.lowercased())
+                                        .font(.caption2)
+                                        .foregroundStyle(Theme.textMuted)
+                                }
                             }
                         }
 
@@ -2941,6 +3041,13 @@ private struct MessageBubble: View {
                         RoundedRectangle(cornerRadius: 20, style: .continuous)
                             .stroke(Theme.border, lineWidth: 0.5)
                     )
+                    .contextMenu {
+                        Button {
+                            onCopy?()
+                        } label: {
+                            Label("Copy", systemImage: "doc.on.doc")
+                        }
+                    }
 
                 // Render shared files
                 if let files = message.sharedFiles, !files.isEmpty {
@@ -3182,19 +3289,22 @@ private struct SharedFileCardView: View {
 private struct CopyButton: View {
     let isCopied: Bool
     let onCopy: (() -> Void)?
-    
+
     var body: some View {
         Button {
             onCopy?()
         } label: {
             Image(systemName: isCopied ? "checkmark" : "doc.on.doc")
-                .font(.system(size: 12))
-                .foregroundStyle(isCopied ? Theme.success : Theme.textMuted)
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(isCopied ? Theme.success : Theme.textSecondary)
                 .frame(width: 28, height: 28)
                 .background(Theme.backgroundSecondary)
                 .clipShape(Circle())
+                .overlay(
+                    Circle().stroke(Theme.border, lineWidth: 0.5)
+                )
         }
-        .opacity(0.7)
+        .accessibilityLabel(isCopied ? "Copied" : "Copy message")
     }
 }
 
@@ -3556,7 +3666,11 @@ private struct ThinkingBubble: View {
             // Expandable content
             if isExpanded && !message.content.isEmpty {
                 ScrollView {
-                    Text(message.content)
+                    // Inline a blinking caret while streaming so the user can
+                    // distinguish in-flight tokens from a settled thought.
+                    // Without this, a paused stream looks identical to a
+                    // completed one.
+                    (Text(message.content) + (message.thinkingDone ? Text("") : Text(" ▍").foregroundColor(Theme.accent)))
                         .font(.caption)
                         .foregroundStyle(Theme.textTertiary)
                         .frame(maxWidth: .infinity, alignment: .leading)

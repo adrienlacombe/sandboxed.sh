@@ -22,6 +22,7 @@ struct SettingsView: View {
     @State private var selectedDefaultAgent: String = ""
     @State private var isLoadingAgents = true
     @State private var skipAgentSelection = false
+    @State private var showClearRulesConfirm = false
 
     private let api = APIService.shared
     private let originalURL: String
@@ -130,6 +131,10 @@ struct SettingsView: View {
                                         .textInputAutocapitalization(.never)
                                         .autocorrectionDisabled()
                                         .keyboardType(.URL)
+                                        .submitLabel(.done)
+                                        .onSubmit {
+                                            Task { await testConnection() }
+                                        }
                                         .padding(.horizontal, 16)
                                         .padding(.vertical, 14)
                                         .background(Color.white.opacity(0.05))
@@ -224,17 +229,35 @@ struct SettingsView: View {
                                             .tint(Theme.accent)
                                     }
 
-                                    if !FidoApprovalState.shared.autoApprovalRules.isEmpty {
-                                        Divider()
-                                            .background(Theme.border)
+                                    Divider()
+                                        .background(Theme.border)
 
+                                    if FidoApprovalState.shared.autoApprovalRules.isEmpty {
+                                        // Without this hint, an empty Auto-Approval section is
+                                        // invisible — users can't tell the feature exists, let
+                                        // alone how rules accumulate. Surface the explanation
+                                        // up-front so first-run state isn't a blank divider.
+                                        HStack(alignment: .top, spacing: 10) {
+                                            Image(systemName: "checkmark.shield")
+                                                .font(.system(size: 16, weight: .medium))
+                                                .foregroundStyle(Theme.textTertiary)
+                                                .frame(width: 24)
+                                            VStack(alignment: .leading, spacing: 4) {
+                                                Text("No auto-approval rules yet")
+                                                    .font(.subheadline.weight(.medium))
+                                                    .foregroundStyle(Theme.textPrimary)
+                                                Text("When you approve a signing request, you can save the choice as a rule so future identical requests skip the prompt.")
+                                                    .font(.caption)
+                                                    .foregroundStyle(Theme.textSecondary)
+                                                    .fixedSize(horizontal: false, vertical: true)
+                                            }
+                                        }
+                                    } else {
                                         AutoApprovalRulesView()
 
                                         Button {
-                                            withAnimation {
-                                                FidoApprovalState.shared.autoApprovalRules.removeAll()
-                                            }
-                                            HapticService.mediumTap()
+                                            showClearRulesConfirm = true
+                                            HapticService.lightTap()
                                         } label: {
                                             HStack {
                                                 Image(systemName: "trash")
@@ -246,6 +269,21 @@ struct SettingsView: View {
                                             .padding(.vertical, 10)
                                             .background(Theme.error.opacity(0.1))
                                             .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                                        }
+                                        .confirmationDialog(
+                                            "Clear all auto-approval rules?",
+                                            isPresented: $showClearRulesConfirm,
+                                            titleVisibility: .visible
+                                        ) {
+                                            Button("Clear All Rules", role: .destructive) {
+                                                withAnimation {
+                                                    FidoApprovalState.shared.autoApprovalRules.removeAll()
+                                                }
+                                                HapticService.mediumTap()
+                                            }
+                                            Button("Cancel", role: .cancel) {}
+                                        } message: {
+                                            Text("This permanently removes every saved auto-approval rule. Future signing requests will require manual approval until you create new rules. This can't be undone.")
                                         }
                                     }
                                 }
