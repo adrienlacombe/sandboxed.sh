@@ -197,20 +197,18 @@ async fn send_message_streaming_app_server(
         TurnStartParams, UserInputItem,
     };
 
+    // Note: codex app-server does NOT honor `OPENAI_API_KEY`/`OPENAI_OAUTH_TOKEN`
+    // env vars (per `app-server/src/lib.rs:646-647`) — it reads `~/.codex/auth.json`
+    // (CODEX_HOME-relative). Auth flows through the per-mission codexhome-XXXX
+    // dir already populated by the workspace bootstrap; the legacy
+    // `oauth_token`-via-env path used by exec mode is dead here, so we don't
+    // forward it.
     let app_cfg = AppServerConfig {
         cli_path: cfg.cli_path.clone(),
         enabled_features: vec!["goals".to_string()],
         default_model: cfg.default_model.clone(),
         model_effort: cfg.model_effort.clone(),
-        env: cfg
-            .oauth_token
-            .as_ref()
-            .map(|t| {
-                let mut m = std::collections::HashMap::new();
-                m.insert("OPENAI_OAUTH_TOKEN".to_string(), t.clone());
-                m
-            })
-            .unwrap_or_default(),
+        env: std::collections::HashMap::new(),
     };
 
     let session_arc = AppServerSession::spawn(app_cfg, &session.directory, workspace_exec).await?;
@@ -264,13 +262,17 @@ async fn send_message_streaming_app_server(
     // Detect /goal prefix server-side. Dashboard does this too, but the
     // backend is the trust boundary — easier to enforce here than rely on
     // every client.
+    //
+    // `strip_prefix` (single-pass) rather than `trim_start_matches`
+    // (greedy): a user who literally wants the objective to start with
+    // `/goal ` (e.g. `/goal /goal explain why this is a bad idea`) shouldn't
+    // have the second `/goal ` silently swallowed too.
     let trimmed = message.trim_start();
-    let is_goal_mission = trimmed.starts_with("/goal ");
-    let user_payload = if is_goal_mission {
-        trimmed.trim_start_matches("/goal ").trim().to_string()
-    } else {
-        message.to_string()
-    };
+    let user_payload = trimmed
+        .strip_prefix("/goal ")
+        .map(|rest| rest.trim().to_string());
+    let is_goal_mission = user_payload.is_some();
+    let user_payload = user_payload.unwrap_or_else(|| message.to_string());
 
     let thread_id = thread.id.clone();
     let session_for_rpc = Arc::clone(&session_arc);
@@ -315,8 +317,24 @@ async fn send_message_streaming_app_server(
     let handle = tokio::spawn(async move {
         let mut translator = AppServerEventTranslator::default();
         let mut terminal = false;
+        let mut stream_closed_unexpectedly = false;
 
-        while let Some(msg) = inbound.recv().await {
+        loop {
+            let msg = match inbound.recv().await {
+                Some(m) => m,
+                None => {
+                    // Reader task exited. If we hadn't already detected a
+                    // terminal status, this is a surprise — codex likely
+                    // crashed or got killed by the OOM watcher. Surface as
+                    // an error so the mission doesn't show as a clean
+                    // completion with no output.
+                    if !terminal {
+                        stream_closed_unexpectedly = true;
+                    }
+                    break;
+                }
+            };
+
             match msg {
                 InboundMessage::Notification { method, params } => {
                     let outcome = translator.handle_notification(&method, &params, is_goal_mission);
@@ -350,6 +368,14 @@ async fn send_message_streaming_app_server(
             if terminal {
                 break;
             }
+        }
+
+        if stream_closed_unexpectedly {
+            let _ = tx
+                .send(ExecutionEvent::Error {
+                    message: "codex app-server stream closed before mission terminated".to_string(),
+                })
+                .await;
         }
 
         let _ = tx
@@ -565,14 +591,12 @@ impl AppServerEventTranslator {
                         "interrupted" => {
                             terminal = true;
                         }
-                        "completed" => {
-                            // For non-goal missions, a completed turn IS the
-                            // mission terminal. For goal missions, the goal
-                            // continuation engine will keep launching more
-                            // turns; we wait for thread/goal/updated.
-                            if !is_goal_mission {
-                                terminal = true;
-                            }
+                        // For non-goal missions, a completed turn IS the
+                        // mission terminal. For goal missions, the goal
+                        // continuation engine will keep launching more
+                        // turns; we wait for thread/goal/updated instead.
+                        "completed" if !is_goal_mission => {
+                            terminal = true;
                         }
                         _ => {}
                     }
@@ -588,10 +612,8 @@ impl AppServerEventTranslator {
                     }
                 }
             }
-            "thread/goal/cleared" => {
-                if is_goal_mission {
-                    terminal = true;
-                }
+            "thread/goal/cleared" if is_goal_mission => {
+                terminal = true;
             }
 
             // ----- Errors / warnings -----

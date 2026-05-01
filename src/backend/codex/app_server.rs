@@ -217,7 +217,6 @@ pub struct RpcError {
 
 /// A live connection to a `codex app-server` process.
 pub struct AppServerSession {
-    config: AppServerConfig,
     next_id: Arc<Mutex<i64>>,
     pending: PendingMap,
     stdin: Arc<Mutex<Option<ChildStdin>>>,
@@ -225,6 +224,26 @@ pub struct AppServerSession {
     inbound_rx: Mutex<Option<mpsc::Receiver<InboundMessage>>>,
     child: Arc<Mutex<Option<Child>>>,
     reader_task: Mutex<Option<JoinHandle<()>>>,
+}
+
+impl Drop for AppServerSession {
+    fn drop(&mut self) {
+        // If the caller dropped the session without calling `shutdown()` (e.g.
+        // mission_runner panicked, receiver was dropped abruptly, or a
+        // mid-flight error path forgot to clean up) make a best-effort kill
+        // of the child process. Without this the codex app-server stays
+        // alive after the mission row is gone.
+        if let Ok(mut guard) = self.child.try_lock() {
+            if let Some(mut child) = guard.take() {
+                let _ = child.start_kill();
+            }
+        }
+        if let Ok(mut guard) = self.reader_task.try_lock() {
+            if let Some(task) = guard.take() {
+                task.abort();
+            }
+        }
+    }
 }
 
 impl AppServerSession {
@@ -393,10 +412,27 @@ impl AppServerSession {
                 }
             }
             debug!("codex app-server: reader loop exited (EOF)");
+            // Drain any still-pending request senders so callers stuck in
+            // `rx.await` get a clear error instead of hanging until the
+            // session is dropped. Without this drain, `request()` blocks
+            // forever when codex closes stdout mid-RPC (process crash,
+            // panic, or `kill`).
+            let mut pending_guard = pending_for_task.lock().await;
+            for (_, sender) in pending_guard.drain() {
+                let _ = sender.send(Err(RpcError {
+                    code: 0,
+                    message: "codex app-server stream closed before responding".to_string(),
+                }));
+            }
         });
 
+        // `config` was consumed only for its `cli_path`/`enabled_features`/
+        // `env` fields when spawning. The session itself doesn't carry it
+        // around because `default_model` and `model_effort` are passed
+        // through to `thread/start` by the caller.
+        let _ = config;
+
         Ok(Self {
-            config,
             next_id: Arc::new(Mutex::new(1)),
             pending,
             stdin: Arc::new(Mutex::new(Some(stdin))),
@@ -424,9 +460,6 @@ impl AppServerSession {
             id
         };
 
-        let (tx, rx) = oneshot::channel();
-        self.pending.lock().await.insert(id, tx);
-
         let envelope = json!({
             "jsonrpc": "2.0",
             "id": id,
@@ -435,16 +468,31 @@ impl AppServerSession {
         });
         let line = format!("{}\n", serde_json::to_string(&envelope)?);
 
-        {
+        // Insert the pending sender BEFORE writing to stdout so a fast
+        // server response (responses can arrive before `write_all` returns
+        // on a busy event loop) doesn't get logged as "response for unknown
+        // id" by the reader task. If the write fails, we remove the entry
+        // so the pending map doesn't grow unbounded across failed RPCs.
+        let (tx, rx) = oneshot::channel();
+        self.pending.lock().await.insert(id, tx);
+
+        let write_result = {
             let mut stdin_lock = self.stdin.lock().await;
-            let stdin = stdin_lock
-                .as_mut()
-                .ok_or_else(|| anyhow!("codex app-server stdin closed"))?;
-            stdin
-                .write_all(line.as_bytes())
-                .await
-                .with_context(|| format!("writing {} request to codex app-server", method))?;
-            stdin.flush().await.ok();
+            match stdin_lock.as_mut() {
+                Some(stdin) => match stdin.write_all(line.as_bytes()).await {
+                    Ok(()) => {
+                        stdin.flush().await.ok();
+                        Ok(())
+                    }
+                    Err(e) => Err(anyhow!("writing {} request: {}", method, e)),
+                },
+                None => Err(anyhow!("codex app-server stdin closed")),
+            }
+        };
+
+        if let Err(e) = write_result {
+            self.pending.lock().await.remove(&id);
+            return Err(e);
         }
 
         let raw = rx
@@ -520,14 +568,11 @@ impl AppServerSession {
     }
 
     pub async fn thread_start(&self, params: ThreadStartParams) -> Result<ThreadStartResult> {
-        let mut effective = params;
-        if effective.model.is_none() {
-            effective.model = self.config.default_model.clone();
-        }
-        if effective.reasoning_effort.is_none() {
-            effective.reasoning_effort = self.config.model_effort.clone();
-        }
-        self.request("thread/start", effective).await
+        // No defaults applied here — the caller (`send_message_streaming_app_server`)
+        // already merges `CodexConfig.default_model` / `model_effort` into
+        // `params` before invoking, and keeping the fallback in two places
+        // would silently disagree if one drifts.
+        self.request("thread/start", params).await
     }
 
     pub async fn turn_start(&self, params: TurnStartParams) -> Result<Value> {
