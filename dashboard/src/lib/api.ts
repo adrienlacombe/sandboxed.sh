@@ -1318,6 +1318,8 @@ export async function listLibraryCommands(): Promise<CommandSummary[]> {
 export interface BuiltinCommandsResponse {
   opencode: CommandSummary[];
   claudecode: CommandSummary[];
+  /** Codex builtin commands (codex 0.128.0+ — empty on older binaries). */
+  codex?: CommandSummary[];
 }
 
 // Get builtin slash commands for each backend
@@ -1325,9 +1327,14 @@ export async function getBuiltinCommands(): Promise<BuiltinCommandsResponse> {
   const res = await apiFetch("/api/library/builtin-commands");
   if (!res.ok) {
     // Fallback to empty if endpoint not available
-    return { opencode: [], claudecode: [] };
+    return { opencode: [], claudecode: [], codex: [] };
   }
-  return res.json();
+  const json = await res.json();
+  return {
+    opencode: json.opencode ?? [],
+    claudecode: json.claudecode ?? [],
+    codex: json.codex ?? [],
+  };
 }
 
 // Get command
