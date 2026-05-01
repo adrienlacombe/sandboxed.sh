@@ -231,6 +231,13 @@ async fn send_message_streaming_app_server(
         cwd: Some(session.directory.clone()),
         reasoning_effort: cfg.model_effort.clone(),
         ephemeral: None,
+        // Match exec-mode's `--dangerously-bypass-approvals-and-sandbox`.
+        // Without these, codex defaults to `on-request` + `read-only`, which
+        // means every shell command pings us for an elicitation and writes
+        // outside cwd are rejected — wrong for missions that already run
+        // inside per-mission systemd-nspawn containers.
+        approval_policy: Some("never".to_string()),
+        sandbox: Some("danger-full-access".to_string()),
     };
     let thread = match session_arc.thread_start(thread_start_params).await {
         Ok(t) => t.thread,

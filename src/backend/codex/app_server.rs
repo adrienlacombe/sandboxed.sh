@@ -125,6 +125,21 @@ pub struct ThreadStartParams {
     /// Leave `None` so codex picks the default (non-ephemeral).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ephemeral: Option<bool>,
+    /// Codex `ApprovalPolicy`. Valid values empirically:
+    /// `untrusted`, `on-failure`, `on-request`, `granular`, `never`.
+    /// Default in app-server is `on-request` — codex will block on
+    /// elicitations for every shell command and tool call. Mirror exec-mode's
+    /// `--dangerously-bypass-approvals-and-sandbox` by sending `never` so the
+    /// agent runs without prompting.
+    #[serde(rename = "approvalPolicy", skip_serializing_if = "Option::is_none")]
+    pub approval_policy: Option<String>,
+    /// Codex sandbox policy (string form on the wire — codex echoes it back as
+    /// a tagged object). Valid values: `read-only`, `workspace-write`,
+    /// `danger-full-access`. Default is `read-only`, which blocks shell writes
+    /// to `/tmp` and outside `cwd`. We pick `danger-full-access` to match
+    /// exec-mode's bypass-sandbox behaviour.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sandbox: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
