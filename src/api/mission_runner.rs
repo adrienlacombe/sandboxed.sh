@@ -3027,12 +3027,26 @@ async fn run_mission_turn(
         }
         "codex" => {
             let requested_model = config.default_model.as_deref();
+            // Goal-mode missions (`/goal <objective>`) need to reach the
+            // codex backend with the prefix intact so its app-server driver
+            // can route via `thread/goal/set` instead of a plain
+            // `turn/start`. The "User:\n... Instructions: ..." convo
+            // wrapper buries the prefix and breaks detection; for goal
+            // missions we send the raw user message instead. Non-goal
+            // codex missions keep the wrapped convo so they retain the
+            // history/deliverable scaffolding the model relies on.
+            let codex_message_owned: String = if user_message.trim_start().starts_with("/goal ") {
+                user_message.clone()
+            } else {
+                convo.clone()
+            };
+            let codex_message: &str = codex_message_owned.as_str();
             let all_keys = super::ai_providers::get_all_openai_keys_for_codex(&config.working_dir);
             if all_keys.is_empty() {
                 let mut result = run_codex_turn(
                     &workspace,
                     &mission_work_dir,
-                    &convo,
+                    codex_message,
                     requested_model,
                     model_effort.as_deref(),
                     effective_agent.as_deref(),
@@ -3057,7 +3071,7 @@ async fn run_mission_turn(
                     result = run_codex_turn(
                         &workspace,
                         &mission_work_dir,
-                        &convo,
+                        codex_message,
                         Some(fallback_model),
                         model_effort.as_deref(),
                         effective_agent.as_deref(),
@@ -3079,7 +3093,7 @@ async fn run_mission_turn(
                     result = run_codex_turn(
                         &workspace,
                         &mission_work_dir,
-                        &convo,
+                        codex_message,
                         None,
                         model_effort.as_deref(),
                         effective_agent.as_deref(),
@@ -3136,7 +3150,7 @@ async fn run_mission_turn(
                     let mut result = run_codex_turn(
                         &workspace,
                         &mission_work_dir,
-                        &convo,
+                        codex_message,
                         requested_model,
                         model_effort.as_deref(),
                         effective_agent.as_deref(),
@@ -3163,7 +3177,7 @@ async fn run_mission_turn(
                         result = run_codex_turn(
                             &workspace,
                             &mission_work_dir,
-                            &convo,
+                            codex_message,
                             Some(fallback_model),
                             model_effort.as_deref(),
                             effective_agent.as_deref(),
@@ -3189,7 +3203,7 @@ async fn run_mission_turn(
                         result = run_codex_turn(
                             &workspace,
                             &mission_work_dir,
-                            &convo,
+                            codex_message,
                             None,
                             model_effort.as_deref(),
                             effective_agent.as_deref(),

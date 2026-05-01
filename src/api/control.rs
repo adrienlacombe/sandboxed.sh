@@ -9669,10 +9669,20 @@ async fn run_single_control_turn(
             let requested_codex_model = requested_model
                 .as_deref()
                 .or(config.default_model.as_deref());
+            // Goal-mode missions need the raw `/goal <objective>` message to
+            // reach the codex backend; the wrapped `convo` buries the prefix
+            // and breaks `parse_goal_prefix`. Mirror the same routing the
+            // mission_runner dispatch uses.
+            let codex_message_owned: String = if user_message.trim_start().starts_with("/goal ") {
+                user_message.clone()
+            } else {
+                convo.clone()
+            };
+            let codex_message: &str = codex_message_owned.as_str();
             let mut result = Box::pin(super::mission_runner::run_codex_turn(
                 exec_workspace,
                 &ctx.working_dir,
-                &convo,
+                codex_message,
                 requested_codex_model,
                 requested_model_effort.as_deref(),
                 config.opencode_agent.as_deref(),
@@ -9698,7 +9708,7 @@ async fn run_single_control_turn(
                 result = Box::pin(super::mission_runner::run_codex_turn(
                     exec_workspace,
                     &ctx.working_dir,
-                    &convo,
+                    codex_message,
                     Some(fallback_model),
                     requested_model_effort.as_deref(),
                     config.opencode_agent.as_deref(),
@@ -9722,7 +9732,7 @@ async fn run_single_control_turn(
                 result = Box::pin(super::mission_runner::run_codex_turn(
                     exec_workspace,
                     &ctx.working_dir,
-                    &convo,
+                    codex_message,
                     None,
                     requested_model_effort.as_deref(),
                     config.opencode_agent.as_deref(),
