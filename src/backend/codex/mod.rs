@@ -1,3 +1,4 @@
+pub mod app_server;
 pub mod client;
 
 use anyhow::Error;
