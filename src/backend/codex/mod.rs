@@ -406,26 +406,39 @@ impl AppServerEventTranslator {
 
         match method {
             // ----- Streaming text & reasoning -----
+            //
+            // mission_runner expects TextDelta and Thinking content to be
+            // **per-item snapshots** (full text so far for that item), not
+            // raw incremental chunks — exec-mode's `emit_text_snapshot`
+            // already followed that contract. Codex's `delta` notifications
+            // carry incremental pieces; we accumulate them per item id and
+            // emit a snapshot of the running buffer.
             "item/agentMessage/delta" => {
                 if let Some(delta) = params.get("delta").and_then(|v| v.as_str()) {
                     let item_id = params
                         .get("itemId")
                         .and_then(|v| v.as_str())
-                        .unwrap_or("")
+                        .unwrap_or("__anon")
                         .to_string();
-                    self.delta_buffers
-                        .entry(item_id)
-                        .or_default()
-                        .push_str(delta);
+                    let entry = self.delta_buffers.entry(item_id).or_default();
+                    entry.push_str(delta);
                     events.push(ExecutionEvent::TextDelta {
-                        content: delta.to_string(),
+                        content: entry.clone(),
                     });
                 }
             }
             "item/reasoning/textDelta" | "item/reasoning/summaryTextDelta" => {
                 if let Some(delta) = params.get("delta").and_then(|v| v.as_str()) {
+                    let item_id = params
+                        .get("itemId")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("__anon_reasoning")
+                        .to_string();
+                    let key = format!("reasoning:{}", item_id);
+                    let entry = self.delta_buffers.entry(key).or_default();
+                    entry.push_str(delta);
                     events.push(ExecutionEvent::Thinking {
-                        content: delta.to_string(),
+                        content: entry.clone(),
                     });
                 }
             }
