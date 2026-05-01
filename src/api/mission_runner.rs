@@ -13301,6 +13301,20 @@ pub async fn run_codex_turn(
                         total_input_tokens = total_input_tokens.saturating_add(input_tokens);
                         total_output_tokens = total_output_tokens.saturating_add(output_tokens);
                     }
+                    ExecutionEvent::GoalIteration { iteration, objective } => {
+                        let _ = events_tx.send(AgentEvent::GoalIteration {
+                            iteration,
+                            objective,
+                            mission_id: Some(mission_id),
+                        });
+                    }
+                    ExecutionEvent::GoalStatus { status, objective } => {
+                        let _ = events_tx.send(AgentEvent::GoalStatus {
+                            status,
+                            objective,
+                            mission_id: Some(mission_id),
+                        });
+                    }
                     ExecutionEvent::Error { message } => {
                         // Codex CLI emits two kinds of post-response errors we
                         // want to treat as non-fatal:
@@ -13775,6 +13789,24 @@ pub async fn run_gemini_turn(
                     ExecutionEvent::Usage { input_tokens, output_tokens } => {
                         total_input_tokens = total_input_tokens.saturating_add(input_tokens);
                         total_output_tokens = total_output_tokens.saturating_add(output_tokens);
+                    }
+                    // Goal events don't apply to Gemini today (no /goal
+                    // continuation loop for that backend), but we still
+                    // forward them so a future Gemini integration that
+                    // adds goal mode just works.
+                    ExecutionEvent::GoalIteration { iteration, objective } => {
+                        let _ = events_tx.send(AgentEvent::GoalIteration {
+                            iteration,
+                            objective,
+                            mission_id: Some(mission_id),
+                        });
+                    }
+                    ExecutionEvent::GoalStatus { status, objective } => {
+                        let _ = events_tx.send(AgentEvent::GoalStatus {
+                            status,
+                            objective,
+                            mission_id: Some(mission_id),
+                        });
                     }
                     ExecutionEvent::Error { message } => {
                         error_message = Some(message.clone());

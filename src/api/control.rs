@@ -2631,6 +2631,23 @@ pub enum AgentEvent {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         resumable: bool,
     },
+    /// Goal-mode iteration marker — fired once per turn while a codex
+    /// `/goal` continuation loop is active. UI renders as "iter N" pill.
+    GoalIteration {
+        iteration: u32,
+        objective: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        mission_id: Option<Uuid>,
+    },
+    /// Goal status transitioned. Carries the canonical status string from
+    /// codex's `thread/goal/updated`: `active`, `paused`, `budgetLimited`,
+    /// `complete`, or `cleared` when the goal was explicitly aborted.
+    GoalStatus {
+        status: String,
+        objective: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        mission_id: Option<Uuid>,
+    },
     /// Mission status changed (by agent or user)
     MissionStatusChanged {
         mission_id: Uuid,
@@ -2808,6 +2825,8 @@ impl AgentEvent {
             AgentEvent::MissionMetadataUpdated { .. } => "mission_metadata_updated",
             AgentEvent::MissionSettingsUpdated { .. } => "mission_settings_updated",
             AgentEvent::FidoSignRequest { .. } => "fido_sign_request",
+            AgentEvent::GoalIteration { .. } => "goal_iteration",
+            AgentEvent::GoalStatus { .. } => "goal_status",
         }
     }
 
@@ -2831,6 +2850,8 @@ impl AgentEvent {
             AgentEvent::MissionMetadataUpdated { mission_id, .. } => Some(*mission_id),
             AgentEvent::MissionSettingsUpdated { mission_id, .. } => Some(*mission_id),
             AgentEvent::FidoSignRequest { .. } => None,
+            AgentEvent::GoalIteration { mission_id, .. } => *mission_id,
+            AgentEvent::GoalStatus { mission_id, .. } => *mission_id,
         }
     }
 }

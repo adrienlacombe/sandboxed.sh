@@ -284,8 +284,19 @@ async fn send_message_streaming_app_server(
 
     let session_for_loop = Arc::clone(&session_arc);
     let session_id = session.id.clone();
+    let initial_objective = if is_goal_mission {
+        user_payload.clone()
+    } else {
+        String::new()
+    };
     let handle = tokio::spawn(async move {
-        let mut translator = AppServerEventTranslator::default();
+        // Seed the cached objective so the first GoalIteration event has
+        // it before `thread/goal/updated` arrives. Cleared when not a
+        // goal mission (no iteration counters fire then anyway).
+        let mut translator = AppServerEventTranslator {
+            goal_objective: initial_objective,
+            ..Default::default()
+        };
         let mut terminal = false;
         let mut stream_closed_unexpectedly = false;
 
@@ -390,6 +401,18 @@ struct AppServerEventTranslator {
     /// so we don't double-count when codex sends both turn-level and
     /// thread-level token deltas.
     emitted_usage_for_turn: std::collections::HashSet<String>,
+    /// 1-based iteration counter for goal missions — incremented on every
+    /// `turn/started` we observe while the goal is active. Surfaces as
+    /// `GoalIteration` ExecutionEvents that the UI renders as a pill.
+    goal_iteration: u32,
+    /// Mirror of the goal objective so iteration markers can carry it
+    /// without re-parsing every notification. Set when the driver issues
+    /// `thread/goal/set`.
+    goal_objective: String,
+    /// Set of turn ids we've already counted as iterations, so repeated
+    /// `turn/started` for the same turn (codex re-emits on resume) doesn't
+    /// double-count.
+    counted_turn_ids: std::collections::HashSet<String>,
 }
 
 struct TranslateOutcome {
@@ -577,16 +600,59 @@ impl AppServerEventTranslator {
                 }
             }
 
+            // ----- Per-turn marker (goal mode iteration counter) -----
+            //
+            // We only count iterations for goal missions since codex's
+            // continuation engine fires `turn/started` for each iteration
+            // automatically. For non-goal missions there's only ever one
+            // turn, so a counter would be noise.
+            "turn/started" if is_goal_mission => {
+                let turn_id = params
+                    .get("turn")
+                    .and_then(|t| t.get("id"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                // Codex can re-emit `turn/started` for the same turn after
+                // a thread/resume; dedupe by id.
+                if !turn_id.is_empty() && self.counted_turn_ids.insert(turn_id) {
+                    self.goal_iteration = self.goal_iteration.saturating_add(1);
+                    events.push(ExecutionEvent::GoalIteration {
+                        iteration: self.goal_iteration,
+                        objective: self.goal_objective.clone(),
+                    });
+                }
+            }
+
             // ----- Goal lifecycle -----
             "thread/goal/updated" => {
                 if let Some(goal) = params.get("goal") {
-                    let status = goal.get("status").and_then(|v| v.as_str()).unwrap_or("");
+                    let status = goal
+                        .get("status")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    // Refresh our cached objective on every update — covers
+                    // the initial set, pause/resume, and budget bumps.
+                    if let Some(obj) = goal.get("objective").and_then(|v| v.as_str()) {
+                        self.goal_objective = obj.to_string();
+                    }
+                    if !status.is_empty() {
+                        events.push(ExecutionEvent::GoalStatus {
+                            status: status.clone(),
+                            objective: self.goal_objective.clone(),
+                        });
+                    }
                     if status == "complete" || status == "budgetLimited" {
                         terminal = true;
                     }
                 }
             }
             "thread/goal/cleared" if is_goal_mission => {
+                events.push(ExecutionEvent::GoalStatus {
+                    status: "cleared".to_string(),
+                    objective: self.goal_objective.clone(),
+                });
                 terminal = true;
             }
 

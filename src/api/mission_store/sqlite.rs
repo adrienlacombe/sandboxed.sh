@@ -3010,6 +3010,28 @@ impl MissionStore for SqliteMissionStore {
                     "updated_at": updated_at
                 }),
             ),
+            AgentEvent::GoalIteration {
+                iteration,
+                objective,
+                ..
+            } => (
+                "goal_iteration",
+                None,
+                None,
+                None,
+                objective.clone(),
+                serde_json::json!({ "iteration": iteration }),
+            ),
+            AgentEvent::GoalStatus {
+                status, objective, ..
+            } => (
+                "goal_status",
+                None,
+                None,
+                None,
+                objective.clone(),
+                serde_json::json!({ "status": status }),
+            ),
             // Skip events that are less important for debugging
             AgentEvent::Status { .. }
             | AgentEvent::AgentPhase { .. }
