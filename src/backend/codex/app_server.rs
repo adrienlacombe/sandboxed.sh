@@ -235,17 +235,12 @@ impl AppServerSession {
         // workspace exec — so app-server works inside per-mission systemd-nspawn
         // containers without losing stdio.
         let mut child = if let Some(exec) = workspace_exec {
-            exec.spawn_streaming(
-                Path::new(cwd),
-                &config.cli_path,
-                &args,
-                config.env.clone(),
-            )
-            .await
-            .map_err(|e| {
-                error!("Failed to spawn codex app-server in workspace: {}", e);
-                anyhow!("Failed to spawn codex app-server in workspace: {}", e)
-            })?
+            exec.spawn_streaming(Path::new(cwd), &config.cli_path, &args, config.env.clone())
+                .await
+                .map_err(|e| {
+                    error!("Failed to spawn codex app-server in workspace: {}", e);
+                    anyhow!("Failed to spawn codex app-server in workspace: {}", e)
+                })?
         } else {
             let mut cmd = Command::new(&config.cli_path);
             cmd.current_dir(cwd)
@@ -309,7 +304,10 @@ impl AppServerSession {
                 let value: Value = match serde_json::from_str(trimmed) {
                     Ok(v) => v,
                     Err(e) => {
-                        warn!("codex app-server: failed to parse line as JSON: {} — line={}", e, trimmed);
+                        warn!(
+                            "codex app-server: failed to parse line as JSON: {} — line={}",
+                            e, trimmed
+                        );
                         continue;
                     }
                 };
@@ -436,10 +434,15 @@ impl AppServerSession {
 
         let raw = rx
             .await
-            .map_err(|_| anyhow!("codex app-server reader task dropped before responding to {}", method))?
+            .map_err(|_| {
+                anyhow!(
+                    "codex app-server reader task dropped before responding to {}",
+                    method
+                )
+            })?
             .map_err(|e| anyhow!("{} failed: {}", method, e))?;
-        let parsed: R = serde_json::from_value(raw)
-            .with_context(|| format!("parsing {} response", method))?;
+        let parsed: R =
+            serde_json::from_value(raw).with_context(|| format!("parsing {} response", method))?;
         Ok(parsed)
     }
 
@@ -481,7 +484,11 @@ impl AppServerSession {
 
     // -------- Typed RPC methods --------
 
-    pub async fn initialize(&self, client_name: &str, client_version: &str) -> Result<InitializeResult> {
+    pub async fn initialize(
+        &self,
+        client_name: &str,
+        client_version: &str,
+    ) -> Result<InitializeResult> {
         self.request(
             "initialize",
             InitializeParams {

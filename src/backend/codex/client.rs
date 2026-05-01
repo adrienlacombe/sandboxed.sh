@@ -21,15 +21,28 @@ pub struct CodexConfig {
     pub oauth_token: Option<String>,
     pub default_model: Option<String>,
     pub model_effort: Option<String>,
+    /// When true, the backend drives codex via the experimental
+    /// `codex app-server` JSON-RPC protocol instead of `codex exec`. Required
+    /// for `/goal` (continuation-loop) support — exec doesn't parse slash
+    /// commands and never arms codex's goals.rs runtime.
+    ///
+    /// Off by default; flip on globally with `CODEX_APP_SERVER_MODE=1` or
+    /// per-mission via Mission.goal_mode once that schema lands.
+    pub use_app_server: bool,
 }
 
 impl Default for CodexConfig {
     fn default() -> Self {
+        let use_app_server = std::env::var("CODEX_APP_SERVER_MODE")
+            .ok()
+            .map(|v| matches!(v.as_str(), "1" | "true" | "yes" | "on"))
+            .unwrap_or(false);
         Self {
             cli_path: std::env::var("CODEX_CLI_PATH").unwrap_or_else(|_| "codex".to_string()),
             oauth_token: std::env::var("OPENAI_OAUTH_TOKEN").ok(),
             default_model: None,
             model_effort: None,
+            use_app_server,
         }
     }
 }

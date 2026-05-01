@@ -105,6 +105,21 @@ impl Backend for CodexBackend {
         message: &str,
     ) -> Result<(mpsc::Receiver<ExecutionEvent>, JoinHandle<()>), Error> {
         let config = self.config.read().await.clone();
+
+        // App-server mode is opt-in (env var or per-config flag). The /goal
+        // continuation loop only works through this path because `codex exec`
+        // doesn't parse slash commands; the model would just see "/goal X" as
+        // user text.
+        if config.use_app_server {
+            return send_message_streaming_app_server(
+                config,
+                session,
+                message,
+                self.workspace_exec.as_ref(),
+            )
+            .await;
+        }
+
         let client = CodexClient::with_config(config);
         let workspace_exec = self.workspace_exec.as_ref();
 
@@ -151,6 +166,442 @@ impl Backend for CodexBackend {
         });
 
         Ok((rx, handle))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// App-server mode driver (Path A)
+// ---------------------------------------------------------------------------
+
+/// Drives a single mission turn via `codex app-server`. Mirrors the exec-mode
+/// `send_message_streaming` contract: returns a receiver of ExecutionEvents and
+/// a JoinHandle that resolves when the turn (or the goal loop) reaches a
+/// terminal state.
+///
+/// Goal vs non-goal routing:
+/// - Message starts with `/goal ` → strip the prefix and call
+///   `thread/goal/set` instead of `turn/start`. Codex auto-starts a turn and
+///   keeps looping until the model invokes `update_goal { status: "complete" }`
+///   (or the optional token budget is hit). We finish the mission when we see
+///   a `thread/goal/updated` notification with terminal status.
+/// - Otherwise → `turn/start` with a single text input item. We finish the
+///   mission on the first `turn/completed` notification.
+async fn send_message_streaming_app_server(
+    cfg: client::CodexConfig,
+    session: &Session,
+    message: &str,
+    workspace_exec: Option<&crate::workspace_exec::WorkspaceExec>,
+) -> Result<(mpsc::Receiver<ExecutionEvent>, JoinHandle<()>), Error> {
+    use app_server::{
+        AppServerConfig, AppServerSession, GoalSetParams, InboundMessage, ThreadStartParams,
+        TurnStartParams, UserInputItem,
+    };
+
+    let app_cfg = AppServerConfig {
+        cli_path: cfg.cli_path.clone(),
+        enabled_features: vec!["goals".to_string()],
+        default_model: cfg.default_model.clone(),
+        model_effort: cfg.model_effort.clone(),
+        env: cfg
+            .oauth_token
+            .as_ref()
+            .map(|t| {
+                let mut m = std::collections::HashMap::new();
+                m.insert("OPENAI_OAUTH_TOKEN".to_string(), t.clone());
+                m
+            })
+            .unwrap_or_default(),
+    };
+
+    let session_arc = AppServerSession::spawn(app_cfg, &session.directory, workspace_exec).await?;
+    let session_arc = Arc::new(session_arc);
+
+    // Initialize handshake — without `experimentalApi: true`, every
+    // thread/goal/* RPC is rejected.
+    if let Err(e) = session_arc.initialize("sandboxed-sh", "1.2.0").await {
+        let _ = session_arc.shutdown().await;
+        return Err(anyhow::anyhow!("codex app-server initialize failed: {}", e));
+    }
+    // Best-effort `notifications/initialized` — codex tolerates clients that
+    // skip this but it matches the LSP-style handshake.
+    let _ = session_arc.send_initialized_notification().await;
+
+    let thread_start_params = ThreadStartParams {
+        model: session.model.clone(),
+        cwd: Some(session.directory.clone()),
+        reasoning_effort: cfg.model_effort.clone(),
+        ephemeral: None,
+    };
+    let thread = match session_arc.thread_start(thread_start_params).await {
+        Ok(t) => t.thread,
+        Err(e) => {
+            let _ = session_arc.shutdown().await;
+            return Err(anyhow::anyhow!("codex thread/start failed: {}", e));
+        }
+    };
+
+    let (tx, rx) = mpsc::channel::<ExecutionEvent>(256);
+
+    // Take the inbound channel before issuing any further RPC — `goal/set`
+    // and `turn/start` start emitting notifications before they return.
+    let mut inbound = match session_arc.take_inbound().await {
+        Some(rx) => rx,
+        None => {
+            let _ = session_arc.shutdown().await;
+            return Err(anyhow::anyhow!(
+                "codex app-server inbound stream already taken"
+            ));
+        }
+    };
+
+    // Detect /goal prefix server-side. Dashboard does this too, but the
+    // backend is the trust boundary — easier to enforce here than rely on
+    // every client.
+    let trimmed = message.trim_start();
+    let is_goal_mission = trimmed.starts_with("/goal ");
+    let user_payload = if is_goal_mission {
+        trimmed.trim_start_matches("/goal ").trim().to_string()
+    } else {
+        message.to_string()
+    };
+
+    let thread_id = thread.id.clone();
+    let session_for_rpc = Arc::clone(&session_arc);
+
+    // Issue the priming RPC. For goal missions, codex auto-starts the first
+    // turn after `goal/set`; for non-goal, we explicitly send `turn/start`.
+    if is_goal_mission {
+        if user_payload.is_empty() {
+            let _ = session_arc.shutdown().await;
+            return Err(anyhow::anyhow!(
+                "/goal requires an objective — got empty string"
+            ));
+        }
+        if let Err(e) = session_for_rpc
+            .goal_set(GoalSetParams {
+                thread_id: thread_id.clone(),
+                objective: user_payload.clone(),
+                token_budget: None,
+            })
+            .await
+        {
+            let _ = session_arc.shutdown().await;
+            return Err(anyhow::anyhow!("codex thread/goal/set failed: {}", e));
+        }
+    } else {
+        if let Err(e) = session_for_rpc
+            .turn_start(TurnStartParams {
+                thread_id: thread_id.clone(),
+                input: vec![UserInputItem::Text {
+                    text: user_payload.clone(),
+                }],
+            })
+            .await
+        {
+            let _ = session_arc.shutdown().await;
+            return Err(anyhow::anyhow!("codex turn/start failed: {}", e));
+        }
+    }
+
+    let session_for_loop = Arc::clone(&session_arc);
+    let session_id = session.id.clone();
+    let handle = tokio::spawn(async move {
+        let mut translator = AppServerEventTranslator::default();
+        let mut terminal = false;
+
+        while let Some(msg) = inbound.recv().await {
+            match msg {
+                InboundMessage::Notification { method, params } => {
+                    let outcome = translator.handle_notification(&method, &params, is_goal_mission);
+                    for ev in outcome.events {
+                        if tx.send(ev).await.is_err() {
+                            terminal = true;
+                            break;
+                        }
+                    }
+                    if outcome.terminal {
+                        terminal = true;
+                    }
+                }
+                InboundMessage::ServerRequest {
+                    id,
+                    method,
+                    params: _,
+                } => {
+                    // Codex elicits permission for command exec, file change,
+                    // and dynamic-tool invocations through server-initiated
+                    // requests. Exec mode runs with
+                    // `--dangerously-bypass-approvals-and-sandbox`; we mirror
+                    // that policy here by auto-approving every elicitation.
+                    let result = elicitation_auto_approve(&method);
+                    if let Err(e) = session_for_loop.respond_to_server_request(id, result).await {
+                        debug!("failed to respond to server request {}: {}", method, e);
+                    }
+                }
+            }
+
+            if terminal {
+                break;
+            }
+        }
+
+        let _ = tx
+            .send(ExecutionEvent::MessageComplete {
+                session_id: session_id.clone(),
+            })
+            .await;
+
+        let _ = session_for_loop.shutdown().await;
+    });
+
+    Ok((rx, handle))
+}
+
+/// Auto-approve any server-initiated elicitation. Matches exec-mode's
+/// `--dangerously-bypass-approvals-and-sandbox` posture. Specific elicitations
+/// expect different result shapes; cover the common ones explicitly and fall
+/// back to a generic `{decision:"approve"}` for anything else.
+fn elicitation_auto_approve(method: &str) -> serde_json::Value {
+    use serde_json::json;
+    match method {
+        "item/commandExecution/requestApproval"
+        | "item/fileChange/requestApproval"
+        | "item/permissions/requestApproval" => json!({ "decision": "approve" }),
+        // Auth refresh requests — we don't have refresh tokens to give back,
+        // so respond with an error-like null and let codex surface its own
+        // re-auth notification.
+        "account/chatgptAuthTokens/refresh" => serde_json::Value::Null,
+        _ => json!({ "decision": "approve" }),
+    }
+}
+
+/// Translates codex app-server notifications into ExecutionEvents and detects
+/// terminal state for the mission.
+#[derive(Default)]
+struct AppServerEventTranslator {
+    /// Keep track of which item ids we've already emitted text for, so
+    /// repeated `item/agentMessage/delta` events don't duplicate text into
+    /// the mission stream beyond what each delta carries.
+    delta_buffers: std::collections::HashMap<String, String>,
+    /// True once we've emitted a synthetic Usage event for the current turn,
+    /// so we don't double-count when codex sends both turn-level and
+    /// thread-level token deltas.
+    emitted_usage_for_turn: std::collections::HashSet<String>,
+}
+
+struct TranslateOutcome {
+    events: Vec<ExecutionEvent>,
+    terminal: bool,
+}
+
+impl AppServerEventTranslator {
+    fn handle_notification(
+        &mut self,
+        method: &str,
+        params: &serde_json::Value,
+        is_goal_mission: bool,
+    ) -> TranslateOutcome {
+        let mut events = Vec::new();
+        let mut terminal = false;
+
+        match method {
+            // ----- Streaming text & reasoning -----
+            "item/agentMessage/delta" => {
+                if let Some(delta) = params.get("delta").and_then(|v| v.as_str()) {
+                    let item_id = params
+                        .get("itemId")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    self.delta_buffers
+                        .entry(item_id)
+                        .or_default()
+                        .push_str(delta);
+                    events.push(ExecutionEvent::TextDelta {
+                        content: delta.to_string(),
+                    });
+                }
+            }
+            "item/reasoning/textDelta" | "item/reasoning/summaryTextDelta" => {
+                if let Some(delta) = params.get("delta").and_then(|v| v.as_str()) {
+                    events.push(ExecutionEvent::Thinking {
+                        content: delta.to_string(),
+                    });
+                }
+            }
+
+            // ----- Item lifecycle (tool calls, command execution) -----
+            "item/started" | "item/completed" => {
+                if let Some(item) = params.get("item") {
+                    let kind = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                    let id = item
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    match kind {
+                        "toolCall" | "tool_call" | "functionCall" | "function_call" => {
+                            let name = item
+                                .get("name")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("unknown_tool")
+                                .to_string();
+                            if method == "item/started" {
+                                let args = item
+                                    .get("arguments")
+                                    .or_else(|| item.get("args"))
+                                    .or_else(|| item.get("input"))
+                                    .cloned()
+                                    .unwrap_or(serde_json::Value::Null);
+                                events.push(ExecutionEvent::ToolCall { id, name, args });
+                            } else {
+                                let result = item
+                                    .get("result")
+                                    .or_else(|| item.get("output"))
+                                    .cloned()
+                                    .unwrap_or(serde_json::Value::Null);
+                                events.push(ExecutionEvent::ToolResult { id, name, result });
+                            }
+                        }
+                        "commandExecution" => {
+                            // Bash-like commands. Surface as a synthetic
+                            // tool call named "bash" to match the exec-mode
+                            // legacy translator's convention.
+                            let command = item
+                                .get("command")
+                                .cloned()
+                                .unwrap_or(serde_json::Value::Null);
+                            if method == "item/started" {
+                                events.push(ExecutionEvent::ToolCall {
+                                    id,
+                                    name: "bash".to_string(),
+                                    args: serde_json::json!({ "command": command }),
+                                });
+                            } else {
+                                let result = item
+                                    .get("aggregatedOutput")
+                                    .or_else(|| item.get("output"))
+                                    .cloned()
+                                    .unwrap_or(serde_json::Value::Null);
+                                events.push(ExecutionEvent::ToolResult {
+                                    id,
+                                    name: "bash".to_string(),
+                                    result,
+                                });
+                            }
+                        }
+                        // Other item types (assistantMessage, userMessage, etc.)
+                        // are surfaced through delta events; nothing to do here.
+                        _ => {}
+                    }
+                }
+            }
+
+            // ----- Turn lifecycle -----
+            "turn/completed" => {
+                if let Some(turn) = params.get("turn") {
+                    let turn_id = turn
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    if !turn_id.is_empty() && !self.emitted_usage_for_turn.contains(&turn_id) {
+                        if let Some(usage) = turn.get("tokenUsage").or_else(|| turn.get("usage")) {
+                            let input = usage
+                                .get("inputTokens")
+                                .or_else(|| usage.get("input_tokens"))
+                                .or_else(|| usage.get("promptTokens"))
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(0);
+                            let output = usage
+                                .get("outputTokens")
+                                .or_else(|| usage.get("output_tokens"))
+                                .or_else(|| usage.get("completionTokens"))
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(0);
+                            if input > 0 || output > 0 {
+                                events.push(ExecutionEvent::Usage {
+                                    input_tokens: input,
+                                    output_tokens: output,
+                                });
+                            }
+                        }
+                        self.emitted_usage_for_turn.insert(turn_id);
+                    }
+
+                    let status = turn.get("status").and_then(|v| v.as_str()).unwrap_or("");
+                    match status {
+                        "failed" => {
+                            let msg = turn
+                                .get("error")
+                                .and_then(|e| e.get("message"))
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("turn failed");
+                            events.push(ExecutionEvent::Error {
+                                message: msg.to_string(),
+                            });
+                            terminal = true;
+                        }
+                        "interrupted" => {
+                            terminal = true;
+                        }
+                        "completed" => {
+                            // For non-goal missions, a completed turn IS the
+                            // mission terminal. For goal missions, the goal
+                            // continuation engine will keep launching more
+                            // turns; we wait for thread/goal/updated.
+                            if !is_goal_mission {
+                                terminal = true;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
+            // ----- Goal lifecycle -----
+            "thread/goal/updated" => {
+                if let Some(goal) = params.get("goal") {
+                    let status = goal.get("status").and_then(|v| v.as_str()).unwrap_or("");
+                    if status == "complete" || status == "budgetLimited" {
+                        terminal = true;
+                    }
+                }
+            }
+            "thread/goal/cleared" => {
+                if is_goal_mission {
+                    terminal = true;
+                }
+            }
+
+            // ----- Errors / warnings -----
+            "error" => {
+                if let Some(err) = params.get("error") {
+                    let message = err
+                        .get("message")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("codex app-server error")
+                        .to_string();
+                    let will_retry = params
+                        .get("willRetry")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    events.push(ExecutionEvent::Error {
+                        message: message.clone(),
+                    });
+                    if !will_retry {
+                        terminal = true;
+                    }
+                }
+            }
+
+            // Notifications we deliberately ignore: thread/started,
+            // thread/status/changed, warning, remoteControl/status/changed,
+            // turn/started, item/agentMessage/delta we already handled, etc.
+            _ => {}
+        }
+
+        TranslateOutcome { events, terminal }
     }
 }
 
