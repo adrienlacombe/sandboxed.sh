@@ -224,8 +224,14 @@ async fn send_message_streaming_app_server(
     // skip this but it matches the LSP-style handshake.
     let _ = session_arc.send_initialized_notification().await;
 
+    // Resolve the model the same way exec mode does (`client.rs` ~L98):
+    // per-session override wins, otherwise fall back to the operator-configured
+    // default. Without this `or_else`, an operator who sets `default_model`
+    // through the codex backend config would silently get codex's built-in
+    // default in app-server mode.
+    let resolved_model = session.model.clone().or_else(|| cfg.default_model.clone());
     let thread_start_params = ThreadStartParams {
-        model: session.model.clone(),
+        model: resolved_model,
         cwd: Some(session.directory.clone()),
         reasoning_effort: cfg.model_effort.clone(),
         ephemeral: None,
@@ -577,6 +583,10 @@ impl AppServerEventTranslator {
 
                     let status = turn.get("status").and_then(|v| v.as_str()).unwrap_or("");
                     match status {
+                        // `failed` is unconditional — a turn that hard-errors
+                        // takes the mission down regardless of goal mode,
+                        // because codex's continuation loop won't restart
+                        // a failed turn either way.
                         "failed" => {
                             let msg = turn
                                 .get("error")
@@ -588,14 +598,14 @@ impl AppServerEventTranslator {
                             });
                             terminal = true;
                         }
-                        "interrupted" => {
-                            terminal = true;
-                        }
-                        // For non-goal missions, a completed turn IS the
-                        // mission terminal. For goal missions, the goal
-                        // continuation engine will keep launching more
-                        // turns; we wait for thread/goal/updated instead.
-                        "completed" if !is_goal_mission => {
+                        // For goal missions, both `interrupted` and
+                        // `completed` are non-terminal at the turn level —
+                        // codex's goals.rs may launch the next turn or emit
+                        // `thread/goal/updated` with a terminal status; we
+                        // wait for that signal instead of guessing.
+                        // For non-goal missions, the mission ends when its
+                        // single turn ends (whether interrupted or completed).
+                        "interrupted" | "completed" if !is_goal_mission => {
                             terminal = true;
                         }
                         _ => {}
