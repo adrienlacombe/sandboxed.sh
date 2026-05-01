@@ -8,6 +8,15 @@
 import SwiftUI
 import os
 
+/// Snapshot of the active codex goal-mode loop, surfaced as a pill above
+/// the composer. Status mirrors codex's `thread/goal/updated` payload:
+/// `active`, `paused`, `budgetLimited`, `complete`, or `cleared`.
+struct GoalPillInfo: Equatable {
+    var iteration: Int
+    var status: String
+    var objective: String
+}
+
 struct ControlView: View {
     private static let draftTextKey = "control_draft_text"
     private static let lastMissionIdKey = "control_last_mission_id"
@@ -33,6 +42,12 @@ struct ControlView: View {
     @State private var scrollToBottomTick = 0
     @State private var progress: ExecutionProgress?
     @State private var isAtBottom = true
+
+    /// Goal-mode pill state. Tracks the latest `iteration`, `status`, and
+    /// `objective` for codex `/goal` continuation missions. `nil` when no
+    /// goal is active or when the mission has reached a terminal goal
+    /// status (`complete`, `cleared`, `budgetLimited`).
+    @State private var goalInfo: GoalPillInfo?
     @State private var copiedMessageId: String?
     @State private var shouldScrollImmediately = false
     @State private var isLoadingHistory = false  // Track when loading historical messages to prevent animated scroll
@@ -1033,8 +1048,52 @@ struct ControlView: View {
         !inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
+    /// Goal-mode pill — sits above the composer while a codex `/goal`
+    /// continuation loop is active. State is fed by `goal_iteration` /
+    /// `goal_status` SSE events; cleared automatically on terminal status.
+    @ViewBuilder
+    private var goalPill: some View {
+        if let goal = goalInfo {
+            HStack(spacing: 6) {
+                Image(systemName: "target")
+                    .font(.system(size: 10, weight: .semibold))
+                Text("Goal")
+                    .font(.caption2.weight(.semibold))
+                Text("·")
+                    .foregroundStyle(Theme.accent.opacity(0.6))
+                Text(
+                    goal.status == "active"
+                        ? "iter \(goal.iteration)"
+                        : goal.status
+                )
+                .font(.caption2.weight(.medium))
+                if !goal.objective.isEmpty {
+                    Text("·")
+                        .foregroundStyle(Theme.accent.opacity(0.6))
+                    Text(goal.objective)
+                        .font(.caption2)
+                        .foregroundStyle(Theme.accent.opacity(0.7))
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                }
+            }
+            .foregroundStyle(Theme.accent)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 6)
+            .background(Theme.accent.opacity(0.12))
+            .clipShape(Capsule())
+            .overlay(
+                Capsule().stroke(Theme.accent.opacity(0.3), lineWidth: 0.5)
+            )
+            .padding(.top, 8)
+            .transition(.move(edge: .bottom).combined(with: .opacity))
+        }
+    }
+
     private var inputView: some View {
         VStack(spacing: 0) {
+            goalPill
+
             // Queue indicator above input when agent is busy with queued messages
             if runState != .idle && queueLength > 0 {
                 Button {
@@ -2550,6 +2609,34 @@ struct ControlView: View {
         case "text_delta":
             if !isHistoricalReplay, let content = data["content"] as? String {
                 upsertStreamingFallbackThought(content: content, done: false)
+            }
+
+        case "goal_iteration":
+            // Goal-mode iteration marker — increment the counter shown in
+            // the pill above the composer. Backend dedupes by turn id, so
+            // we trust the value as authoritative.
+            let iteration = data["iteration"] as? Int ?? 0
+            let objective = data["objective"] as? String ?? goalInfo?.objective ?? ""
+            goalInfo = GoalPillInfo(
+                iteration: iteration,
+                status: goalInfo?.status ?? "active",
+                objective: objective
+            )
+
+        case "goal_status":
+            // Goal status transitioned. Terminal statuses clear the pill;
+            // active/paused keep it visible with the new label.
+            let status = data["status"] as? String ?? ""
+            let objective = data["objective"] as? String ?? goalInfo?.objective ?? ""
+            switch status {
+            case "complete", "cleared", "budgetLimited":
+                goalInfo = nil
+            default:
+                goalInfo = GoalPillInfo(
+                    iteration: goalInfo?.iteration ?? 0,
+                    status: status,
+                    objective: objective
+                )
             }
             
         case "thinking":
