@@ -342,6 +342,23 @@ export type ControlAgentEvent =
     }
   | { type: "thinking"; content: string; done: boolean; mission_id?: string }
   | {
+      // Codex `/goal` continuation loop — `iteration` is 1-based, monotonic
+      // within a mission. Surfaced once per `turn/started` while the goal
+      // is active.
+      type: "goal_iteration";
+      iteration: number;
+      objective: string;
+      mission_id?: string;
+    }
+  | {
+      // Goal status transitions: `active`, `paused`, `budgetLimited`,
+      // `complete`, or `cleared` (explicit abort).
+      type: "goal_status";
+      status: string;
+      objective: string;
+      mission_id?: string;
+    }
+  | {
       type: "tool_call";
       tool_call_id: string;
       name: string;

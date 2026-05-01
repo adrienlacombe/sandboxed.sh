@@ -3540,6 +3540,14 @@ export default function ControlClient() {
   const isBusy = viewingRunState === "running";
   const canSubmitComposer = canSubmitInput || input.trim().length > 0;
 
+  // Goal-mode state, keyed by mission id. Updated from `goal_iteration` /
+  // `goal_status` SSE events. Cleared when status reaches a terminal value
+  // (`complete`, `cleared`, `budgetLimited`) so finished goals stop showing
+  // a pill on subsequent renders.
+  const [goalInfoByMission, setGoalInfoByMission] = useState<
+    Record<string, { iteration: number; status: string; objective: string }>
+  >({});
+
   const streamCleanupRef = useRef<null | (() => void)>(null);
   const enhancedInputRef = useRef<EnhancedInputHandle>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -6380,6 +6388,59 @@ export default function ControlClient() {
         }
       }
 
+      if (event.type === "goal_iteration" && isRecord(data)) {
+        const missionId =
+          typeof data["mission_id"] === "string" ? data["mission_id"] : undefined;
+        const iteration =
+          typeof data["iteration"] === "number" ? data["iteration"] : undefined;
+        const objective =
+          typeof data["objective"] === "string" ? data["objective"] : "";
+        if (missionId && iteration !== undefined) {
+          setGoalInfoByMission((prev) => ({
+            ...prev,
+            [missionId]: {
+              iteration,
+              status: prev[missionId]?.status ?? "active",
+              objective: objective || prev[missionId]?.objective || "",
+            },
+          }));
+        }
+      }
+
+      if (event.type === "goal_status" && isRecord(data)) {
+        const missionId =
+          typeof data["mission_id"] === "string" ? data["mission_id"] : undefined;
+        const status =
+          typeof data["status"] === "string" ? data["status"] : undefined;
+        const objective =
+          typeof data["objective"] === "string" ? data["objective"] : "";
+        if (missionId && status) {
+          // Clear pill on terminal statuses — keeps the UI uncluttered once
+          // the goal is no longer driving the mission.
+          if (
+            status === "complete" ||
+            status === "cleared" ||
+            status === "budgetLimited"
+          ) {
+            setGoalInfoByMission((prev) => {
+              if (!(missionId in prev)) return prev;
+              const next = { ...prev };
+              delete next[missionId];
+              return next;
+            });
+          } else {
+            setGoalInfoByMission((prev) => ({
+              ...prev,
+              [missionId]: {
+                iteration: prev[missionId]?.iteration ?? 0,
+                status,
+                objective: objective || prev[missionId]?.objective || "",
+              },
+            }));
+          }
+        }
+      }
+
       if (event.type === "mission_title_changed" && isRecord(data)) {
         const missionId = typeof data["mission_id"] === "string" ? data["mission_id"] : undefined;
         const title = typeof data["title"] === "string" ? data["title"] : undefined;
@@ -8398,6 +8459,40 @@ export default function ControlClient() {
                   placeholder="Message the root agent… (paste files to upload)"
                   backend={viewingMission?.backend ?? currentMission?.backend}
                 />
+                {(() => {
+                  // Goal-mode pill — shown above the composer while a codex
+                  // `/goal` continuation loop is active. Cleared automatically
+                  // by the SSE handler when status hits a terminal value.
+                  const activeMissionId = viewingMission?.id ?? currentMission?.id;
+                  const goal = activeMissionId
+                    ? goalInfoByMission[activeMissionId]
+                    : undefined;
+                  if (!goal) return null;
+                  const statusLabel =
+                    goal.status === "active"
+                      ? `iter ${goal.iteration}`
+                      : goal.status === "paused"
+                        ? "paused"
+                        : goal.status;
+                  return (
+                    <div
+                      className="absolute -top-9 left-2 right-2 flex items-center gap-2 px-3 py-1.5 rounded-full bg-indigo-500/10 border border-indigo-500/30 text-xs text-indigo-200 max-w-fit"
+                      title={goal.objective}
+                    >
+                      <span className="font-semibold">Goal</span>
+                      <span className="text-indigo-300/60">·</span>
+                      <span>{statusLabel}</span>
+                      {goal.objective && (
+                        <>
+                          <span className="text-indigo-300/60">·</span>
+                          <span className="truncate max-w-[40ch] text-indigo-200/70">
+                            {goal.objective}
+                          </span>
+                        </>
+                      )}
+                    </div>
+                  );
+                })()}
 
                 {isBusy ? (
                   <>
