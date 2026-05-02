@@ -143,6 +143,32 @@ fn resolve_model(session_model: Option<&str>, default_model: Option<&str>) -> Op
         .or_else(|| default_model.map(|s| s.to_string()))
 }
 
+/// Fold a codex delta into a per-item buffer, robust to both incremental
+/// and cumulative-snapshot delta semantics.
+///
+/// Codex emits two flavors depending on the notification:
+/// - **Incremental** (`item/agentMessage/delta`, `item/reasoning/textDelta`):
+///   each `delta` is a new token. Append.
+/// - **Cumulative snapshot** (`item/reasoning/summaryTextDelta`):
+///   each `delta` is the full summary so far. Replace.
+///
+/// Detection rule: if the new delta is a strict extension of the current
+/// buffer (`delta.starts_with(buffer)` AND `delta.len() >= buffer.len()`),
+/// treat as a cumulative snapshot and replace. Otherwise append. This
+/// auto-handles both cases without needing per-method dispatch and is
+/// robust to codex flipping semantics across versions.
+fn fold_delta_into(buffer: &mut String, delta: &str) {
+    if delta.starts_with(buffer.as_str()) && delta.len() >= buffer.len() {
+        // Cumulative snapshot: delta contains everything we already had,
+        // plus more. Atomic replacement.
+        buffer.clear();
+        buffer.push_str(delta);
+    } else {
+        // Incremental: append.
+        buffer.push_str(delta);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // App-server mode driver (Path A)
 // ---------------------------------------------------------------------------
@@ -532,7 +558,7 @@ impl AppServerEventTranslator {
                         .unwrap_or("__anon")
                         .to_string();
                     let entry = self.delta_buffers.entry(item_id).or_default();
-                    entry.push_str(delta);
+                    fold_delta_into(entry, delta);
                     events.push(ExecutionEvent::TextDelta {
                         content: entry.clone(),
                     });
@@ -545,9 +571,22 @@ impl AppServerEventTranslator {
                         .and_then(|v| v.as_str())
                         .unwrap_or("__anon_reasoning")
                         .to_string();
-                    let key = format!("reasoning:{}", item_id);
+                    // Different buffer keys for the two reasoning sub-streams:
+                    // observed empirically (PR #403 prod smoke) that
+                    // `summaryTextDelta` is sent as cumulative snapshots while
+                    // `textDelta` is incremental. Sharing one buffer
+                    // concatenated the cumulative summary on top of the
+                    // already-cumulative reasoning text, producing a 35x
+                    // snowball of "The targeted Lean module build…" in the
+                    // mission UI.
+                    let kind = if method == "item/reasoning/summaryTextDelta" {
+                        "summary"
+                    } else {
+                        "reasoning"
+                    };
+                    let key = format!("{}:{}", kind, item_id);
                     let entry = self.delta_buffers.entry(key).or_default();
-                    entry.push_str(delta);
+                    fold_delta_into(entry, delta);
                     events.push(ExecutionEvent::Thinking {
                         content: entry.clone(),
                     });
@@ -839,6 +878,55 @@ mod tests {
     fn resolve_model_returns_none_when_both_unset() {
         let resolved = resolve_model(None, None);
         assert!(resolved.is_none());
+    }
+
+    #[test]
+    fn fold_delta_appends_incremental_tokens() {
+        let mut buf = String::new();
+        for tok in ["P", "O", "N", "G"] {
+            fold_delta_into(&mut buf, tok);
+        }
+        assert_eq!(buf, "PONG");
+    }
+
+    #[test]
+    fn fold_delta_replaces_cumulative_snapshots() {
+        // Bug regression: codex `item/reasoning/summaryTextDelta` sends
+        // the full summary so far on each event. Without this fix, two
+        // snapshots "The" then "The targeted" would append to "TheThe
+        // targeted" — the snowball that produced the 35x repeated
+        // "The targeted Lean module build finished cleanly" in the UI.
+        let mut buf = String::new();
+        for snapshot in [
+            "The",
+            "The targeted",
+            "The targeted Lean",
+            "The targeted Lean module",
+        ] {
+            fold_delta_into(&mut buf, snapshot);
+        }
+        assert_eq!(buf, "The targeted Lean module");
+    }
+
+    #[test]
+    fn fold_delta_handles_mixed_token_types() {
+        // Real-world: codex first sends a cumulative snapshot then an
+        // unrelated incremental tail. Empty buffer → cumulative path
+        // (snapshot starts_with(""), len > 0). Then incremental " more"
+        // doesn't start with the buffer → append.
+        let mut buf = String::new();
+        fold_delta_into(&mut buf, "Hello world");
+        fold_delta_into(&mut buf, "!");
+        assert_eq!(buf, "Hello world!");
+    }
+
+    #[test]
+    fn fold_delta_idempotent_on_repeated_snapshot() {
+        // Same snapshot twice: should not duplicate.
+        let mut buf = String::new();
+        fold_delta_into(&mut buf, "stable");
+        fold_delta_into(&mut buf, "stable");
+        assert_eq!(buf, "stable");
     }
 
     #[tokio::test]
