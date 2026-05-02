@@ -3302,6 +3302,11 @@ export default function ControlClient() {
       "tool_result",
       "text_delta",
       "thinking",
+      // Goal-mode events fed into goalInfoByMission on hydration so the
+      // pill renders on a fresh page load instead of waiting for the
+      // next live SSE update.
+      "goal_iteration",
+      "goal_status",
     ],
     []
   );
@@ -4403,6 +4408,53 @@ export default function ControlClient() {
         }
         setCurrentMission(mission);
         setViewingMission(mission);
+        // Hydrate the goal-mode pill state from persisted events so the
+        // "Goal · iter N · …" badge survives a page reload. Without this,
+        // goalInfoByMission only updates from live SSE — a goal mission
+        // already in flight when the user opens the page renders with no
+        // pill until the next goal_iteration arrives. Walk events newest
+        // first; first matching goal_iteration / goal_status wins.
+        if (events) {
+          let latestIteration: number | undefined;
+          let latestStatus: string | undefined;
+          let latestObjective: string | undefined;
+          for (let i = events.length - 1; i >= 0; i--) {
+            const ev = events[i];
+            const meta = (ev as { metadata?: unknown }).metadata;
+            const metaRecord = isRecord(meta) ? meta : null;
+            if (latestIteration === undefined && ev.event_type === "goal_iteration") {
+              if (metaRecord && typeof metaRecord["iteration"] === "number") {
+                latestIteration = metaRecord["iteration"] as number;
+              }
+              if (typeof ev.content === "string") {
+                latestObjective = ev.content;
+              }
+            }
+            if (latestStatus === undefined && ev.event_type === "goal_status") {
+              if (metaRecord && typeof metaRecord["status"] === "string") {
+                latestStatus = metaRecord["status"] as string;
+              }
+              if (typeof ev.content === "string" && !latestObjective) {
+                latestObjective = ev.content;
+              }
+            }
+            if (latestIteration !== undefined && latestStatus !== undefined) break;
+          }
+          // Skip terminal statuses — those clear the pill, matching the live handler.
+          const isTerminalStatus = latestStatus
+            ? ["complete", "cleared", "budgetLimited"].includes(latestStatus)
+            : false;
+          if ((latestIteration !== undefined || latestStatus !== undefined) && !isTerminalStatus) {
+            setGoalInfoByMission((prev) => ({
+              ...prev,
+              [id]: {
+                iteration: latestIteration ?? prev[id]?.iteration ?? 0,
+                status: latestStatus ?? prev[id]?.status ?? "active",
+                objective: latestObjective ?? prev[id]?.objective ?? "",
+              },
+            }));
+          }
+        }
         // Use events if available, otherwise fall back to basic history
         let historyItems = events ? eventsToItems(events, mission) : missionHistoryToItems(mission);
         if (events && !historyItems.some((item) => item.kind === "assistant")) {
