@@ -48,6 +48,13 @@ struct ControlView: View {
     /// goal is active or when the mission has reached a terminal goal
     /// status (`complete`, `cleared`, `budgetLimited`).
     @State private var goalInfo: GoalPillInfo?
+
+    /// Slash-command catalog fetched from /api/library/builtin-commands.
+    /// Lazy-loaded on first `/` keypress, refreshed when the backend
+    /// changes. The popover above the composer filters this list by the
+    /// substring after the leading `/` in `inputText`.
+    @State private var slashCommandCatalog: BuiltinCommandsResponse?
+    @State private var slashCommandLoading = false
     @State private var copiedMessageId: String?
     @State private var shouldScrollImmediately = false
     @State private var isLoadingHistory = false  // Track when loading historical messages to prevent animated scroll
@@ -1048,6 +1055,65 @@ struct ControlView: View {
         !inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
+    /// Visible slash commands for the current backend, filtered by the
+    /// prefix after the leading `/` in `inputText`. Empty when the input
+    /// doesn't start with `/`, when the catalog hasn't loaded yet, or when
+    /// nothing matches the filter.
+    private var slashSuggestions: [SlashCommand] {
+        guard let catalog = slashCommandCatalog else { return [] }
+        let trimmed = inputText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.hasPrefix("/") else { return [] }
+        // Pull the command name fragment (everything after `/`, before the
+        // first whitespace). e.g. "/goal create file" → "goal".
+        let afterSlash = String(trimmed.dropFirst())
+        let nameFragment: String = {
+            if let space = afterSlash.firstIndex(where: { $0.isWhitespace }) {
+                return String(afterSlash[..<space])
+            }
+            return afterSlash
+        }()
+        // Once the user has typed a space after the command name they're
+        // entering args — hide the popover so it doesn't cover the input.
+        if afterSlash.contains(where: { $0.isWhitespace }) { return [] }
+        let backend = viewingMission?.backend ?? currentMission?.backend
+        let pool: [SlashCommand]
+        switch backend {
+        case "codex": pool = catalog.codex ?? []
+        case "claudecode": pool = catalog.claudecode
+        case "opencode": pool = catalog.opencode
+        default:
+            // No mission yet → show every backend's commands so the user
+            // can preview what's available.
+            pool = catalog.opencode
+                + catalog.claudecode
+                + (catalog.codex ?? [])
+        }
+        return pool.filter { $0.matchesPrefix(nameFragment) }
+    }
+
+    /// Replace the composer text with `/<name> ` (trailing space ready for
+    /// args) when the user picks a suggestion.
+    private func applySlashCommand(_ cmd: SlashCommand) {
+        inputText = "/\(cmd.name) "
+        isInputFocused = true
+    }
+
+    /// Lazy-load the slash command catalog the first time the user types
+    /// `/`. Best-effort: failures just leave the popover empty.
+    private func loadSlashCommandsIfNeeded() {
+        guard slashCommandCatalog == nil, !slashCommandLoading else { return }
+        slashCommandLoading = true
+        Task {
+            defer { slashCommandLoading = false }
+            do {
+                slashCommandCatalog = try await APIService.shared.getBuiltinCommands()
+            } catch {
+                // Silent failure — popover stays empty until next attempt.
+                print("Failed to load slash commands: \(error)")
+            }
+        }
+    }
+
     /// Goal-mode pill — sits above the composer while a codex `/goal`
     /// continuation loop is active. State is fed by `goal_iteration` /
     /// `goal_status` SSE events; cleared automatically on terminal status.
@@ -1092,6 +1158,15 @@ struct ControlView: View {
 
     private var inputView: some View {
         VStack(spacing: 0) {
+            // Slash-command popover. Renders above the composer when the
+            // input starts with `/` and we have at least one matching
+            // command. Tap-to-insert rewrites the input and refocuses.
+            SlashCommandSuggestions(
+                commands: slashSuggestions,
+                onSelect: applySlashCommand
+            )
+            .animation(.easeInOut(duration: 0.15), value: slashSuggestions.count)
+
             goalPill
 
             // Queue indicator above input when agent is busy with queued messages
@@ -1149,6 +1224,14 @@ struct ControlView: View {
                     .submitLabel(.send)
                     .onSubmit {
                         sendMessage()
+                    }
+                    .onChange(of: inputText) { _, newValue in
+                        // Lazy-load the slash catalog the first time the user
+                        // starts typing a slash command. Avoids a fetch on
+                        // every fresh ControlView mount when slashes are rare.
+                        if newValue.trimmingCharacters(in: .whitespaces).hasPrefix("/") {
+                            loadSlashCommandsIfNeeded()
+                        }
                     }
 
                 // Send button - always available when there's text

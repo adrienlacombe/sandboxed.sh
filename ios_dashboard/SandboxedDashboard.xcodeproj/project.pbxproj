@@ -54,6 +54,7 @@
 		CC2222222222222222222222 /* FidoApprovalState.swift in Sources */ = {isa = PBXBuildFile; fileRef = DD2222222222222222222222 /* FidoApprovalState.swift */; };
 		CC3333333333333333333333 /* FidoApprovalOverlay.swift in Sources */ = {isa = PBXBuildFile; fileRef = DD3333333333333333333333 /* FidoApprovalOverlay.swift */; };
 		CC4444444444444444444444 /* AutoApprovalRulesView.swift in Sources */ = {isa = PBXBuildFile; fileRef = DD4444444444444444444444 /* AutoApprovalRulesView.swift */; };
+		AA5555555555555555555555 /* SlashCommandSuggestions.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB5555555555555555555555 /* SlashCommandSuggestions.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -118,6 +119,7 @@
 		DD2222222222222222222222 /* FidoApprovalState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FidoApprovalState.swift; sourceTree = "<group>"; };
 		DD3333333333333333333333 /* FidoApprovalOverlay.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FidoApprovalOverlay.swift; sourceTree = "<group>"; };
 		DD4444444444444444444444 /* AutoApprovalRulesView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AutoApprovalRulesView.swift; sourceTree = "<group>"; };
+		BB5555555555555555555555 /* SlashCommandSuggestions.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SlashCommandSuggestions.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXGroup section */
@@ -179,6 +181,7 @@
 				4CC2B6E9848FF220F103DED2 /* LoadingView.swift */,
 				76082CCC47D9D91308F4AE10 /* MarkdownView.swift */,
 				A636998B83DD23C5D2688C2D /* RunningMissionsBar.swift */,
+				BB5555555555555555555555 /* SlashCommandSuggestions.swift */,
 				28244CFFEB655FD5E5F3EB17 /* StatusBadge.swift */,
 				D99EC9DCFB8CE3EEAD759135 /* ToolUI */,
 				BB1111111111111111111111 /* WorkerPillView.swift */,
@@ -450,6 +453,7 @@
 				AA1111111111111111111111 /* WorkerPillView.swift in Sources */,
 				AA2222222222222222222222 /* WorkerSheetView.swift in Sources */,
 				AA3333333333333333333333 /* WorkerPeekView.swift in Sources */,
+				AA5555555555555555555555 /* SlashCommandSuggestions.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

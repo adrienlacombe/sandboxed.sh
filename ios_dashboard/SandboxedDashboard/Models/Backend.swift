@@ -69,6 +69,35 @@ struct ProvidersResponse: Codable {
 }
 
 /// Combined agent with backend info for display
+// MARK: - Slash commands
+
+/// One slash command surfaced by `/api/library/builtin-commands`. Mirrors
+/// the backend's `CommandSummary` shape — `params` is included so the
+/// suggestion popover can hint at required arguments (e.g. `/goal
+/// <objective>`).
+struct SlashCommand: Codable, Identifiable, Hashable {
+    let name: String
+    let description: String?
+    let path: String
+    var params: [SlashCommandParam] = []
+
+    var id: String { name }
+}
+
+struct SlashCommandParam: Codable, Hashable {
+    let name: String
+    var required: Bool = false
+    var description: String? = nil
+}
+
+/// Per-backend builtin commands payload. The `codex` field is optional —
+/// older codex builds (pre-0.128.0) omit it entirely.
+struct BuiltinCommandsResponse: Codable {
+    var opencode: [SlashCommand] = []
+    var claudecode: [SlashCommand] = []
+    var codex: [SlashCommand]? = nil
+}
+
 struct CombinedAgent: Identifiable, Hashable {
     let backend: String
     let backendName: String
