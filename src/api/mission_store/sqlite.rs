@@ -1678,6 +1678,34 @@ impl SqliteMissionStore {
         Self::migrate_automations_table(conn)?;
         Self::ensure_automation_indexes(conn)?;
 
+        // Goal-mode columns (PR #403): set to true when a mission was started
+        // via codex `/goal <objective>`. The codex backend infers from the
+        // user's message at send time; persisting on the row lets the UI
+        // render the goal pill from a fresh page load without SSE replay.
+        let has_goal_mode_column: bool = conn
+            .prepare("SELECT 1 FROM pragma_table_info('missions') WHERE name = 'goal_mode'")
+            .map_err(|e| format!("Failed to check for goal_mode column: {}", e))?
+            .exists([])
+            .map_err(|e| format!("Failed to query table info: {}", e))?;
+        if !has_goal_mode_column {
+            tracing::info!("Running migration: adding 'goal_mode' column to missions table");
+            conn.execute(
+                "ALTER TABLE missions ADD COLUMN goal_mode INTEGER NOT NULL DEFAULT 0",
+                [],
+            )
+            .map_err(|e| format!("Failed to add goal_mode column: {}", e))?;
+        }
+        let has_goal_objective_column: bool = conn
+            .prepare("SELECT 1 FROM pragma_table_info('missions') WHERE name = 'goal_objective'")
+            .map_err(|e| format!("Failed to check for goal_objective column: {}", e))?
+            .exists([])
+            .map_err(|e| format!("Failed to query table info: {}", e))?;
+        if !has_goal_objective_column {
+            tracing::info!("Running migration: adding 'goal_objective' column to missions table");
+            conn.execute("ALTER TABLE missions ADD COLUMN goal_objective TEXT", [])
+                .map_err(|e| format!("Failed to add goal_objective column: {}", e))?;
+        }
+
         Ok(())
     }
 
@@ -1982,6 +2010,8 @@ impl MissionStore for SqliteMissionStore {
                         mission_mode: row.get::<_, Option<String>>(24)?
                             .and_then(|s| serde_json::from_value(serde_json::Value::String(s)).ok())
                             .unwrap_or_default(),
+                        goal_mode: false,
+                        goal_objective: None,
                     })
                 })
                 .map_err(|e| e.to_string())?
@@ -2057,6 +2087,8 @@ impl MissionStore for SqliteMissionStore {
                         mission_mode: row.get::<_, Option<String>>(24)?
                             .and_then(|s| serde_json::from_value(serde_json::Value::String(s)).ok())
                             .unwrap_or_default(),
+                        goal_mode: false,
+                        goal_objective: None,
                     })
                 })
                 .optional()
@@ -2173,6 +2205,8 @@ impl MissionStore for SqliteMissionStore {
             parent_mission_id,
             working_directory: working_directory.map(|s| s.to_string()),
             mission_mode: MissionMode::default(),
+            goal_mode: false,
+            goal_objective: None,
         };
 
         let m = mission.clone();
@@ -2257,6 +2291,8 @@ impl MissionStore for SqliteMissionStore {
                         mission_mode: row.get::<_, Option<String>>(22)?
                             .and_then(|s| serde_json::from_value(serde_json::Value::String(s)).ok())
                             .unwrap_or_default(),
+                        goal_mode: false,
+                        goal_objective: None,
                     })
                 })
                 .map_err(|e| e.to_string())?
@@ -2732,6 +2768,8 @@ impl MissionStore for SqliteMissionStore {
                         parent_mission_id: None,
                         working_directory: None,
                         mission_mode: MissionMode::default(),
+                        goal_mode: false,
+                        goal_objective: None,
                     })
                 })
                 .map_err(|e| e.to_string())?
@@ -2797,6 +2835,8 @@ impl MissionStore for SqliteMissionStore {
                         parent_mission_id: None,
                         mission_mode: MissionMode::default(),
                         working_directory: None,
+                        goal_mode: false,
+                        goal_objective: None,
                     })
                 })
                 .map_err(|e| e.to_string())?
@@ -4103,6 +4143,8 @@ impl MissionStore for SqliteMissionStore {
                         working_directory: None,
                         mission_mode: serde_json::from_value(serde_json::Value::String(mode_str))
                             .unwrap_or_default(),
+                        goal_mode: false,
+                        goal_objective: None,
                     })
                 })
                 .map_err(|e| e.to_string())?

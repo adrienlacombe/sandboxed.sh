@@ -15030,6 +15030,8 @@ And the report:
             parent_mission_id: None,
             working_directory: None,
             mission_mode: MissionMode::default(),
+            goal_mode: false,
+            goal_objective: None,
         };
         let weak = Mission {
             id: Uuid::new_v4(),
@@ -15058,6 +15060,8 @@ And the report:
             parent_mission_id: None,
             working_directory: None,
             mission_mode: MissionMode::default(),
+            goal_mode: false,
+            goal_objective: None,
         };
 
         let strong_score = mission_search_relevance_score(
@@ -15101,6 +15105,8 @@ And the report:
             parent_mission_id: None,
             working_directory: None,
             mission_mode: MissionMode::default(),
+            goal_mode: false,
+            goal_objective: None,
         };
 
         let score = mission_search_relevance_score(
@@ -15141,6 +15147,8 @@ And the report:
             parent_mission_id: None,
             working_directory: None,
             mission_mode: MissionMode::default(),
+            goal_mode: false,
+            goal_objective: None,
         };
 
         let score = mission_search_relevance_score(
@@ -15181,6 +15189,8 @@ And the report:
             parent_mission_id: None,
             working_directory: None,
             mission_mode: MissionMode::default(),
+            goal_mode: false,
+            goal_objective: None,
         };
 
         let score = mission_search_relevance_score(
@@ -15221,6 +15231,8 @@ And the report:
             parent_mission_id: None,
             working_directory: None,
             mission_mode: MissionMode::default(),
+            goal_mode: false,
+            goal_objective: None,
         };
 
         let score = mission_search_relevance_score(
@@ -15345,6 +15357,8 @@ And the report:
             parent_mission_id: None,
             working_directory: None,
             mission_mode: MissionMode::default(),
+            goal_mode: false,
+            goal_objective: None,
         };
         let before = mission_search_freshness_key(
             &[MissionSearchCandidate {

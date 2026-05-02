@@ -85,6 +85,18 @@ pub struct Mission {
     /// Mission operating mode (task or assistant)
     #[serde(default)]
     pub mission_mode: MissionMode,
+    /// True when the mission was started via codex `/goal <objective>`. The
+    /// codex backend infers this from the user's message at send time, but
+    /// persisting it on the row lets the UI render the goal pill from a
+    /// fresh page load (no SSE replay required) and survives reconnects.
+    #[serde(default)]
+    pub goal_mode: bool,
+    /// Cached goal objective when `goal_mode` is true. Updated on each
+    /// `thread/goal/updated` notification so the latest text from codex
+    /// (which may have been edited via `/goal pause`/`/goal resume`)
+    /// stays current.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub goal_objective: Option<String>,
 }
 
 fn default_backend() -> String {

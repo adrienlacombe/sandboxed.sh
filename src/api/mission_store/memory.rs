@@ -98,6 +98,8 @@ impl MissionStore for InMemoryMissionStore {
             parent_mission_id,
             working_directory: working_directory.map(|s| s.to_string()),
             mission_mode: super::MissionMode::default(),
+            goal_mode: false,
+            goal_objective: None,
         };
         self.missions
             .write()
