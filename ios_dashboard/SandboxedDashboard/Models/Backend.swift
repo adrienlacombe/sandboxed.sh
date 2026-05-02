@@ -75,27 +75,89 @@ struct ProvidersResponse: Codable {
 /// the backend's `CommandSummary` shape — `params` is included so the
 /// suggestion popover can hint at required arguments (e.g. `/goal
 /// <objective>`).
+///
+/// All fields except `name` decode defensively: Swift's auto-synthesized
+/// `Codable` throws `keyNotFound` on missing JSON keys, but the Rust side
+/// uses `skip_serializing_if` on optional/empty fields. A custom decoder
+/// keeps us robust to those omissions.
 struct SlashCommand: Codable, Identifiable, Hashable {
     let name: String
     let description: String?
     let path: String
-    var params: [SlashCommandParam] = []
+    let params: [SlashCommandParam]
 
     var id: String { name }
+
+    private enum CodingKeys: String, CodingKey {
+        case name, description, path, params
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        name = try c.decode(String.self, forKey: .name)
+        description = try c.decodeIfPresent(String.self, forKey: .description)
+        path = try c.decodeIfPresent(String.self, forKey: .path) ?? ""
+        params = try c.decodeIfPresent([SlashCommandParam].self, forKey: .params) ?? []
+    }
+
+    /// Manual init for the ad-hoc test fixtures we sometimes construct
+    /// without going through the decoder.
+    init(name: String, description: String?, path: String, params: [SlashCommandParam] = []) {
+        self.name = name
+        self.description = description
+        self.path = path
+        self.params = params
+    }
 }
 
 struct SlashCommandParam: Codable, Hashable {
     let name: String
-    var required: Bool = false
-    var description: String? = nil
+    let required: Bool
+    let description: String?
+
+    private enum CodingKeys: String, CodingKey {
+        case name, required, description
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        name = try c.decode(String.self, forKey: .name)
+        required = try c.decodeIfPresent(Bool.self, forKey: .required) ?? false
+        description = try c.decodeIfPresent(String.self, forKey: .description)
+    }
+
+    init(name: String, required: Bool = false, description: String? = nil) {
+        self.name = name
+        self.required = required
+        self.description = description
+    }
 }
 
-/// Per-backend builtin commands payload. The `codex` field is optional —
-/// older codex builds (pre-0.128.0) omit it entirely.
+/// Per-backend builtin commands payload. Every field decodes defensively —
+/// older codex builds (pre-0.128.0) omit the `codex` field entirely, and
+/// any backend with no commands omits its array via Rust's
+/// `skip_serializing_if = "Vec::is_empty"`.
 struct BuiltinCommandsResponse: Codable {
-    var opencode: [SlashCommand] = []
-    var claudecode: [SlashCommand] = []
-    var codex: [SlashCommand]? = nil
+    let opencode: [SlashCommand]
+    let claudecode: [SlashCommand]
+    let codex: [SlashCommand]?
+
+    private enum CodingKeys: String, CodingKey {
+        case opencode, claudecode, codex
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        opencode = try c.decodeIfPresent([SlashCommand].self, forKey: .opencode) ?? []
+        claudecode = try c.decodeIfPresent([SlashCommand].self, forKey: .claudecode) ?? []
+        codex = try c.decodeIfPresent([SlashCommand].self, forKey: .codex)
+    }
+
+    init(opencode: [SlashCommand] = [], claudecode: [SlashCommand] = [], codex: [SlashCommand]? = nil) {
+        self.opencode = opencode
+        self.claudecode = claudecode
+        self.codex = codex
+    }
 }
 
 struct CombinedAgent: Identifiable, Hashable {
