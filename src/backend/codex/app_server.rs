@@ -526,6 +526,32 @@ impl AppServerSession {
         Ok(())
     }
 
+    /// Send a JSON-RPC error response to a server-initiated request. Used for
+    /// elicitations we can't satisfy (e.g. `account/chatgptAuthTokens/refresh`
+    /// — we don't carry refresh credentials in this client). Returning a
+    /// typed error tells codex to fail the in-flight turn immediately rather
+    /// than wait for a 10-second timeout on a malformed `null` result.
+    pub async fn respond_to_server_request_error(
+        &self,
+        id: Value,
+        code: i64,
+        message: &str,
+    ) -> Result<()> {
+        let envelope = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": { "code": code, "message": message },
+        });
+        let line = format!("{}\n", serde_json::to_string(&envelope)?);
+        let mut stdin_lock = self.stdin.lock().await;
+        let stdin = stdin_lock
+            .as_mut()
+            .ok_or_else(|| anyhow!("codex app-server stdin closed"))?;
+        stdin.write_all(line.as_bytes()).await?;
+        stdin.flush().await.ok();
+        Ok(())
+    }
+
     /// Send the `notifications/initialized` client notification (LSP-style
     /// handshake completion). Best-effort — the server tolerates clients that
     /// skip it but some experimental gates expect to see it.
@@ -573,6 +599,23 @@ impl AppServerSession {
         // `params` before invoking, and keeping the fallback in two places
         // would silently disagree if one drifts.
         self.request("thread/start", params).await
+    }
+
+    /// Resume a previously-started thread by id. Codex 0.128.0 accepts
+    /// `thread/resume` with `{threadId}` to reattach to a session whose
+    /// rollout already lives under `$CODEX_HOME/sessions/...` — used by
+    /// the backend to recover from a mid-mission codex crash without
+    /// losing the thread state.
+    ///
+    /// The response is the same `ThreadStartResult` shape (`{thread, ...}`).
+    pub async fn thread_resume(&self, thread_id: &str) -> Result<ThreadStartResult> {
+        self.request(
+            "thread/resume",
+            json!({
+                "threadId": thread_id,
+            }),
+        )
+        .await
     }
 
     pub async fn turn_start(&self, params: TurnStartParams) -> Result<Value> {

@@ -184,6 +184,11 @@ async fn send_message_streaming_app_server(
         model_effort: cfg.model_effort.clone(),
         env: std::collections::HashMap::new(),
     };
+    // Keep an owned clone of the spawn config so the driver task can
+    // re-spawn the codex process via `thread/resume` if the stdio
+    // stream closes mid-mission. The original `app_cfg` is consumed by
+    // the first spawn below.
+    let app_cfg_for_reconnect = app_cfg.clone();
 
     let session_arc = AppServerSession::spawn(app_cfg, &session.directory, workspace_exec).await?;
     let session_arc = Arc::new(session_arc);
@@ -229,7 +234,7 @@ async fn send_message_streaming_app_server(
 
     // Take the inbound channel before issuing any further RPC — `goal/set`
     // and `turn/start` start emitting notifications before they return.
-    let mut inbound = match session_arc.take_inbound().await {
+    let inbound = match session_arc.take_inbound().await {
         Some(rx) => rx,
         None => {
             let _ = session_arc.shutdown().await;
@@ -282,13 +287,20 @@ async fn send_message_streaming_app_server(
         }
     }
 
-    let session_for_loop = Arc::clone(&session_arc);
     let session_id = session.id.clone();
     let initial_objective = if is_goal_mission {
         user_payload.clone()
     } else {
         String::new()
     };
+    // State the driver task needs in order to re-spawn the codex
+    // app-server process if it crashes mid-mission. Owned clones (not
+    // borrowed refs) so the spawned task is `'static`.
+    let reconnect_app_cfg = app_cfg_for_reconnect;
+    let reconnect_cwd = session.directory.clone();
+    let reconnect_workspace_exec = workspace_exec.cloned();
+    let reconnect_thread_id = thread.id.clone();
+
     let handle = tokio::spawn(async move {
         // Seed the cached objective so the first GoalIteration event has
         // it before `thread/goal/updated` arrives. Cleared when not a
@@ -300,55 +312,129 @@ async fn send_message_streaming_app_server(
         let mut terminal = false;
         let mut stream_closed_unexpectedly = false;
 
-        loop {
-            let msg = match inbound.recv().await {
-                Some(m) => m,
-                None => {
-                    // Reader task exited. If we hadn't already detected a
-                    // terminal status, this is a surprise — codex likely
-                    // crashed or got killed by the OOM watcher. Surface as
-                    // an error so the mission doesn't show as a clean
-                    // completion with no output.
-                    if !terminal {
-                        stream_closed_unexpectedly = true;
-                    }
-                    break;
-                }
-            };
+        // Mutable so we can swap in a fresh session after a reconnect.
+        let mut session_arc = session_arc;
+        let mut inbound = inbound;
 
-            match msg {
-                InboundMessage::Notification { method, params } => {
-                    let outcome = translator.handle_notification(&method, &params, is_goal_mission);
-                    for ev in outcome.events {
-                        if tx.send(ev).await.is_err() {
+        // Cap the number of automatic reconnects per mission so a
+        // systemic codex crash doesn't loop forever. One retry covers
+        // the common case (transient OOM kill, network blip) without
+        // hiding a persistent failure.
+        const MAX_RECONNECTS: u32 = 1;
+        let mut reconnect_attempts: u32 = 0;
+
+        'outer: loop {
+            loop {
+                let msg = match inbound.recv().await {
+                    Some(m) => m,
+                    None => break, // inner loop → check whether to reconnect
+                };
+
+                match msg {
+                    InboundMessage::Notification { method, params } => {
+                        let outcome =
+                            translator.handle_notification(&method, &params, is_goal_mission);
+                        for ev in outcome.events {
+                            if tx.send(ev).await.is_err() {
+                                terminal = true;
+                                break;
+                            }
+                        }
+                        if outcome.terminal {
                             terminal = true;
-                            break;
                         }
                     }
-                    if outcome.terminal {
-                        terminal = true;
+                    InboundMessage::ServerRequest {
+                        id,
+                        method,
+                        params: _,
+                    } => {
+                        // Codex elicits permission for command exec, file change,
+                        // and dynamic-tool invocations through server-initiated
+                        // requests. Exec mode runs with
+                        // `--dangerously-bypass-approvals-and-sandbox`; we mirror
+                        // that policy here by auto-approving every elicitation.
+                        // Auth-refresh requests get a typed JSON-RPC error
+                        // because we don't carry refresh credentials in the
+                        // app-server path (codex reads its own auth.json).
+                        let send_err = if method == "account/chatgptAuthTokens/refresh" {
+                            session_arc
+                                .respond_to_server_request_error(
+                                    id,
+                                    -32603,
+                                    "sandboxed-sh: auth refresh not supported by client; \
+                                     codex must re-read $CODEX_HOME/auth.json",
+                                )
+                                .await
+                        } else {
+                            let result = elicitation_auto_approve(&method);
+                            session_arc.respond_to_server_request(id, result).await
+                        };
+                        if let Err(e) = send_err {
+                            debug!("failed to respond to server request {}: {}", method, e);
+                        }
                     }
                 }
-                InboundMessage::ServerRequest {
-                    id,
-                    method,
-                    params: _,
-                } => {
-                    // Codex elicits permission for command exec, file change,
-                    // and dynamic-tool invocations through server-initiated
-                    // requests. Exec mode runs with
-                    // `--dangerously-bypass-approvals-and-sandbox`; we mirror
-                    // that policy here by auto-approving every elicitation.
-                    let result = elicitation_auto_approve(&method);
-                    if let Err(e) = session_for_loop.respond_to_server_request(id, result).await {
-                        debug!("failed to respond to server request {}: {}", method, e);
-                    }
+
+                if terminal {
+                    break 'outer;
                 }
             }
 
+            // Inbound closed. If we already terminated, fine — exit.
+            // Otherwise codex crashed mid-mission; attempt one reconnect
+            // via `thread/resume` before giving up.
             if terminal {
-                break;
+                break 'outer;
             }
+            if reconnect_attempts >= MAX_RECONNECTS {
+                stream_closed_unexpectedly = true;
+                break 'outer;
+            }
+            reconnect_attempts += 1;
+
+            tracing::warn!(
+                "codex app-server stream closed mid-mission; attempting thread/resume (attempt {})",
+                reconnect_attempts
+            );
+            let _ = session_arc.shutdown().await;
+
+            let new_session = match app_server::AppServerSession::spawn(
+                reconnect_app_cfg.clone(),
+                &reconnect_cwd,
+                reconnect_workspace_exec.as_ref(),
+            )
+            .await
+            {
+                Ok(s) => Arc::new(s),
+                Err(e) => {
+                    tracing::error!("codex app-server reconnect: spawn failed: {}", e);
+                    stream_closed_unexpectedly = true;
+                    break 'outer;
+                }
+            };
+            if let Err(e) = new_session.initialize("sandboxed-sh", "1.2.0").await {
+                tracing::error!("codex app-server reconnect: initialize failed: {}", e);
+                stream_closed_unexpectedly = true;
+                break 'outer;
+            }
+            let _ = new_session.send_initialized_notification().await;
+            if let Err(e) = new_session.thread_resume(&reconnect_thread_id).await {
+                tracing::error!("codex app-server reconnect: thread/resume failed: {}", e);
+                stream_closed_unexpectedly = true;
+                break 'outer;
+            }
+            let new_inbound = match new_session.take_inbound().await {
+                Some(rx) => rx,
+                None => {
+                    tracing::error!("codex app-server reconnect: inbound stream missing");
+                    stream_closed_unexpectedly = true;
+                    break 'outer;
+                }
+            };
+            session_arc = new_session;
+            inbound = new_inbound;
+            tracing::info!("codex app-server reconnected via thread/resume");
         }
 
         if stream_closed_unexpectedly {
@@ -365,7 +451,7 @@ async fn send_message_streaming_app_server(
             })
             .await;
 
-        let _ = session_for_loop.shutdown().await;
+        let _ = session_arc.shutdown().await;
     });
 
     Ok((rx, handle))
@@ -375,16 +461,15 @@ async fn send_message_streaming_app_server(
 /// `--dangerously-bypass-approvals-and-sandbox` posture. Specific elicitations
 /// expect different result shapes; cover the common ones explicitly and fall
 /// back to a generic `{decision:"approve"}` for anything else.
+///
+/// Note: `account/chatgptAuthTokens/refresh` is handled separately at the
+/// caller (it needs a JSON-RPC error response, not a result payload).
 fn elicitation_auto_approve(method: &str) -> serde_json::Value {
     use serde_json::json;
     match method {
         "item/commandExecution/requestApproval"
         | "item/fileChange/requestApproval"
         | "item/permissions/requestApproval" => json!({ "decision": "approve" }),
-        // Auth refresh requests — we don't have refresh tokens to give back,
-        // so respond with an error-like null and let codex surface its own
-        // re-auth notification.
-        "account/chatgptAuthTokens/refresh" => serde_json::Value::Null,
         _ => json!({ "decision": "approve" }),
     }
 }
