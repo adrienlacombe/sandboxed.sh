@@ -227,6 +227,12 @@ export type ChatItem =
       timestamp: number;
       sharedFiles?: SharedFile[];
       resumable?: boolean;
+      /** Goal-mode iteration that this assistant message ended. Set when
+       *  the mission is in goal mode and we've seen at least one
+       *  goal_iteration event before this message. UI replaces "Turn
+       *  complete" with "Iteration N" so the chat doesn't read as a
+       *  series of standalone turns. */
+      goalIteration?: number;
     }
   | {
       kind: "thinking";
@@ -2765,7 +2771,13 @@ const ChatItemRow = memo(function ChatItemRow({
                 item.success ? "text-emerald-400" : "text-red-400"
               )}
             />
-            <span>{item.success ? "Turn complete" : "Failed"}</span>
+            <span>
+              {item.success
+                ? item.goalIteration && item.goalIteration > 0
+                  ? `Iteration ${item.goalIteration}`
+                  : "Turn complete"
+                : "Failed"}
+            </span>
             {displayModel && (
               <>
                 <span>•</span>
@@ -5789,6 +5801,15 @@ export default function ControlClient() {
 
       if (event.type === "assistant_message" && isRecord(data)) {
         const now = Date.now();
+        // If the event carries a goal iteration (because the mission is
+        // running a codex `/goal` continuation loop), stamp it onto the
+        // assistant message so the chat badge reads "Iteration N · 14
+        // tools" instead of the misleading per-turn "Turn complete".
+        const eventMissionId =
+          typeof data["mission_id"] === "string" ? data["mission_id"] : undefined;
+        const goalIterationForEvent = eventMissionId
+          ? goalInfoByMission[eventMissionId]?.iteration
+          : undefined;
         // Parse shared_files if present
         let sharedFiles: SharedFile[] | undefined;
         if (Array.isArray(data["shared_files"])) {
@@ -5866,6 +5887,7 @@ export default function ControlClient() {
               timestamp: now,
               sharedFiles: sharedFiles ?? existing.sharedFiles,
               resumable,
+              goalIteration: goalIterationForEvent ?? existing.goalIteration,
             };
             return updated;
           }
@@ -5880,6 +5902,10 @@ export default function ControlClient() {
             timestamp: now,
             sharedFiles,
             resumable,
+            // Stamp the current goal iteration when the mission is in
+            // goal mode so the chat badge can render "Iteration N"
+            // instead of the noisy per-turn "Turn complete".
+            goalIteration: goalIterationForEvent,
           };
 
           const firstQueuedIdx = filtered.findIndex(
@@ -6053,11 +6079,20 @@ export default function ControlClient() {
           thinkingFlushTimeoutRef.current = null;
         }
 
-        // Flush immediately if done, otherwise debounce (100ms)
-        if (done) {
+        // Flush immediately on:
+        //  - `done: true` (finalization)
+        //  - first delta of a brand-new thought (no pending content yet)
+        //  - the existing thought session was just (re)started
+        // Otherwise debounce at 30 ms — codex's reasoning summary deltas
+        // arrive in tight ~10–20 ms bursts and the previous 100 ms
+        // debounce kept resetting until `done`, so the user only ever
+        // saw the final snapshot ("Thought for <1s") with no streaming.
+        const shouldFlushNow =
+          done || shouldStartNew || !existingPending || !existingContent;
+        if (shouldFlushNow) {
           flushThinking();
         } else {
-          thinkingFlushTimeoutRef.current = setTimeout(flushThinking, 100);
+          thinkingFlushTimeoutRef.current = setTimeout(flushThinking, 30);
         }
         return;
       }
