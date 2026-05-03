@@ -4466,6 +4466,21 @@ echo "[sandboxed] Harness bootstrap start"
 # Keep bun global bin dirs discoverable for command checks and installed CLIs.
 export PATH="/root/.bun/bin:/root/.cache/.bun/bin:$PATH"
 
+# --- Patched: bootstrap a minbase debootstrap rootfs into a usable state.
+#     Without these the rest of this script no-ops (no bun, no npm, no curl)
+#     and the workspace ends up unusable for missions.
+export DEBIAN_FRONTEND=noninteractive
+if ! command -v curl >/dev/null 2>&1; then
+  echo "[sandboxed] baseline rootfs prereqs: installing curl/ca-certs/gnupg/git/jq/python3/build-essential"
+  apt-get update -qq || true
+  apt-get install -y -qq --no-install-recommends curl ca-certificates gnupg git jq python3 wget build-essential || true
+fi
+if ! command -v node >/dev/null 2>&1 && ! command -v bun >/dev/null 2>&1; then
+  echo "[sandboxed] baseline rootfs prereqs: installing Node.js 22 (NodeSource)"
+  curl -fsSL https://deb.nodesource.com/setup_22.x | bash - >/dev/null 2>&1 || true
+  apt-get install -y -qq --no-install-recommends nodejs || true
+fi
+
 # Ensure bun is in PATH first (it's our preferred package manager)
 if [ -x /root/.bun/bin/bun ] && ! command -v bun >/dev/null 2>&1; then
   ln -sf /root/.bun/bin/bun /usr/local/bin/bun || true
