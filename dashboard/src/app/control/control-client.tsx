@@ -18,7 +18,7 @@ import { LazyJsonHighlighter } from "@/components/lazy-json-highlighter";
 import { cn } from "@/lib/utils";
 import { getMissionShortName } from "@/lib/mission-display";
 import { inferMissionRole } from "@/lib/mission-role";
-import { isFinishedStatus } from "@/lib/mission-status";
+import { getMissionDotColor, isFinishedStatus } from "@/lib/mission-status";
 import { getRuntimeApiBase } from "@/lib/settings";
 import { authHeader } from "@/lib/auth";
 import {
@@ -877,10 +877,14 @@ function statusLabel(state: ControlRunState): {
   }
 }
 
-function missionStatusLabel(status: MissionStatus): {
+function missionStatusLabel(status: MissionStatus, isRunning = false): {
   label: string;
   className: string;
 } {
+  if (isRunning) {
+    return { label: "Running", className: "bg-indigo-500/20 text-indigo-400" };
+  }
+
   switch (status) {
     case "active":
       return { label: "Active", className: "bg-indigo-500/20 text-indigo-400" };
@@ -900,23 +904,8 @@ function missionStatusLabel(status: MissionStatus): {
   }
 }
 
-function missionStatusDotClass(status: MissionStatus): string {
-  switch (status) {
-    case "active":
-      return "bg-emerald-400";
-    case "completed":
-      return "bg-emerald-400";
-    case "failed":
-      return "bg-red-400";
-    case "interrupted":
-      return "bg-amber-400";
-    case "blocked":
-      return "bg-orange-400";
-    case "not_feasible":
-      return "bg-red-400";
-    default:
-      return "bg-white/40";
-  }
+function missionStatusDotClass(status: MissionStatus, isRunning = false): string {
+  return getMissionDotColor(status, isRunning);
 }
 
 // Copy button component
@@ -1921,9 +1910,9 @@ function MissionWorkbenchPanel({
   onSetStatus: (status: MissionStatus) => void;
   className?: string;
 }) {
-  const status = mission ? missionStatusLabel(mission.status) : null;
   const title = mission?.title?.trim() || (mission ? getMissionShortName(mission.id) : "No mission selected");
   const isRunning = Boolean(runningInfo);
+  const status = mission ? missionStatusLabel(mission.status, isRunning) : null;
   const canResume =
     mission &&
     !isRunning &&
@@ -1977,9 +1966,9 @@ function MissionWorkbenchPanel({
                 <div className="rounded-md border border-white/[0.05] bg-white/[0.02] p-2">
                   <p className="text-[10px] text-white/30">Status</p>
                   <div className="mt-1 flex items-center gap-1.5">
-                    <span className={cn("h-2 w-2 rounded-full", missionStatusDotClass(mission.status))} />
+                    <span className={cn("h-2 w-2 rounded-full", missionStatusDotClass(mission.status, isRunning))} />
                     <span className={cn("text-xs font-medium", status?.className)}>
-                      {isRunning ? "Running" : status?.label}
+                      {status?.label}
                     </span>
                   </div>
                 </div>
@@ -7587,7 +7576,7 @@ export default function ControlClient() {
   const activeWorkspaceLabel = activeMission?.workspace_name
     || (activeMission?.workspace_id ? workspaceNameById[activeMission.workspace_id] : undefined);
   const missionStatus = activeMission
-    ? missionStatusLabel(activeMission.status)
+    ? missionStatusLabel(activeMission.status, viewingMissionIsRunning)
     : null;
 
   // Update favicon with mission status dot
@@ -7737,7 +7726,7 @@ export default function ControlClient() {
                   <div
                     className={cn(
                       "h-2 w-2 rounded-full shrink-0",
-                      missionStatusDotClass(activeMission.status)
+                      missionStatusDotClass(activeMission.status, viewingMissionIsRunning)
                     )}
                     title={missionStatus?.label}
                   />

@@ -175,7 +175,7 @@ function NeedsYouInbox({
   onResume: (id: string) => void;
   onDelete: (id: string) => void;
 }) {
-  const inboxMissions = useMemo(
+  const inboxCandidates = useMemo(
     () =>
       missions
         .filter(
@@ -186,10 +186,10 @@ function NeedsYouInbox({
         .sort(
           (a, b) =>
             new Date(b.updated_at).getTime() - new Date(a.updated_at).getTime()
-        )
-        .slice(0, 8),
+        ),
     [missions, runningMissionIds]
   );
+  const inboxMissions = useMemo(() => inboxCandidates.slice(0, 8), [inboxCandidates]);
 
   return (
     <section className="flex min-h-0 max-h-[46vh] flex-col border-b border-white/[0.06] pb-4">
@@ -199,7 +199,7 @@ function NeedsYouInbox({
           <h2 className="text-sm font-medium text-white/80">Needs You</h2>
         </div>
         <span className="rounded bg-amber-500/10 px-1.5 py-0.5 text-[10px] tabular-nums text-amber-300">
-          {inboxMissions.length}
+          {inboxCandidates.length}
         </span>
       </div>
 

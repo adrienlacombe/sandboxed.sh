@@ -123,6 +123,15 @@ test.describe('Overview Page', () => {
       created_at: now,
       updated_at: now,
     };
+    const extraBlockedMissions = Array.from({ length: 8 }, (_, index) => ({
+      id: `44444444-4444-4444-8444-44444444444${index}`,
+      title: `Waiting mission ${index + 1}`,
+      status: 'blocked',
+      history: [],
+      resumable: false,
+      created_at: now,
+      updated_at: now,
+    }));
 
     await page.route('**/api/**', async (route) => {
       const path = new URL(route.request().url()).pathname;
@@ -164,7 +173,12 @@ test.describe('Overview Page', () => {
         return;
       }
       if (path === '/api/control/missions') {
-        await json([blockedMission, interruptedMission, runningInterruptedMission]);
+        await json([
+          blockedMission,
+          interruptedMission,
+          ...extraBlockedMissions,
+          runningInterruptedMission,
+        ]);
         return;
       }
       if (path === '/api/control/running') {
@@ -202,6 +216,7 @@ test.describe('Overview Page', () => {
 
     const inbox = page.getByRole('heading', { name: 'Needs You' }).locator('xpath=ancestor::section');
     await expect(inbox).toBeVisible();
+    await expect(inbox.locator('.tabular-nums')).toHaveText('10');
     await expect(inbox.getByText('Review deployment plan')).toBeVisible();
     await expect(inbox.getByText('Answer product question')).toBeVisible();
     await expect(inbox.getByText('Running resumed mission')).not.toBeVisible();
