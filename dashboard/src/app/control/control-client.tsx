@@ -18,7 +18,7 @@ import { LazyJsonHighlighter } from "@/components/lazy-json-highlighter";
 import { cn } from "@/lib/utils";
 import { getMissionShortName } from "@/lib/mission-display";
 import { inferMissionRole } from "@/lib/mission-role";
-import { isFinishedStatus } from "@/lib/mission-status";
+import { getMissionDotColor, isFinishedStatus } from "@/lib/mission-status";
 import { getRuntimeApiBase } from "@/lib/settings";
 import { authHeader } from "@/lib/auth";
 import {
@@ -119,6 +119,8 @@ import {
   ExternalLink,
   MessageSquare,
   Users,
+  BriefcaseBusiness,
+  Inbox,
 } from "lucide-react";
 import { IMAGE_PATH_PATTERN } from "@/lib/file-extensions";
 import { insertTextAtSelection, type TextSelection } from "@/lib/text-selection";
@@ -203,6 +205,7 @@ import { NewMissionDialog } from "@/components/new-mission-dialog";
 import { MissionSwitcher, normalizeMetadataText } from "@/components/mission-switcher";
 import { WorkerPanel } from "@/components/worker-panel";
 import { SubagentsPanel, type SubagentEntry } from "@/components/subagents-panel";
+import { RelativeTime } from "@/components/ui/relative-time";
 
 import type { SharedFile } from "@/lib/api";
 
@@ -874,10 +877,14 @@ function statusLabel(state: ControlRunState): {
   }
 }
 
-function missionStatusLabel(status: MissionStatus): {
+function missionStatusLabel(status: MissionStatus, isRunning = false): {
   label: string;
   className: string;
 } {
+  if (isRunning) {
+    return { label: "Running", className: "bg-indigo-500/20 text-indigo-400" };
+  }
+
   switch (status) {
     case "active":
       return { label: "Active", className: "bg-indigo-500/20 text-indigo-400" };
@@ -897,23 +904,8 @@ function missionStatusLabel(status: MissionStatus): {
   }
 }
 
-function missionStatusDotClass(status: MissionStatus): string {
-  switch (status) {
-    case "active":
-      return "bg-emerald-400";
-    case "completed":
-      return "bg-emerald-400";
-    case "failed":
-      return "bg-red-400";
-    case "interrupted":
-      return "bg-amber-400";
-    case "blocked":
-      return "bg-orange-400";
-    case "not_feasible":
-      return "bg-red-400";
-    default:
-      return "bg-white/40";
-  }
+function missionStatusDotClass(status: MissionStatus, isRunning = false): string {
+  return getMissionDotColor(status, isRunning);
 }
 
 // Copy button component
@@ -1886,6 +1878,209 @@ function ThinkingPanel({
         )}
       </div>
     </div>
+  );
+}
+
+function MissionWorkbenchPanel({
+  mission,
+  workspaceLabel,
+  role,
+  runningInfo,
+  childMissions,
+  onClose,
+  onResume,
+  onCancel,
+  onOpenAutomations,
+  onOpenSwitcher,
+  onViewMission,
+  onSetStatus,
+  className,
+}: {
+  mission: Mission | null;
+  workspaceLabel?: string;
+  role: ReturnType<typeof inferMissionRole>;
+  runningInfo: RunningMissionInfo | null;
+  childMissions: Mission[];
+  onClose: () => void;
+  onResume: () => void;
+  onCancel: (missionId: string) => void;
+  onOpenAutomations: () => void;
+  onOpenSwitcher: () => void;
+  onViewMission: (missionId: string) => void;
+  onSetStatus: (status: MissionStatus) => void;
+  className?: string;
+}) {
+  const title = mission?.title?.trim() || (mission ? getMissionShortName(mission.id) : "No mission selected");
+  const isRunning = Boolean(runningInfo);
+  const status = mission ? missionStatusLabel(mission.status, isRunning) : null;
+  const canResume =
+    mission &&
+    !isRunning &&
+    mission.resumable &&
+    (mission.status === "interrupted" || mission.status === "blocked" || mission.status === "failed");
+
+  return (
+    <aside
+      className={cn(
+        "w-full h-full flex flex-col rounded-2xl glass-panel border border-white/[0.06] overflow-hidden animate-slide-in-right",
+        className
+      )}
+      aria-label="Mission workbench"
+    >
+      <div className="flex items-center justify-between border-b border-white/[0.06] px-4 py-3">
+        <div className="flex min-w-0 items-center gap-2">
+          <BriefcaseBusiness className="h-4 w-4 shrink-0 text-indigo-400" />
+          <span className="truncate text-sm font-medium text-white">Workbench</span>
+        </div>
+        <button
+          onClick={onClose}
+          className="flex h-6 w-6 items-center justify-center rounded-lg text-white/40 hover:bg-white/[0.04] hover:text-white transition-colors"
+          title="Close workbench"
+        >
+          <X className="h-3.5 w-3.5" />
+        </button>
+      </div>
+
+      <div className="min-h-0 flex-1 overflow-y-auto p-4 space-y-4">
+        {!mission ? (
+          <div className="flex h-full flex-col items-center justify-center text-center">
+            <Inbox className="mb-3 h-8 w-8 text-white/20" />
+            <p className="text-sm text-white/40">Select a mission to inspect.</p>
+            <button
+              onClick={onOpenSwitcher}
+              className="mt-4 rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2 text-sm text-white/70 hover:bg-white/[0.04]"
+            >
+              Open mission switcher
+            </button>
+          </div>
+        ) : (
+          <>
+            <section className="space-y-3">
+              <div>
+                <p className="mb-1 text-[10px] uppercase tracking-wide text-white/30">Mission</p>
+                <h2 className="line-clamp-3 text-sm font-medium leading-snug text-white/85" title={title}>
+                  {title}
+                </h2>
+              </div>
+              <div className="grid grid-cols-2 gap-2">
+                <div className="rounded-md border border-white/[0.05] bg-white/[0.02] p-2">
+                  <p className="text-[10px] text-white/30">Status</p>
+                  <div className="mt-1 flex items-center gap-1.5">
+                    <span className={cn("h-2 w-2 rounded-full", missionStatusDotClass(mission.status, isRunning))} />
+                    <span className={cn("text-xs font-medium", status?.className)}>
+                      {status?.label}
+                    </span>
+                  </div>
+                </div>
+                <div className="rounded-md border border-white/[0.05] bg-white/[0.02] p-2">
+                  <p className="text-[10px] text-white/30">Role</p>
+                  <p className="mt-1 truncate text-xs font-medium capitalize text-white/70">
+                    {role ?? "mission"}
+                  </p>
+                </div>
+                <div className="rounded-md border border-white/[0.05] bg-white/[0.02] p-2">
+                  <p className="text-[10px] text-white/30">Workspace</p>
+                  <p className="mt-1 truncate text-xs font-medium text-white/70" title={workspaceLabel}>
+                    {workspaceLabel ?? "Unassigned"}
+                  </p>
+                </div>
+                <div className="rounded-md border border-white/[0.05] bg-white/[0.02] p-2">
+                  <p className="text-[10px] text-white/30">Updated</p>
+                  <RelativeTime date={mission.updated_at} className="mt-1 text-xs font-medium text-white/70" />
+                </div>
+              </div>
+              {mission.short_description && (
+                <p className="rounded-md border border-white/[0.05] bg-white/[0.02] p-2 text-xs leading-relaxed text-white/50">
+                  {mission.short_description}
+                </p>
+              )}
+            </section>
+
+            <section className="space-y-2">
+              <p className="text-[10px] uppercase tracking-wide text-white/30">Actions</p>
+              <div className="grid grid-cols-2 gap-2">
+                {canResume && (
+                  <button
+                    onClick={onResume}
+                    className="inline-flex items-center justify-center gap-1.5 rounded-lg border border-emerald-500/20 bg-emerald-500/10 px-3 py-2 text-xs font-medium text-emerald-300 hover:bg-emerald-500/15"
+                  >
+                    <RotateCcw className="h-3.5 w-3.5" />
+                    Resume
+                  </button>
+                )}
+                {isRunning && (
+                  <button
+                    onClick={() => onCancel(mission.id)}
+                    className="inline-flex items-center justify-center gap-1.5 rounded-lg border border-red-500/20 bg-red-500/10 px-3 py-2 text-xs font-medium text-red-300 hover:bg-red-500/15"
+                  >
+                    <Square className="h-3.5 w-3.5" />
+                    Stop
+                  </button>
+                )}
+                <button
+                  onClick={onOpenAutomations}
+                  className="inline-flex items-center justify-center gap-1.5 rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2 text-xs font-medium text-white/70 hover:bg-white/[0.04]"
+                >
+                  <Clock className="h-3.5 w-3.5" />
+                  Automations
+                </button>
+                <button
+                  onClick={onOpenSwitcher}
+                  className="inline-flex items-center justify-center gap-1.5 rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2 text-xs font-medium text-white/70 hover:bg-white/[0.04]"
+                >
+                  <Layers className="h-3.5 w-3.5" />
+                  Switch
+                </button>
+              </div>
+            </section>
+
+            <section className="space-y-2">
+              <p className="text-[10px] uppercase tracking-wide text-white/30">Mark As</p>
+              <div className="flex flex-wrap gap-1.5">
+                {(["completed", "blocked", "failed"] as MissionStatus[]).map((nextStatus) => (
+                  <button
+                    key={nextStatus}
+                    onClick={() => onSetStatus(nextStatus)}
+                    disabled={mission.status === nextStatus}
+                    className="rounded-md border border-white/[0.06] bg-white/[0.02] px-2 py-1 text-[10px] capitalize text-white/55 transition-colors hover:bg-white/[0.04] disabled:cursor-not-allowed disabled:opacity-40"
+                  >
+                    {nextStatus.replace("_", " ")}
+                  </button>
+                ))}
+              </div>
+            </section>
+
+            <section className="space-y-2">
+              <div className="flex items-center justify-between">
+                <p className="text-[10px] uppercase tracking-wide text-white/30">Worker Missions</p>
+                <span className="text-[10px] tabular-nums text-white/30">{childMissions.length}</span>
+              </div>
+              {childMissions.length === 0 ? (
+                <div className="rounded-md border border-white/[0.04] bg-white/[0.01] px-3 py-4 text-center text-xs text-white/30">
+                  No workers attached to this mission.
+                </div>
+              ) : (
+                <div className="space-y-1.5">
+                  {childMissions.slice(0, 6).map((child) => (
+                    <button
+                      key={child.id}
+                      onClick={() => onViewMission(child.id)}
+                      className="flex w-full items-center gap-2 rounded-md border border-white/[0.05] bg-white/[0.02] px-2.5 py-2 text-left hover:bg-white/[0.04]"
+                    >
+                      <span className={cn("h-2 w-2 rounded-full", missionStatusDotClass(child.status))} />
+                      <span className="min-w-0 flex-1 truncate text-xs text-white/70">
+                        {child.title?.trim() || getMissionShortName(child.id)}
+                      </span>
+                      <ChevronRight className="h-3 w-3 text-white/30" />
+                    </button>
+                  ))}
+                </div>
+              )}
+            </section>
+          </>
+        )}
+      </div>
+    </aside>
   );
 }
 
@@ -3258,6 +3453,9 @@ export default function ControlClient() {
   // Thinking panel state
   const [showThinkingPanel, setShowThinkingPanel] = useState(false);
   const [thinkingPanelManuallyHidden, setThinkingPanelManuallyHidden] = useState(false);
+  const [showWorkbenchPanel, setShowWorkbenchPanel] = useState(
+    () => searchParams.get("workbench") === "1"
+  );
   const handleToggleThinkingPanel = useCallback(() => {
     setShowThinkingPanel((prev) => {
       const next = !prev;
@@ -7378,7 +7576,7 @@ export default function ControlClient() {
   const activeWorkspaceLabel = activeMission?.workspace_name
     || (activeMission?.workspace_id ? workspaceNameById[activeMission.workspace_id] : undefined);
   const missionStatus = activeMission
-    ? missionStatusLabel(activeMission.status)
+    ? missionStatusLabel(activeMission.status, viewingMissionIsRunning)
     : null;
 
   // Update favicon with mission status dot
@@ -7528,7 +7726,7 @@ export default function ControlClient() {
                   <div
                     className={cn(
                       "h-2 w-2 rounded-full shrink-0",
-                      missionStatusDotClass(activeMission.status)
+                      missionStatusDotClass(activeMission.status, viewingMissionIsRunning)
                     )}
                     title={missionStatus?.label}
                   />
@@ -7601,6 +7799,20 @@ export default function ControlClient() {
           >
             <Clock className="h-4 w-4" />
             <span className="hidden lg:inline">Automations</span>
+          </button>
+
+          <button
+            onClick={() => setShowWorkbenchPanel((prev) => !prev)}
+            className={cn(
+              "flex items-center gap-2 rounded-lg border px-3 py-2 text-sm transition-colors",
+              showWorkbenchPanel
+                ? "border-indigo-500/30 bg-indigo-500/10 text-indigo-400"
+                : "border-white/[0.06] bg-white/[0.02] text-white/70 hover:bg-white/[0.04]"
+            )}
+            title={showWorkbenchPanel ? "Hide mission workbench" : "Show mission workbench"}
+          >
+            <BriefcaseBusiness className="h-4 w-4" />
+            <span className="hidden sm:inline">Workbench</span>
           </button>
 
           {/* Thinking panel toggle */}
@@ -8617,12 +8829,30 @@ export default function ControlClient() {
         </div>
       </div>
 
-        {/* Right column: Worker Panel, Thinking Panel, and Desktop Stream stacked */}
-        {(showThinkingPanel || showDesktopStream || (showWorkerPanel && isBossMission)) && (
+        {/* Right column: Workbench, Thinking Panel and Desktop Stream stacked */}
+        {(showWorkbenchPanel || showThinkingPanel || showDesktopStream || (showWorkerPanel && isBossMission)) && (
           <div className={cn(
             "min-h-0 flex flex-col gap-4 transition-all duration-300 animate-fade-in shrink-0",
             showDesktopStream ? "flex-1 max-w-md" : "w-80"
           )}>
+            {showWorkbenchPanel && (
+              <MissionWorkbenchPanel
+                mission={activeMission}
+                workspaceLabel={activeWorkspaceLabel}
+                role={activeMissionRole}
+                runningInfo={viewingRunningInfo}
+                childMissions={childMissions}
+                onClose={() => setShowWorkbenchPanel(false)}
+                onResume={handleResumeMission}
+                onCancel={handleCancelMission}
+                onOpenAutomations={() => setShowAutomationsDialog(true)}
+                onOpenSwitcher={() => setShowMissionSwitcher(true)}
+                onViewMission={handleViewMission}
+                onSetStatus={handleSetStatus}
+                className={showThinkingPanel || showDesktopStream || (showWorkerPanel && isBossMission) ? "flex-shrink-0 max-h-[40%]" : "flex-1"}
+              />
+            )}
+
             {/* Worker Panel — real child missions (parent_mission_id) */}
             {showWorkerPanel && childMissions.length > 0 && (
               <WorkerPanel
@@ -8633,7 +8863,7 @@ export default function ControlClient() {
                 onSelectWorker={(missionId) => handleViewMission(missionId)}
                 onClose={() => setShowWorkerPanel(false)}
                 className={cn(
-                  showThinkingPanel || showDesktopStream || hasInMissionSubagents
+                  showWorkbenchPanel || showThinkingPanel || showDesktopStream || hasInMissionSubagents
                     ? "flex-shrink-0 max-h-[50%]"
                     : "flex-1"
                 )}
@@ -8647,7 +8877,7 @@ export default function ControlClient() {
                 onFocusItem={focusChatItem}
                 onClose={() => setShowWorkerPanel(false)}
                 className={cn(
-                  showThinkingPanel || showDesktopStream || childMissions.length > 0
+                  showWorkbenchPanel || showThinkingPanel || showDesktopStream || childMissions.length > 0
                     ? "flex-shrink-0 max-h-[50%]"
                     : "flex-1"
                 )}
@@ -8659,7 +8889,7 @@ export default function ControlClient() {
               <ThinkingPanel
                 items={thinkingItems}
                 onClose={handleCloseThinkingPanel}
-                className={showDesktopStream ? "flex-shrink-0 max-h-[40%]" : "flex-1"}
+                className={showWorkbenchPanel || showDesktopStream || (showWorkerPanel && isBossMission) ? "flex-shrink-0 max-h-[40%]" : "flex-1"}
                 basePath={missionWorkingDirectory}
                 missionId={viewingMissionId}
               />
