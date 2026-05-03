@@ -2631,7 +2631,7 @@ impl MissionStore for SqliteMissionStore {
             let conn = conn.blocking_lock();
             let rows = conn
                 .execute(
-                    "DELETE, COALESCE(goal_mode, 0) as goal_mode, goal_objective FROM missions WHERE id = ?1",
+                    "DELETE FROM missions WHERE id = ?1",
                     params![id.to_string()],
                 )
                 .map_err(|e| e.to_string())?;
