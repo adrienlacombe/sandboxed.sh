@@ -1885,7 +1885,7 @@ function MissionWorkbenchPanel({
   mission,
   workspaceLabel,
   role,
-  runningInfo,
+  isRunning,
   childMissions,
   onClose,
   onResume,
@@ -1899,7 +1899,7 @@ function MissionWorkbenchPanel({
   mission: Mission | null;
   workspaceLabel?: string;
   role: ReturnType<typeof inferMissionRole>;
-  runningInfo: RunningMissionInfo | null;
+  isRunning: boolean;
   childMissions: Mission[];
   onClose: () => void;
   onResume: () => void;
@@ -1911,7 +1911,6 @@ function MissionWorkbenchPanel({
   className?: string;
 }) {
   const title = mission?.title?.trim() || (mission ? getMissionShortName(mission.id) : "No mission selected");
-  const isRunning = Boolean(runningInfo);
   const status = mission ? missionStatusLabel(mission.status, isRunning) : null;
   const canResume =
     mission &&
@@ -8840,7 +8839,7 @@ export default function ControlClient() {
                 mission={activeMission}
                 workspaceLabel={activeWorkspaceLabel}
                 role={activeMissionRole}
-                runningInfo={viewingRunningInfo}
+                isRunning={viewingMissionIsRunning}
                 childMissions={childMissions}
                 onClose={() => setShowWorkbenchPanel(false)}
                 onResume={handleResumeMission}

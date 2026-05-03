@@ -11,7 +11,7 @@ async function fulfillJson(route: Route, body: unknown, status = 200) {
   });
 }
 
-async function mockRunningInterruptedMission(page: Page) {
+async function mockRunningInterruptedMission(page: Page, runningState = 'running') {
   const now = new Date().toISOString();
   const mission = {
     id: RUNNING_INTERRUPTED_MISSION_ID,
@@ -62,11 +62,19 @@ async function mockRunningInterruptedMission(page: Page) {
       return;
     }
     if (path === '/api/control/running') {
-      await fulfillJson(route, [{ mission_id: RUNNING_INTERRUPTED_MISSION_ID, state: 'running', queue_len: 0 }]);
+      await fulfillJson(route, [{ mission_id: RUNNING_INTERRUPTED_MISSION_ID, state: runningState, queue_len: 0 }]);
       return;
     }
     if (path === '/api/control/progress') {
-      await fulfillJson(route, { run_state: 'running', queue_len: 0, mission_id: RUNNING_INTERRUPTED_MISSION_ID });
+      await fulfillJson(route, {
+        run_state: runningState === 'running' ? 'running' : 'idle',
+        queue_len: 0,
+        mission_id: RUNNING_INTERRUPTED_MISSION_ID,
+      });
+      return;
+    }
+    if (path === '/api/control/queue') {
+      await fulfillJson(route, []);
       return;
     }
     if (path === '/api/control/stream') {
@@ -103,6 +111,24 @@ async function mockRunningInterruptedMission(page: Page) {
     }
 
     await fulfillJson(route, {});
+  });
+}
+
+async function stubControlStream(page: Page) {
+  await page.addInitScript(() => {
+    const originalFetch = window.fetch.bind(window);
+    window.fetch = (input, init) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+      if (url.includes('/api/control/stream')) {
+        return Promise.resolve(
+          new Response(new ReadableStream(), {
+            status: 200,
+            headers: { 'Content-Type': 'text/event-stream' },
+          })
+        );
+      }
+      return originalFetch(input, init);
+    };
   });
 }
 
@@ -181,21 +207,7 @@ test.describe('Control/Mission Page', () => {
   });
 
   test('workbench uses running colors for a resumed interrupted mission', async ({ page }) => {
-    await page.addInitScript(() => {
-      const originalFetch = window.fetch.bind(window);
-      window.fetch = (input, init) => {
-        const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
-        if (url.includes('/api/control/stream')) {
-          return Promise.resolve(
-            new Response(new ReadableStream(), {
-              status: 200,
-              headers: { 'Content-Type': 'text/event-stream' },
-            })
-          );
-        }
-        return originalFetch(input, init);
-      };
-    });
+    await stubControlStream(page);
     await mockRunningInterruptedMission(page);
     await page.goto(`/control?mission=${RUNNING_INTERRUPTED_MISSION_ID}&workbench=1`);
 
@@ -206,5 +218,19 @@ test.describe('Control/Mission Page', () => {
     await expect(statusCard.getByText('Running')).toBeVisible();
     await expect(statusCard.locator('.bg-indigo-400')).toBeVisible();
     await expect(statusCard.locator('.text-indigo-400')).toBeVisible();
+  });
+
+  test('workbench ignores stale finished running info', async ({ page }) => {
+    await stubControlStream(page);
+    await mockRunningInterruptedMission(page, 'finished');
+    await page.goto(`/control?mission=${RUNNING_INTERRUPTED_MISSION_ID}&workbench=1`);
+
+    const workbench = page.getByLabel('Mission workbench');
+    await expect(workbench).toBeVisible();
+
+    const statusCard = workbench.getByText('Status').locator('xpath=ancestor::div[contains(@class, "rounded-md")]');
+    await expect(statusCard.getByText('Interrupted')).toBeVisible();
+    await expect(statusCard.locator('.bg-amber-400')).toBeVisible();
+    await expect(statusCard.locator('.text-amber-400')).toBeVisible();
   });
 });
