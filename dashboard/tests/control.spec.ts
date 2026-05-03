@@ -1,6 +1,7 @@
 import { test, expect, type Page, type Route } from '@playwright/test';
 
 const RUNNING_INTERRUPTED_MISSION_ID = '55555555-5555-4555-8555-555555555555';
+type MockRunningState = 'queued' | 'running' | 'waiting_for_tool' | 'finished';
 
 async function fulfillJson(route: Route, body: unknown, status = 200) {
   await route.fulfill({
@@ -11,7 +12,7 @@ async function fulfillJson(route: Route, body: unknown, status = 200) {
   });
 }
 
-async function mockRunningInterruptedMission(page: Page) {
+async function mockInterruptedMission(page: Page, runningState: MockRunningState) {
   const now = new Date().toISOString();
   const mission = {
     id: RUNNING_INTERRUPTED_MISSION_ID,
@@ -62,11 +63,15 @@ async function mockRunningInterruptedMission(page: Page) {
       return;
     }
     if (path === '/api/control/running') {
-      await fulfillJson(route, [{ mission_id: RUNNING_INTERRUPTED_MISSION_ID, state: 'running', queue_len: 0 }]);
+      await fulfillJson(route, [{ mission_id: RUNNING_INTERRUPTED_MISSION_ID, state: runningState, queue_len: 0 }]);
       return;
     }
     if (path === '/api/control/progress') {
-      await fulfillJson(route, { run_state: 'running', queue_len: 0, mission_id: RUNNING_INTERRUPTED_MISSION_ID });
+      await fulfillJson(route, { run_state: runningState === 'finished' ? 'idle' : 'running', queue_len: 0, mission_id: RUNNING_INTERRUPTED_MISSION_ID });
+      return;
+    }
+    if (path === '/api/control/queue') {
+      await fulfillJson(route, []);
       return;
     }
     if (path === '/api/control/stream') {
@@ -103,6 +108,24 @@ async function mockRunningInterruptedMission(page: Page) {
     }
 
     await fulfillJson(route, {});
+  });
+}
+
+async function keepMockedControlStreamOpen(page: Page) {
+  await page.addInitScript(() => {
+    const originalFetch = window.fetch.bind(window);
+    window.fetch = (input, init) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+      if (url.includes('/api/control/stream')) {
+        return Promise.resolve(
+          new Response(new ReadableStream(), {
+            status: 200,
+            headers: { 'Content-Type': 'text/event-stream' },
+          })
+        );
+      }
+      return originalFetch(input, init);
+    };
   });
 }
 
@@ -181,22 +204,8 @@ test.describe('Control/Mission Page', () => {
   });
 
   test('workbench uses running colors for a resumed interrupted mission', async ({ page }) => {
-    await page.addInitScript(() => {
-      const originalFetch = window.fetch.bind(window);
-      window.fetch = (input, init) => {
-        const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
-        if (url.includes('/api/control/stream')) {
-          return Promise.resolve(
-            new Response(new ReadableStream(), {
-              status: 200,
-              headers: { 'Content-Type': 'text/event-stream' },
-            })
-          );
-        }
-        return originalFetch(input, init);
-      };
-    });
-    await mockRunningInterruptedMission(page);
+    await keepMockedControlStreamOpen(page);
+    await mockInterruptedMission(page, 'running');
     await page.goto(`/control?mission=${RUNNING_INTERRUPTED_MISSION_ID}&workbench=1`);
 
     const workbench = page.getByLabel('Mission workbench');
@@ -206,5 +215,19 @@ test.describe('Control/Mission Page', () => {
     await expect(statusCard.getByText('Running')).toBeVisible();
     await expect(statusCard.locator('.bg-indigo-400')).toBeVisible();
     await expect(statusCard.locator('.text-indigo-400')).toBeVisible();
+  });
+
+  test('workbench ignores finished running records for status display', async ({ page }) => {
+    await keepMockedControlStreamOpen(page);
+    await mockInterruptedMission(page, 'finished');
+    await page.goto(`/control?mission=${RUNNING_INTERRUPTED_MISSION_ID}&workbench=1`);
+
+    const workbench = page.getByLabel('Mission workbench');
+    await expect(workbench).toBeVisible();
+
+    const statusCard = workbench.getByText('Status').locator('xpath=ancestor::div[contains(@class, "rounded-md")]');
+    await expect(statusCard.getByText('Interrupted')).toBeVisible();
+    await expect(statusCard.getByText('Running')).not.toBeVisible();
+    await expect(statusCard.locator('.bg-amber-400')).toBeVisible();
   });
 });
