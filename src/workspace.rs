@@ -4501,9 +4501,19 @@ else
 fi
 
 if [ -n "$PKG_MGR" ]; then
+  # --- Patched: claude-code via npm to dodge bun ELF wrapping bug.
+  #     bun global-install of @anthropic-ai/claude-code points the
+  #     `claude` exec at the precompiled ELF inside the platform sub-package
+  #     and bun then tries to interpret it as JavaScript at runtime
+  #     (`error: Unexpected at .../claude:1:1`). npm wraps platform packages
+  #     correctly, so use npm for claude even when bun is preferred elsewhere.
+  CLAUDE_PKG_MGR="$PKG_MGR"
+  if [ "$PKG_MGR" = "bun" ] && command -v npm >/dev/null 2>&1; then
+    CLAUDE_PKG_MGR="npm"
+  fi
   if [ "{install_claudecode}" = "true" ] && ! command -v claude >/dev/null 2>&1; then
-    echo "[sandboxed] Installing Claude Code via $PKG_MGR..."
-    if ! $PKG_MGR install -g @anthropic-ai/claude-code@latest; then
+    echo "[sandboxed] Installing Claude Code via $CLAUDE_PKG_MGR..."
+    if ! $CLAUDE_PKG_MGR install -g @anthropic-ai/claude-code@latest; then
       echo "[sandboxed] Claude Code install failed"
     fi
   fi
