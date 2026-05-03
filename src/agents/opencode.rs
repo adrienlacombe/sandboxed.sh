@@ -118,6 +118,10 @@ impl OpenCodeAgent {
             OpenCodeEvent::MessageComplete { .. } => return, // Don't forward completion marker
             OpenCodeEvent::TurnSummary { .. } => return,     // Summary is handled elsewhere
             OpenCodeEvent::Usage { .. } => return,           // Usage tracked at runner level
+            // Goal events are codex-only today; OpenCode missions never
+            // emit them. Catch-all silently ignores rather than panic on
+            // a non-exhaustive match.
+            OpenCodeEvent::GoalIteration { .. } | OpenCodeEvent::GoalStatus { .. } => return,
         };
 
         match events_tx.send(agent_event) {

@@ -1678,6 +1678,34 @@ impl SqliteMissionStore {
         Self::migrate_automations_table(conn)?;
         Self::ensure_automation_indexes(conn)?;
 
+        // Goal-mode columns (PR #403): set to true when a mission was started
+        // via codex `/goal <objective>`. The codex backend infers from the
+        // user's message at send time; persisting on the row lets the UI
+        // render the goal pill from a fresh page load without SSE replay.
+        let has_goal_mode_column: bool = conn
+            .prepare("SELECT 1 FROM pragma_table_info('missions') WHERE name = 'goal_mode'")
+            .map_err(|e| format!("Failed to check for goal_mode column: {}", e))?
+            .exists([])
+            .map_err(|e| format!("Failed to query table info: {}", e))?;
+        if !has_goal_mode_column {
+            tracing::info!("Running migration: adding 'goal_mode' column to missions table");
+            conn.execute(
+                "ALTER TABLE missions ADD COLUMN goal_mode INTEGER NOT NULL DEFAULT 0",
+                [],
+            )
+            .map_err(|e| format!("Failed to add goal_mode column: {}", e))?;
+        }
+        let has_goal_objective_column: bool = conn
+            .prepare("SELECT 1 FROM pragma_table_info('missions') WHERE name = 'goal_objective'")
+            .map_err(|e| format!("Failed to check for goal_objective column: {}", e))?
+            .exists([])
+            .map_err(|e| format!("Failed to query table info: {}", e))?;
+        if !has_goal_objective_column {
+            tracing::info!("Running migration: adding 'goal_objective' column to missions table");
+            conn.execute("ALTER TABLE missions ADD COLUMN goal_objective TEXT", [])
+                .map_err(|e| format!("Failed to add goal_objective column: {}", e))?;
+        }
+
         Ok(())
     }
 
@@ -1982,6 +2010,8 @@ impl MissionStore for SqliteMissionStore {
                         mission_mode: row.get::<_, Option<String>>(24)?
                             .and_then(|s| serde_json::from_value(serde_json::Value::String(s)).ok())
                             .unwrap_or_default(),
+                            goal_mode: row.get::<_, i32>(25).unwrap_or(0) != 0,
+                            goal_objective: row.get(26).ok().flatten(),
                     })
                 })
                 .map_err(|e| e.to_string())?
@@ -2009,8 +2039,7 @@ impl MissionStore for SqliteMissionStore {
                             created_at, updated_at, interrupted_at, resumable, desktop_sessions,
                             COALESCE(backend, 'opencode') as backend, session_id, terminal_reason,
                             config_profile, parent_mission_id, working_directory,
-                            COALESCE(mission_mode, 'task') as mission_mode
-                     FROM missions WHERE id = ?1",
+                            COALESCE(mission_mode, 'task') as mission_mode, COALESCE(goal_mode, 0) as goal_mode, goal_objective FROM missions WHERE id = ?1",
                 )
                 .map_err(|e| e.to_string())?;
 
@@ -2057,6 +2086,8 @@ impl MissionStore for SqliteMissionStore {
                         mission_mode: row.get::<_, Option<String>>(24)?
                             .and_then(|s| serde_json::from_value(serde_json::Value::String(s)).ok())
                             .unwrap_or_default(),
+                            goal_mode: row.get::<_, i32>(25).unwrap_or(0) != 0,
+                            goal_objective: row.get(26).ok().flatten(),
                     })
                 })
                 .optional()
@@ -2173,6 +2204,8 @@ impl MissionStore for SqliteMissionStore {
             parent_mission_id,
             working_directory: working_directory.map(|s| s.to_string()),
             mission_mode: MissionMode::default(),
+            goal_mode: false,
+            goal_objective: None,
         };
 
         let m = mission.clone();
@@ -2183,8 +2216,8 @@ impl MissionStore for SqliteMissionStore {
         tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
             conn.execute(
-                "INSERT INTO missions (id, status, title, short_description, metadata_updated_at, metadata_source, metadata_model, metadata_version, workspace_id, agent, model_override, model_effort, backend, config_profile, created_at, updated_at, resumable, session_id, parent_mission_id, working_directory, mission_mode)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
+                "INSERT INTO missions (id, status, title, short_description, metadata_updated_at, metadata_source, metadata_model, metadata_version, workspace_id, agent, model_override, model_effort, backend, config_profile, created_at, updated_at, resumable, session_id, parent_mission_id, working_directory, mission_mode, goal_mode, goal_objective)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)",
                 params![
                     m.id.to_string(),
                     status_to_string(m.status),
@@ -2207,6 +2240,8 @@ impl MissionStore for SqliteMissionStore {
                     m.parent_mission_id.map(|id| id.to_string()),
                     m.working_directory,
                     mission_mode_str,
+                    if m.goal_mode { 1i64 } else { 0i64 },
+                    m.goal_objective,
                 ],
             )
             .map_err(|e| e.to_string())?;
@@ -2257,6 +2292,8 @@ impl MissionStore for SqliteMissionStore {
                         mission_mode: row.get::<_, Option<String>>(22)?
                             .and_then(|s| serde_json::from_value(serde_json::Value::String(s)).ok())
                             .unwrap_or_default(),
+                            goal_mode: row.get::<_, i32>(23).unwrap_or(0) != 0,
+                            goal_objective: row.get(24).ok().flatten(),
                     })
                 })
                 .map_err(|e| e.to_string())?
@@ -2594,7 +2631,7 @@ impl MissionStore for SqliteMissionStore {
             let conn = conn.blocking_lock();
             let rows = conn
                 .execute(
-                    "DELETE FROM missions WHERE id = ?1",
+                    "DELETE, COALESCE(goal_mode, 0) as goal_mode, goal_objective FROM missions WHERE id = ?1",
                     params![id.to_string()],
                 )
                 .map_err(|e| e.to_string())?;
@@ -2617,7 +2654,7 @@ impl MissionStore for SqliteMissionStore {
             // Find missions to delete
             let mut stmt = conn
                 .prepare(
-                    "SELECT m.id FROM missions m
+                    "SELECT m.id, COALESCE(goal_mode, 0) as goal_mode, goal_objective FROM missions m
                      LEFT JOIN mission_events e ON m.id = e.mission_id AND e.event_type IN ('user_message', 'assistant_message')
                      WHERE m.status = 'active'
                        AND (m.title IS NULL OR m.title = '' OR m.title = 'Untitled Mission')
@@ -2680,8 +2717,7 @@ impl MissionStore for SqliteMissionStore {
                 .prepare(
                     "SELECT id, status, title, workspace_id, workspace_name, agent, model_override,
                             created_at, updated_at, interrupted_at, resumable, desktop_sessions,
-                            COALESCE(backend, 'opencode') as backend
-                     FROM missions m
+                            COALESCE(backend, 'opencode') as backend, COALESCE(goal_mode, 0) as goal_mode, goal_objective FROM missions m
                      WHERE status = 'active'
                        AND max(
                              m.updated_at,
@@ -2732,6 +2768,8 @@ impl MissionStore for SqliteMissionStore {
                         parent_mission_id: None,
                         working_directory: None,
                         mission_mode: MissionMode::default(),
+                        goal_mode: false,
+                        goal_objective: None,
                     })
                 })
                 .map_err(|e| e.to_string())?
@@ -2797,6 +2835,8 @@ impl MissionStore for SqliteMissionStore {
                         parent_mission_id: None,
                         mission_mode: MissionMode::default(),
                         working_directory: None,
+                        goal_mode: false,
+                        goal_objective: None,
                     })
                 })
                 .map_err(|e| e.to_string())?
@@ -3009,6 +3049,28 @@ impl MissionStore for SqliteMissionStore {
                     "session_id": session_id,
                     "updated_at": updated_at
                 }),
+            ),
+            AgentEvent::GoalIteration {
+                iteration,
+                objective,
+                ..
+            } => (
+                "goal_iteration",
+                None,
+                None,
+                None,
+                objective.clone(),
+                serde_json::json!({ "iteration": iteration }),
+            ),
+            AgentEvent::GoalStatus {
+                status, objective, ..
+            } => (
+                "goal_status",
+                None,
+                None,
+                None,
+                objective.clone(),
+                serde_json::json!({ "status": status }),
             ),
             // Skip events that are less important for debugging
             AgentEvent::Status { .. }
@@ -4042,8 +4104,7 @@ impl MissionStore for SqliteMissionStore {
             let conn = conn.blocking_lock();
             let mut stmt = conn
                 .prepare(
-                    "SELECT id, status, title, workspace_id, agent, backend, created_at, updated_at, mission_mode, short_description
-                     FROM missions WHERE mission_mode = 'assistant' ORDER BY updated_at DESC",
+                    "SELECT id, status, title, workspace_id, agent, backend, created_at, updated_at, mission_mode, short_description, COALESCE(goal_mode, 0) as goal_mode, goal_objective FROM missions WHERE mission_mode = 'assistant' ORDER BY updated_at DESC",
                 )
                 .map_err(|e| e.to_string())?;
             let missions = stmt
@@ -4081,6 +4142,8 @@ impl MissionStore for SqliteMissionStore {
                         working_directory: None,
                         mission_mode: serde_json::from_value(serde_json::Value::String(mode_str))
                             .unwrap_or_default(),
+                        goal_mode: false,
+                        goal_objective: None,
                     })
                 })
                 .map_err(|e| e.to_string())?
@@ -6011,8 +6074,8 @@ impl MissionStore for SqliteMissionStore {
                 .map(|t| format!("{t} (imported)"))
                 .or_else(|| Some("Imported mission".to_string()));
             tx.execute(
-                "INSERT INTO missions (id, status, title, short_description, metadata_updated_at, metadata_source, metadata_model, metadata_version, workspace_id, workspace_name, agent, model_override, model_effort, backend, config_profile, created_at, updated_at, interrupted_at, resumable, desktop_sessions, session_id, terminal_reason, parent_mission_id, working_directory, mission_mode)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)",
+                "INSERT INTO missions (id, status, title, short_description, metadata_updated_at, metadata_source, metadata_model, metadata_version, workspace_id, workspace_name, agent, model_override, model_effort, backend, config_profile, created_at, updated_at, interrupted_at, resumable, desktop_sessions, session_id, terminal_reason, parent_mission_id, working_directory, mission_mode, goal_mode, goal_objective)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27)",
                 rusqlite::params![
                     new_mission_id.to_string(),
                     status_str,
@@ -6046,6 +6109,8 @@ impl MissionStore for SqliteMissionStore {
                     Option::<String>::None,
                     mission.working_directory,
                     mission_mode_str,
+                    if mission.goal_mode { 1i64 } else { 0i64 },
+                    mission.goal_objective.clone(),
                 ],
             )
             .map_err(|e| format!("Failed to insert mission: {e}"))?;

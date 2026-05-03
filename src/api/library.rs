@@ -23,10 +23,10 @@ use tokio::sync::RwLock;
 
 use crate::library::{
     rename::{ItemType, RenameResult},
-    AmpCodeConfig, ClaudeCodeConfig, Command, CommandSummary, ConfigProfile, ConfigProfileSummary,
-    GitAuthor, InitScript, InitScriptSummary, LibraryAgent, LibraryAgentSummary, LibraryStatus,
-    LibraryStore, McpServer, MigrationReport, SandboxedConfig, Skill, SkillSummary,
-    WorkspaceTemplate, WorkspaceTemplateSummary,
+    AmpCodeConfig, ClaudeCodeConfig, Command, CommandParam, CommandSummary, ConfigProfile,
+    ConfigProfileSummary, GitAuthor, InitScript, InitScriptSummary, LibraryAgent,
+    LibraryAgentSummary, LibraryStatus, LibraryStore, McpServer, MigrationReport, SandboxedConfig,
+    Skill, SkillSummary, WorkspaceTemplate, WorkspaceTemplateSummary,
 };
 use crate::nspawn::NspawnDistro;
 use crate::util::{internal_error, not_found_or_internal, sanitize_skill_list};
@@ -941,6 +941,10 @@ struct BuiltinCommandsResponse {
     opencode: Vec<CommandSummary>,
     /// Commands for Claude Code
     claudecode: Vec<CommandSummary>,
+    /// Commands for Codex (`codex` CLI 0.128.0+).
+    /// Empty when the workspace's codex binary predates the goals feature flag.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    codex: Vec<CommandSummary>,
 }
 
 /// GET /api/library/builtin-commands - Get builtin slash commands for each backend.
@@ -1074,9 +1078,28 @@ async fn get_builtin_commands() -> Json<BuiltinCommandsResponse> {
         },
     ];
 
+    // Codex builtin commands. `/goal` lands in codex 0.128.0 behind the
+    // `[features] goals = true` flag — the backend forwards `--enable goals`
+    // automatically when it sees a `/goal ` prefix on the prompt, so there's
+    // nothing for the user to configure beyond typing the command.
+    let codex_commands = vec![CommandSummary {
+        name: "goal".to_string(),
+        description: Some(
+            "Loop until the objective is achieved (codex 0.128.0+, requires goals feature)"
+                .to_string(),
+        ),
+        path: "builtin-codex".to_string(),
+        params: vec![CommandParam {
+            name: "objective".to_string(),
+            required: true,
+            description: Some("What the agent should keep iterating on until done".to_string()),
+        }],
+    }];
+
     Json(BuiltinCommandsResponse {
         opencode: opencode_commands,
         claudecode: claudecode_commands,
+        codex: codex_commands,
     })
 }
 

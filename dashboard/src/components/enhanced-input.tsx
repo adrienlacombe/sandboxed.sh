@@ -16,6 +16,17 @@ const FALLBACK_CLAUDECODE_COMMANDS: CommandSummary[] = [
   { name: 'clear', description: 'Clear conversation history and start fresh', path: 'builtin-claude' },
 ];
 
+const FALLBACK_CODEX_COMMANDS: CommandSummary[] = [
+  {
+    name: 'goal',
+    description: 'Loop until the objective is achieved (codex 0.128.0+)',
+    path: 'builtin-codex',
+    params: [
+      { name: 'objective', required: true, description: 'What the agent should keep iterating on until done' },
+    ],
+  },
+];
+
 export interface SubmitPayload {
   content: string;
   agent?: string;
@@ -188,28 +199,39 @@ export const EnhancedInput = memo(forwardRef<EnhancedInputHandle, EnhancedInputP
       let builtinCommands: CommandSummary[] = [];
       try {
         const builtinResponse = await fetchBuiltinCommands();
-        // Select commands based on backend type.
-        // For known backends with no native slash commands (e.g., codex), show none.
         const builtinByBackend: Record<string, CommandSummary[]> = {
           claudecode: builtinResponse.claudecode,
           opencode: builtinResponse.opencode,
+          // Codex got native slash commands in 0.128.0 (currently just /goal).
+          // The backend returns an empty array for older binaries; the field
+          // is optional in the response type.
+          codex: builtinResponse.codex ?? [],
         };
         if (backend) {
           builtinCommands = builtinByBackend[backend] ?? [];
         } else {
-          // No backend selected yet, show both known builtin sets.
-          builtinCommands = [...builtinResponse.opencode, ...builtinResponse.claudecode];
+          // No backend selected yet, show every known builtin set.
+          builtinCommands = [
+            ...builtinResponse.opencode,
+            ...builtinResponse.claudecode,
+            ...(builtinResponse.codex ?? []),
+          ];
         }
       } catch {
         // Use fallback commands if API fails
         const fallbackByBackend: Record<string, CommandSummary[]> = {
           claudecode: FALLBACK_CLAUDECODE_COMMANDS,
           opencode: FALLBACK_OPENCODE_COMMANDS,
+          codex: FALLBACK_CODEX_COMMANDS,
         };
         if (backend) {
           builtinCommands = fallbackByBackend[backend] ?? [];
         } else {
-          builtinCommands = [...FALLBACK_OPENCODE_COMMANDS, ...FALLBACK_CLAUDECODE_COMMANDS];
+          builtinCommands = [
+            ...FALLBACK_OPENCODE_COMMANDS,
+            ...FALLBACK_CLAUDECODE_COMMANDS,
+            ...FALLBACK_CODEX_COMMANDS,
+          ];
         }
       }
 

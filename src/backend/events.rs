@@ -26,6 +26,16 @@ pub enum ExecutionEvent {
         input_tokens: u64,
         output_tokens: u64,
     },
+    /// Goal-mode iteration marker. Emitted once per turn by the codex
+    /// app-server driver when a goal is active so the UI can render
+    /// "iter N" pills. `iteration` is 1-based and monotonically increasing
+    /// within a single mission. Backends that don't run goal loops just
+    /// don't emit this event.
+    GoalIteration { iteration: u32, objective: String },
+    /// Goal status transitioned (active/paused/budgetLimited/complete).
+    /// Carries the canonical status string from codex's `thread/goal/updated`
+    /// notification. UI renders this as a goal-state pill.
+    GoalStatus { status: String, objective: String },
     /// Message execution completed.
     MessageComplete { session_id: String },
     /// Error occurred.

@@ -2631,6 +2631,23 @@ pub enum AgentEvent {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         resumable: bool,
     },
+    /// Goal-mode iteration marker — fired once per turn while a codex
+    /// `/goal` continuation loop is active. UI renders as "iter N" pill.
+    GoalIteration {
+        iteration: u32,
+        objective: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        mission_id: Option<Uuid>,
+    },
+    /// Goal status transitioned. Carries the canonical status string from
+    /// codex's `thread/goal/updated`: `active`, `paused`, `budgetLimited`,
+    /// `complete`, or `cleared` when the goal was explicitly aborted.
+    GoalStatus {
+        status: String,
+        objective: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        mission_id: Option<Uuid>,
+    },
     /// Mission status changed (by agent or user)
     MissionStatusChanged {
         mission_id: Uuid,
@@ -2808,6 +2825,8 @@ impl AgentEvent {
             AgentEvent::MissionMetadataUpdated { .. } => "mission_metadata_updated",
             AgentEvent::MissionSettingsUpdated { .. } => "mission_settings_updated",
             AgentEvent::FidoSignRequest { .. } => "fido_sign_request",
+            AgentEvent::GoalIteration { .. } => "goal_iteration",
+            AgentEvent::GoalStatus { .. } => "goal_status",
         }
     }
 
@@ -2831,6 +2850,8 @@ impl AgentEvent {
             AgentEvent::MissionMetadataUpdated { mission_id, .. } => Some(*mission_id),
             AgentEvent::MissionSettingsUpdated { mission_id, .. } => Some(*mission_id),
             AgentEvent::FidoSignRequest { .. } => None,
+            AgentEvent::GoalIteration { mission_id, .. } => *mission_id,
+            AgentEvent::GoalStatus { mission_id, .. } => *mission_id,
         }
     }
 }
@@ -5053,6 +5074,26 @@ fn spawn_control_session(
         ));
     }
 
+    // Spawn in-process orphan detector. Every 60 s it asks the control
+    // actor for the live running list and marks any mission whose
+    // `seconds_since_activity` exceeds the silence threshold as
+    // interrupted. This covers two failure modes the existing recovery
+    // didn't:
+    //  1. mission_runner task died mid-flight (backend alive, codex
+    //     orphaned in its container). Boot-time recovery only catches
+    //     this across a full restart.
+    //  2. codex hung — process alive in `futex_wait_queue` with no
+    //     events flowing. Stale-mission cleanup eventually catches this
+    //     after `stale_hours` (default 24 h); 10 min is a much closer
+    //     match for "agent may be stuck" UX.
+    if state.mission_store.is_persistent() {
+        tokio::spawn(stuck_mission_watchdog_loop(
+            Arc::clone(&state.mission_store),
+            state.cmd_tx.clone(),
+            events_tx.clone(),
+        ));
+    }
+
     // Spawn event logger task (logs all events to SQLite for debugging/replay)
     if state.mission_store.is_persistent() {
         let store = Arc::clone(&state.mission_store);
@@ -5185,6 +5226,156 @@ async fn cleanup_stale_active_missions_once(
 }
 
 /// Background task that periodically cleans up stale missions.
+/// Periodic watchdog: marks missions interrupted when the runner has
+/// stalled for too long, even if the mission row is still `Active`.
+///
+/// Two cases this catches that the boot-time orphan recovery and the
+/// daily stale-mission cleanup miss:
+/// 1. mission_runner task died mid-flight (e.g. codex stdio EOF after
+///    one of our reconnect attempts). The mission row stays Active
+///    forever because nothing emits a terminal status; the codex
+///    process can survive in its container namespace.
+/// 2. codex itself hung — process alive but `futex_wait_queue` with no
+///    events. Observed live on prod after a deploy mid-mission: 70+
+///    minutes of silence, dashboard correctly flagged "may be stuck"
+///    but no path was forcing termination.
+///
+/// Threshold is intentionally generous (15 min) so a model in the
+/// middle of a slow API turn or a long shell command isn't false-killed.
+async fn stuck_mission_watchdog_loop(
+    mission_store: Arc<dyn MissionStore>,
+    cmd_tx: mpsc::Sender<ControlCommand>,
+    events_tx: broadcast::Sender<AgentEvent>,
+) {
+    use std::collections::HashSet;
+
+    const CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+    /// Silence threshold before declaring a mission stuck. Conservative
+    /// so legitimately long codex turns (Lean compiles, CI polls) don't
+    /// trigger false positives.
+    const STUCK_SECONDS: u64 = 900;
+
+    tracing::info!(
+        "Stuck-mission watchdog started: threshold {}s, poll every {}s",
+        STUCK_SECONDS,
+        CHECK_INTERVAL.as_secs()
+    );
+
+    loop {
+        tokio::time::sleep(CHECK_INTERVAL).await;
+
+        // Pull the in-memory running list from the actor — same source
+        // /api/control/running serves, includes seconds_since_activity.
+        let (resp_tx, resp_rx) = oneshot::channel();
+        if cmd_tx
+            .send(ControlCommand::ListRunning { respond: resp_tx })
+            .await
+            .is_err()
+        {
+            tracing::debug!("Stuck-mission watchdog: actor channel closed; exiting");
+            return;
+        }
+        let running_list = match resp_rx.await {
+            Ok(list) => list,
+            Err(_) => continue,
+        };
+
+        // Cross-check against DB: any mission Active in the store but
+        // not in `running_list` is an orphan from a runner death.
+        let active_missions = match mission_store.get_all_active_missions().await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("Stuck-mission watchdog: list active failed: {}", e);
+                continue;
+            }
+        };
+
+        let running_ids: HashSet<Uuid> = running_list.iter().map(|info| info.mission_id).collect();
+
+        // Case 1 — actor reports the mission running but stalled past
+        // threshold. Cancel via the actor (clean shutdown) and mark
+        // the row Interrupted.
+        for info in &running_list {
+            if info.seconds_since_activity >= STUCK_SECONDS {
+                tracing::warn!(
+                    "Stuck-mission watchdog: cancelling {} after {}s of inactivity",
+                    info.mission_id,
+                    info.seconds_since_activity
+                );
+                let (cancel_tx, cancel_rx) = oneshot::channel();
+                if cmd_tx
+                    .send(ControlCommand::CancelMission {
+                        mission_id: info.mission_id,
+                        respond: cancel_tx,
+                    })
+                    .await
+                    .is_ok()
+                {
+                    let _ = cancel_rx.await;
+                }
+                if let Err(e) = mission_store
+                    .update_mission_status_with_reason(
+                        info.mission_id,
+                        MissionStatus::Interrupted,
+                        Some("watchdog_stalled"),
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        "Stuck-mission watchdog: status update failed for {}: {}",
+                        info.mission_id,
+                        e
+                    );
+                    continue;
+                }
+                let _ = events_tx.send(AgentEvent::MissionStatusChanged {
+                    mission_id: info.mission_id,
+                    status: MissionStatus::Interrupted,
+                    summary: Some(format!(
+                        "Interrupted: no agent activity for {}s (>{}s threshold)",
+                        info.seconds_since_activity, STUCK_SECONDS
+                    )),
+                });
+            }
+        }
+
+        // Case 2 — Active in DB, not in actor's running list at all.
+        // This is the "mission_runner died, row never finalized" path.
+        for mission in &active_missions {
+            if running_ids.contains(&mission.id) {
+                continue;
+            }
+            tracing::warn!(
+                "Stuck-mission watchdog: orphan {} (no live runner); marking interrupted",
+                mission.id
+            );
+            if let Err(e) = mission_store
+                .update_mission_status_with_reason(
+                    mission.id,
+                    MissionStatus::Interrupted,
+                    Some("orphan_no_runner"),
+                )
+                .await
+            {
+                tracing::warn!(
+                    "Stuck-mission watchdog: status update failed for {}: {}",
+                    mission.id,
+                    e
+                );
+                continue;
+            }
+            let _ = events_tx.send(AgentEvent::MissionStatusChanged {
+                mission_id: mission.id,
+                status: MissionStatus::Interrupted,
+                summary: Some(
+                    "Interrupted: mission runner exited without reporting a terminal status"
+                        .to_string(),
+                ),
+            });
+        }
+    }
+}
+
 async fn stale_mission_cleanup_loop(
     mission_store: Arc<dyn MissionStore>,
     stale_hours: u64,
@@ -9648,10 +9839,20 @@ async fn run_single_control_turn(
             let requested_codex_model = requested_model
                 .as_deref()
                 .or(config.default_model.as_deref());
+            // Goal-mode missions need the raw `/goal <objective>` message to
+            // reach the codex backend; the wrapped `convo` buries the prefix
+            // and breaks `parse_goal_prefix`. Mirror the same routing the
+            // mission_runner dispatch uses.
+            let codex_message_owned: String = if user_message.trim_start().starts_with("/goal ") {
+                user_message.clone()
+            } else {
+                convo.clone()
+            };
+            let codex_message: &str = codex_message_owned.as_str();
             let mut result = Box::pin(super::mission_runner::run_codex_turn(
                 exec_workspace,
                 &ctx.working_dir,
-                &convo,
+                codex_message,
                 requested_codex_model,
                 requested_model_effort.as_deref(),
                 config.opencode_agent.as_deref(),
@@ -9677,7 +9878,7 @@ async fn run_single_control_turn(
                 result = Box::pin(super::mission_runner::run_codex_turn(
                     exec_workspace,
                     &ctx.working_dir,
-                    &convo,
+                    codex_message,
                     Some(fallback_model),
                     requested_model_effort.as_deref(),
                     config.opencode_agent.as_deref(),
@@ -9701,7 +9902,7 @@ async fn run_single_control_turn(
                 result = Box::pin(super::mission_runner::run_codex_turn(
                     exec_workspace,
                     &ctx.working_dir,
-                    &convo,
+                    codex_message,
                     None,
                     requested_model_effort.as_deref(),
                     config.opencode_agent.as_deref(),
@@ -14999,6 +15200,8 @@ And the report:
             parent_mission_id: None,
             working_directory: None,
             mission_mode: MissionMode::default(),
+            goal_mode: false,
+            goal_objective: None,
         };
         let weak = Mission {
             id: Uuid::new_v4(),
@@ -15027,6 +15230,8 @@ And the report:
             parent_mission_id: None,
             working_directory: None,
             mission_mode: MissionMode::default(),
+            goal_mode: false,
+            goal_objective: None,
         };
 
         let strong_score = mission_search_relevance_score(
@@ -15070,6 +15275,8 @@ And the report:
             parent_mission_id: None,
             working_directory: None,
             mission_mode: MissionMode::default(),
+            goal_mode: false,
+            goal_objective: None,
         };
 
         let score = mission_search_relevance_score(
@@ -15110,6 +15317,8 @@ And the report:
             parent_mission_id: None,
             working_directory: None,
             mission_mode: MissionMode::default(),
+            goal_mode: false,
+            goal_objective: None,
         };
 
         let score = mission_search_relevance_score(
@@ -15150,6 +15359,8 @@ And the report:
             parent_mission_id: None,
             working_directory: None,
             mission_mode: MissionMode::default(),
+            goal_mode: false,
+            goal_objective: None,
         };
 
         let score = mission_search_relevance_score(
@@ -15190,6 +15401,8 @@ And the report:
             parent_mission_id: None,
             working_directory: None,
             mission_mode: MissionMode::default(),
+            goal_mode: false,
+            goal_objective: None,
         };
 
         let score = mission_search_relevance_score(
@@ -15314,6 +15527,8 @@ And the report:
             parent_mission_id: None,
             working_directory: None,
             mission_mode: MissionMode::default(),
+            goal_mode: false,
+            goal_objective: None,
         };
         let before = mission_search_freshness_key(
             &[MissionSearchCandidate {

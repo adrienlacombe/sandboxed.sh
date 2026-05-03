@@ -227,6 +227,12 @@ export type ChatItem =
       timestamp: number;
       sharedFiles?: SharedFile[];
       resumable?: boolean;
+      /** Goal-mode iteration that this assistant message ended. Set when
+       *  the mission is in goal mode and we've seen at least one
+       *  goal_iteration event before this message. UI replaces "Turn
+       *  complete" with "Iteration N" so the chat doesn't read as a
+       *  series of standalone turns. */
+      goalIteration?: number;
     }
   | {
       kind: "thinking";
@@ -2765,7 +2771,13 @@ const ChatItemRow = memo(function ChatItemRow({
                 item.success ? "text-emerald-400" : "text-red-400"
               )}
             />
-            <span>{item.success ? "Turn complete" : "Failed"}</span>
+            <span>
+              {item.success
+                ? item.goalIteration && item.goalIteration > 0
+                  ? `Iteration ${item.goalIteration}`
+                  : "Turn complete"
+                : "Failed"}
+            </span>
             {displayModel && (
               <>
                 <span>•</span>
@@ -3290,6 +3302,11 @@ export default function ControlClient() {
       "tool_result",
       "text_delta",
       "thinking",
+      // Goal-mode events fed into goalInfoByMission on hydration so the
+      // pill renders on a fresh page load instead of waiting for the
+      // next live SSE update.
+      "goal_iteration",
+      "goal_status",
     ],
     []
   );
@@ -3539,6 +3556,14 @@ export default function ControlClient() {
   // Treat "waiting_for_tool" as not busy for message input (user should respond immediately)
   const isBusy = viewingRunState === "running";
   const canSubmitComposer = canSubmitInput || input.trim().length > 0;
+
+  // Goal-mode state, keyed by mission id. Updated from `goal_iteration` /
+  // `goal_status` SSE events. Cleared when status reaches a terminal value
+  // (`complete`, `cleared`, `budgetLimited`) so finished goals stop showing
+  // a pill on subsequent renders.
+  const [goalInfoByMission, setGoalInfoByMission] = useState<
+    Record<string, { iteration: number; status: string; objective: string }>
+  >({});
 
   const streamCleanupRef = useRef<null | (() => void)>(null);
   const enhancedInputRef = useRef<EnhancedInputHandle>(null);
@@ -4383,6 +4408,53 @@ export default function ControlClient() {
         }
         setCurrentMission(mission);
         setViewingMission(mission);
+        // Hydrate the goal-mode pill state from persisted events so the
+        // "Goal · iter N · …" badge survives a page reload. Without this,
+        // goalInfoByMission only updates from live SSE — a goal mission
+        // already in flight when the user opens the page renders with no
+        // pill until the next goal_iteration arrives. Walk events newest
+        // first; first matching goal_iteration / goal_status wins.
+        if (events) {
+          let latestIteration: number | undefined;
+          let latestStatus: string | undefined;
+          let latestObjective: string | undefined;
+          for (let i = events.length - 1; i >= 0; i--) {
+            const ev = events[i];
+            const meta = (ev as { metadata?: unknown }).metadata;
+            const metaRecord = isRecord(meta) ? meta : null;
+            if (latestIteration === undefined && ev.event_type === "goal_iteration") {
+              if (metaRecord && typeof metaRecord["iteration"] === "number") {
+                latestIteration = metaRecord["iteration"] as number;
+              }
+              if (typeof ev.content === "string") {
+                latestObjective = ev.content;
+              }
+            }
+            if (latestStatus === undefined && ev.event_type === "goal_status") {
+              if (metaRecord && typeof metaRecord["status"] === "string") {
+                latestStatus = metaRecord["status"] as string;
+              }
+              if (typeof ev.content === "string" && !latestObjective) {
+                latestObjective = ev.content;
+              }
+            }
+            if (latestIteration !== undefined && latestStatus !== undefined) break;
+          }
+          // Skip terminal statuses — those clear the pill, matching the live handler.
+          const isTerminalStatus = latestStatus
+            ? ["complete", "cleared", "budgetLimited"].includes(latestStatus)
+            : false;
+          if ((latestIteration !== undefined || latestStatus !== undefined) && !isTerminalStatus) {
+            setGoalInfoByMission((prev) => ({
+              ...prev,
+              [id]: {
+                iteration: latestIteration ?? prev[id]?.iteration ?? 0,
+                status: latestStatus ?? prev[id]?.status ?? "active",
+                objective: latestObjective ?? prev[id]?.objective ?? "",
+              },
+            }));
+          }
+        }
         // Use events if available, otherwise fall back to basic history
         let historyItems = events ? eventsToItems(events, mission) : missionHistoryToItems(mission);
         if (events && !historyItems.some((item) => item.kind === "assistant")) {
@@ -5781,6 +5853,15 @@ export default function ControlClient() {
 
       if (event.type === "assistant_message" && isRecord(data)) {
         const now = Date.now();
+        // If the event carries a goal iteration (because the mission is
+        // running a codex `/goal` continuation loop), stamp it onto the
+        // assistant message so the chat badge reads "Iteration N · 14
+        // tools" instead of the misleading per-turn "Turn complete".
+        const eventMissionId =
+          typeof data["mission_id"] === "string" ? data["mission_id"] : undefined;
+        const goalIterationForEvent = eventMissionId
+          ? goalInfoByMission[eventMissionId]?.iteration
+          : undefined;
         // Parse shared_files if present
         let sharedFiles: SharedFile[] | undefined;
         if (Array.isArray(data["shared_files"])) {
@@ -5858,6 +5939,7 @@ export default function ControlClient() {
               timestamp: now,
               sharedFiles: sharedFiles ?? existing.sharedFiles,
               resumable,
+              goalIteration: goalIterationForEvent ?? existing.goalIteration,
             };
             return updated;
           }
@@ -5872,6 +5954,10 @@ export default function ControlClient() {
             timestamp: now,
             sharedFiles,
             resumable,
+            // Stamp the current goal iteration when the mission is in
+            // goal mode so the chat badge can render "Iteration N"
+            // instead of the noisy per-turn "Turn complete".
+            goalIteration: goalIterationForEvent,
           };
 
           const firstQueuedIdx = filtered.findIndex(
@@ -6045,11 +6131,20 @@ export default function ControlClient() {
           thinkingFlushTimeoutRef.current = null;
         }
 
-        // Flush immediately if done, otherwise debounce (100ms)
-        if (done) {
+        // Flush immediately on:
+        //  - `done: true` (finalization)
+        //  - first delta of a brand-new thought (no pending content yet)
+        //  - the existing thought session was just (re)started
+        // Otherwise debounce at 30 ms — codex's reasoning summary deltas
+        // arrive in tight ~10–20 ms bursts and the previous 100 ms
+        // debounce kept resetting until `done`, so the user only ever
+        // saw the final snapshot ("Thought for <1s") with no streaming.
+        const shouldFlushNow =
+          done || shouldStartNew || !existingPending || !existingContent;
+        if (shouldFlushNow) {
           flushThinking();
         } else {
-          thinkingFlushTimeoutRef.current = setTimeout(flushThinking, 100);
+          thinkingFlushTimeoutRef.current = setTimeout(flushThinking, 30);
         }
         return;
       }
@@ -6377,6 +6472,59 @@ export default function ControlClient() {
             ...prev,
             phase: "idle",
           }));
+        }
+      }
+
+      if (event.type === "goal_iteration" && isRecord(data)) {
+        const missionId =
+          typeof data["mission_id"] === "string" ? data["mission_id"] : undefined;
+        const iteration =
+          typeof data["iteration"] === "number" ? data["iteration"] : undefined;
+        const objective =
+          typeof data["objective"] === "string" ? data["objective"] : "";
+        if (missionId && iteration !== undefined) {
+          setGoalInfoByMission((prev) => ({
+            ...prev,
+            [missionId]: {
+              iteration,
+              status: prev[missionId]?.status ?? "active",
+              objective: objective || prev[missionId]?.objective || "",
+            },
+          }));
+        }
+      }
+
+      if (event.type === "goal_status" && isRecord(data)) {
+        const missionId =
+          typeof data["mission_id"] === "string" ? data["mission_id"] : undefined;
+        const status =
+          typeof data["status"] === "string" ? data["status"] : undefined;
+        const objective =
+          typeof data["objective"] === "string" ? data["objective"] : "";
+        if (missionId && status) {
+          // Clear pill on terminal statuses — keeps the UI uncluttered once
+          // the goal is no longer driving the mission.
+          if (
+            status === "complete" ||
+            status === "cleared" ||
+            status === "budgetLimited"
+          ) {
+            setGoalInfoByMission((prev) => {
+              if (!(missionId in prev)) return prev;
+              const next = { ...prev };
+              delete next[missionId];
+              return next;
+            });
+          } else {
+            setGoalInfoByMission((prev) => ({
+              ...prev,
+              [missionId]: {
+                iteration: prev[missionId]?.iteration ?? 0,
+                status,
+                objective: objective || prev[missionId]?.objective || "",
+              },
+            }));
+          }
         }
       }
 
@@ -8398,6 +8546,40 @@ export default function ControlClient() {
                   placeholder="Message the root agent… (paste files to upload)"
                   backend={viewingMission?.backend ?? currentMission?.backend}
                 />
+                {(() => {
+                  // Goal-mode pill — shown above the composer while a codex
+                  // `/goal` continuation loop is active. Cleared automatically
+                  // by the SSE handler when status hits a terminal value.
+                  const activeMissionId = viewingMission?.id ?? currentMission?.id;
+                  const goal = activeMissionId
+                    ? goalInfoByMission[activeMissionId]
+                    : undefined;
+                  if (!goal) return null;
+                  const statusLabel =
+                    goal.status === "active"
+                      ? `iter ${goal.iteration}`
+                      : goal.status === "paused"
+                        ? "paused"
+                        : goal.status;
+                  return (
+                    <div
+                      className="absolute -top-9 left-2 right-2 flex items-center gap-2 px-3 py-1.5 rounded-full bg-indigo-500/10 border border-indigo-500/30 text-xs text-indigo-200 max-w-fit"
+                      title={goal.objective}
+                    >
+                      <span className="font-semibold">Goal</span>
+                      <span className="text-indigo-300/60">·</span>
+                      <span>{statusLabel}</span>
+                      {goal.objective && (
+                        <>
+                          <span className="text-indigo-300/60">·</span>
+                          <span className="truncate max-w-[40ch] text-indigo-200/70">
+                            {goal.objective}
+                          </span>
+                        </>
+                      )}
+                    </div>
+                  );
+                })()}
 
                 {isBusy ? (
                   <>

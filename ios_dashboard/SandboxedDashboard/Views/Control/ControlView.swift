@@ -8,6 +8,15 @@
 import SwiftUI
 import os
 
+/// Snapshot of the active codex goal-mode loop, surfaced as a pill above
+/// the composer. Status mirrors codex's `thread/goal/updated` payload:
+/// `active`, `paused`, `budgetLimited`, `complete`, or `cleared`.
+struct GoalPillInfo: Equatable {
+    var iteration: Int
+    var status: String
+    var objective: String
+}
+
 struct ControlView: View {
     private static let draftTextKey = "control_draft_text"
     private static let lastMissionIdKey = "control_last_mission_id"
@@ -33,6 +42,19 @@ struct ControlView: View {
     @State private var scrollToBottomTick = 0
     @State private var progress: ExecutionProgress?
     @State private var isAtBottom = true
+
+    /// Goal-mode pill state. Tracks the latest `iteration`, `status`, and
+    /// `objective` for codex `/goal` continuation missions. `nil` when no
+    /// goal is active or when the mission has reached a terminal goal
+    /// status (`complete`, `cleared`, `budgetLimited`).
+    @State private var goalInfo: GoalPillInfo?
+
+    /// Slash-command catalog fetched from /api/library/builtin-commands.
+    /// Lazy-loaded on first `/` keypress, refreshed when the backend
+    /// changes. The popover above the composer filters this list by the
+    /// substring after the leading `/` in `inputText`.
+    @State private var slashCommandCatalog: BuiltinCommandsResponse?
+    @State private var slashCommandLoading = false
     @State private var copiedMessageId: String?
     @State private var shouldScrollImmediately = false
     @State private var isLoadingHistory = false  // Track when loading historical messages to prevent animated scroll
@@ -1033,8 +1055,120 @@ struct ControlView: View {
         !inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
+    /// Visible slash commands for the current backend, filtered by the
+    /// prefix after the leading `/` in `inputText`. Empty when the input
+    /// doesn't start with `/`, when the catalog hasn't loaded yet, or when
+    /// nothing matches the filter.
+    private var slashSuggestions: [SlashCommand] {
+        guard let catalog = slashCommandCatalog else { return [] }
+        let trimmed = inputText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.hasPrefix("/") else { return [] }
+        // Pull the command name fragment (everything after `/`, before the
+        // first whitespace). e.g. "/goal create file" → "goal".
+        let afterSlash = String(trimmed.dropFirst())
+        let nameFragment: String = {
+            if let space = afterSlash.firstIndex(where: { $0.isWhitespace }) {
+                return String(afterSlash[..<space])
+            }
+            return afterSlash
+        }()
+        // Once the user has typed a space after the command name they're
+        // entering args — hide the popover so it doesn't cover the input.
+        if afterSlash.contains(where: { $0.isWhitespace }) { return [] }
+        let backend = viewingMission?.backend ?? currentMission?.backend
+        let pool: [SlashCommand]
+        switch backend {
+        case "codex": pool = catalog.codex ?? []
+        case "claudecode": pool = catalog.claudecode
+        case "opencode": pool = catalog.opencode
+        default:
+            // No mission yet → show every backend's commands so the user
+            // can preview what's available.
+            pool = catalog.opencode
+                + catalog.claudecode
+                + (catalog.codex ?? [])
+        }
+        return pool.filter { $0.matchesPrefix(nameFragment) }
+    }
+
+    /// Replace the composer text with `/<name> ` (trailing space ready for
+    /// args) when the user picks a suggestion.
+    private func applySlashCommand(_ cmd: SlashCommand) {
+        inputText = "/\(cmd.name) "
+        isInputFocused = true
+    }
+
+    /// Lazy-load the slash command catalog the first time the user types
+    /// `/`. Best-effort: failures just leave the popover empty.
+    private func loadSlashCommandsIfNeeded() {
+        guard slashCommandCatalog == nil, !slashCommandLoading else { return }
+        slashCommandLoading = true
+        Task {
+            defer { slashCommandLoading = false }
+            do {
+                slashCommandCatalog = try await APIService.shared.getBuiltinCommands()
+            } catch {
+                // Silent failure — popover stays empty until next attempt.
+                print("Failed to load slash commands: \(error)")
+            }
+        }
+    }
+
+    /// Goal-mode pill — sits above the composer while a codex `/goal`
+    /// continuation loop is active. State is fed by `goal_iteration` /
+    /// `goal_status` SSE events; cleared automatically on terminal status.
+    @ViewBuilder
+    private var goalPill: some View {
+        if let goal = goalInfo {
+            HStack(spacing: 6) {
+                Image(systemName: "target")
+                    .font(.system(size: 10, weight: .semibold))
+                Text("Goal")
+                    .font(.caption2.weight(.semibold))
+                Text("·")
+                    .foregroundStyle(Theme.accent.opacity(0.6))
+                Text(
+                    goal.status == "active"
+                        ? "iter \(goal.iteration)"
+                        : goal.status
+                )
+                .font(.caption2.weight(.medium))
+                if !goal.objective.isEmpty {
+                    Text("·")
+                        .foregroundStyle(Theme.accent.opacity(0.6))
+                    Text(goal.objective)
+                        .font(.caption2)
+                        .foregroundStyle(Theme.accent.opacity(0.7))
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                }
+            }
+            .foregroundStyle(Theme.accent)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 6)
+            .background(Theme.accent.opacity(0.12))
+            .clipShape(Capsule())
+            .overlay(
+                Capsule().stroke(Theme.accent.opacity(0.3), lineWidth: 0.5)
+            )
+            .padding(.top, 8)
+            .transition(.move(edge: .bottom).combined(with: .opacity))
+        }
+    }
+
     private var inputView: some View {
         VStack(spacing: 0) {
+            // Slash-command popover. Renders above the composer when the
+            // input starts with `/` and we have at least one matching
+            // command. Tap-to-insert rewrites the input and refocuses.
+            SlashCommandSuggestions(
+                commands: slashSuggestions,
+                onSelect: applySlashCommand
+            )
+            .animation(.easeInOut(duration: 0.15), value: slashSuggestions.count)
+
+            goalPill
+
             // Queue indicator above input when agent is busy with queued messages
             if runState != .idle && queueLength > 0 {
                 Button {
@@ -1090,6 +1224,14 @@ struct ControlView: View {
                     .submitLabel(.send)
                     .onSubmit {
                         sendMessage()
+                    }
+                    .onChange(of: inputText) { _, newValue in
+                        // Lazy-load the slash catalog the first time the user
+                        // starts typing a slash command. Avoids a fetch on
+                        // every fresh ControlView mount when slashes are rare.
+                        if newValue.trimmingCharacters(in: .whitespaces).hasPrefix("/") {
+                            loadSlashCommandsIfNeeded()
+                        }
                     }
 
                 // Send button - always available when there's text
@@ -2550,6 +2692,34 @@ struct ControlView: View {
         case "text_delta":
             if !isHistoricalReplay, let content = data["content"] as? String {
                 upsertStreamingFallbackThought(content: content, done: false)
+            }
+
+        case "goal_iteration":
+            // Goal-mode iteration marker — increment the counter shown in
+            // the pill above the composer. Backend dedupes by turn id, so
+            // we trust the value as authoritative.
+            let iteration = data["iteration"] as? Int ?? 0
+            let objective = data["objective"] as? String ?? goalInfo?.objective ?? ""
+            goalInfo = GoalPillInfo(
+                iteration: iteration,
+                status: goalInfo?.status ?? "active",
+                objective: objective
+            )
+
+        case "goal_status":
+            // Goal status transitioned. Terminal statuses clear the pill;
+            // active/paused keep it visible with the new label.
+            let status = data["status"] as? String ?? ""
+            let objective = data["objective"] as? String ?? goalInfo?.objective ?? ""
+            switch status {
+            case "complete", "cleared", "budgetLimited":
+                goalInfo = nil
+            default:
+                goalInfo = GoalPillInfo(
+                    iteration: goalInfo?.iteration ?? 0,
+                    status: status,
+                    objective: objective
+                )
             }
             
         case "thinking":

@@ -449,6 +449,15 @@ final class APIService {
     func getBackend(id: String) async throws -> Backend {
         try await get("/api/backends/\(id)")
     }
+
+    // MARK: - Slash commands
+
+    /// Fetch the per-backend list of built-in slash commands. Codex 0.128.0+
+    /// surfaces `/goal <objective>` here; older binaries return an empty
+    /// `codex` array and pre-/goal builds omit the field entirely.
+    func getBuiltinCommands() async throws -> BuiltinCommandsResponse {
+        try await get("/api/library/builtin-commands")
+    }
     
     func listBackendAgents(backendId: String) async throws -> [BackendAgent] {
         try await get("/api/backends/\(backendId)/agents")
