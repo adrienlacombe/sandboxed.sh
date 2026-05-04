@@ -1935,6 +1935,7 @@ impl MissionRunner {
         mission_cmd_tx: mpsc::Sender<crate::tools::mission::MissionControlCommand>,
         current_mission: Arc<RwLock<Option<Uuid>>>,
         secrets: Option<Arc<SecretsStore>>,
+        user_id: String,
     ) -> bool {
         // Don't start if already running
         if self.is_running() {
@@ -2015,6 +2016,7 @@ impl MissionRunner {
                 session_id,
                 config_profile,
                 working_directory,
+                Some(user_id),
             )
             .await;
             (msg_id, user_message, result)
@@ -2333,6 +2335,7 @@ async fn run_mission_turn(
     session_id: Option<String>,
     mission_config_profile: Option<String>,
     mission_working_directory: Option<String>,
+    user_id: Option<String>,
 ) -> AgentResult {
     let mut config = config;
     let effective_agent = agent_override.clone();
@@ -2505,6 +2508,15 @@ async fn run_mission_turn(
     } else {
         mission_work_dir
     };
+
+    apply_github_oauth_to_workspace_env(
+        &mut workspace,
+        &mission_work_dir,
+        user_id.as_deref(),
+        secrets.as_ref(),
+        mission_id,
+    )
+    .await;
 
     // For Telegram missions, append channel instructions and memory awareness
     // to CLAUDE.md so the backend LLM adopts the bot persona.
@@ -5492,6 +5504,120 @@ fn workspace_path_for_env(
         }
     }
     host_path.to_path_buf()
+}
+
+async fn apply_github_oauth_to_workspace_env(
+    workspace: &mut Workspace,
+    work_dir: &std::path::Path,
+    user_id: Option<&str>,
+    secrets: Option<&Arc<SecretsStore>>,
+    mission_id: Uuid,
+) {
+    let Some(user_id) = user_id else {
+        return;
+    };
+    let Some(creds) = super::auth::github_oauth_credentials_for_user(secrets, user_id).await else {
+        return;
+    };
+
+    let helper_dir = work_dir.join(".sandboxed-sh-bin");
+    if let Err(e) = std::fs::create_dir_all(&helper_dir) {
+        tracing::warn!(
+            mission_id = %mission_id,
+            error = %e,
+            "Failed to create GitHub OAuth helper directory"
+        );
+        return;
+    }
+
+    let helper_path = helper_dir.join("github-askpass.sh");
+    let helper = r#"#!/bin/sh
+case "$1" in
+  *Username*) printf '%s\n' "${GITHUB_USER:-x-access-token}" ;;
+  *Password*) printf '%s\n' "$GITHUB_TOKEN" ;;
+  *) printf '%s\n' "$GITHUB_TOKEN" ;;
+esac
+"#;
+    if let Err(e) = std::fs::write(&helper_path, helper) {
+        tracing::warn!(
+            mission_id = %mission_id,
+            error = %e,
+            "Failed to write GitHub OAuth askpass helper"
+        );
+        return;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(e) =
+            std::fs::set_permissions(&helper_path, std::fs::Permissions::from_mode(0o700))
+        {
+            tracing::warn!(
+                mission_id = %mission_id,
+                error = %e,
+                "Failed to chmod GitHub OAuth askpass helper"
+            );
+        }
+    }
+
+    let helper_env_path = workspace_path_for_env(workspace, &helper_path)
+        .to_string_lossy()
+        .to_string();
+    let env = &mut workspace.env_vars;
+    env.insert("GH_TOKEN".to_string(), creds.access_token.clone());
+    env.insert("GITHUB_TOKEN".to_string(), creds.access_token);
+    env.insert(
+        "GITHUB_USER".to_string(),
+        creds
+            .login
+            .clone()
+            .unwrap_or_else(|| "x-access-token".to_string()),
+    );
+    env.insert("GIT_ASKPASS".to_string(), helper_env_path);
+    env.insert("GIT_TERMINAL_PROMPT".to_string(), "0".to_string());
+
+    if let Some(name) = creds.name.as_deref().or(creds.login.as_deref()) {
+        env.entry("GIT_AUTHOR_NAME".to_string())
+            .or_insert_with(|| name.to_string());
+        env.entry("GIT_COMMITTER_NAME".to_string())
+            .or_insert_with(|| name.to_string());
+    }
+    let fallback_email = creds.login.as_ref().and_then(|login| {
+        creds
+            .github_user_id
+            .as_ref()
+            .map(|id| format!("{}+{}@users.noreply.github.com", id, login))
+    });
+    if let Some(email) = creds.email.as_deref().or(fallback_email.as_deref()) {
+        env.entry("GIT_AUTHOR_EMAIL".to_string())
+            .or_insert_with(|| email.to_string());
+        env.entry("GIT_COMMITTER_EMAIL".to_string())
+            .or_insert_with(|| email.to_string());
+    }
+
+    let base_count = env
+        .get("GIT_CONFIG_COUNT")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(0);
+    let rewrites = [
+        ("url.https://github.com/.insteadOf", "git@github.com:"),
+        ("url.https://github.com/.insteadOf", "ssh://git@github.com/"),
+    ];
+    for (offset, (key, value)) in rewrites.iter().enumerate() {
+        let idx = base_count + offset;
+        env.insert(format!("GIT_CONFIG_KEY_{}", idx), (*key).to_string());
+        env.insert(format!("GIT_CONFIG_VALUE_{}", idx), (*value).to_string());
+    }
+    env.insert(
+        "GIT_CONFIG_COUNT".to_string(),
+        (base_count + rewrites.len()).to_string(),
+    );
+
+    tracing::info!(
+        mission_id = %mission_id,
+        github_login = ?creds.login,
+        "Injected user GitHub OAuth environment for mission"
+    );
 }
 
 fn strip_ansi_codes(input: &str) -> Cow<'_, str> {

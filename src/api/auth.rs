@@ -10,19 +10,33 @@
 
 use axum::{
     body::Body,
-    extract::State,
+    extract::{Query, State},
     http::{Request, StatusCode},
     middleware::Next,
-    response::{IntoResponse, Response},
+    response::{Html, IntoResponse, Response},
     Extension, Json,
 };
 use chrono::{Duration, Utc};
 use jsonwebtoken::{DecodingKey, EncodingKey, Header, Validation};
+use std::collections::HashMap;
+use std::sync::Arc;
+use uuid::Uuid;
 
 use super::routes::AppState;
 use super::types::{LoginRequest, LoginResponse};
 use crate::config::{AuthMode, Config, UserAccount};
+use crate::secrets::types::{SecretMetadata, SecretType};
+use crate::secrets::SecretsStore;
 use crate::util::internal_error;
+
+const GITHUB_OAUTH_REGISTRY: &str = "github-oauth";
+const GITHUB_ACCESS_TOKEN_SUFFIX: &str = "access-token";
+const GITHUB_REFRESH_TOKEN_SUFFIX: &str = "refresh-token";
+const GITHUB_AUTHORIZE_URL: &str = "https://github.com/login/oauth/authorize";
+const GITHUB_TOKEN_URL: &str = "https://github.com/login/oauth/access_token";
+const GITHUB_USER_URL: &str = "https://api.github.com/user";
+const GITHUB_USER_EMAILS_URL: &str = "https://api.github.com/user/emails";
+const GITHUB_DEFAULT_SCOPES: &str = "repo workflow read:user user:email";
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct Claims {
@@ -41,6 +55,22 @@ struct Claims {
 pub struct AuthUser {
     pub id: String,
     pub username: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct PendingGithubOAuth {
+    pub user: AuthUser,
+    pub redirect_uri: String,
+    pub created_at: chrono::DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct GithubOAuthCredentials {
+    pub access_token: String,
+    pub login: Option<String>,
+    pub github_user_id: Option<String>,
+    pub name: Option<String>,
+    pub email: Option<String>,
 }
 
 fn configured_single_tenant_user_id() -> Option<String> {
@@ -522,6 +552,605 @@ pub async fn change_password(
         "success": true,
         "password_changed_at": now
     })))
+}
+
+// ─── GitHub OAuth for user-scoped bot/mission git access ───────────────────
+
+fn github_oauth_client_id() -> Option<String> {
+    std::env::var("GITHUB_OAUTH_CLIENT_ID")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+fn github_oauth_client_secret() -> Option<String> {
+    std::env::var("GITHUB_OAUTH_CLIENT_SECRET")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+fn github_oauth_scopes() -> String {
+    std::env::var("GITHUB_OAUTH_SCOPES")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| GITHUB_DEFAULT_SCOPES.to_string())
+}
+
+fn trim_trailing_slash(value: &str) -> String {
+    value.trim_end_matches('/').to_string()
+}
+
+fn github_oauth_redirect_uri(config: &Config) -> String {
+    if let Ok(uri) = std::env::var("GITHUB_OAUTH_REDIRECT_URI") {
+        let trimmed = uri.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+
+    if let Ok(public_url) = std::env::var("SANDBOXED_PUBLIC_URL") {
+        let trimmed = public_url.trim();
+        if !trimmed.is_empty() {
+            return format!("{}/api/auth/github/callback", trim_trailing_slash(trimmed));
+        }
+    }
+
+    format!(
+        "http://{}:{}/api/auth/github/callback",
+        config.host, config.port
+    )
+}
+
+fn github_secret_key(user_id: &str, suffix: &str) -> String {
+    format!(
+        "{}-{}",
+        crate::api::mission_store::sanitize_filename(user_id),
+        suffix
+    )
+}
+
+fn github_oauth_configured() -> bool {
+    github_oauth_client_id().is_some() && github_oauth_client_secret().is_some()
+}
+
+async fn ensure_secrets_ready(secrets: &SecretsStore) -> Result<(), String> {
+    if !secrets.is_initialized().await {
+        secrets
+            .initialize("default")
+            .await
+            .map_err(|e| format!("Failed to initialize secrets store: {}", e))?;
+    }
+    if !secrets.can_decrypt().await {
+        return Err(
+            "Secrets store is locked. Unlock it or set SANDBOXED_SECRET_PASSPHRASE before connecting GitHub."
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct GithubOAuthStatusResponse {
+    pub configured: bool,
+    pub connected: bool,
+    pub can_decrypt: bool,
+    pub login: Option<String>,
+    pub github_user_id: Option<String>,
+    pub name: Option<String>,
+    pub email: Option<String>,
+    pub scopes: Option<String>,
+    pub connected_at: Option<String>,
+    pub expires_at: Option<i64>,
+    pub is_expired: bool,
+    pub message: Option<String>,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct GithubOAuthAuthorizeResponse {
+    pub url: String,
+    pub state: String,
+    pub redirect_uri: String,
+    pub scopes: String,
+}
+
+pub async fn github_oauth_status(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+) -> Json<GithubOAuthStatusResponse> {
+    let Some(secrets) = state.secrets.as_ref() else {
+        return Json(GithubOAuthStatusResponse {
+            configured: github_oauth_configured(),
+            connected: false,
+            can_decrypt: false,
+            login: None,
+            github_user_id: None,
+            name: None,
+            email: None,
+            scopes: None,
+            connected_at: None,
+            expires_at: None,
+            is_expired: false,
+            message: Some("Secrets store is not available".to_string()),
+        });
+    };
+
+    let can_decrypt = secrets.can_decrypt().await;
+    let key = github_secret_key(&user.id, GITHUB_ACCESS_TOKEN_SUFFIX);
+    let secret_info = secrets
+        .list_secrets(GITHUB_OAUTH_REGISTRY)
+        .await
+        .ok()
+        .and_then(|secrets| secrets.into_iter().find(|secret| secret.key == key));
+
+    let Some(secret_info) = secret_info else {
+        return Json(GithubOAuthStatusResponse {
+            configured: github_oauth_configured(),
+            connected: false,
+            can_decrypt,
+            login: None,
+            github_user_id: None,
+            name: None,
+            email: None,
+            scopes: None,
+            connected_at: None,
+            expires_at: None,
+            is_expired: false,
+            message: None,
+        });
+    };
+
+    let labels = secret_info.labels;
+    Json(GithubOAuthStatusResponse {
+        configured: github_oauth_configured(),
+        connected: !secret_info.is_expired,
+        can_decrypt,
+        login: labels.get("github_login").cloned(),
+        github_user_id: labels.get("github_user_id").cloned(),
+        name: labels.get("github_name").cloned(),
+        email: labels.get("github_email").cloned(),
+        scopes: labels.get("scopes").cloned(),
+        connected_at: labels.get("connected_at").cloned(),
+        expires_at: secret_info.expires_at,
+        is_expired: secret_info.is_expired,
+        message: secret_info
+            .is_expired
+            .then_some("GitHub OAuth token is expired; reconnect GitHub.".to_string()),
+    })
+}
+
+pub async fn github_oauth_authorize(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+) -> Result<Json<GithubOAuthAuthorizeResponse>, (StatusCode, String)> {
+    let client_id = github_oauth_client_id().ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            "GITHUB_OAUTH_CLIENT_ID is not configured".to_string(),
+        )
+    })?;
+    let _client_secret = github_oauth_client_secret().ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            "GITHUB_OAUTH_CLIENT_SECRET is not configured".to_string(),
+        )
+    })?;
+
+    let secrets = state.secrets.as_ref().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Secrets store is not available".to_string(),
+        )
+    })?;
+    ensure_secrets_ready(secrets)
+        .await
+        .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+
+    let state_token = Uuid::new_v4().to_string();
+    let redirect_uri = github_oauth_redirect_uri(&state.config);
+    let scopes = github_oauth_scopes();
+
+    {
+        let mut pending = state.pending_github_oauth.write().await;
+        let cutoff = Utc::now() - Duration::minutes(15);
+        pending.retain(|_, value| value.created_at >= cutoff);
+        pending.insert(
+            state_token.clone(),
+            PendingGithubOAuth {
+                user,
+                redirect_uri: redirect_uri.clone(),
+                created_at: Utc::now(),
+            },
+        );
+    }
+
+    let mut url = url::Url::parse(GITHUB_AUTHORIZE_URL).map_err(internal_error)?;
+    url.query_pairs_mut()
+        .append_pair("client_id", &client_id)
+        .append_pair("redirect_uri", &redirect_uri)
+        .append_pair("scope", &scopes)
+        .append_pair("state", &state_token)
+        .append_pair("allow_signup", "true");
+
+    Ok(Json(GithubOAuthAuthorizeResponse {
+        url: url.to_string(),
+        state: state_token,
+        redirect_uri,
+        scopes,
+    }))
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct GithubOAuthCallbackQuery {
+    pub code: Option<String>,
+    pub state: Option<String>,
+    pub error: Option<String>,
+    pub error_description: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct GithubTokenResponse {
+    access_token: Option<String>,
+    token_type: Option<String>,
+    scope: Option<String>,
+    expires_in: Option<i64>,
+    refresh_token: Option<String>,
+    refresh_token_expires_in: Option<i64>,
+    error: Option<String>,
+    error_description: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct GithubUserResponse {
+    id: i64,
+    login: String,
+    name: Option<String>,
+    email: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct GithubEmailResponse {
+    email: String,
+    primary: bool,
+    verified: bool,
+}
+
+pub async fn github_oauth_callback(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<GithubOAuthCallbackQuery>,
+) -> Result<Html<String>, (StatusCode, String)> {
+    if let Some(error) = query.error {
+        let description = query.error_description.unwrap_or_default();
+        return Ok(github_callback_html(
+            "GitHub connection cancelled",
+            &format!("{} {}", error, description).trim(),
+            false,
+        ));
+    }
+
+    let code = query
+        .code
+        .ok_or_else(|| (StatusCode::BAD_REQUEST, "Missing OAuth code".to_string()))?;
+    let state_token = query
+        .state
+        .ok_or_else(|| (StatusCode::BAD_REQUEST, "Missing OAuth state".to_string()))?;
+
+    let pending = state
+        .pending_github_oauth
+        .write()
+        .await
+        .remove(&state_token)
+        .ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                "OAuth state is invalid or expired".to_string(),
+            )
+        })?;
+
+    let client_id = github_oauth_client_id().ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            "GITHUB_OAUTH_CLIENT_ID is not configured".to_string(),
+        )
+    })?;
+    let client_secret = github_oauth_client_secret().ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            "GITHUB_OAUTH_CLIENT_SECRET is not configured".to_string(),
+        )
+    })?;
+    let secrets = state.secrets.as_ref().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Secrets store is not available".to_string(),
+        )
+    })?;
+    ensure_secrets_ready(secrets)
+        .await
+        .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+
+    let token_response = state
+        .http_client
+        .post(GITHUB_TOKEN_URL)
+        .header("Accept", "application/json")
+        .header("User-Agent", "sandboxed.sh")
+        .form(&[
+            ("client_id", client_id.as_str()),
+            ("client_secret", client_secret.as_str()),
+            ("code", code.as_str()),
+            ("redirect_uri", pending.redirect_uri.as_str()),
+        ])
+        .send()
+        .await
+        .map_err(internal_error)?;
+
+    if !token_response.status().is_success() {
+        let status = token_response.status();
+        let text = token_response.text().await.unwrap_or_default();
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            format!("GitHub token exchange failed ({}): {}", status, text),
+        ));
+    }
+
+    let token_data: GithubTokenResponse = token_response.json().await.map_err(internal_error)?;
+    if let Some(error) = token_data.error {
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            format!(
+                "GitHub token exchange failed: {} {}",
+                error,
+                token_data.error_description.unwrap_or_default()
+            ),
+        ));
+    }
+    let access_token = token_data.access_token.ok_or_else(|| {
+        (
+            StatusCode::BAD_GATEWAY,
+            "GitHub did not return an access token".to_string(),
+        )
+    })?;
+
+    let github_user = fetch_github_user(&state.http_client, &access_token)
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, e))?;
+    let email = if github_user
+        .email
+        .as_deref()
+        .is_some_and(|v| !v.trim().is_empty())
+    {
+        github_user.email.clone()
+    } else {
+        fetch_github_primary_email(&state.http_client, &access_token)
+            .await
+            .ok()
+            .flatten()
+    };
+
+    store_github_oauth(
+        secrets,
+        &pending.user,
+        &access_token,
+        token_data.refresh_token.as_deref(),
+        token_data.expires_in,
+        token_data.refresh_token_expires_in,
+        token_data.scope.as_deref(),
+        token_data.token_type.as_deref(),
+        &github_user,
+        email.as_deref(),
+    )
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    Ok(github_callback_html(
+        "GitHub connected",
+        "You can close this window and return to sandboxed.sh.",
+        true,
+    ))
+}
+
+fn github_callback_html(title: &str, message: &str, success: bool) -> Html<String> {
+    let color = if success { "#34d399" } else { "#f87171" };
+    let title = escape_html(title);
+    let message = escape_html(message);
+    Html(format!(
+        r#"<!doctype html>
+<html>
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>{title}</title></head>
+<body style="margin:0;background:#121214;color:white;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;display:grid;min-height:100vh;place-items:center">
+  <main style="max-width:440px;padding:32px;text-align:center">
+    <div style="width:48px;height:48px;border-radius:999px;background:{color};margin:0 auto 20px"></div>
+    <h1 style="font-size:22px;margin:0 0 10px">{title}</h1>
+    <p style="color:rgba(255,255,255,.68);line-height:1.5">{message}</p>
+    <button onclick="window.close()" style="margin-top:18px;border:1px solid rgba(255,255,255,.14);background:rgba(255,255,255,.06);color:white;border-radius:8px;padding:10px 14px">Close</button>
+  </main>
+</body>
+</html>"#
+    ))
+}
+
+fn escape_html(input: &str) -> String {
+    input
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
+}
+
+async fn fetch_github_user(
+    client: &reqwest::Client,
+    access_token: &str,
+) -> Result<GithubUserResponse, String> {
+    let resp = client
+        .get(GITHUB_USER_URL)
+        .bearer_auth(access_token)
+        .header("Accept", "application/vnd.github+json")
+        .header("User-Agent", "sandboxed.sh")
+        .send()
+        .await
+        .map_err(|e| format!("Failed to fetch GitHub user: {}", e))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        return Err(format!("GitHub user fetch failed ({}): {}", status, text));
+    }
+
+    resp.json()
+        .await
+        .map_err(|e| format!("Failed to parse GitHub user response: {}", e))
+}
+
+async fn fetch_github_primary_email(
+    client: &reqwest::Client,
+    access_token: &str,
+) -> Result<Option<String>, String> {
+    let resp = client
+        .get(GITHUB_USER_EMAILS_URL)
+        .bearer_auth(access_token)
+        .header("Accept", "application/vnd.github+json")
+        .header("User-Agent", "sandboxed.sh")
+        .send()
+        .await
+        .map_err(|e| format!("Failed to fetch GitHub emails: {}", e))?;
+
+    if !resp.status().is_success() {
+        return Ok(None);
+    }
+
+    let emails: Vec<GithubEmailResponse> = resp
+        .json()
+        .await
+        .map_err(|e| format!("Failed to parse GitHub emails response: {}", e))?;
+    Ok(emails
+        .into_iter()
+        .find(|email| email.primary && email.verified)
+        .map(|email| email.email))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn store_github_oauth(
+    secrets: &SecretsStore,
+    user: &AuthUser,
+    access_token: &str,
+    refresh_token: Option<&str>,
+    expires_in: Option<i64>,
+    refresh_token_expires_in: Option<i64>,
+    scopes: Option<&str>,
+    token_type: Option<&str>,
+    github_user: &GithubUserResponse,
+    email: Option<&str>,
+) -> Result<(), String> {
+    let now = Utc::now();
+    let expires_at = expires_in.map(|seconds| (now + Duration::seconds(seconds)).timestamp());
+    let refresh_expires_at =
+        refresh_token_expires_in.map(|seconds| (now + Duration::seconds(seconds)).timestamp());
+    let connected_at = now.to_rfc3339();
+
+    let mut labels = HashMap::new();
+    labels.insert("provider".to_string(), "github".to_string());
+    labels.insert("user_id".to_string(), user.id.clone());
+    labels.insert("username".to_string(), user.username.clone());
+    labels.insert("github_login".to_string(), github_user.login.clone());
+    labels.insert("github_user_id".to_string(), github_user.id.to_string());
+    labels.insert("connected_at".to_string(), connected_at);
+    if let Some(name) = github_user.name.as_deref().filter(|v| !v.trim().is_empty()) {
+        labels.insert("github_name".to_string(), name.to_string());
+    }
+    if let Some(email) = email.filter(|v| !v.trim().is_empty()) {
+        labels.insert("github_email".to_string(), email.to_string());
+    }
+    if let Some(scopes) = scopes.filter(|v| !v.trim().is_empty()) {
+        labels.insert("scopes".to_string(), scopes.to_string());
+    }
+    if let Some(token_type) = token_type.filter(|v| !v.trim().is_empty()) {
+        labels.insert("token_type".to_string(), token_type.to_string());
+    }
+
+    secrets
+        .set_secret(
+            GITHUB_OAUTH_REGISTRY,
+            &github_secret_key(&user.id, GITHUB_ACCESS_TOKEN_SUFFIX),
+            access_token,
+            Some(SecretMetadata {
+                secret_type: Some(SecretType::OAuthAccessToken),
+                expires_at,
+                labels,
+            }),
+        )
+        .await
+        .map_err(|e| format!("Failed to store GitHub access token: {}", e))?;
+
+    if let Some(refresh_token) = refresh_token.filter(|v| !v.trim().is_empty()) {
+        let mut refresh_labels = HashMap::new();
+        refresh_labels.insert("provider".to_string(), "github".to_string());
+        refresh_labels.insert("user_id".to_string(), user.id.clone());
+        refresh_labels.insert("github_login".to_string(), github_user.login.clone());
+        secrets
+            .set_secret(
+                GITHUB_OAUTH_REGISTRY,
+                &github_secret_key(&user.id, GITHUB_REFRESH_TOKEN_SUFFIX),
+                refresh_token,
+                Some(SecretMetadata {
+                    secret_type: Some(SecretType::OAuthRefreshToken),
+                    expires_at: refresh_expires_at,
+                    labels: refresh_labels,
+                }),
+            )
+            .await
+            .map_err(|e| format!("Failed to store GitHub refresh token: {}", e))?;
+    }
+
+    Ok(())
+}
+
+pub async fn github_oauth_disconnect(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let secrets = state.secrets.as_ref().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Secrets store is not available".to_string(),
+        )
+    })?;
+
+    for suffix in [GITHUB_ACCESS_TOKEN_SUFFIX, GITHUB_REFRESH_TOKEN_SUFFIX] {
+        let key = github_secret_key(&user.id, suffix);
+        if let Err(e) = secrets.delete_secret(GITHUB_OAUTH_REGISTRY, &key).await {
+            tracing::debug!("GitHub OAuth secret {} was not deleted: {}", key, e);
+        }
+    }
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+pub async fn github_oauth_credentials_for_user(
+    secrets: Option<&Arc<SecretsStore>>,
+    user_id: &str,
+) -> Option<GithubOAuthCredentials> {
+    let secrets = secrets?;
+    let key = github_secret_key(user_id, GITHUB_ACCESS_TOKEN_SUFFIX);
+    let info = secrets
+        .list_secrets(GITHUB_OAUTH_REGISTRY)
+        .await
+        .ok()?
+        .into_iter()
+        .find(|secret| secret.key == key)?;
+    if info.is_expired {
+        return None;
+    }
+    let access_token = secrets.get_secret(GITHUB_OAUTH_REGISTRY, &key).await.ok()?;
+    let labels = info.labels;
+    Some(GithubOAuthCredentials {
+        access_token,
+        login: labels.get("github_login").cloned(),
+        github_user_id: labels.get("github_user_id").cloned(),
+        name: labels.get("github_name").cloned(),
+        email: labels.get("github_email").cloned(),
+    })
 }
 
 #[cfg(test)]

@@ -9,11 +9,19 @@ import SwiftUI
 
 struct SettingsView: View {
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.openURL) private var openURL
+    @Environment(\.scenePhase) private var scenePhase
 
     @State private var serverURL: String
     @State private var isTestingConnection = false
     @State private var connectionStatus: ConnectionStatus = .unknown
     @State private var showingSaveConfirmation = false
+    @State private var githubStatus: GithubOAuthStatus?
+    @State private var isLoadingGithubStatus = false
+    @State private var isConnectingGithub = false
+    @State private var isDisconnectingGithub = false
+    @State private var githubErrorMessage: String?
+    @State private var didLaunchGithubOAuth = false
     
     // Default agent settings
     @State private var backends: [Backend] = Backend.defaults
@@ -149,6 +157,8 @@ struct SettingsView: View {
                                 }
                             }
                         }
+
+                        githubSection
 
                         // Mission Preferences Section
                         VStack(alignment: .leading, spacing: 16) {
@@ -350,10 +360,203 @@ struct SettingsView: View {
         .presentationDragIndicator(.visible)
         .task {
             await loadAgents()
+            await loadGithubStatus()
+        }
+        .onChange(of: scenePhase) { _, phase in
+            if phase == .active && didLaunchGithubOAuth {
+                didLaunchGithubOAuth = false
+                Task { await loadGithubStatus() }
+            }
         }
     }
     
     // MARK: - Default Agent Picker
+
+    private var githubSection: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Label("GitHub", systemImage: "link.circle")
+                .font(.headline)
+                .foregroundStyle(Theme.textPrimary)
+
+            GlassCard(padding: 20, cornerRadius: 20) {
+                VStack(alignment: .leading, spacing: 16) {
+                    HStack(alignment: .top, spacing: 12) {
+                        ZStack {
+                            Circle()
+                                .fill(githubStatusColor.opacity(0.14))
+                                .frame(width: 40, height: 40)
+                            Image(systemName: githubStatusIcon)
+                                .font(.system(size: 17, weight: .semibold))
+                                .foregroundStyle(githubStatusColor)
+                        }
+
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("GitHub Account")
+                                .font(.subheadline.weight(.medium))
+                                .foregroundStyle(Theme.textPrimary)
+                            Text(githubStatusMessage)
+                                .font(.caption)
+                                .foregroundStyle(Theme.textSecondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+
+                        Spacer()
+
+                        Button {
+                            Task { await loadGithubStatus() }
+                        } label: {
+                            Image(systemName: "arrow.clockwise")
+                                .font(.system(size: 13, weight: .medium))
+                                .foregroundStyle(Theme.textMuted)
+                        }
+                        .disabled(isLoadingGithubStatus)
+                        .symbolEffect(.rotate, isActive: isLoadingGithubStatus)
+                    }
+
+                    if let githubStatus, githubStatus.connected {
+                        Divider()
+                            .background(Theme.border)
+
+                        VStack(spacing: 10) {
+                            githubInfoRow(label: "Account", value: githubStatus.login.map { "@\($0)" } ?? "Connected")
+                            githubInfoRow(label: "Email", value: githubStatus.email ?? "GitHub noreply fallback")
+                            githubInfoRow(label: "Scopes", value: githubStatus.scopes ?? "Default OAuth scopes")
+                            githubInfoRow(label: "Connected", value: formattedGithubDate(githubStatus.connectedAt))
+                        }
+                    }
+
+                    if let blockedReason = githubBlockedReason, githubStatus?.connected != true {
+                        HStack(alignment: .top, spacing: 10) {
+                            Image(systemName: "exclamationmark.triangle.fill")
+                                .font(.system(size: 14))
+                                .foregroundStyle(Theme.warning)
+                            Text(blockedReason)
+                                .font(.caption)
+                                .foregroundStyle(Theme.warning)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                        .padding(12)
+                        .background(Theme.warning.opacity(0.1))
+                        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                    }
+
+                    if let githubErrorMessage {
+                        HStack(alignment: .top, spacing: 10) {
+                            Image(systemName: "xmark.circle.fill")
+                                .font(.system(size: 14))
+                                .foregroundStyle(Theme.error)
+                            Text(githubErrorMessage)
+                                .font(.caption)
+                                .foregroundStyle(Theme.error)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                        .padding(12)
+                        .background(Theme.error.opacity(0.1))
+                        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                    }
+
+                    HStack(spacing: 10) {
+                        Button {
+                            Task { await connectGithub() }
+                        } label: {
+                            HStack {
+                                if isConnectingGithub {
+                                    ProgressView()
+                                        .progressViewStyle(.circular)
+                                        .tint(.white)
+                                        .scaleEffect(0.8)
+                                } else {
+                                    Image(systemName: "arrow.up.forward.app")
+                                }
+                                Text(githubStatus?.connected == true ? "Reconnect" : "Connect GitHub")
+                                    .fontWeight(.semibold)
+                            }
+                            .frame(maxWidth: .infinity)
+                        }
+                        .buttonStyle(GlassProminentButtonStyle())
+                        .disabled(githubConnectDisabled)
+
+                        if githubStatus?.connected == true {
+                            Button {
+                                Task { await disconnectGithub() }
+                            } label: {
+                                HStack {
+                                    if isDisconnectingGithub {
+                                        ProgressView()
+                                            .progressViewStyle(.circular)
+                                            .scaleEffect(0.8)
+                                    } else {
+                                        Image(systemName: "link.badge.minus")
+                                    }
+                                    Text("Disconnect")
+                                }
+                                .font(.subheadline.weight(.medium))
+                                .foregroundStyle(Theme.error)
+                                .padding(.horizontal, 14)
+                                .padding(.vertical, 12)
+                                .background(Theme.error.opacity(0.1))
+                                .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                            }
+                            .buttonStyle(.plain)
+                            .disabled(isDisconnectingGithub)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private func githubInfoRow(label: String, value: String) -> some View {
+        HStack(alignment: .firstTextBaseline) {
+            Text(label)
+                .font(.caption)
+                .foregroundStyle(Theme.textSecondary)
+            Spacer()
+            Text(value)
+                .font(.caption.weight(.medium))
+                .foregroundStyle(Theme.textPrimary)
+                .lineLimit(1)
+                .truncationMode(.middle)
+        }
+    }
+
+    private var githubStatusIcon: String {
+        if isLoadingGithubStatus { return "arrow.trianglehead.2.clockwise.rotate.90" }
+        if githubStatus?.connected == true { return "checkmark.circle.fill" }
+        return "link.badge.plus"
+    }
+
+    private var githubStatusColor: Color {
+        if githubStatus?.connected == true { return Theme.success }
+        if githubBlockedReason != nil { return Theme.warning }
+        return Theme.textSecondary
+    }
+
+    private var githubStatusMessage: String {
+        if isLoadingGithubStatus { return "Checking GitHub connection..." }
+        if githubStatus?.connected == true {
+            return "Connected as @\(githubStatus?.login ?? "github-user")"
+        }
+        return "No GitHub account connected for this sandbox user."
+    }
+
+    private var githubBlockedReason: String? {
+        guard let githubStatus else { return nil }
+        if !githubStatus.configured {
+            return "GitHub OAuth is not configured on the server."
+        }
+        if !githubStatus.canDecrypt {
+            return "The server secrets store is locked."
+        }
+        return githubStatus.message
+    }
+
+    private var githubConnectDisabled: Bool {
+        isConnectingGithub
+            || isLoadingGithubStatus
+            || githubStatus?.configured != true
+            || githubStatus?.canDecrypt != true
+    }
     
     private var defaultAgentPicker: some View {
         VStack(spacing: 8) {
@@ -474,6 +677,70 @@ struct SettingsView: View {
                 selectedDefaultAgent = ""
             }
         }
+    }
+
+    private func loadGithubStatus() async {
+        guard api.isConfigured else { return }
+        isLoadingGithubStatus = true
+        githubErrorMessage = nil
+        defer { isLoadingGithubStatus = false }
+
+        do {
+            githubStatus = try await api.getGithubOAuthStatus()
+        } catch {
+            githubErrorMessage = error.localizedDescription
+        }
+    }
+
+    private func connectGithub() async {
+        isConnectingGithub = true
+        githubErrorMessage = nil
+        defer { isConnectingGithub = false }
+
+        do {
+            let response = try await api.startGithubOAuth()
+            guard let url = URL(string: response.url) else {
+                throw APIError.invalidURL
+            }
+            didLaunchGithubOAuth = true
+            openURL(url)
+            HapticService.lightTap()
+
+            try? await Task.sleep(for: .seconds(2))
+            await loadGithubStatus()
+        } catch {
+            didLaunchGithubOAuth = false
+            githubErrorMessage = error.localizedDescription
+            HapticService.error()
+        }
+    }
+
+    private func disconnectGithub() async {
+        isDisconnectingGithub = true
+        githubErrorMessage = nil
+        defer { isDisconnectingGithub = false }
+
+        do {
+            try await api.disconnectGithubOAuth()
+            await loadGithubStatus()
+            HapticService.success()
+        } catch {
+            githubErrorMessage = error.localizedDescription
+            HapticService.error()
+        }
+    }
+
+    private func formattedGithubDate(_ rawValue: String?) -> String {
+        guard let rawValue else { return "Unknown" }
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        let date = formatter.date(from: rawValue) ?? {
+            let fallback = ISO8601DateFormatter()
+            fallback.formatOptions = [.withInternetDateTime]
+            return fallback.date(from: rawValue)
+        }()
+        guard let date else { return rawValue }
+        return DateFormatter.localizedString(from: date, dateStyle: .medium, timeStyle: .short)
     }
 
     private func testConnection() async {

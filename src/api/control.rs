@@ -3221,6 +3221,7 @@ impl ControlHub {
             mission_store,
             self.secrets.clone(),
             self.telegram_bridge.clone(),
+            user.id.clone(),
         );
         sessions.insert(user.id.clone(), state.clone());
 
@@ -4947,6 +4948,7 @@ fn spawn_control_session(
     mission_store: Arc<dyn MissionStore>,
     secrets: Option<Arc<SecretsStore>>,
     telegram_bridge: Option<super::telegram::SharedTelegramBridge>,
+    user_id: String,
 ) -> ControlState {
     let (cmd_tx, cmd_rx) = mpsc::channel::<ControlCommand>(256);
     let (events_tx, events_rx) = broadcast::channel::<AgentEvent>(1024);
@@ -5002,6 +5004,7 @@ fn spawn_control_session(
         progress,
         mission_store,
         secrets,
+        user_id,
     ));
 
     // Recover orphaned missions from previous run.
@@ -6617,6 +6620,7 @@ async fn control_actor_loop(
     progress: Arc<RwLock<ExecutionProgress>>,
     mission_store: Arc<dyn MissionStore>,
     secrets: Option<Arc<SecretsStore>>,
+    user_id: String,
 ) {
     // Queue stores (id, content, agent, target_mission_id) for the current/primary mission
     // The target_mission_id tracks which mission each queued message is intended for
@@ -7020,6 +7024,7 @@ async fn control_actor_loop(
                                             mission_cmd_tx.clone(),
                                             Arc::new(RwLock::new(Some(tid))),
                                             secrets.clone(),
+                                            user_id.clone(),
                                         );
                                     }
                                     let _ = respond.send(was_running);
@@ -7121,6 +7126,7 @@ async fn control_actor_loop(
                                                 mission_cmd_tx.clone(),
                                                 Arc::new(RwLock::new(Some(tid))),
                                                 secrets.clone(),
+                                                user_id.clone(),
                                             );
                                             tracing::info!("Auto-started mission {} in parallel", tid);
                                             parallel_runners.insert(tid, runner);
@@ -7723,6 +7729,7 @@ async fn control_actor_loop(
                                 mission_cmd_tx.clone(),
                                 Arc::new(RwLock::new(Some(mission_id))), // Each runner tracks its own mission
                                 secrets.clone(),
+                                user_id.clone(),
                             );
 
                             if started {
@@ -8885,6 +8892,7 @@ async fn control_actor_loop(
                                     mission_cmd_tx.clone(),
                                     Arc::new(RwLock::new(Some(*mission_id))),
                                     secrets.clone(),
+                                    user_id.clone(),
                                 );
 
                                 // If no queued messages, update status and mark for cleanup

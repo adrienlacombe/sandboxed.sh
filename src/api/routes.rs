@@ -90,6 +90,8 @@ pub struct AppState {
     /// Pending OAuth state for provider authorization
     pub pending_oauth:
         Arc<RwLock<HashMap<crate::ai_providers::ProviderType, crate::ai_providers::PendingOAuth>>>,
+    /// Pending GitHub OAuth states for dashboard/user GitHub account linking.
+    pub pending_github_oauth: Arc<RwLock<HashMap<String, auth::PendingGithubOAuth>>>,
     /// Secrets store for encrypted credentials
     pub secrets: Option<Arc<crate::secrets::SecretsStore>>,
     /// Console session pool for WebSocket reconnection
@@ -160,6 +162,7 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         crate::ai_providers::AIProviderStore::new(config.working_dir.join(AI_PROVIDERS_PATH)).await,
     );
     let pending_oauth = Arc::new(RwLock::new(HashMap::new()));
+    let pending_github_oauth = Arc::new(RwLock::new(HashMap::new()));
 
     // Initialize provider health tracker and model chain store
     let health_tracker = Arc::new(crate::provider_health::ProviderHealthTracker::new());
@@ -443,6 +446,7 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         opencode_agents_cache: RwLock::new(opencode_api::OpenCodeAgentsCache::default()),
         ai_providers,
         pending_oauth,
+        pending_github_oauth,
         secrets,
         console_pool,
         settings,
@@ -542,6 +546,10 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
     let public_routes = Router::new()
         .route("/api/health", get(health))
         .route("/api/auth/login", post(auth::login))
+        .route(
+            "/api/auth/github/callback",
+            get(auth::github_oauth_callback),
+        )
         // Webhook receiver endpoint (no auth required - uses webhook secret validation)
         .route(
             "/api/webhooks/:mission_id/:webhook_id",
@@ -931,6 +939,15 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         // Auth management endpoints
         .route("/api/auth/status", get(auth::auth_status))
         .route("/api/auth/change-password", post(auth::change_password))
+        .route("/api/auth/github/status", get(auth::github_oauth_status))
+        .route(
+            "/api/auth/github/authorize",
+            post(auth::github_oauth_authorize),
+        )
+        .route(
+            "/api/auth/github",
+            axum::routing::delete(auth::github_oauth_disconnect),
+        )
         // Backend management endpoints
         .route("/api/backends", get(backends_api::list_backends))
         .route("/api/backends/:id", get(backends_api::get_backend))

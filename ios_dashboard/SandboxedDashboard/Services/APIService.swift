@@ -92,6 +92,20 @@ final class APIService {
         }
         return response.status == "ok"
     }
+
+    // MARK: - GitHub OAuth
+
+    func getGithubOAuthStatus() async throws -> GithubOAuthStatus {
+        try await get("/api/auth/github/status")
+    }
+
+    func startGithubOAuth() async throws -> GithubOAuthAuthorizeResponse {
+        try await post("/api/auth/github/authorize", body: EmptyBody())
+    }
+
+    func disconnectGithubOAuth() async throws {
+        let _: EmptyResponse = try await delete("/api/auth/github")
+    }
     
     // MARK: - Missions
     
@@ -707,6 +721,50 @@ final class APIService {
 struct MissionEventsResult {
     let events: [StoredEvent]
     let maxSequence: Int64?
+}
+
+struct GithubOAuthStatus: Decodable, Equatable {
+    let configured: Bool
+    let connected: Bool
+    let canDecrypt: Bool
+    let login: String?
+    let githubUserId: String?
+    let name: String?
+    let email: String?
+    let scopes: String?
+    let connectedAt: String?
+    let expiresAt: Int?
+    let isExpired: Bool
+    let message: String?
+
+    enum CodingKeys: String, CodingKey {
+        case configured
+        case connected
+        case canDecrypt = "can_decrypt"
+        case login
+        case githubUserId = "github_user_id"
+        case name
+        case email
+        case scopes
+        case connectedAt = "connected_at"
+        case expiresAt = "expires_at"
+        case isExpired = "is_expired"
+        case message
+    }
+}
+
+struct GithubOAuthAuthorizeResponse: Decodable {
+    let url: String
+    let state: String
+    let redirectUri: String
+    let scopes: String
+
+    enum CodingKeys: String, CodingKey {
+        case url
+        case state
+        case redirectUri = "redirect_uri"
+        case scopes
+    }
 }
 
 enum APIError: LocalizedError {

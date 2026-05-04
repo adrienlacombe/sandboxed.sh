@@ -52,6 +52,18 @@ Copy `.env.example` to `.env` and configure the values below. The full file cont
 | `MAX_ITERATIONS` | `50` | Max tool-call iterations per mission |
 | `MAX_PARALLEL_MISSIONS` | `1` | Number of missions that can run concurrently |
 
+#### GitHub OAuth
+
+Set these when users should connect their own GitHub accounts from Settings > GitHub. Mission runs and Telegram bots inherit the connected user's token for GitHub commits and pushes.
+
+| Variable | Default | Description |
+|---|---|---|
+| `GITHUB_OAUTH_CLIENT_ID` | _(unset)_ | GitHub OAuth App client ID |
+| `GITHUB_OAUTH_CLIENT_SECRET` | _(unset)_ | GitHub OAuth App client secret |
+| `GITHUB_OAUTH_REDIRECT_URI` | `$SANDBOXED_PUBLIC_URL/api/auth/github/callback` | Callback URL registered on the GitHub OAuth App |
+| `GITHUB_OAUTH_SCOPES` | `repo workflow read:user user:email` | OAuth scopes requested from GitHub |
+| `SANDBOXED_SECRET_PASSPHRASE` | _(unset)_ | Unlocks the encrypted secrets store used for GitHub tokens |
+
 ### Enabling container workspaces
 
 By default, workspaces run in host/fallback mode — processes execute directly inside the Docker container. To enable full **systemd-nspawn isolation** (each workspace gets its own lightweight container), edit `docker-compose.yml` and uncomment the privileged lines:

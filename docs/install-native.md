@@ -1048,6 +1048,26 @@ Note: Multi-user mode provides separate login credentials but does **not**
 provide workspace or data isolation between users. All users see the same
 missions and workspaces.
 
+### 11.3 GitHub OAuth for User Git Access
+
+To let each sandbox user connect a GitHub account from Settings > GitHub, create
+a GitHub OAuth App and set these variables:
+
+```bash
+# In /etc/sandboxed_sh/sandboxed_sh.env:
+GITHUB_OAUTH_CLIENT_ID=<github-oauth-client-id>
+GITHUB_OAUTH_CLIENT_SECRET=<github-oauth-client-secret>
+GITHUB_OAUTH_REDIRECT_URI=https://agent.yourdomain.com/api/auth/github/callback
+GITHUB_OAUTH_SCOPES="repo workflow read:user user:email"
+
+# Required so encrypted GitHub tokens can be stored and read by mission runners.
+SANDBOXED_SECRET_PASSPHRASE=<strong-secret-passphrase>
+```
+
+Use the same callback URL in the GitHub OAuth App. When connected, mission runs
+and Telegram bots inherit the current sandbox user's GitHub token for commits
+and pushes.
+
 ---
 
 ## 12) Dashboard Configuration

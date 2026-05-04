@@ -149,6 +149,40 @@ export async function changePassword(
   return apiPost("/api/auth/change-password", request, "Failed to change password");
 }
 
+export interface GithubOAuthStatusResponse {
+  configured: boolean;
+  connected: boolean;
+  can_decrypt: boolean;
+  login: string | null;
+  github_user_id: string | null;
+  name: string | null;
+  email: string | null;
+  scopes: string | null;
+  connected_at: string | null;
+  expires_at: number | null;
+  is_expired: boolean;
+  message: string | null;
+}
+
+export interface GithubOAuthAuthorizeResponse {
+  url: string;
+  state: string;
+  redirect_uri: string;
+  scopes: string;
+}
+
+export async function getGithubOAuthStatus(): Promise<GithubOAuthStatusResponse> {
+  return apiGet("/api/auth/github/status", "Failed to fetch GitHub OAuth status");
+}
+
+export async function startGithubOAuth(): Promise<GithubOAuthAuthorizeResponse> {
+  return apiPost("/api/auth/github/authorize", undefined, "Failed to start GitHub OAuth");
+}
+
+export async function disconnectGithubOAuth(): Promise<void> {
+  return apiDel("/api/auth/github", "Failed to disconnect GitHub");
+}
+
 // Get statistics
 export async function getStats(since?: string): Promise<StatsResponse> {
   const qs = since ? `?since=${encodeURIComponent(since)}` : "";
