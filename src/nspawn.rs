@@ -555,6 +555,9 @@ pub async fn execute_in_container(
     cmd.arg("--quiet");
     // Disable timezone bind-mount (minbase containers lack /usr/share/zoneinfo)
     cmd.arg("--timezone=off");
+    cmd.arg("--register=no");
+    cmd.arg("--keep-unit");
+    // Skip machined registration (no dbus inside docker entrypoint)
 
     match config.network_mode {
         NetworkMode::Host => {}
@@ -644,6 +647,8 @@ pub async fn execute_in_container_streaming(
     cmd.arg("-D").arg(path);
     cmd.arg("--quiet");
     cmd.arg("--timezone=off");
+    cmd.arg("--register=no");
+    cmd.arg("--keep-unit");
 
     match config.network_mode {
         NetworkMode::Host => {}
