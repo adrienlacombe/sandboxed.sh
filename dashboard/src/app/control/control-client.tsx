@@ -3279,6 +3279,53 @@ export default function ControlClient() {
   const lastQueueLenRef = useRef<number | null>(null);
   const syncingQueueRef = useRef(false);
 
+  // Backwards-pagination state. Long missions can have 20k+ history events
+  // and the initial load is capped at HISTORY_PAGE_SIZE for memory + render
+  // perf. These caches let the user click "Load older messages" to fetch
+  // the next page back without re-fetching the whole history.
+  //
+  // missionMinSeqRef            — lowest `sequence` currently loaded; used
+  //                               as the next `before_seq` cursor.
+  // missionHistoricEventsRef    — accumulated raw history events for the
+  //                               mission (initial + paginated older). Kept
+  //                               so we can replay `eventsToItems` over the
+  //                               full set when prepending older events,
+  //                               which preserves tool_call/result linkage
+  //                               and thinking-delta consolidation.
+  // historicItemsCountRef       — number of items in `items` that came
+  //                               from the current historic snapshot, so a
+  //                               paginate-older replace knows where the
+  //                               live SSE-appended tail starts.
+  // missionTotalHistoryRef      — server-reported total count (matching
+  //                               the type filter); compared against
+  //                               accumulated cache size to decide whether
+  //                               more older events exist.
+  const missionMinSeqRef = useRef<Map<string, number>>(new Map());
+  const missionHistoricEventsRef = useRef<Map<string, StoredEvent[]>>(new Map());
+  const historicItemsCountRef = useRef<Map<string, number>>(new Map());
+  const missionTotalHistoryRef = useRef<Map<string, number>>(new Map());
+  // Captured scroll geometry from the moment of `setItems` during a
+  // paginate-back. Consumed by a `useLayoutEffect` watching `items` so the
+  // restoration runs synchronously after commit but BEFORE the browser
+  // paints — using `requestAnimationFrame` here would let the user see a
+  // one-frame jump against the longer DOM before the scroll adjusts.
+  const pendingScrollRestoreRef = useRef<{
+    oldScrollTop: number;
+    oldScrollHeight: number;
+  } | null>(null);
+  // Pagination UI state carries `missionId` so a stale-mission completion
+  // (or a stuck `loading: true` from a fetch the user navigated away
+  // from) can't surface on a different mission's button. The JSX reads
+  // through `activeOlderLoadState` below, which only honors the state
+  // when the recorded mission id matches what the user is currently
+  // viewing — otherwise it falls back to the safe defaults
+  // (`hasMore=false`, `loading=false`).
+  const [olderLoadState, setOlderLoadState] = useState<{
+    missionId: string | null;
+    hasMore: boolean;
+    loading: boolean;
+  }>({ missionId: null, hasMore: false, loading: false });
+
   // Performance optimization: limit rendered items for large conversations
   const INITIAL_VISIBLE_ITEMS = 30;
   const LOAD_MORE_INCREMENT = 30;
@@ -3517,10 +3564,13 @@ export default function ControlClient() {
    */
   const missionMaxSeqRef = useRef<Map<string, number>>(new Map());
 
+  // Page size for both the initial history load and each backwards-
+  // paginate-older fetch. Tuned for memory headroom on long missions —
+  // see the `chatScrollContainerRef` comment block above.
+  const HISTORY_PAGE_SIZE = 5000;
+
   const loadHistoryEvents = useCallback(
     async (id: string, opts?: { sinceSeq?: number }) => {
-      const MAX_EVENTS = 5000;
-
       if (opts?.sinceSeq !== undefined) {
         // Delta load — used on reconnect/visibility/periodic sync.
         // The server returns events with sequence > sinceSeq already
@@ -3535,7 +3585,7 @@ export default function ControlClient() {
         const { events, meta } = await getMissionEventsWithMeta(id, {
           types: HISTORY_EVENT_TYPES,
           sinceSeq: opts.sinceSeq,
-          limit: MAX_EVENTS,
+          limit: HISTORY_PAGE_SIZE,
         });
         if (meta.maxSequence === undefined) {
           missionMaxSeqRef.current.delete(id);
@@ -3548,21 +3598,21 @@ export default function ControlClient() {
         const lastSeq =
           events.length > 0 ? events[events.length - 1].sequence : opts.sinceSeq;
         const cursor =
-          events.length >= MAX_EVENTS && lastSeq < meta.maxSequence
+          events.length >= HISTORY_PAGE_SIZE && lastSeq < meta.maxSequence
             ? lastSeq
             : meta.maxSequence;
         missionMaxSeqRef.current.set(id, cursor);
         return events;
       }
 
-      // Initial load — request the most recent MAX_EVENTS events.
+      // Initial load — request the most recent HISTORY_PAGE_SIZE events.
       // `latest=true` lets the server compute the tail offset in one
       // shot, so clients no longer need the binary-search probe loop
       // to handle 25k+ event missions.
       const { events, meta } = await getMissionEventsWithMeta(id, {
         types: HISTORY_EVENT_TYPES,
         latest: true,
-        limit: MAX_EVENTS,
+        limit: HISTORY_PAGE_SIZE,
       });
       // Only seed `missionMaxSeqRef` when the server has confirmed it
       // supports the resume protocol via `X-Max-Sequence`. Seeding from
@@ -3574,10 +3624,71 @@ export default function ControlClient() {
       }
       // Defensive: sort by sequence ASC in case upstream contract changes.
       const sorted = events.slice().sort((a, b) => a.sequence - b.sequence);
+      // Seed pagination caches: snapshot of historic events, lowest seq
+      // (cursor for next backwards page), and total filtered count from
+      // the server (so we know when the user has reached the start).
+      missionHistoricEventsRef.current.set(id, sorted);
+      if (sorted.length > 0) {
+        missionMinSeqRef.current.set(id, sorted[0].sequence);
+      } else {
+        missionMinSeqRef.current.delete(id);
+      }
+      if (meta.totalEvents !== undefined) {
+        missionTotalHistoryRef.current.set(id, meta.totalEvents);
+      } else {
+        missionTotalHistoryRef.current.delete(id);
+      }
       return sorted;
     },
     [HISTORY_EVENT_TYPES]
   );
+
+  /**
+   * Recompute "is there more older history to load" for a mission, by
+   * comparing the locally-cached event count against the server's total.
+   * `undefined` total (e.g. older backend without `X-Total-Events`) is
+   * treated as "unknown → assume yes" if we got a full page on the last
+   * fetch — gives the user the option to try, and the next fetch will
+   * surface emptiness.
+   */
+  const computeHasMoreOlder = useCallback((id: string): boolean => {
+    const accumulated = missionHistoricEventsRef.current.get(id)?.length ?? 0;
+    const total = missionTotalHistoryRef.current.get(id);
+    if (total === undefined) {
+      // Heuristic: a full page suggests there could be more. Empty/short
+      // page rules it out.
+      return accumulated >= HISTORY_PAGE_SIZE;
+    }
+    return accumulated < total;
+  }, []);
+
+  /**
+   * Bookkeeping after an initial history load completes and `setItems`
+   * has been called. Records how many items were derived from history
+   * (so a later "load older" page-replace can find the live tail) and
+   * publishes the "more older messages exist" state to the UI.
+   */
+  // `historyItemsLen` MUST count only items derived from server events
+  // (i.e. the result of `eventsToItems` / `missionHistoryToItems`), NOT
+  // the post-queue-merge length. `loadOlderHistoryEvents` later splices
+  // via `prev.slice(oldHistoricCount)`; if queued messages were counted
+  // here, they'd land before the splice point, get rebuilt by
+  // `eventsToItems` (which doesn't see queued messages), and silently
+  // disappear from the UI on the next page-back.
+  const seedPaginationStateAfterInitialLoad = useCallback(
+    (id: string, historyItemsLen: number) => {
+      historicItemsCountRef.current.set(id, historyItemsLen);
+      setOlderLoadState({
+        missionId: id,
+        hasMore: computeHasMoreOlder(id),
+        loading: false,
+      });
+    },
+    [computeHasMoreOlder]
+  );
+
+  // `loadOlderHistoryEvents` is declared further down, after
+  // `eventsToItems` (TDZ). Search for its definition there.
 
   // Tool groups expansion state - tracks which groups are expanded by their first tool's id
   const [expandedToolGroups, setExpandedToolGroups] = useState<Set<string>>(new Set());
@@ -3810,6 +3921,28 @@ export default function ControlClient() {
     if (items.length > 0 && isAtBottom) {
       scrollToBottomImmediate();
     }
+  }, [items]);
+
+  // Backwards-pagination scroll restore. `loadOlderHistoryEvents` snapshots
+  // `scrollTop` + `scrollHeight` BEFORE prepending items into this ref;
+  // after React commits the longer list, we adjust `scrollTop` to keep the
+  // previously-visible message in the viewport. This MUST run in a
+  // `useLayoutEffect` (synchronously after commit, before browser paint) —
+  // doing it in `requestAnimationFrame` produces a one-frame flash where
+  // the user sees the old `scrollTop` against the new (taller) DOM before
+  // the adjustment lands. Declared after the scroll-to-bottom effect on
+  // purpose so React runs it second; the bottom-scroll only fires when
+  // `isAtBottom`, which is never true during a paginate-back.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  useLayoutEffect(() => {
+    const pending = pendingScrollRestoreRef.current;
+    if (!pending) return;
+    pendingScrollRestoreRef.current = null;
+    const scrollEl = containerRef.current;
+    if (!scrollEl) return;
+    const newScrollHeight = scrollEl.scrollHeight;
+    scrollEl.scrollTop =
+      newScrollHeight - pending.oldScrollHeight + pending.oldScrollTop;
   }, [items]);
 
   // Sync input to localStorage draft
@@ -4545,6 +4678,157 @@ export default function ControlClient() {
     return items;
   }, []);
 
+  /**
+   * Fetch the next page of older history events (events with `sequence`
+   * strictly less than the lowest currently loaded). Replays
+   * `eventsToItems` over the full accumulated event set so tool-call /
+   * tool-result linkage and thinking-delta consolidation stay coherent
+   * across the page boundary, then splices the new historic prefix in
+   * front of the SSE-appended live tail.
+   *
+   * Defined after `eventsToItems` so the callback's dependency array can
+   * reference it without hitting `const` TDZ at component init.
+   */
+  const loadOlderHistoryEvents = useCallback(
+    async (id: string) => {
+      const beforeSeq = missionMinSeqRef.current.get(id);
+      if (beforeSeq === undefined || beforeSeq <= 1) {
+        setOlderLoadState({ missionId: id, hasMore: false, loading: false });
+        return;
+      }
+      // The button click that fired this is for the currently-viewing
+      // mission, so writing `missionId: id` here is correct. If the user
+      // switches missions during the in-flight fetch, the UI's
+      // `activeOlderLoadState` selector will discard this loading state
+      // (it filters on `missionId === viewingMissionId`), so a fetch
+      // that never gets to clear `loading: false` can't pin the new
+      // mission's button to a stuck "Loading…" state.
+      setOlderLoadState((prev) => ({
+        missionId: id,
+        hasMore: prev.missionId === id ? prev.hasMore : false,
+        loading: true,
+      }));
+      try {
+        const { events: olderEvents } = await getMissionEventsWithMeta(id, {
+          types: HISTORY_EVENT_TYPES,
+          beforeSeq,
+          limit: HISTORY_PAGE_SIZE,
+        });
+        if (olderEvents.length === 0) {
+          // Same per-mission gate as below — see comment on
+          // `stillActiveForId`. If the user switched missions while we
+          // were fetching, don't pin the new mission's UI to "no more
+          // older messages" based on the old mission's empty page.
+          if (
+            currentMissionRef.current?.id === id ||
+            viewingMissionRef.current?.id === id
+          ) {
+            setOlderLoadState({ missionId: id, hasMore: false, loading: false });
+          }
+          return;
+        }
+
+        // After the await, the user may have switched missions. Read the
+        // *currently-viewing* mission from refs (which the keep-in-sync
+        // useEffects update synchronously from state), NOT from the
+        // closure-captured `viewingMission` — that's stale across renders
+        // and would happily prepend the old mission's events into the new
+        // mission's items.
+        const liveCurrent = currentMissionRef.current;
+        const liveViewing = viewingMissionRef.current;
+        // Single shared gate. If false, this completion belongs to a
+        // mission the user has already navigated away from — every side
+        // effect below (cursor advance, cache merge, items splice,
+        // `olderLoadState` reset, scroll restore) MUST be skipped, or a
+        // stale-mission completion will corrupt refs that
+        // `loadHistoryEvents`/`reloadMissionHistory` may not reset on the
+        // user's eventual return path.
+        const stillActiveForId = liveCurrent?.id === id || liveViewing?.id === id;
+
+        if (stillActiveForId) {
+          const sortedOlder = olderEvents
+            .slice()
+            .sort((a, b) => a.sequence - b.sequence);
+
+          missionMinSeqRef.current.set(id, sortedOlder[0].sequence);
+          const existing = missionHistoricEventsRef.current.get(id) ?? [];
+          const merged = [...sortedOlder, ...existing];
+          missionHistoricEventsRef.current.set(id, merged);
+
+          const mission =
+            liveCurrent?.id === id
+              ? liveCurrent
+              : liveViewing?.id === id
+                ? liveViewing
+                : null;
+          const newHistoricItems = eventsToItems(merged, mission);
+          const oldHistoricCount = historicItemsCountRef.current.get(id) ?? 0;
+          historicItemsCountRef.current.set(id, newHistoricItems.length);
+
+          // Snapshot scroll geometry FIRST, then setItems. The
+          // `useLayoutEffect` watching `items` reads
+          // `pendingScrollRestoreRef` synchronously after commit and
+          // BEFORE paint, so the user never sees the longer DOM with
+          // the old scrollTop. (Doing this in `requestAnimationFrame`
+          // would land one frame late and produce a visible jump.)
+          const scrollEl = containerRef.current;
+          if (scrollEl) {
+            pendingScrollRestoreRef.current = {
+              oldScrollTop: scrollEl.scrollTop,
+              oldScrollHeight: scrollEl.scrollHeight,
+            };
+          }
+
+          setItems((prev) => {
+            const liveTail = prev.slice(oldHistoricCount);
+            return [...newHistoricItems, ...liveTail];
+          });
+
+          // The render path uses `groupedItems.slice(-visibleItemsLimit)` —
+          // the LAST N items. Prepended older items land at the START of
+          // the array, so without expanding the limit they'd never
+          // actually render and the chat would visually be unchanged
+          // (and the scroll-restore would no-op against an unchanged
+          // DOM). Grow the limit by exactly the number of newly-added
+          // historic items so the visible window now also covers the
+          // older page. We don't shrink it past `prev` — other code
+          // may have already grown it for unrelated reasons.
+          const addedHistoricItems = newHistoricItems.length - oldHistoricCount;
+          if (addedHistoricItems > 0) {
+            setVisibleItemsLimit((prev) => prev + addedHistoricItems);
+          }
+
+          setOlderLoadState({
+            missionId: id,
+            hasMore: computeHasMoreOlder(id),
+            loading: false,
+          });
+        }
+      } catch (err) {
+        console.error("Failed to load older events:", err);
+        toast.error("Failed to load older messages");
+        // Only clear the loading flag if the active mission is still the
+        // one we were paginating — otherwise we'd wipe state set for a
+        // newer, unrelated mission. (The missionId-tagged read selector
+        // also protects the UI here, but we keep this guard so we don't
+        // gratuitously rewrite state for a mission that isn't viewable.)
+        const stillActive =
+          currentMissionRef.current?.id === id ||
+          viewingMissionRef.current?.id === id;
+        if (stillActive) {
+          setOlderLoadState((prev) =>
+            prev.missionId === id ? { ...prev, loading: false } : prev
+          );
+        }
+      }
+    },
+    // Note: `viewingMission` is intentionally NOT in deps — the body now
+    // reads `viewingMissionRef.current` (synced from state by an effect
+    // above), so capturing the state value would re-introduce the stale
+    // closure that bugbot flagged.
+    [HISTORY_EVENT_TYPES, eventsToItems, computeHasMoreOlder]
+  );
+
   // Load mission from URL param on mount (and retry on auth success)
   const [authRetryTrigger, setAuthRetryTrigger] = useState(0);
 
@@ -4662,6 +4946,10 @@ export default function ControlClient() {
             historyItems = missionHistoryToItems(mission);
           }
         }
+        // Capture the events-derived count BEFORE the queue merge — this is
+        // what `loadOlderHistoryEvents` needs to find the live tail
+        // correctly (see `seedPaginationStateAfterInitialLoad`).
+        const historicEventsLen = historyItems.length;
         // Merge queued messages that belong to this mission
         const missionQueuedMessages = queuedMessages.filter((qm) => qm.mission_id === id);
         if (missionQueuedMessages.length > 0) {
@@ -4686,6 +4974,7 @@ export default function ControlClient() {
         }
         setItems(historyItems);
         adjustVisibleItemsLimit(historyItems);
+        seedPaginationStateAfterInitialLoad(id, historicEventsLen);
         applyDesktopSessionState(mission);
         // Also check events for desktop sessions (in case mission.desktop_sessions isn't populated yet)
         if (events) {
@@ -4748,6 +5037,9 @@ export default function ControlClient() {
                   historyItems = missionHistoryToItems(mission);
                 }
               }
+              // Capture pre-queue length so pagination doesn't clip
+              // queued items (see `seedPaginationStateAfterInitialLoad`).
+              const historicEventsLen = historyItems.length;
               // Merge queued messages that belong to this mission
               const missionQueuedMessages = queuedMessages.filter((qm) => qm.mission_id === mission.id);
               if (missionQueuedMessages.length > 0) {
@@ -4770,6 +5062,7 @@ export default function ControlClient() {
               }
               setItems(historyItems);
               adjustVisibleItemsLimit(historyItems);
+              seedPaginationStateAfterInitialLoad(mission.id, historicEventsLen);
               // Also check events for desktop sessions
               applyDesktopSessionFromEvents(events);
             })
@@ -4802,6 +5095,7 @@ export default function ControlClient() {
     missionHistoryToItems,
     adjustVisibleItemsLimit,
     loadHistoryEvents,
+    seedPaginationStateAfterInitialLoad,
     applyDesktopSessionState,
     applyDesktopSessionFromEvents,
     authRetryTrigger,
@@ -5144,6 +5438,9 @@ export default function ControlClient() {
           }
         }
 
+        // Capture pre-queue length so pagination doesn't clip queued items
+        // (see `seedPaginationStateAfterInitialLoad`).
+        const historicEventsLen = historyItems.length;
         // Merge queued messages that belong to this mission
         const missionQueuedMessages = queuedMessages.filter((qm) => qm.mission_id === missionId);
         if (missionQueuedMessages.length > 0) {
@@ -5167,6 +5464,7 @@ export default function ControlClient() {
 
         setItems(historyItems);
         adjustVisibleItemsLimit(historyItems);
+        seedPaginationStateAfterInitialLoad(missionId, historicEventsLen);
         // Check if mission has an active desktop session (stored metadata or fallback to history)
         applyDesktopSessionState(mission);
         // Also check events for desktop sessions
@@ -5221,6 +5519,7 @@ export default function ControlClient() {
       applyDesktopSessionState,
       adjustVisibleItemsLimit,
       loadHistoryEvents,
+      seedPaginationStateAfterInitialLoad,
       router,
     ]
   );
@@ -7463,6 +7762,9 @@ export default function ControlClient() {
           }
         }
 
+        // Pre-queue length: pagination uses this to find the live tail
+        // without clipping queued items (see `seedPaginationStateAfterInitialLoad`).
+        const historicEventsLen = historyItems.length;
         const missionQueuedMessages = queuedMessages.filter(
           (qm) => qm.mission_id === missionId
         );
@@ -7489,6 +7791,7 @@ export default function ControlClient() {
 
         setItems(historyItems);
         adjustVisibleItemsLimit(historyItems);
+        seedPaginationStateAfterInitialLoad(missionId, historicEventsLen);
         updateMissionItems(missionId, historyItems);
         if (events) {
           applyDesktopSessionFromEvents(events);
@@ -7502,6 +7805,7 @@ export default function ControlClient() {
       eventsToItems,
       missionHistoryToItems,
       adjustVisibleItemsLimit,
+      seedPaginationStateAfterInitialLoad,
       updateMissionItems,
       applyDesktopSessionFromEvents,
     ]
@@ -8328,6 +8632,36 @@ export default function ControlClient() {
         )}>
         {/* Messages */}
         <div ref={containerRef} className="flex-1 overflow-y-auto p-6">
+          {/* Backwards pagination — only when there's actually more older
+              history to fetch and the chat isn't empty. Click prepends the
+              previous page; scroll position is preserved so the message
+              currently in view stays put.
+              `olderLoadState` is single-shared but tagged with `missionId`,
+              so we ignore it unless it's for the mission the user is
+              actually viewing. Otherwise a stale completion (or a
+              still-in-flight fetch from a previously-viewed mission)
+              could pin this button to a wrong "Loading…" / hidden state. */}
+          {items.length > 0 &&
+            olderLoadState.missionId === viewingMissionId &&
+            olderLoadState.hasMore &&
+            viewingMissionId && (
+            <div className="flex justify-center mb-4">
+              <button
+                type="button"
+                disabled={olderLoadState.loading}
+                onClick={() => {
+                  void loadOlderHistoryEvents(viewingMissionId);
+                }}
+                className={cn(
+                  "px-4 py-1.5 text-xs rounded-full border transition-colors",
+                  "border-white/10 bg-white/[0.03] text-white/60 hover:bg-white/[0.06] hover:text-white/80",
+                  olderLoadState.loading && "opacity-60 cursor-wait"
+                )}
+              >
+                {olderLoadState.loading ? "Loading older messages…" : "Load older messages"}
+              </button>
+            </div>
+          )}
           {items.length === 0 ? (
             <div className="flex h-full items-center justify-center">
               <div className="text-center">
