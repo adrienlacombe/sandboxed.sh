@@ -1,0 +1,46 @@
+name: Android APK
+
+on:
+  push:
+    paths:
+      - ".github/workflows/android-apk.yml"
+      - "android_dashboard/**"
+  pull_request:
+    branches: [master, main]
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths:
+      - ".github/workflows/android-apk.yml"
+      - "android_dashboard/**"
+  workflow_dispatch:
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  build-debug-apk:
+    name: Build Debug APK
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: android_dashboard
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up JDK
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Build debug APK
+        run: ./gradlew :app:assembleDebug --no-daemon
+
+      - name: Upload debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: sandboxed-dashboard-debug-apk
+          path: android_dashboard/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
