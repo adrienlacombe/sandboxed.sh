@@ -47,6 +47,7 @@ use super::ai_providers as ai_providers_api;
 use super::ampcode as ampcode_api;
 use super::auth::{self, AuthUser};
 use super::backends as backends_api;
+use super::github_auth;
 use super::claudecode as claudecode_api;
 use super::console;
 use super::control;
@@ -90,6 +91,9 @@ pub struct AppState {
     /// Pending OAuth state for provider authorization
     pub pending_oauth:
         Arc<RwLock<HashMap<crate::ai_providers::ProviderType, crate::ai_providers::PendingOAuth>>>,
+    /// Pending GitHub OAuth login state, keyed by random nonce.
+    pub pending_github_oauth:
+        Arc<RwLock<HashMap<String, super::github_auth::PendingGithubOAuth>>>,
     /// Secrets store for encrypted credentials
     pub secrets: Option<Arc<crate::secrets::SecretsStore>>,
     /// Console session pool for WebSocket reconnection
@@ -160,6 +164,7 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         crate::ai_providers::AIProviderStore::new(config.working_dir.join(AI_PROVIDERS_PATH)).await,
     );
     let pending_oauth = Arc::new(RwLock::new(HashMap::new()));
+    let pending_github_oauth = Arc::new(RwLock::new(HashMap::new()));
 
     // Initialize provider health tracker and model chain store
     let health_tracker = Arc::new(crate::provider_health::ProviderHealthTracker::new());
@@ -443,6 +448,7 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         opencode_agents_cache: RwLock::new(opencode_api::OpenCodeAgentsCache::default()),
         ai_providers,
         pending_oauth,
+        pending_github_oauth,
         secrets,
         console_pool,
         settings,
@@ -542,6 +548,8 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
     let public_routes = Router::new()
         .route("/api/health", get(health))
         .route("/api/auth/login", post(auth::login))
+        .route("/api/auth/github/start", get(github_auth::start))
+        .route("/api/auth/github/callback", get(github_auth::callback))
         // Webhook receiver endpoint (no auth required - uses webhook secret validation)
         .route(
             "/api/webhooks/:mission_id/:webhook_id",
@@ -1141,6 +1149,7 @@ async fn health(State(state): State<Arc<AppState>>) -> Json<HealthResponse> {
         auth_mode: auth_mode.to_string(),
         max_iterations: state.config.max_iterations,
         library_remote,
+        github_enabled: state.config.auth.github_enabled(),
     })
 }
 
