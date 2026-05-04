@@ -28,6 +28,7 @@ pub mod desktop;
 mod desktop_stream;
 pub mod fido;
 mod fs;
+mod github_auth;
 pub mod library;
 pub mod mcp;
 pub mod metadata_llm;
