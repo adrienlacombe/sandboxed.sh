@@ -82,6 +82,7 @@ data class Workspace(
 data class CreateWorkspaceRequest(
     val name: String,
     @SerialName("workspace_type") val workspaceType: String = "container",
+    val path: String? = null,
 )
 
 @Serializable
@@ -313,6 +314,7 @@ data class Automation(
 
 @Serializable
 data class AutomationCommandSource(
+    @SerialName("type")
     val kind: String = "inline",
     val content: String? = null,
     val name: String? = null,
@@ -321,12 +323,14 @@ data class AutomationCommandSource(
 
 @Serializable
 data class AutomationTrigger(
+    @SerialName("type")
     val kind: String = "interval",
     val seconds: Int? = null,
 )
 
 @Serializable
 data class AutomationStopPolicy(
+    @SerialName("type")
     val kind: String = "never",
     val count: Int? = null,
     val repo: String? = null,
