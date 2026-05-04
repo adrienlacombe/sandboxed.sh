@@ -13,8 +13,9 @@ import kotlinx.coroutines.launch
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.intOrNull
-import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import sh.sandboxed.dashboard.data.AppContainer
 import sh.sandboxed.dashboard.data.ChatMessage
@@ -160,7 +161,7 @@ class ControlViewModel(private val container: AppContainer) : ViewModel() {
                         runCatching {
                             val (events, max) = container.api.missionEvents(mid, sinceSeq = sinceSeq, limit = 200)
                             events.forEach { ev ->
-                                handle(SseEvent(ev.eventType, kotlinx.serialization.json.JsonObject(emptyMap())))
+                                handle(storedEventToSse(ev))
                             }
                             if (max != null) lastSeq = max
                         }
@@ -204,6 +205,7 @@ class ControlViewModel(private val container: AppContainer) : ViewModel() {
     private fun handle(evt: SseEvent) {
         val obj = (evt.data as? JsonObject) ?: return
         fun s(k: String): String? = obj[k]?.jsonPrimitive?.content
+        fun b(k: String): Boolean? = obj[k]?.jsonPrimitive?.booleanOrNull
         fun i(k: String): Int? = obj[k]?.jsonPrimitive?.intOrNull
         val missionId = s("mission_id") ?: _state.value.mission?.id
         if (missionId != null && missionId != _state.value.mission?.id) return
@@ -221,10 +223,10 @@ class ControlViewModel(private val container: AppContainer) : ViewModel() {
                     content = content,
                 ))
             }
-            "text_delta" -> { val delta = s("delta") ?: return; appendDelta(delta) }
+            "text_delta" -> { val content = s("content") ?: return; setStreamingAssistant(content) }
             "thinking" -> {
-                val text = s("thinking_text") ?: ""
-                val done = obj["done"]?.jsonPrimitive?.content == "true"
+                val text = s("content") ?: ""
+                val done = b("done") == true
                 upsertThinking(text, done)
             }
             "agent_phase" -> {
@@ -232,20 +234,26 @@ class ControlViewModel(private val container: AppContainer) : ViewModel() {
                 appendMessage(ChatMessage(kind = ChatMessageKind.Phase(phase, s("detail"), s("agent")), content = ""))
             }
             "tool_call" -> {
-                val name = s("tool_name") ?: return
-                appendMessage(ChatMessage(kind = ChatMessageKind.ToolCall(name, true), content = s("arguments") ?: ""))
+                val name = s("name") ?: return
+                val args = obj["args"]
+                val toolUi = ToolUiParser.parse(name, args)
+                if (toolUi !is sh.sandboxed.dashboard.data.ToolUiContent.Unknown) {
+                    appendMessage(ChatMessage(kind = ChatMessageKind.ToolUi(name, toolUi), content = ""))
+                } else {
+                    appendMessage(ChatMessage(kind = ChatMessageKind.ToolCall(name, true), content = args.displayText()))
+                }
             }
             "tool_result" -> {
-                val name = s("tool_name") ?: ""
-                val isError = obj["is_error"]?.jsonPrimitive?.content == "true"
+                val name = s("name") ?: ""
+                val isError = b("is_error") == true
                 appendMessage(ChatMessage(
                     kind = if (isError) ChatMessageKind.ErrorMsg else ChatMessageKind.ToolCall(name, false),
-                    content = s("result") ?: "",
+                    content = obj["result"].displayText(),
                 ))
             }
             "tool_ui" -> {
-                val name = s("tool_name") ?: "ui"
-                val content = ToolUiParser.parse(name, obj["arguments"])
+                val name = s("name") ?: "ui"
+                val content = ToolUiParser.parse(name, obj["args"])
                 appendMessage(ChatMessage(kind = ChatMessageKind.ToolUi(name, content), content = ""))
             }
             "goal_iteration" -> {
@@ -287,14 +295,37 @@ class ControlViewModel(private val container: AppContainer) : ViewModel() {
 
     private fun appendMessage(m: ChatMessage) { _state.update { it.copy(messages = it.messages + m) } }
 
-    private fun appendDelta(delta: String) {
+    private fun storedEventToSse(ev: sh.sandboxed.dashboard.data.StoredEvent): SseEvent {
+        val data = ev.metadata.toMutableMap()
+        data["mission_id"] = JsonPrimitive(ev.missionId)
+        if (ev.content.isNotBlank()) data["content"] = JsonPrimitive(ev.content)
+        ev.toolCallId?.let { data["tool_call_id"] = JsonPrimitive(it) }
+        ev.toolName?.let { data["name"] = JsonPrimitive(it) }
+        when (ev.eventType) {
+            "tool_call" -> data["args"] = parseJsonOrString(ev.content)
+            "tool_result" -> data["result"] = parseJsonOrString(ev.content)
+        }
+        return SseEvent(ev.eventType, JsonObject(data))
+    }
+
+    private fun parseJsonOrString(value: String): JsonElement =
+        runCatching { sh.sandboxed.dashboard.data.api.Net.json.parseToJsonElement(value) }
+            .getOrElse { JsonPrimitive(value) }
+
+    private fun JsonElement?.displayText(): String = when (this) {
+        null -> ""
+        is JsonPrimitive -> content
+        else -> toString()
+    }
+
+    private fun setStreamingAssistant(content: String) {
         _state.update { st ->
             val msgs = st.messages.toMutableList()
             val last = msgs.lastOrNull()
             if (last?.kind is ChatMessageKind.Assistant) {
-                msgs[msgs.lastIndex] = last.copy(content = last.content + delta)
+                msgs[msgs.lastIndex] = last.copy(content = content)
             } else {
-                msgs += ChatMessage(kind = ChatMessageKind.Assistant(), content = delta)
+                msgs += ChatMessage(kind = ChatMessageKind.Assistant(), content = content)
             }
             st.copy(messages = msgs)
         }
@@ -309,7 +340,8 @@ class ControlViewModel(private val container: AppContainer) : ViewModel() {
             } else {
                 val cur = msgs[idx]
                 val kind = (cur.kind as ChatMessageKind.Thinking).copy(done = done)
-                msgs[idx] = cur.copy(kind = kind, content = (cur.content + text))
+                val merged = if (text.startsWith(cur.content)) text else cur.content + text
+                msgs[idx] = cur.copy(kind = kind, content = merged)
             }
             st.copy(messages = msgs)
         }

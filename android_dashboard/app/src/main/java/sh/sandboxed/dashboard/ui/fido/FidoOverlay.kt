@@ -97,12 +97,11 @@ private fun FidoApprovalDialog(
 
 private fun requestBiometric(host: FragmentActivity?, onResult: (Boolean) -> Unit) {
     val activity = host
-    if (activity == null) { onResult(true); return }
+    if (activity == null) { onResult(false); return }
     val mgr = BiometricManager.from(activity)
     val auth = mgr.canAuthenticate(BiometricManager.Authenticators.BIOMETRIC_WEAK or BiometricManager.Authenticators.DEVICE_CREDENTIAL)
     if (auth != BiometricManager.BIOMETRIC_SUCCESS) {
-        // No biometric available — proceed with explicit approval anyway
-        onResult(true); return
+        onResult(false); return
     }
     val executor = ContextCompat.getMainExecutor(activity)
     val prompt = BiometricPrompt(activity, executor, object : BiometricPrompt.AuthenticationCallback() {
