@@ -13,8 +13,8 @@ android {
         applicationId = "sh.sandboxed.dashboard"
         minSdk = 26
         targetSdk = 36
-        versionCode = 2
-        versionName = "0.2.0"
+        versionCode = 3
+        versionName = "0.3.0"
         vectorDrawables { useSupportLibrary = true }
     }
 
@@ -79,6 +79,7 @@ dependencies {
     implementation("androidx.documentfile:documentfile:1.1.0")
     implementation("androidx.biometric:biometric:1.1.0")
     implementation("androidx.fragment:fragment-ktx:1.8.9")
+    implementation("androidx.browser:browser:1.10.0")
 
     implementation("androidx.compose.ui:ui")
     implementation("androidx.compose.ui:ui-graphics")
