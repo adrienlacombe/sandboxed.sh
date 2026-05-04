@@ -186,6 +186,29 @@ Two layers:
 
 `Settings → Sign out` clears the token.
 
+### Sign in with GitHub (Android side; backend stub pending)
+
+The Android client supports a "Sign in with GitHub" button on the login screen, gated on the server reporting `github_enabled: true` from `/api/health`. The client side is wired end-to-end; the matching server routes need to be added to `src/api/auth.rs` to make it functional.
+
+**Backend contract** (Android assumes this — implement to match):
+
+| Endpoint | Behaviour |
+| --- | --- |
+| `GET /api/health` | Add `github_enabled: bool` to the response when a GitHub OAuth App is configured. |
+| `GET /api/auth/github/start?redirect=<uri>` | Validate that `redirect` matches an allow-list (the only entry the app sends is `sandboxed://auth/callback`), set a state cookie, and 302 to GitHub's `/login/oauth/authorize?client_id=…&state=…&redirect_uri=…&scope=read:user`. |
+| `GET /api/auth/github/callback?code=&state=` | Verify state against the cookie, exchange `code` with GitHub for an access token, fetch `/user`, look up or provision a `UserAccount` (optionally gate on a configured `github_login_allowlist`), issue a JWT, then 302 to the saved `redirect` with `?token=<jwt>&exp=<unix_ts>` (or `?error=<message>` on failure). |
+
+**Android side** (already implemented):
+
+- `AndroidManifest.xml` declares an intent-filter for `sandboxed://auth/callback` on `MainActivity` (`launchMode="singleTask"` so deep links route via `onNewIntent`).
+- `util/GitHubAuth.kt` opens the Custom Tab pointed at `<baseUrl>/api/auth/github/start?redirect=sandboxed%3A%2F%2Fauth%2Fcallback`.
+- `MainActivity.handleAuthIntent` parses the callback URI's `token` query parameter and writes it to DataStore — `AuthGate` observes settings and switches the phase to `AUTHENTICATED` automatically.
+- The button is rendered by `LoginScreen` only when `health.github_enabled` is `true`, so deployments without the OAuth App configured see the password flow unchanged.
+
+**Permissions / scopes**: the only GitHub OAuth scope the client needs is `read:user` (display name, login). Add `user:email` if you want the verified email on the server.
+
+**Allowlist**: it's worth gating the callback by a configurable list of GitHub usernames or org membership before issuing a JWT, otherwise the OAuth route becomes a public sign-up endpoint. The Android client doesn't care — it just receives a JWT or an error message.
+
 ## Persistent settings (DataStore)
 
 Defined in `Settings.kt`:
@@ -271,7 +294,8 @@ All tokens live in `ui/theme/Color.kt`.
 
 ## Known gaps vs iOS
 
-The only unmatched feature is interactive `/goal` controls (pause / resume / clear). The status banner is shown but there are no buttons. Everything else from the iOS feature surface is implemented.
+- Interactive `/goal` controls (pause / resume / clear) — banner reflects status but no buttons yet.
+- "Sign in with GitHub" — Android side is wired (Custom Tab + deep-link callback handler); the matching `/api/auth/github/{start,callback}` routes still need to be added to the Rust backend.
 
 ## License
 
