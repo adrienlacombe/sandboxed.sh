@@ -148,7 +148,7 @@ pub fn verify_password_hash(password: &str, stored: &str) -> bool {
     constant_time_eq(&hex::encode(&computed), &hex::encode(&expected_hash))
 }
 
-fn issue_jwt(secret: &str, ttl_days: i64, user: &AuthUser) -> anyhow::Result<(String, i64)> {
+pub(super) fn issue_jwt(secret: &str, ttl_days: i64, user: &AuthUser) -> anyhow::Result<(String, i64)> {
     let now = Utc::now();
     let exp = now + Duration::days(ttl_days.max(1));
     let claims = Claims {

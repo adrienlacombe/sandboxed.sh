@@ -28,6 +28,7 @@ mod desktop_stream;
 pub mod fido;
 mod fs;
 pub(crate) mod grok_goal;
+mod github_auth;
 pub mod library;
 pub mod mcp;
 pub mod metadata_llm;
