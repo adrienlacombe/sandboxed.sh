@@ -10022,6 +10022,16 @@ pub async fn run_opencode_turn(
     use std::sync::{Arc, Mutex};
     use tokio::io::{AsyncBufReadExt, BufReader};
 
+    // oh-my-opencode's packaged implicit default can drift from the
+    // Library-synced agent names. Pass the Sandboxed default explicitly so
+    // API-created OpenCode missions don't fail before the first turn.
+    let default_agent = if agent.is_none() {
+        Some("sisyphus")
+    } else {
+        None
+    };
+    let agent = agent.or(default_agent);
+
     // Determine CLI runner: prefer backend config, then env var, then try bunx/npx
     // We use 'bunx oh-my-opencode run' or 'npx oh-my-opencode run' for per-workspace execution.
     let workspace_exec = WorkspaceExec::new(workspace.clone());
@@ -10329,27 +10339,32 @@ pub async fn run_opencode_turn(
     // oh-my-opencode wraps opencode with extra features (todo enforcement, background tasks)
     // but requires a compatible opencode version.  When the flag is set, or when the
     // workspace agent names are incompatible, fall back to plain `opencode run`.
-    let use_plain_opencode = workspace
+    let configured_plain_opencode = workspace
         .config
         .get("disable_oh_my_opencode")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    let agent_needs_plain_opencode = agent
+        .map(|a| a.eq_ignore_ascii_case("sisyphus"))
+        .unwrap_or(false);
+    let use_plain_opencode = configured_plain_opencode || agent_needs_plain_opencode;
 
     tracing::info!(
         mission_id = %mission_id,
         use_plain_opencode = use_plain_opencode,
+        configured_plain_opencode = configured_plain_opencode,
+        agent_needs_plain_opencode = agent_needs_plain_opencode,
         "OpenCode mode selection"
     );
 
-    // When using plain opencode, inject the builtin proxy provider for the model
-    // and strip MCP servers (they hang during boot and aren't needed for simple
-    // assistant-mode chat).
+    // When using plain opencode, inject the builtin proxy provider for builtin
+    // models and strip MCP servers (they hang during boot and aren't needed for
+    // simple assistant-mode chat).
     let plain_opencode_model = if use_plain_opencode {
-        let m = resolved_model
-            .as_deref()
-            .filter(|m| m.starts_with("builtin/"))
-            .unwrap_or("builtin/fast");
-        ensure_opencode_provider_for_model(&opencode_config_dir_host, m);
+        let m = resolved_model.as_deref().unwrap_or("builtin/fast");
+        if m.starts_with("builtin/") {
+            ensure_opencode_provider_for_model(&opencode_config_dir_host, m);
+        }
 
         // Replace workspace MCPs with profile-defined MCPs only.
         // Workspace MCPs (desktop, playwright, cq) hang during boot.
