@@ -31,11 +31,17 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.launch
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Code
+import androidx.compose.material3.Icon
+import androidx.compose.material3.OutlinedButton
+import androidx.compose.ui.platform.LocalContext
 import sh.sandboxed.dashboard.data.AppContainer
 import sh.sandboxed.dashboard.data.AppSettings
 import sh.sandboxed.dashboard.data.LoginRequest
 import sh.sandboxed.dashboard.ui.components.ErrorBanner
 import sh.sandboxed.dashboard.ui.theme.Palette
+import sh.sandboxed.dashboard.util.GitHubAuth
 
 @Composable
 fun AuthGate(
@@ -45,6 +51,7 @@ fun AuthGate(
 ) {
     var phase by remember { mutableStateOf(AuthPhase.RESOLVING) }
     var authMode by remember { mutableStateOf<String?>(null) }
+    var githubEnabled by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf<String?>(null) }
 
     LaunchedEffect(settings.baseUrl, settings.jwtToken) {
@@ -55,6 +62,7 @@ fun AuthGate(
         phase = AuthPhase.RESOLVING
         try {
             val health = container.api.health()
+            githubEnabled = health.githubEnabled
             if (!health.authRequired || health.authMode == "disabled") {
                 phase = AuthPhase.AUTHENTICATED
             } else {
@@ -70,7 +78,7 @@ fun AuthGate(
     when (phase) {
         AuthPhase.RESOLVING -> FullscreenSpinner()
         AuthPhase.NEEDS_CONFIG -> ConfigSheet(container, settings, error)
-        AuthPhase.NEEDS_LOGIN -> LoginScreen(container, settings, authMode ?: "single_tenant")
+        AuthPhase.NEEDS_LOGIN -> LoginScreen(container, settings, authMode ?: "single_tenant", githubEnabled)
         AuthPhase.AUTHENTICATED -> content()
     }
 }
@@ -131,8 +139,9 @@ private fun ConfigSheet(container: AppContainer, settings: AppSettings, error: S
 }
 
 @Composable
-private fun LoginScreen(container: AppContainer, settings: AppSettings, authMode: String) {
+private fun LoginScreen(container: AppContainer, settings: AppSettings, authMode: String, githubEnabled: Boolean) {
     val scope = rememberCoroutineScope()
+    val ctx = LocalContext.current
     var username by remember { mutableStateOf(settings.lastUsername) }
     var password by remember { mutableStateOf("") }
     var loading by remember { mutableStateOf(false) }
@@ -184,6 +193,18 @@ private fun LoginScreen(container: AppContainer, settings: AppSettings, authMode
                 modifier = Modifier.fillMaxWidth(),
                 colors = ButtonDefaults.buttonColors(containerColor = Palette.Accent, contentColor = Palette.TextPrimary),
             ) { Text(if (loading) "Signing in…" else "Sign in") }
+
+            if (githubEnabled) {
+                Text("or", color = Palette.TextTertiary, style = MaterialTheme.typography.labelMedium, modifier = Modifier.align(Alignment.CenterHorizontally))
+                OutlinedButton(
+                    onClick = { GitHubAuth.launch(ctx, settings.baseUrl) },
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Icon(Icons.Filled.Code, contentDescription = null)
+                    Spacer(Modifier.height(0.dp))
+                    Text("  Sign in with GitHub")
+                }
+            }
         }
     }
 }

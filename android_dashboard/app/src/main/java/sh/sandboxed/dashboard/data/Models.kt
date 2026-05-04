@@ -95,6 +95,7 @@ data class HealthResponse(
     val status: String = "ok",
     @SerialName("auth_required") val authRequired: Boolean = false,
     @SerialName("auth_mode") val authMode: String? = null,
+    @SerialName("github_enabled") val githubEnabled: Boolean = false,
 )
 
 @Serializable
