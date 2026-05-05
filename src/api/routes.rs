@@ -60,7 +60,6 @@ use super::providers::ModelCatalog;
 use super::ai_providers as ai_providers_api;
 use super::auth::{self, AuthUser};
 use super::backends as backends_api;
-use super::github_auth;
 use super::claudecode as claudecode_api;
 use super::console;
 use super::control;
@@ -68,6 +67,7 @@ use super::deferred_proxy as deferred_proxy_api;
 use super::desktop;
 use super::desktop_stream;
 use super::fs;
+use super::github_auth;
 use super::library as library_api;
 use super::mcp as mcp_api;
 use super::model_routing as model_routing_api;
@@ -105,8 +105,7 @@ pub struct AppState {
     pub pending_oauth:
         Arc<RwLock<HashMap<crate::ai_providers::ProviderType, crate::ai_providers::PendingOAuth>>>,
     /// Pending GitHub OAuth login state, keyed by random nonce.
-    pub pending_github_oauth:
-        Arc<RwLock<HashMap<String, super::github_auth::PendingGithubOAuth>>>,
+    pub pending_github_oauth: Arc<RwLock<HashMap<String, super::github_auth::PendingGithubOAuth>>>,
     /// Secrets store for encrypted credentials
     pub secrets: Option<Arc<crate::secrets::SecretsStore>>,
     /// Console session pool for WebSocket reconnection

@@ -334,8 +334,13 @@ impl AuthConfig {
     /// advertised on `/api/health`. Requires the OAuth App credentials,
     /// a non-empty user allowlist, and a JWT secret to issue tokens.
     pub fn github_enabled(&self) -> bool {
-        self.github_oauth_client_id.as_deref().is_some_and(|s| !s.is_empty())
-            && self.github_oauth_client_secret.as_deref().is_some_and(|s| !s.is_empty())
+        self.github_oauth_client_id
+            .as_deref()
+            .is_some_and(|s| !s.is_empty())
+            && self
+                .github_oauth_client_secret
+                .as_deref()
+                .is_some_and(|s| !s.is_empty())
             && !self.github_oauth_allowlist.is_empty()
             && self.jwt_secret.as_deref().is_some_and(|s| !s.is_empty())
     }
@@ -343,12 +348,10 @@ impl AuthConfig {
     /// True iff `gh_login` is permitted to sign in via GitHub OAuth.
     pub fn github_user_allowed(&self, gh_login: &str) -> bool {
         let login = gh_login.trim().to_lowercase();
-        self.github_oauth_allowlist
-            .iter()
-            .any(|entry| {
-                let e = entry.trim();
-                e == "*" || e.eq_ignore_ascii_case(&login)
-            })
+        self.github_oauth_allowlist.iter().any(|entry| {
+            let e = entry.trim();
+            e == "*" || e.eq_ignore_ascii_case(&login)
+        })
     }
 
     /// True iff `redirect_uri` is on the redirect allowlist.
@@ -498,8 +501,12 @@ impl Config {
                 .transpose()?
                 .unwrap_or(30),
             users,
-            github_oauth_client_id: std::env::var("GITHUB_OAUTH_CLIENT_ID").ok().filter(|s| !s.is_empty()),
-            github_oauth_client_secret: std::env::var("GITHUB_OAUTH_CLIENT_SECRET").ok().filter(|s| !s.is_empty()),
+            github_oauth_client_id: std::env::var("GITHUB_OAUTH_CLIENT_ID")
+                .ok()
+                .filter(|s| !s.is_empty()),
+            github_oauth_client_secret: std::env::var("GITHUB_OAUTH_CLIENT_SECRET")
+                .ok()
+                .filter(|s| !s.is_empty()),
             github_oauth_allowlist,
             github_oauth_redirect_allowlist,
             public_base_url: std::env::var("SANDBOXED_PUBLIC_URL")
