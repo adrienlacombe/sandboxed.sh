@@ -40,8 +40,11 @@ object Ansi {
                 i = end + 1
                 continue
             }
-            // accumulate run of plain chars until next escape
-            val nextEsc = input.indexOf(0x1B.toChar(), startIndex = i)
+            // accumulate run of plain chars until next escape; if the current char
+            // is itself a stray ESC (no `[` follows), include it in the run and
+            // search from i+1 to guarantee forward progress.
+            val searchFrom = if (c == 0x1B.toChar()) i + 1 else i
+            val nextEsc = if (searchFrom < input.length) input.indexOf(0x1B.toChar(), startIndex = searchFrom) else -1
             val runEnd = if (nextEsc == -1) input.length else nextEsc
             val run = input.substring(i, runEnd)
             if (run.isNotEmpty()) {
@@ -50,7 +53,9 @@ object Ansi {
                 append(run)
                 pop()
             }
-            i = runEnd
+            // runEnd is always > i now (searchFrom>=i+1 when c==ESC, otherwise c is plain
+            // text and runEnd >= i+1 because we'd have consumed it).
+            i = if (runEnd > i) runEnd else i + 1
         }
     }
 

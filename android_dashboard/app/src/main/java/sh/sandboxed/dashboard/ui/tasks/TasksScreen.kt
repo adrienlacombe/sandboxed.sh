@@ -40,6 +40,7 @@ import sh.sandboxed.dashboard.data.TaskStatus
 import sh.sandboxed.dashboard.ui.components.ErrorBanner
 import sh.sandboxed.dashboard.ui.components.GlassCard
 import sh.sandboxed.dashboard.ui.theme.Palette
+import sh.sandboxed.dashboard.util.boundedForText
 
 private data class TasksState(val items: List<TaskState> = emptyList(), val loading: Boolean = false, val error: String? = null)
 
@@ -92,7 +93,7 @@ private fun TaskRow(t: TaskState) {
             if (t.iterations > 0) Text("iterations: ${t.iterations}", color = Palette.TextTertiary, style = MaterialTheme.typography.bodySmall)
             t.result?.takeIf { it.isNotBlank() }?.let {
                 Spacer(Modifier.height(4.dp))
-                Text(it, color = Palette.TextSecondary, style = MaterialTheme.typography.bodySmall, maxLines = 4)
+                Text(it.boundedForText(), color = Palette.TextSecondary, style = MaterialTheme.typography.bodySmall, maxLines = 4)
             }
         }
     }
