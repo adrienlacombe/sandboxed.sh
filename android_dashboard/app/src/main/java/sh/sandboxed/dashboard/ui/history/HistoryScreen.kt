@@ -61,6 +61,7 @@ import sh.sandboxed.dashboard.ui.components.GlassCard
 import sh.sandboxed.dashboard.ui.components.StatusBadge
 import sh.sandboxed.dashboard.ui.theme.Palette
 import sh.sandboxed.dashboard.util.Haptics
+import sh.sandboxed.dashboard.util.boundedForText
 
 private enum class HistoryFilter { ALL, ACTIVE, INTERRUPTED, COMPLETED, FAILED }
 
@@ -267,10 +268,10 @@ private fun MomentRow(m: MissionMomentSearchResult, onOpen: () -> Unit) {
                 )
             }
             Spacer(Modifier.height(4.dp))
-            Text(m.snippet, color = Palette.TextPrimary, style = MaterialTheme.typography.bodyMedium, maxLines = 3)
+            Text(m.snippet.boundedForText(maxChars = 1_500), color = Palette.TextPrimary, style = MaterialTheme.typography.bodyMedium, maxLines = 3)
             if (m.rationale.isNotBlank()) {
                 Spacer(Modifier.height(4.dp))
-                Text(m.rationale, color = Palette.TextTertiary, style = MaterialTheme.typography.bodySmall, maxLines = 2)
+                Text(m.rationale.boundedForText(maxChars = 1_000), color = Palette.TextTertiary, style = MaterialTheme.typography.bodySmall, maxLines = 2)
             }
         }
     }
