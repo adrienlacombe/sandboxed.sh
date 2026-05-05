@@ -67,7 +67,7 @@ import sh.sandboxed.dashboard.ui.theme.Palette
 import java.io.File
 
 private data class FilesState(
-    val path: String = "/workspace",
+    val path: String = "/",
     val entries: List<FileEntry> = emptyList(),
     val loading: Boolean = false,
     val error: String? = null,
@@ -90,11 +90,21 @@ private class FilesViewModel(private val container: AppContainer) : ViewModel() 
     fun refresh() {
         _state.update { it.copy(loading = true, error = null) }
         viewModelScope.launch {
-            runCatching { container.api.listFiles(_state.value.path) }
+            val path = _state.value.path
+            runCatching { container.api.listFiles(path) }
                 .onSuccess { list ->
                     _state.update { st -> st.copy(entries = list.sortedWith(compareBy({ !it.isDirectory }, { it.name.lowercase() })), loading = false) }
                 }
-                .onFailure { e -> _state.update { it.copy(error = e.message, loading = false) } }
+                .onFailure { e ->
+                    // Fall back to "/" once if the requested path can't be opened (e.g. server returns
+                    // 500 because the directory doesn't exist on this install).
+                    if (path != "/") {
+                        _state.update { it.copy(path = "/", error = "Could not open $path — falling back to /") }
+                        refresh()
+                    } else {
+                        _state.update { it.copy(error = e.message, loading = false) }
+                    }
+                }
         }
     }
 
