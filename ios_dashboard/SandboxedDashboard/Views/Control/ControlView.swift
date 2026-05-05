@@ -2538,9 +2538,12 @@ struct ControlView: View {
                 timestamp: existing.timestamp
             )
         } else {
+            // Append a UUID-suffixed id so concurrent fallback thoughts can't collide
+            // and crash the Thoughts sheet's `ForEach`. The "stream-thinking-" prefix
+            // is preserved because `isStreamingFallbackThought` still checks it.
             messages.append(
                 ChatMessage(
-                    id: "\(streamingThoughtPrefix)\(Date().timeIntervalSince1970)",
+                    id: "\(streamingThoughtPrefix)\(UUID().uuidString)",
                     type: .thinking(done: done, startTime: Date()),
                     content: content
                 )
@@ -2734,10 +2737,22 @@ struct ControlView: View {
                 break
             }
 
-            // Remove phase items when thinking starts
+            // Skip if we've already seen this server-supplied event id —
+            // delta resume can re-deliver completed thinking events we already
+            // appended, and the active-message fast path won't catch them
+            // because the existing one is already `done: true`. Run this
+            // *before* stripping phase messages, otherwise a duplicate-event
+            // break would silently clear a still-relevant `agent_phase`
+            // indicator without adding any new content.
+            let eventId = data["id"] as? String
+            if let eventId, messages.contains(where: { $0.id == eventId }) {
+                break
+            }
+
+            // Remove phase items now that we know we're committing this event.
             messages.removeAll { $0.isPhase }
 
-            // Find existing thinking message or create new
+            // Find existing active thinking message or create new
             if let index = messages.lastIndex(where: { $0.isThinking && !$0.thinkingDone }) {
                 let existing = messages[index]
                 let existingStartTime = existing.thinkingStartTime ?? existing.timestamp
@@ -2750,28 +2765,35 @@ struct ControlView: View {
                     timestamp: existing.timestamp
                 )
             } else {
-                // Create new thinking message - whether done or not
-                // This handles the case where we receive a completed thought without seeing it active first
-                // (e.g., when joining a mission mid-thought or reconnecting)
+                // Create new thinking message - whether done or not.
+                // Handles the case where we receive a completed thought without seeing it
+                // active first (joining mid-thought or reconnecting).
+                //
+                // Prefer the server-supplied event id when available; otherwise fall back
+                // to a UUID. A wall-clock-second id can collide during history replay
+                // (many thinking events landing in the same instant), which then crashes
+                // the Thoughts sheet's `ForEach` with a duplicate-id assertion.
+                let messageId = eventId ?? "thinking-\(UUID().uuidString)"
                 let message = ChatMessage(
-                    id: "thinking-\(Date().timeIntervalSince1970)",
+                    id: messageId,
                     type: .thinking(done: done, startTime: Date()),
                     content: content
                 )
                 messages.append(message)
             }
-            
+
         case "agent_phase":
             let phase = data["phase"] as? String ?? ""
             let detail = data["detail"] as? String
             let agent = data["agent"] as? String
-            
+
             // Remove existing phase messages
             messages.removeAll { $0.isPhase }
-            
-            // Add new phase message
+
+            // Add new phase message. UUID-suffixed id so back-to-back phase events in the
+            // same instant cannot collide and crash a `ForEach`.
             let message = ChatMessage(
-                id: "phase-\(Date().timeIntervalSince1970)",
+                id: "phase-\(UUID().uuidString)",
                 type: .phase(phase: phase, detail: detail, agent: agent),
                 content: ""
             )
@@ -3985,19 +4007,6 @@ private struct ThoughtsSheet: View {
                 } else {
                     ScrollView {
                         VStack(spacing: 14) {
-                            HStack(spacing: 10) {
-                                ThoughtSummaryCard(
-                                    title: "Active",
-                                    value: "\(activeThoughts.count)",
-                                    tint: hasActiveThinking ? Theme.accent : Theme.textMuted
-                                )
-                                ThoughtSummaryCard(
-                                    title: "Completed",
-                                    value: "\(completedThoughts.count)",
-                                    tint: Theme.success
-                                )
-                            }
-
                             if !activeThoughts.isEmpty {
                                 ThoughtSection(title: "Thinking Now", icon: "brain") {
                                     ForEach(activeThoughts) { msg in
@@ -4039,27 +4048,6 @@ private struct ThoughtsSheet: View {
                 }
             }
         }
-    }
-}
-
-private struct ThoughtSummaryCard: View {
-    let title: String
-    let value: String
-    let tint: Color
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text(title)
-                .font(.caption)
-                .foregroundStyle(Theme.textMuted)
-            Text(value)
-                .font(.headline.monospacedDigit())
-                .foregroundStyle(tint)
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(10)
-        .background(Theme.backgroundSecondary)
-        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
     }
 }
 
@@ -4990,14 +4978,6 @@ private struct MissionRow: View {
         String(missionId.prefix(8))
     }
 
-    private var missionDisplayLabel: String {
-        let trimmed = displayName?.trimmingCharacters(in: .whitespacesAndNewlines)
-        if let trimmed, !trimmed.isEmpty {
-            return trimmed
-        }
-        return shortId
-    }
-
     private var statusColor: Color {
         if isRunning {
             return Theme.success
@@ -5029,25 +5009,76 @@ private struct MissionRow: View {
         }
     }
 
+    /// Whether the supplied `displayName` is just the uppercased short id.
+    /// `missionDisplayName(for:)` always returns at least the uppercased
+    /// 8-char short id (with an optional `"<workspace> · "` prefix), so we
+    /// can't detect the bare-id case by checking for nil/empty — we have to
+    /// compare against the actual short id. When it matches we suppress the
+    /// secondary line: the title above already carries the meaning.
+    private var displayLabelIsShortId: Bool {
+        guard let trimmed = displayName?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !trimmed.isEmpty
+        else { return true }
+        return trimmed.caseInsensitiveCompare(shortId) == .orderedSame
+    }
+
+    /// "<description> · <backend>" collapsed onto one line so we don't stack
+    /// four lineLimit-1 captions in a narrow row.
+    private var secondaryMetadataLine: String? {
+        var parts: [String] = []
+        if let shortDescription = shortDescription?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !shortDescription.isEmpty {
+            parts.append(shortDescription)
+        }
+        if let backend = backend?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !backend.isEmpty {
+            parts.append(backend)
+        }
+        return parts.isEmpty ? nil : parts.joined(separator: " · ")
+    }
+
+    private var trailingStatusPill: some View {
+        Group {
+            if isRunning, let state = runningState {
+                Text(state)
+                    .font(.caption2)
+                    .foregroundStyle(Theme.textMuted)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(Theme.backgroundSecondary)
+                    .clipShape(Capsule())
+            } else {
+                Text(status.displayLabel)
+                    .font(.caption2)
+                    .foregroundStyle(statusColor)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(statusColor.opacity(0.1))
+                    .clipShape(Capsule())
+            }
+        }
+    }
+
     var body: some View {
         Button {
             onSelect()
             HapticService.selectionChanged()
         } label: {
             HStack(spacing: 12) {
-                // Status icon indicator
                 Image(systemName: statusIcon)
                     .font(.system(size: 18))
                     .foregroundStyle(statusColor)
                     .symbolEffect(.pulse, options: (isRunning && runningState == "running") ? .repeating : .nonRepeating)
                     .frame(width: 24, height: 24)
 
-                // Mission info
                 VStack(alignment: .leading, spacing: 2) {
+                    // Title (or short id when there is no title) is the primary
+                    // line. The viewing checkmark sits right next to it.
                     HStack(spacing: 6) {
-                        Text(missionDisplayLabel)
-                            .font(.subheadline.monospaced().weight(.medium))
+                        Text(title?.isEmpty == false ? title! : shortId)
+                            .font(.subheadline.weight(.medium))
                             .foregroundStyle(Theme.textPrimary)
+                            .lineLimit(1)
 
                         if isViewing {
                             Image(systemName: "checkmark.circle.fill")
@@ -5056,82 +5087,78 @@ private struct MissionRow: View {
                         }
                     }
 
-                    if let title = title, !title.isEmpty {
-                        Text(title)
-                            .font(.caption)
+                    // Secondary line: optional human display name when distinct
+                    // from the short id, plus collapsed description+backend.
+                    if !displayLabelIsShortId,
+                       let displayName = displayName?.trimmingCharacters(in: .whitespacesAndNewlines),
+                       !displayName.isEmpty,
+                       displayName != title {
+                        Text(displayName)
+                            .font(.caption.monospaced())
                             .foregroundStyle(Theme.textSecondary)
                             .lineLimit(1)
                     }
 
-                    if let shortDescription = shortDescription, !shortDescription.isEmpty {
-                        Text(shortDescription)
+                    if let secondaryMetadataLine {
+                        Text(secondaryMetadataLine)
                             .font(.caption2)
                             .foregroundStyle(Theme.textMuted)
                             .lineLimit(1)
-                    }
-
-                    if let backend = backend?.trimmingCharacters(in: .whitespacesAndNewlines), !backend.isEmpty {
-                        Text(backend)
-                            .font(.caption2.monospaced())
-                            .foregroundStyle(Theme.textMuted)
-                            .lineLimit(1)
+                            .truncationMode(.tail)
                     }
                 }
 
-                Spacer()
+                Spacer(minLength: 8)
 
-                // Running state or status
-                if isRunning, let state = runningState {
-                    Text(state)
-                        .font(.caption2)
-                        .foregroundStyle(Theme.textMuted)
-                        .padding(.horizontal, 8)
-                        .padding(.vertical, 4)
-                        .background(Theme.backgroundSecondary)
-                        .clipShape(Capsule())
-                } else {
-                    Text(status.displayLabel)
-                        .font(.caption2)
-                        .foregroundStyle(statusColor)
-                        .padding(.horizontal, 8)
-                        .padding(.vertical, 4)
-                        .background(statusColor.opacity(0.1))
-                        .clipShape(Capsule())
-                }
-
-                if !quickActions.isEmpty, let onQuickAction {
-                    ForEach(quickActions, id: \.self) { action in
-                        Button {
-                            onQuickAction(action)
-                            HapticService.lightTap()
-                        } label: {
-                            Label(action.label, systemImage: action.icon)
-                                .font(.caption2.weight(.semibold))
-                                .padding(.horizontal, 8)
-                                .padding(.vertical, 4)
-                                .background(Theme.accent.opacity(0.14))
-                                .foregroundStyle(Theme.accent)
-                                .clipShape(Capsule())
-                        }
-                        .buttonStyle(.plain)
-                    }
-                }
-
-                // Cancel button for running missions
-                if let onCancel = onCancel {
-                    Button {
-                        onCancel()
-                        HapticService.lightTap()
-                    } label: {
-                        Image(systemName: "xmark.circle.fill")
-                            .foregroundStyle(Theme.textMuted)
-                    }
-                    .buttonStyle(.plain)
-                }
+                trailingStatusPill
             }
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+        .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+            // Cancel ships first so it occupies the leftmost (closest)
+            // trailing slot when the user swipes — matches Mail's destructive
+            // affordance placement.
+            if let onCancel {
+                Button(role: .destructive) {
+                    onCancel()
+                    HapticService.lightTap()
+                } label: {
+                    Label("Cancel", systemImage: "xmark.circle.fill")
+                }
+            }
+            if let onQuickAction {
+                ForEach(quickActions, id: \.self) { action in
+                    Button {
+                        onQuickAction(action)
+                        HapticService.lightTap()
+                    } label: {
+                        Label(action.label, systemImage: action.icon)
+                    }
+                    .tint(Theme.accent)
+                }
+            }
+        }
+        .contextMenu {
+            // Long-press fallback: keeps every action discoverable for
+            // accessibility and for users who don't know about swipes.
+            if let onQuickAction {
+                ForEach(quickActions, id: \.self) { action in
+                    Button {
+                        onQuickAction(action)
+                    } label: {
+                        Label(action.label, systemImage: action.icon)
+                    }
+                }
+            }
+            if let onCancel {
+                Button(role: .destructive) {
+                    onCancel()
+                } label: {
+                    Label("Cancel Mission", systemImage: "xmark.circle.fill")
+                }
+            }
+        }
     }
 }
 
