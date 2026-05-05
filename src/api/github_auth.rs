@@ -117,12 +117,10 @@ pub async fn start(
         ));
     }
 
-    let client_id = state
-        .config
-        .auth
-        .github_oauth_client_id
-        .as_deref()
-        .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "missing client id".into()))?;
+    let client_id = state.config.auth.github_oauth_client_id.as_deref().ok_or((
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "missing client id".into(),
+    ))?;
 
     let nonce = random_state();
     {
@@ -139,7 +137,10 @@ pub async fn start(
         );
     }
 
-    let server_redirect = format!("{}/api/auth/github/callback", server_base_url(&state, &headers));
+    let server_redirect = format!(
+        "{}/api/auth/github/callback",
+        server_base_url(&state, &headers)
+    );
     let authorize = format!(
         "https://github.com/login/oauth/authorize?client_id={}&state={}&redirect_uri={}&scope={}",
         urlencoding::encode(client_id),
@@ -186,8 +187,18 @@ pub async fn callback(
     };
 
     let token_url = "https://github.com/login/oauth/access_token";
-    let client_id = state.config.auth.github_oauth_client_id.as_deref().unwrap_or("");
-    let client_secret = state.config.auth.github_oauth_client_secret.as_deref().unwrap_or("");
+    let client_id = state
+        .config
+        .auth
+        .github_oauth_client_id
+        .as_deref()
+        .unwrap_or("");
+    let client_secret = state
+        .config
+        .auth
+        .github_oauth_client_secret
+        .as_deref()
+        .unwrap_or("");
 
     let token_resp: GithubTokenResponse = match state
         .http_client
@@ -203,9 +214,13 @@ pub async fn callback(
     {
         Ok(r) => match r.json().await {
             Ok(parsed) => parsed,
-            Err(e) => return redirect_with_error(&pending.redirect_uri, &format!("token parse: {e}")),
+            Err(e) => {
+                return redirect_with_error(&pending.redirect_uri, &format!("token parse: {e}"))
+            }
         },
-        Err(e) => return redirect_with_error(&pending.redirect_uri, &format!("token exchange: {e}")),
+        Err(e) => {
+            return redirect_with_error(&pending.redirect_uri, &format!("token exchange: {e}"))
+        }
     };
 
     let access_token = match token_resp.access_token {
@@ -230,7 +245,9 @@ pub async fn callback(
     {
         Ok(r) => match r.json().await {
             Ok(parsed) => parsed,
-            Err(e) => return redirect_with_error(&pending.redirect_uri, &format!("user parse: {e}")),
+            Err(e) => {
+                return redirect_with_error(&pending.redirect_uri, &format!("user parse: {e}"))
+            }
         },
         Err(e) => return redirect_with_error(&pending.redirect_uri, &format!("fetch user: {e}")),
     };
@@ -257,7 +274,11 @@ pub async fn callback(
     let target = format!(
         "{}{}token={}&exp={}",
         pending.redirect_uri,
-        if pending.redirect_uri.contains('?') { "&" } else { "?" },
+        if pending.redirect_uri.contains('?') {
+            "&"
+        } else {
+            "?"
+        },
         urlencoding::encode(&jwt),
         exp,
     );
