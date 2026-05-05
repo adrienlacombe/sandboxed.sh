@@ -385,20 +385,25 @@ object ToolUiParser {
     fun parse(name: String, args: kotlinx.serialization.json.JsonElement?): ToolUiContent {
         val obj = (args as? JsonObject) ?: return ToolUiContent.Unknown(name, args?.toString() ?: "")
         return when (name) {
-            "ui_data_table" -> ToolUiContent.DataTable(
+            "ui_dataTable", "ui_data_table" -> ToolUiContent.DataTable(
                 title = obj["title"]?.let { textOf(it) },
                 columns = (obj["columns"] as? kotlinx.serialization.json.JsonArray).orEmpty().map {
-                    val c = (it as? JsonObject) ?: return@map TableColumn("", "")
-                    TableColumn(
-                        id = textOf(c["id"]) ?: "",
-                        label = textOf(c["label"]) ?: textOf(c["id"]) ?: "",
-                    )
+                    val c = it as? JsonObject
+                    if (c == null) {
+                        val id = textOf(it) ?: ""
+                        TableColumn(id = id, label = id)
+                    } else {
+                        TableColumn(
+                            id = textOf(c["id"]) ?: "",
+                            label = textOf(c["label"]) ?: textOf(c["id"]) ?: "",
+                        )
+                    }
                 },
                 rows = (obj["rows"] as? kotlinx.serialization.json.JsonArray).orEmpty().mapNotNull {
                     (it as? JsonObject)?.mapValues { (_, v) -> textOf(v) ?: v.toString() }
                 },
             )
-            "ui_option_list" -> ToolUiContent.OptionList(
+            "ui_optionList", "ui_option_list" -> ToolUiContent.OptionList(
                 options = (obj["options"] as? kotlinx.serialization.json.JsonArray).orEmpty().mapNotNull {
                     val o = (it as? JsonObject) ?: return@mapNotNull null
                     UiOption(
@@ -408,7 +413,7 @@ object ToolUiParser {
                         disabled = textOf(o["disabled"]) == "true",
                     )
                 },
-                multiSelect = textOf(obj["selectionMode"]) == "multi",
+                multiSelect = textOf(obj["selectionMode"]) == "multi" || textOf(obj["multiple"]) == "true",
             )
             "ui_progress" -> ToolUiContent.Progress(
                 title = textOf(obj["title"]),
@@ -416,12 +421,12 @@ object ToolUiParser {
                 total = textOf(obj["total"])?.toIntOrNull() ?: 0,
                 status = textOf(obj["status"]),
             )
-            "ui_alert" -> ToolUiContent.Alert(
+            "ui_alert", "ui_notification" -> ToolUiContent.Alert(
                 title = textOf(obj["title"]) ?: "",
                 message = textOf(obj["message"]),
                 severity = textOf(obj["type"]) ?: "info",
             )
-            "ui_code_block" -> ToolUiContent.CodeBlock(
+            "ui_codeBlock", "ui_code", "ui_code_block" -> ToolUiContent.CodeBlock(
                 title = textOf(obj["title"]),
                 language = textOf(obj["language"]),
                 code = textOf(obj["code"]) ?: "",

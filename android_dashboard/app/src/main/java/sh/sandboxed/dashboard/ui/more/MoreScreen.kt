@@ -1,5 +1,6 @@
 package sh.sandboxed.dashboard.ui.more
 
+import android.net.Uri
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
@@ -38,6 +39,7 @@ fun MoreScreen(onNavigate: (String) -> Unit) {
     ) {
         item { Text("More", style = MaterialTheme.typography.headlineSmall, color = Palette.TextPrimary, modifier = Modifier.padding(bottom = 8.dp)) }
         item { Tile("Workspaces", "Hosts and containers", Icons.Filled.Computer) { onNavigate("workspaces") } }
+        item { Tile("Desktop", "Live stream and remote input", Icons.Filled.Computer) { onNavigate("desktop/${Uri.encode(":101")}") } }
         item { Tile("Tasks", "Subtasks running on the agent", Icons.Filled.Schedule) { onNavigate("tasks") } }
         item { Tile("Runs", "Cost-tracked invocations", Icons.Filled.MonetizationOn) { onNavigate("runs") } }
         item { Tile("FIDO approvals", "Auto-approve signing requests", Icons.Filled.Fingerprint) { onNavigate("fido_rules") } }
