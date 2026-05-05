@@ -515,21 +515,39 @@ impl WorkspaceExec {
     }
 
     async fn running_container_leader(&self) -> Option<String> {
-        let name = self.machine_name()?;
-        let machinectl = if Path::new("/usr/bin/machinectl").exists() {
-            "/usr/bin/machinectl"
-        } else {
-            "machinectl"
-        };
-        let output = Command::new(machinectl)
-            .args(["show", &name, "-p", "Leader", "--value"])
+        // Patched: discover the leader via pgrep instead of machinectl.
+        // Inside the docker entrypoint (Caddy as PID 1) machinectl refuses
+        // to operate, and machined cannot create cgroup scopes without
+        // systemd as PID 1, so we run nspawn with --register=no and locate
+        // the leader by scanning for `systemd-nspawn -D <workspace path>`.
+        let path = self.workspace.path.to_string_lossy().into_owned();
+        let nspawn_pids = Command::new("pgrep")
+            .args(["-f", &format!("systemd-nspawn.*-D {}", path)])
             .output()
             .await
             .ok()?;
-        if !output.status.success() {
+        if !nspawn_pids.status.success() {
             return None;
         }
-        let leader = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let nspawn_pid = String::from_utf8_lossy(&nspawn_pids.stdout)
+            .lines()
+            .next()
+            .map(|s| s.trim().to_string())?;
+        if nspawn_pid.is_empty() {
+            return None;
+        }
+        let child_pids = Command::new("pgrep")
+            .args(["-P", &nspawn_pid])
+            .output()
+            .await
+            .ok()?;
+        if !child_pids.status.success() {
+            return None;
+        }
+        let leader = String::from_utf8_lossy(&child_pids.stdout)
+            .lines()
+            .next()
+            .map(|s| s.trim().to_string())?;
         if leader.is_empty() {
             None
         } else {
@@ -560,6 +578,8 @@ impl WorkspaceExec {
         cmd.arg("--quiet");
         cmd.arg("--timezone=off");
         cmd.arg("--console=pipe");
+        cmd.arg("--register=no");
+        cmd.arg("--keep-unit");
 
         let context_dir_name = std::env::var("SANDBOXED_SH_CONTEXT_DIR_NAME")
             .ok()

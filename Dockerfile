@@ -11,7 +11,7 @@
 # ---------------------------------------------------------------------------
 # Stage 1: Rust builder
 # ---------------------------------------------------------------------------
-FROM rust:1.88-bookworm AS rust-builder
+FROM rust:1.91-bookworm AS rust-builder
 
 WORKDIR /build
 

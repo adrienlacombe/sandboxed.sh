@@ -4466,6 +4466,21 @@ echo "[sandboxed] Harness bootstrap start"
 # Keep bun global bin dirs discoverable for command checks and installed CLIs.
 export PATH="/root/.bun/bin:/root/.cache/.bun/bin:$PATH"
 
+# --- Patched: bootstrap a minbase debootstrap rootfs into a usable state.
+#     Without these the rest of this script no-ops (no bun, no npm, no curl)
+#     and the workspace ends up unusable for missions.
+export DEBIAN_FRONTEND=noninteractive
+if ! command -v curl >/dev/null 2>&1; then
+  echo "[sandboxed] baseline rootfs prereqs: installing curl/ca-certs/gnupg/git/jq/python3/build-essential"
+  apt-get update -qq || true
+  apt-get install -y -qq --no-install-recommends curl ca-certificates gnupg git jq python3 wget build-essential || true
+fi
+if ! command -v node >/dev/null 2>&1 && ! command -v bun >/dev/null 2>&1; then
+  echo "[sandboxed] baseline rootfs prereqs: installing Node.js 22 (NodeSource)"
+  curl -fsSL https://deb.nodesource.com/setup_22.x | bash - >/dev/null 2>&1 || true
+  apt-get install -y -qq --no-install-recommends nodejs || true
+fi
+
 # Ensure bun is in PATH first (it's our preferred package manager)
 if [ -x /root/.bun/bin/bun ] && ! command -v bun >/dev/null 2>&1; then
   ln -sf /root/.bun/bin/bun /usr/local/bin/bun || true
@@ -4486,9 +4501,19 @@ else
 fi
 
 if [ -n "$PKG_MGR" ]; then
+  # --- Patched: claude-code via npm to dodge bun ELF wrapping bug.
+  #     bun global-install of @anthropic-ai/claude-code points the
+  #     `claude` exec at the precompiled ELF inside the platform sub-package
+  #     and bun then tries to interpret it as JavaScript at runtime
+  #     (`error: Unexpected at .../claude:1:1`). npm wraps platform packages
+  #     correctly, so use npm for claude even when bun is preferred elsewhere.
+  CLAUDE_PKG_MGR="$PKG_MGR"
+  if [ "$PKG_MGR" = "bun" ] && command -v npm >/dev/null 2>&1; then
+    CLAUDE_PKG_MGR="npm"
+  fi
   if [ "{install_claudecode}" = "true" ] && ! command -v claude >/dev/null 2>&1; then
-    echo "[sandboxed] Installing Claude Code via $PKG_MGR..."
-    if ! $PKG_MGR install -g @anthropic-ai/claude-code@latest; then
+    echo "[sandboxed] Installing Claude Code via $CLAUDE_PKG_MGR..."
+    if ! $CLAUDE_PKG_MGR install -g @anthropic-ai/claude-code@latest; then
       echo "[sandboxed] Claude Code install failed"
     fi
   fi

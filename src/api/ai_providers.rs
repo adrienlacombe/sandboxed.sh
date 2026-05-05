@@ -1624,20 +1624,28 @@ fn write_codex_auth_json_apikey(config_dir: &std::path::Path, api_key: &str) -> 
 ///
 /// This is the standard auth mode for ChatGPT Plus/Pro users who do not have
 /// an OpenAI API platform organization.
-fn write_codex_auth_json_chatgpt(config_dir: &std::path::Path) -> Result<(), String> {
-    let entry = read_oauth_token_entry(ProviderType::OpenAI)
-        .ok_or_else(|| "No OpenAI OAuth credentials found in credential store".to_string())?;
-    if entry.access_token.trim().is_empty() {
-        return Err("OpenAI OAuth access token is empty".to_string());
+/// Shared writer for chatgpt-mode `auth.json`. Both
+/// `write_codex_auth_json_chatgpt` (reads tokens from the canonical
+/// credential store) and `write_codex_auth_json_chatgpt_with_tokens`
+/// (gets tokens passed in for per-attempt rotation) delegate here so the
+/// two paths cannot drift on payload shape, atomic-rename semantics, or
+/// permissions.
+fn write_codex_chatgpt_auth_file(
+    config_dir: &std::path::Path,
+    access_token: &str,
+    refresh_token: &str,
+    source_label: &str,
+) -> Result<(), String> {
+    if access_token.trim().is_empty() {
+        return Err("OAuth access_token is empty".to_string());
     }
 
-    // Extract chatgpt_account_id from the access_token JWT claims.
-    let account_id = extract_chatgpt_account_id(&entry.access_token);
-
-    // The Codex CLI stores an id_token in its tokens object.  We use the
-    // access_token as the id_token since both are JWTs from the same issuer
-    // and the CLI only reads claims from the id_token (chatgpt_account_id etc).
-    let id_token_value = entry.access_token.clone();
+    // The Codex CLI stores an id_token in its tokens object. We use the
+    // access_token as the id_token since both are JWTs from the same
+    // issuer and the CLI only reads claims from the id_token
+    // (chatgpt_account_id etc).
+    let account_id = extract_chatgpt_account_id(access_token);
+    let id_token_value = access_token.to_string();
 
     std::fs::create_dir_all(config_dir)
         .map_err(|e| format!("Failed to create Codex config dir: {}", e))?;
@@ -1651,8 +1659,8 @@ fn write_codex_auth_json_chatgpt(config_dir: &std::path::Path) -> Result<(), Str
         "OPENAI_API_KEY": null,
         "tokens": {
             "id_token": id_token_value,
-            "access_token": entry.access_token,
-            "refresh_token": entry.refresh_token,
+            "access_token": access_token,
+            "refresh_token": refresh_token,
             "account_id": account_id,
         },
         "last_refresh": now,
@@ -1673,9 +1681,21 @@ fn write_codex_auth_json_chatgpt(config_dir: &std::path::Path) -> Result<(), Str
     tracing::info!(
         path = %auth_path.display(),
         account_id = ?account_id,
+        source = %source_label,
         "Wrote Codex auth.json (chatgpt mode)"
     );
     Ok(())
+}
+
+fn write_codex_auth_json_chatgpt(config_dir: &std::path::Path) -> Result<(), String> {
+    let entry = read_oauth_token_entry(ProviderType::OpenAI)
+        .ok_or_else(|| "No OpenAI OAuth credentials found in credential store".to_string())?;
+    write_codex_chatgpt_auth_file(
+        config_dir,
+        &entry.access_token,
+        &entry.refresh_token,
+        "credential_store",
+    )
 }
 
 /// Extract `chatgpt_account_id` from an OpenAI JWT access token.
@@ -1772,6 +1792,125 @@ pub fn read_google_oauth_access_token() -> Option<String> {
         .filter(|s| !s.trim().is_empty())
 }
 
+/// One OpenAI ChatGPT-OAuth identity, materialised from `ai_providers.json`,
+/// usable as a rotation slot alongside raw API keys. The `chatgpt_account_id`
+/// is the rotation identity: OpenAI's usage cap is keyed on it, so two
+/// `ai_providers` rows that share a `chatgpt_account_id` are the same bucket
+/// and are de-duplicated by `get_all_openai_oauth_accounts`.
+#[derive(Debug, Clone)]
+pub struct CodexOAuthAccount {
+    pub provider_id: uuid::Uuid,
+    pub chatgpt_account_id: String,
+    pub refresh_token: String,
+    pub access_token: String,
+    pub expires_at: i64,
+    pub account_email: Option<String>,
+    pub priority: u32,
+}
+
+/// Per-attempt credential override passed to `write_codex_credentials_for_workspace`.
+/// The runner builds one of these for each rotation attempt; the legacy
+/// "process-global creds.json" path is the fallback when the override is `None`.
+#[derive(Debug, Clone)]
+pub enum CodexCredentialOverride<'a> {
+    ApiKey(&'a str),
+    OAuth(&'a CodexOAuthAccount),
+}
+
+/// Enumerate all enabled OpenAI ChatGPT-OAuth accounts in `ai_providers.json`,
+/// in priority/created_at order, de-duplicated by `chatgpt_account_id`.
+///
+/// Used by the codex turn rotation loop. Entries without a parseable
+/// `chatgpt_account_id` claim are skipped (we can't rotate over an identity
+/// we can't identify).
+pub fn get_all_openai_oauth_accounts(working_dir: &Path) -> Vec<CodexOAuthAccount> {
+    let providers = load_ai_providers(working_dir);
+
+    let mut entries: Vec<(u32, usize, &serde_json::Value)> = providers
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| {
+            p.get("provider_type").and_then(|v| v.as_str()) == Some("openai")
+                && p.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true)
+        })
+        .map(|(i, p)| {
+            let priority = p.get("priority").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+            (priority, i, p)
+        })
+        .collect();
+    entries.sort_by_key(|(p, i, _)| (*p, *i));
+
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut accounts: Vec<CodexOAuthAccount> = Vec::new();
+    for (priority, _, p) in entries {
+        let oauth = match p.get("oauth").and_then(|o| o.as_object()) {
+            Some(o) => o,
+            None => continue,
+        };
+        let refresh = oauth
+            .get("refresh_token")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let access = oauth
+            .get("access_token")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let expires_at = oauth
+            .get("expires_at")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        if refresh.is_empty() || access.is_empty() {
+            continue;
+        }
+        let chatgpt_account_id = match extract_chatgpt_account_id(access) {
+            Some(id) => id,
+            None => {
+                tracing::debug!(
+                    "Skipping OpenAI provider entry: access_token has no chatgpt_account_id claim"
+                );
+                continue;
+            }
+        };
+        if !seen.insert(chatgpt_account_id.clone()) {
+            tracing::debug!(
+                chatgpt_account_id = %chatgpt_account_id,
+                "Skipping duplicate OpenAI OAuth identity"
+            );
+            continue;
+        }
+        let provider_id = p
+            .get("id")
+            .and_then(|v| v.as_str())
+            .and_then(|s| uuid::Uuid::parse_str(s).ok())
+            .unwrap_or_else(uuid::Uuid::new_v4);
+        let account_email = p
+            .get("account_email")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        accounts.push(CodexOAuthAccount {
+            provider_id,
+            chatgpt_account_id,
+            refresh_token: refresh.to_string(),
+            access_token: access.to_string(),
+            expires_at,
+            account_email,
+            priority,
+        });
+    }
+    accounts
+}
+
+/// Write a chatgpt-mode `auth.json` for codex from an explicit OAuth token
+/// pair (instead of reading the canonical single-slot credential store).
+/// Used when the runner is rotating across multiple OAuth identities.
+pub(crate) fn write_codex_auth_json_chatgpt_with_tokens(
+    config_dir: &Path,
+    access_token: &str,
+    refresh_token: &str,
+) -> Result<(), String> {
+    write_codex_chatgpt_auth_file(config_dir, access_token, refresh_token, "rotation_override")
+}
+
 /// Write Codex credentials to a workspace.
 ///
 /// For container workspaces, writes to the container's root home directory.
@@ -1779,7 +1918,7 @@ pub fn read_google_oauth_access_token() -> Option<String> {
 pub fn write_codex_credentials_for_workspace(
     workspace: &crate::workspace::Workspace,
     working_dir: &Path,
-    override_api_key: Option<&str>,
+    override_credential: Option<&CodexCredentialOverride>,
 ) -> Result<(), String> {
     use crate::workspace::WorkspaceType;
 
@@ -1795,13 +1934,39 @@ pub fn write_codex_credentials_for_workspace(
         }
     };
 
-    // Priority 0: Use the override key if provided (used during account rotation
-    // to avoid mutating the process-global OPENAI_API_KEY env var).
-    // Priority 1: Use a minted API key if available.
-    if let Some(api_key) = override_api_key
-        .map(|s| s.to_string())
-        .or_else(|| get_openai_api_key_for_codex_default(working_dir))
-    {
+    // Priority 0a: Explicit override (rotation path).
+    match override_credential {
+        Some(CodexCredentialOverride::ApiKey(key)) => {
+            write_codex_auth_json_apikey(&codex_dir, key)?;
+            log_codex_auth_status(workspace, &codex_dir, "api_key_override");
+            tracing::info!(
+                workspace_id = %workspace.id,
+                workspace_type = ?workspace.workspace_type,
+                "Wrote Codex auth.json for workspace (api key, rotation override)"
+            );
+            return Ok(());
+        }
+        Some(CodexCredentialOverride::OAuth(account)) => {
+            write_codex_auth_json_chatgpt_with_tokens(
+                &codex_dir,
+                &account.access_token,
+                &account.refresh_token,
+            )?;
+            log_codex_auth_status(workspace, &codex_dir, "chatgpt_oauth_override");
+            tracing::info!(
+                workspace_id = %workspace.id,
+                workspace_type = ?workspace.workspace_type,
+                provider_id = %account.provider_id,
+                chatgpt_account_id = %account.chatgpt_account_id,
+                "Wrote Codex auth.json for workspace (chatgpt mode, rotation override)"
+            );
+            return Ok(());
+        }
+        None => {}
+    }
+
+    // Priority 1: Use a minted API key if available (no rotation context).
+    if let Some(api_key) = get_openai_api_key_for_codex_default(working_dir) {
         write_codex_auth_json_apikey(&codex_dir, &api_key)?;
         log_codex_auth_status(workspace, &codex_dir, "api_key");
         tracing::info!(
