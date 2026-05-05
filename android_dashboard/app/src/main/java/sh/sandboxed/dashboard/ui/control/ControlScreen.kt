@@ -26,23 +26,38 @@ import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.OpenInNew
 import androidx.compose.material.icons.automirrored.filled.Send
+import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.AttachFile
 import androidx.compose.material.icons.filled.Cancel
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Computer
+import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Flag
+import androidx.compose.material.icons.filled.History
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Schedule
 import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.FilterChip
+import androidx.compose.material3.FilterChipDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
+import androidx.compose.material3.TextFieldDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -55,11 +70,17 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import sh.sandboxed.dashboard.data.AppContainer
+import sh.sandboxed.dashboard.data.Backend
+import sh.sandboxed.dashboard.data.BackendAgent
 import sh.sandboxed.dashboard.data.ChatMessage
 import sh.sandboxed.dashboard.data.ChatMessageKind
+import sh.sandboxed.dashboard.data.Mission
+import sh.sandboxed.dashboard.data.MissionStatus
+import sh.sandboxed.dashboard.data.Provider
 import sh.sandboxed.dashboard.data.QueuedMessage
 import sh.sandboxed.dashboard.data.RunningMissionInfo
 import sh.sandboxed.dashboard.data.SharedFile
+import sh.sandboxed.dashboard.data.Workspace
 import sh.sandboxed.dashboard.ui.components.ErrorBanner
 import sh.sandboxed.dashboard.ui.components.GlassCard
 import sh.sandboxed.dashboard.ui.components.StatusBadge
@@ -68,50 +89,144 @@ import sh.sandboxed.dashboard.ui.theme.Palette
 import sh.sandboxed.dashboard.util.Haptics
 
 @Composable
-fun ControlScreen(container: AppContainer, onOpenAutomations: (String) -> Unit) {
+fun ControlScreen(
+    container: AppContainer,
+    onOpenAutomations: (String) -> Unit,
+    onOpenDesktop: (String) -> Unit,
+) {
     val vm = remember { ControlViewModel(container) }
     val state by vm.state.collectAsState()
     val listState = rememberLazyListState()
     val haptics = remember { Haptics(container) }
+    var showNewMission by remember { mutableStateOf(false) }
+    var showMissionSwitcher by remember { mutableStateOf(false) }
+    var showWorkers by remember { mutableStateOf(false) }
 
     LaunchedEffect(state.messages.size) {
         if (state.messages.isNotEmpty()) listState.animateScrollToItem(state.messages.lastIndex)
     }
 
-    Column(Modifier.fillMaxSize()) {
-        TopBar(
-            mission = state.mission,
-            connected = state.isConnected,
-            canResume = state.mission?.status?.canResume == true,
-            onResume = { haptics.success(); vm.resume() },
-            onAutomations = { state.mission?.id?.let(onOpenAutomations) },
+    LaunchedEffect(showMissionSwitcher) {
+        if (showMissionSwitcher) vm.loadRecentMissions()
+    }
+
+    LaunchedEffect(state.desktopOpenRequest) {
+        if (state.desktopOpenRequest > 0) onOpenDesktop(state.desktopDisplay)
+    }
+
+    Box(Modifier.fillMaxSize()) {
+        Column(Modifier.fillMaxSize()) {
+            TopBar(
+                mission = state.mission,
+                connected = state.isConnected,
+                canResume = state.mission?.let { it.status.canResume || it.resumable } == true,
+                workerCount = state.childMissions.size,
+                runningCount = state.parallel.size,
+                onResume = { haptics.success(); vm.resume() },
+                onAutomations = { state.mission?.id?.let(onOpenAutomations) },
+                onNewMission = { showNewMission = true },
+                onSwitchMissions = { showMissionSwitcher = true },
+                onWorkers = { showWorkers = true },
+                onDesktop = { onOpenDesktop(state.desktopDisplay) },
+            )
+            if (state.parallel.isNotEmpty()) {
+                ParallelBar(state.parallel, state.mission?.id) { haptics.selection(); vm.switchMission(it) }
+            }
+            state.goalStatus?.takeIf { it.isNotBlank() }?.let { GoalBanner(it) }
+            state.error?.let { Box(Modifier.padding(horizontal = 16.dp, vertical = 8.dp)) { ErrorBanner(it) } }
+            if (state.queue.isNotEmpty()) QueueBar(state.queue, vm::deleteQueueItem, vm::clearQueue)
+            LazyColumn(
+                state = listState,
+                modifier = Modifier.weight(1f).fillMaxWidth(),
+                contentPadding = PaddingValues(16.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                items(state.messages, key = { it.id }) { msg -> MessageRow(msg) }
+            }
+            Composer(
+                value = state.draft,
+                onChange = vm::setDraft,
+                onSend = { haptics.medium(); vm.send() },
+                onCancel = { haptics.error(); vm.cancel() },
+                isSending = state.isSending,
+            )
+        }
+    }
+
+    if (showNewMission) {
+        NewMissionDialog(
+            container = container,
+            onDismiss = { showNewMission = false },
+            onCreate = { options ->
+                showNewMission = false
+                haptics.success()
+                vm.createMission(options)
+            },
         )
-        if (state.parallel.isNotEmpty()) {
-            ParallelBar(state.parallel, state.mission?.id) { haptics.selection(); vm.switchMission(it) }
-        }
-        state.goalStatus?.takeIf { it.isNotBlank() }?.let { GoalBanner(it) }
-        state.error?.let { Box(Modifier.padding(horizontal = 16.dp, vertical = 8.dp)) { ErrorBanner(it) } }
-        if (state.queue.isNotEmpty()) QueueBar(state.queue, vm::deleteQueueItem, vm::clearQueue)
-        LazyColumn(
-            state = listState,
-            modifier = Modifier.weight(1f).fillMaxWidth(),
-            contentPadding = PaddingValues(16.dp),
-            verticalArrangement = Arrangement.spacedBy(8.dp),
-        ) {
-            items(state.messages, key = { it.id }) { msg -> MessageRow(msg) }
-        }
-        Composer(
-            value = state.draft,
-            onChange = vm::setDraft,
-            onSend = { haptics.medium(); vm.send() },
-            onCancel = { haptics.error(); vm.cancel() },
-            isSending = state.isSending,
+    }
+    if (showMissionSwitcher) {
+        MissionSwitcherDialog(
+            currentMissionId = state.mission?.id,
+            running = state.parallel,
+            recent = state.recentMissions,
+            loading = state.loadingRecent,
+            onDismiss = { showMissionSwitcher = false },
+            onOpen = {
+                showMissionSwitcher = false
+                haptics.selection()
+                vm.switchMission(it)
+            },
+            onResume = {
+                showMissionSwitcher = false
+                haptics.success()
+                vm.resumeMission(it)
+            },
+            onFollowUp = {
+                showMissionSwitcher = false
+                haptics.selection()
+                vm.createFollowUpMission(it)
+            },
+            onCancel = {
+                haptics.error()
+                vm.cancelMission(it)
+            },
+            onDelete = {
+                haptics.error()
+                vm.deleteMission(it)
+            },
+            onNewMission = {
+                showMissionSwitcher = false
+                showNewMission = true
+            },
+        )
+    }
+    if (showWorkers) {
+        WorkerDialog(
+            workers = state.childMissions,
+            running = state.parallel,
+            onDismiss = { showWorkers = false },
+            onOpen = {
+                showWorkers = false
+                vm.switchMission(it)
+            },
         )
     }
 }
 
 @Composable
-private fun TopBar(mission: sh.sandboxed.dashboard.data.Mission?, connected: Boolean, canResume: Boolean, onResume: () -> Unit, onAutomations: () -> Unit) {
+private fun TopBar(
+    mission: Mission?,
+    connected: Boolean,
+    canResume: Boolean,
+    workerCount: Int,
+    runningCount: Int,
+    onResume: () -> Unit,
+    onAutomations: () -> Unit,
+    onNewMission: () -> Unit,
+    onSwitchMissions: () -> Unit,
+    onWorkers: () -> Unit,
+    onDesktop: () -> Unit,
+) {
     Column(Modifier.fillMaxWidth().background(Palette.BackgroundSecondary).padding(horizontal = 16.dp, vertical = 12.dp)) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Column(Modifier.weight(1f)) {
@@ -128,6 +243,21 @@ private fun TopBar(mission: sh.sandboxed.dashboard.data.Mission?, connected: Boo
             if (mission != null) {
                 IconButton(onClick = onAutomations) { Icon(Icons.Filled.Settings, "Automations", tint = Palette.TextSecondary) }
             }
+            IconButton(onClick = onDesktop) { Icon(Icons.Filled.Computer, "Desktop", tint = Palette.TextSecondary) }
+            if (workerCount > 0) {
+                IconButton(onClick = onWorkers) {
+                    Text("W$workerCount", color = Palette.AccentLight, style = MaterialTheme.typography.labelMedium)
+                }
+            }
+            IconButton(onClick = onSwitchMissions) {
+                Box(contentAlignment = Alignment.Center) {
+                    Icon(Icons.Filled.History, "Missions", tint = if (runningCount > 0) Palette.Accent else Palette.TextSecondary)
+                    if (runningCount > 0) {
+                        Text(runningCount.toString(), color = Palette.TextPrimary, style = MaterialTheme.typography.labelSmall, modifier = Modifier.padding(top = 18.dp))
+                    }
+                }
+            }
+            IconButton(onClick = onNewMission) { Icon(Icons.Filled.Add, "New mission", tint = Palette.Accent) }
         }
         if (mission != null && (mission.metadataModel != null || mission.metadataSource != null || mission.workspaceName != null)) {
             Spacer(Modifier.height(4.dp))
@@ -227,6 +357,391 @@ private fun ParallelBar(running: List<RunningMissionInfo>, currentId: String?, o
                 Text(r.title?.take(20) ?: r.missionId.take(8), style = MaterialTheme.typography.labelMedium, color = Palette.TextPrimary)
             }
         }
+    }
+}
+
+@Composable
+private fun NewMissionDialog(
+    container: AppContainer,
+    onDismiss: () -> Unit,
+    onCreate: (NewMissionOptions) -> Unit,
+) {
+    var workspaces by remember { mutableStateOf<List<Workspace>>(emptyList()) }
+    var backends by remember { mutableStateOf<List<Backend>>(emptyList()) }
+    var agentsByBackend by remember { mutableStateOf<Map<String, List<BackendAgent>>>(emptyMap()) }
+    var providers by remember { mutableStateOf<List<Provider>>(emptyList()) }
+    var selectedWorkspaceId by remember { mutableStateOf<String?>(null) }
+    var selectedBackend by remember { mutableStateOf("") }
+    var selectedAgent by remember { mutableStateOf("") }
+    var selectedModel by remember { mutableStateOf("") }
+    var loading by remember { mutableStateOf(true) }
+
+    LaunchedEffect(Unit) {
+        val settings = container.cached.value
+        workspaces = runCatching { container.api.listWorkspaces() }.getOrNull().orEmpty()
+        backends = runCatching { container.api.listBackends() }.getOrNull().orEmpty()
+        agentsByBackend = backends.associate { backend ->
+            backend.id to runCatching { container.api.listBackendAgents(backend.id) }.getOrNull().orEmpty()
+        }
+        providers = runCatching { container.api.listProviders() }.getOrNull()?.providers.orEmpty()
+
+        selectedWorkspaceId = workspaces.firstOrNull { it.isDefault }?.id ?: workspaces.firstOrNull()?.id
+        selectedBackend = settings.defaultBackend.takeIf { saved -> backends.any { it.id == saved } }
+            ?: backends.firstOrNull()?.id.orEmpty()
+        val selectedAgents = agentsByBackend[selectedBackend].orEmpty()
+        selectedAgent = settings.defaultAgent.takeIf { saved -> selectedAgents.any { it.id == saved } }
+            ?: selectedAgents.firstOrNull()?.id.orEmpty()
+        loading = false
+    }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("New mission", color = Palette.TextPrimary) },
+        text = {
+            if (loading) {
+                Box(Modifier.fillMaxWidth().padding(24.dp), contentAlignment = Alignment.Center) {
+                    CircularProgressIndicator(color = Palette.Accent)
+                }
+            } else {
+                LazyColumn(
+                    modifier = Modifier.fillMaxWidth().heightIn(max = 520.dp),
+                    verticalArrangement = Arrangement.spacedBy(12.dp),
+                ) {
+                    item { DialogSection("Workspace") }
+                    items(workspaces, key = { it.id }) { workspace ->
+                        SelectRow(
+                            title = workspace.name,
+                            subtitle = "${workspace.workspaceType} · ${workspace.path}",
+                            selected = selectedWorkspaceId == workspace.id,
+                        ) { selectedWorkspaceId = workspace.id }
+                    }
+
+                    item { DialogSection("Agent") }
+                    item {
+                        LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            items(backends, key = { it.id }) { backend ->
+                                FilterChip(
+                                    selected = selectedBackend == backend.id,
+                                    onClick = {
+                                        selectedBackend = backend.id
+                                        selectedAgent = agentsByBackend[backend.id].orEmpty().firstOrNull()?.id.orEmpty()
+                                        selectedModel = ""
+                                    },
+                                    label = { Text(backend.name, style = MaterialTheme.typography.labelSmall) },
+                                    colors = dialogChipColors(),
+                                )
+                            }
+                        }
+                    }
+                    items(agentsByBackend[selectedBackend].orEmpty(), key = { it.id }) { agent ->
+                        SelectRow(
+                            title = agent.name,
+                            subtitle = selectedBackend,
+                            selected = selectedAgent == agent.id,
+                        ) { selectedAgent = agent.id }
+                    }
+
+                    item { DialogSection("Model override") }
+                    item {
+                        SelectRow(
+                            title = "Default",
+                            subtitle = "Use the selected agent or server default",
+                            selected = selectedModel.isBlank(),
+                        ) { selectedModel = "" }
+                    }
+                    items(filteredProviders(providers, selectedBackend), key = { it.id }) { provider ->
+                        Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                            Text(provider.name, color = Palette.TextTertiary, style = MaterialTheme.typography.labelMedium)
+                            provider.models.take(12).forEach { model ->
+                                val value = if (selectedBackend == "opencode") "${provider.id}/${model.id}" else model.id
+                                SelectRow(
+                                    title = model.name,
+                                    subtitle = value,
+                                    selected = selectedModel == value,
+                                ) { selectedModel = value }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            Button(
+                onClick = {
+                    onCreate(
+                        NewMissionOptions(
+                            workspaceId = selectedWorkspaceId,
+                            agent = selectedAgent.takeIf { it.isNotBlank() },
+                            modelOverride = selectedModel.takeIf { it.isNotBlank() },
+                            backend = selectedBackend.takeIf { it.isNotBlank() },
+                        )
+                    )
+                },
+                enabled = !loading && selectedWorkspaceId != null && selectedBackend.isNotBlank(),
+                colors = ButtonDefaults.buttonColors(containerColor = Palette.Accent),
+            ) { Text("Create") }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
+        containerColor = Palette.Card,
+    )
+}
+
+@Composable
+private fun MissionSwitcherDialog(
+    currentMissionId: String?,
+    running: List<RunningMissionInfo>,
+    recent: List<Mission>,
+    loading: Boolean,
+    onDismiss: () -> Unit,
+    onOpen: (String) -> Unit,
+    onResume: (String) -> Unit,
+    onFollowUp: (Mission) -> Unit,
+    onCancel: (String) -> Unit,
+    onDelete: (String) -> Unit,
+    onNewMission: () -> Unit,
+) {
+    var query by remember { mutableStateOf("") }
+    val normalized = query.trim().lowercase()
+    val runningIds = running.map { it.missionId }.toSet()
+    val visibleRecent = recent.filter { m ->
+        normalized.isBlank() ||
+            (m.title ?: "").lowercase().contains(normalized) ||
+            (m.shortDescription ?: "").lowercase().contains(normalized) ||
+            (m.agent ?: "").lowercase().contains(normalized) ||
+            m.id.lowercase().contains(normalized)
+    }
+    val byId = recent.associateBy { it.id }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Missions", color = Palette.TextPrimary) },
+        text = {
+            LazyColumn(
+                modifier = Modifier.fillMaxWidth().heightIn(max = 540.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                item {
+                    OutlinedTextField(
+                        value = query,
+                        onValueChange = { query = it },
+                        singleLine = true,
+                        label = { Text("Search") },
+                        modifier = Modifier.fillMaxWidth(),
+                        colors = dialogFieldColors(),
+                    )
+                }
+                if (loading) item { LinearLoading() }
+                if (running.isNotEmpty()) item { DialogSection("Running") }
+                items(running, key = { it.missionId }) { info ->
+                    MissionSwitcherRunningRow(
+                        info = info,
+                        mission = byId[info.missionId],
+                        current = currentMissionId == info.missionId,
+                        onOpen = { onOpen(info.missionId) },
+                        onCancel = { onCancel(info.missionId) },
+                    )
+                }
+
+                val nonRunning = visibleRecent.filterNot { it.id in runningIds }
+                if (nonRunning.any { it.status == MissionStatus.ACTIVE || it.status == MissionStatus.PENDING }) {
+                    item { DialogSection("Active & pending") }
+                    items(nonRunning.filter { it.status == MissionStatus.ACTIVE || it.status == MissionStatus.PENDING }, key = { it.id }) { m ->
+                        MissionSwitcherMissionRow(m, currentMissionId == m.id, onOpen, onResume, onFollowUp, onCancel, onDelete)
+                    }
+                }
+                val completed = nonRunning.filter { it.status == MissionStatus.COMPLETED }
+                if (completed.isNotEmpty()) {
+                    item { DialogSection("Completed") }
+                    items(completed, key = { it.id }) { m ->
+                        MissionSwitcherMissionRow(m, currentMissionId == m.id, onOpen, onResume, onFollowUp, onCancel, onDelete)
+                    }
+                }
+                val failed = nonRunning.filter { it.status == MissionStatus.FAILED || it.status == MissionStatus.NOT_FEASIBLE }
+                if (failed.isNotEmpty()) {
+                    item { DialogSection("Failed") }
+                    items(failed, key = { it.id }) { m ->
+                        MissionSwitcherMissionRow(m, currentMissionId == m.id, onOpen, onResume, onFollowUp, onCancel, onDelete)
+                    }
+                }
+                val interrupted = nonRunning.filter { it.status == MissionStatus.INTERRUPTED || it.status == MissionStatus.BLOCKED }
+                if (interrupted.isNotEmpty()) {
+                    item { DialogSection("Interrupted") }
+                    items(interrupted, key = { it.id }) { m ->
+                        MissionSwitcherMissionRow(m, currentMissionId == m.id, onOpen, onResume, onFollowUp, onCancel, onDelete)
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            Button(onClick = onNewMission, colors = ButtonDefaults.buttonColors(containerColor = Palette.Accent)) {
+                Text("New")
+            }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Close") } },
+        containerColor = Palette.Card,
+    )
+}
+
+@Composable
+private fun WorkerDialog(
+    workers: List<Mission>,
+    running: List<RunningMissionInfo>,
+    onDismiss: () -> Unit,
+    onOpen: (String) -> Unit,
+) {
+    val runningIds = running.map { it.missionId }.toSet()
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Workers", color = Palette.TextPrimary) },
+        text = {
+            LazyColumn(
+                modifier = Modifier.fillMaxWidth().heightIn(max = 460.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                val active = workers.filter { it.id in runningIds || it.status == MissionStatus.ACTIVE || it.status == MissionStatus.PENDING }
+                val completed = workers.filter { it.status == MissionStatus.COMPLETED }
+                val failed = workers.filter { it.status == MissionStatus.FAILED || it.status == MissionStatus.NOT_FEASIBLE || it.status == MissionStatus.INTERRUPTED }
+                if (active.isNotEmpty()) item { DialogSection("Running") }
+                items(active, key = { it.id }) { worker -> WorkerRow(worker, running.firstOrNull { it.missionId == worker.id }, onOpen) }
+                if (completed.isNotEmpty()) item { DialogSection("Completed") }
+                items(completed, key = { it.id }) { worker -> WorkerRow(worker, null, onOpen) }
+                if (failed.isNotEmpty()) item { DialogSection("Failed") }
+                items(failed, key = { it.id }) { worker -> WorkerRow(worker, null, onOpen) }
+                if (workers.isEmpty()) item { Text("No workers yet", color = Palette.TextTertiary) }
+            }
+        },
+        confirmButton = { TextButton(onClick = onDismiss) { Text("Close") } },
+        containerColor = Palette.Card,
+    )
+}
+
+@Composable
+private fun WorkerRow(worker: Mission, running: RunningMissionInfo?, onOpen: (String) -> Unit) {
+    GlassCard(modifier = Modifier.fillMaxWidth(), onClick = { onOpen(worker.id) }) {
+        Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(worker.title ?: worker.shortDescription ?: worker.id.take(8), color = Palette.TextPrimary, style = MaterialTheme.typography.titleSmall, modifier = Modifier.weight(1f))
+                StatusBadge(worker.status)
+            }
+            running?.currentActivity?.takeIf { it.isNotBlank() }?.let {
+                Text(it, color = Palette.TextTertiary, style = MaterialTheme.typography.bodySmall, maxLines = 2)
+            }
+        }
+    }
+}
+
+@Composable
+private fun MissionSwitcherRunningRow(
+    info: RunningMissionInfo,
+    mission: Mission?,
+    current: Boolean,
+    onOpen: () -> Unit,
+    onCancel: () -> Unit,
+) {
+    GlassCard(modifier = Modifier.fillMaxWidth(), onClick = onOpen) {
+        Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                val color = when {
+                    info.isSeverelyStalled -> Palette.Error
+                    info.isStalled -> Palette.Warning
+                    info.isRunning -> Palette.Success
+                    else -> Palette.TextTertiary
+                }
+                Box(Modifier.size(10.dp).background(color, RoundedCornerShape(5.dp)))
+                Spacer(Modifier.width(8.dp))
+                Text(info.title ?: mission?.title ?: info.missionId.take(8), color = if (current) Palette.AccentLight else Palette.TextPrimary, style = MaterialTheme.typography.titleSmall, modifier = Modifier.weight(1f))
+                IconButton(onClick = onCancel) { Icon(Icons.Filled.Cancel, "Cancel", tint = Palette.Warning) }
+            }
+            info.currentActivity?.takeIf { it.isNotBlank() }?.let {
+                Text(it, color = Palette.TextTertiary, style = MaterialTheme.typography.bodySmall, maxLines = 2)
+            }
+            if (info.queueLen > 0) Text("${info.queueLen} queued", color = Palette.Warning, style = MaterialTheme.typography.labelSmall)
+        }
+    }
+}
+
+@Composable
+private fun MissionSwitcherMissionRow(
+    mission: Mission,
+    current: Boolean,
+    onOpen: (String) -> Unit,
+    onResume: (String) -> Unit,
+    onFollowUp: (Mission) -> Unit,
+    onCancel: (String) -> Unit,
+    onDelete: (String) -> Unit,
+) {
+    GlassCard(modifier = Modifier.fillMaxWidth(), onClick = { onOpen(mission.id) }) {
+        Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(mission.title ?: mission.shortDescription ?: mission.id.take(8), color = if (current) Palette.AccentLight else Palette.TextPrimary, style = MaterialTheme.typography.titleSmall, modifier = Modifier.weight(1f))
+                StatusBadge(mission.status)
+            }
+            Row(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
+                Text(mission.updatedAt.take(19).replace('T', ' '), color = Palette.TextTertiary, style = MaterialTheme.typography.bodySmall, modifier = Modifier.weight(1f))
+                if (mission.status.canResume || mission.resumable || mission.status == MissionStatus.FAILED || mission.status == MissionStatus.NOT_FEASIBLE) {
+                    TextButton(onClick = { onResume(mission.id) }) { Text(if (mission.status == MissionStatus.FAILED || mission.status == MissionStatus.NOT_FEASIBLE) "Retry" else "Resume") }
+                }
+                if (mission.status != MissionStatus.ACTIVE && mission.status != MissionStatus.PENDING) {
+                    TextButton(onClick = { onFollowUp(mission) }) { Text("Follow up") }
+                } else {
+                    IconButton(onClick = { onCancel(mission.id) }) { Icon(Icons.Filled.Cancel, "Cancel", tint = Palette.Warning) }
+                }
+                if (mission.status != MissionStatus.ACTIVE && mission.status != MissionStatus.PENDING) {
+                    IconButton(onClick = { onDelete(mission.id) }) { Icon(Icons.Filled.Delete, "Delete", tint = Palette.Error) }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun DialogSection(title: String) {
+    Text(title.uppercase(), color = Palette.TextTertiary, style = MaterialTheme.typography.labelMedium)
+}
+
+@Composable
+private fun SelectRow(title: String, subtitle: String?, selected: Boolean, onClick: () -> Unit) {
+    GlassCard(modifier = Modifier.fillMaxWidth(), onClick = onClick) {
+        Row(Modifier.padding(10.dp), verticalAlignment = Alignment.CenterVertically) {
+            Column(Modifier.weight(1f)) {
+                Text(title, color = if (selected) Palette.AccentLight else Palette.TextPrimary, style = MaterialTheme.typography.bodyMedium)
+                subtitle?.takeIf { it.isNotBlank() }?.let {
+                    Text(it, color = Palette.TextTertiary, style = MaterialTheme.typography.bodySmall, maxLines = 1)
+                }
+            }
+            if (selected) Text("Selected", color = Palette.Accent, style = MaterialTheme.typography.labelSmall)
+        }
+    }
+}
+
+private fun filteredProviders(providers: List<Provider>, backend: String): List<Provider> = when (backend) {
+    "claudecode", "amp" -> providers.filter { it.id == "anthropic" }
+    "codex" -> providers.filter { it.id == "openai" }
+    "gemini" -> providers.filter { it.id == "google" }
+    else -> providers
+}
+
+@Composable
+private fun dialogChipColors() = FilterChipDefaults.filterChipColors(
+    containerColor = Palette.Card,
+    selectedContainerColor = Palette.Accent.copy(alpha = 0.18f),
+    labelColor = Palette.TextSecondary,
+    selectedLabelColor = Palette.Accent,
+)
+
+@Composable
+private fun dialogFieldColors() = TextFieldDefaults.colors(
+    focusedContainerColor = Palette.Card,
+    unfocusedContainerColor = Palette.Card,
+    focusedTextColor = Palette.TextPrimary,
+    unfocusedTextColor = Palette.TextPrimary,
+    cursorColor = Palette.Accent,
+)
+
+@Composable
+private fun LinearLoading() {
+    Box(Modifier.fillMaxWidth().padding(8.dp), contentAlignment = Alignment.Center) {
+        CircularProgressIndicator(strokeWidth = 2.dp, modifier = Modifier.height(20.dp), color = Palette.Accent)
     }
 }
 

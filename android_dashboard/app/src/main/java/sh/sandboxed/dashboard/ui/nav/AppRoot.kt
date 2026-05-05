@@ -1,5 +1,6 @@
 package sh.sandboxed.dashboard.ui.nav
 
+import android.net.Uri
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
@@ -37,6 +38,7 @@ import sh.sandboxed.dashboard.data.AppSettings
 import sh.sandboxed.dashboard.ui.auth.AuthGate
 import sh.sandboxed.dashboard.ui.automations.AutomationsScreen
 import sh.sandboxed.dashboard.ui.control.ControlScreen
+import sh.sandboxed.dashboard.ui.desktop.DesktopStreamScreen
 import sh.sandboxed.dashboard.ui.fido.FidoOverlay
 import sh.sandboxed.dashboard.ui.fido.FidoRulesScreen
 import sh.sandboxed.dashboard.ui.files.FilesScreen
@@ -114,9 +116,11 @@ private fun MainScaffold(container: AppContainer, host: FragmentActivity?) {
 private fun AppNavHost(navController: NavHostController, container: AppContainer) {
     NavHost(navController = navController, startDestination = "control") {
         composable("control") {
-            ControlScreen(container) { missionId ->
-                navController.navigate("automations/$missionId")
-            }
+            ControlScreen(
+                container = container,
+                onOpenAutomations = { missionId -> navController.navigate("automations/$missionId") },
+                onOpenDesktop = { display -> navController.navigate("desktop/${Uri.encode(display)}") },
+            )
         }
         composable("history") {
             HistoryScreen(container) { missionId ->
@@ -134,6 +138,13 @@ private fun AppNavHost(navController: NavHostController, container: AppContainer
         composable("runs") { RunsScreen(container) }
         composable("settings") { SettingsScreen(container) }
         composable("fido_rules") { FidoRulesScreen(container) { navController.popBackStack() } }
+        composable(
+            route = "desktop/{display}",
+            arguments = listOf(navArgument("display") { type = NavType.StringType }),
+        ) { entry ->
+            val display = Uri.decode(entry.arguments?.getString("display").orEmpty()).ifBlank { ":101" }
+            DesktopStreamScreen(container, display)
+        }
         composable(
             route = "automations/{missionId}",
             arguments = listOf(navArgument("missionId") { type = NavType.StringType }),

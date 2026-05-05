@@ -119,6 +119,8 @@ class ApiService(
         getList("/api/control/missions", mapOf("limit" to limit.toString(), "offset" to offset.toString()))
 
     suspend fun getMission(id: String): Mission = getJson("/api/control/missions/$id")
+    suspend fun childMissions(parentId: String): List<Mission> =
+        listMissions(limit = 200).filter { it.parentMissionId == parentId }
     suspend fun currentMission(): Mission? = runCatching { getJson<Mission>("/api/control/missions/current") }.getOrNull()
     suspend fun createMission(req: CreateMissionRequest): Mission = postJson("/api/control/missions", req)
     suspend fun loadMission(id: String): Mission = postEmpty("/api/control/missions/$id/load")
