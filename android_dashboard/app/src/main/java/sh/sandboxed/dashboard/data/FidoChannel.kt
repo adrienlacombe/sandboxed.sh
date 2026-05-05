@@ -43,6 +43,8 @@ class FidoChannel(
     fun start() {
         if (job?.isActive == true) return
         job = scope.launch {
+            // Let the first Compose frame render before we open the SSE socket.
+            delay(500)
             var attempt = 0
             while (true) {
                 if (cached.value.jwtToken == null && cached.value.baseUrl.isBlank()) {

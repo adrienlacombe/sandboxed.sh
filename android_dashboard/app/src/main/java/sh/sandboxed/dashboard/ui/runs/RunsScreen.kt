@@ -39,6 +39,7 @@ import sh.sandboxed.dashboard.ui.components.ErrorBanner
 import sh.sandboxed.dashboard.ui.components.GlassCard
 import sh.sandboxed.dashboard.ui.tasks.EmptyState
 import sh.sandboxed.dashboard.ui.theme.Palette
+import sh.sandboxed.dashboard.util.boundedForText
 
 private data class RunsState(val items: List<Run> = emptyList(), val loading: Boolean = false, val error: String? = null)
 
@@ -91,10 +92,10 @@ private fun RunRow(r: Run) {
                 Text("  $" + "%.2f".format(r.costDollars), color = Palette.AccentLight, style = MaterialTheme.typography.labelMedium)
             }
             Spacer(Modifier.height(4.dp))
-            Text(r.inputText, color = Palette.TextPrimary, style = MaterialTheme.typography.bodyMedium, maxLines = 2)
+            Text(r.inputText.boundedForText(maxChars = 1_000), color = Palette.TextPrimary, style = MaterialTheme.typography.bodyMedium, maxLines = 2)
             r.summaryText?.takeIf { it.isNotBlank() }?.let {
                 Spacer(Modifier.height(4.dp))
-                Text(it, color = Palette.TextSecondary, style = MaterialTheme.typography.bodySmall, maxLines = 3)
+                Text(it.boundedForText(maxChars = 1_500), color = Palette.TextSecondary, style = MaterialTheme.typography.bodySmall, maxLines = 3)
             }
             if (r.createdAt.isNotBlank()) {
                 Spacer(Modifier.height(4.dp))
