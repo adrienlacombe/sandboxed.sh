@@ -1,5 +1,6 @@
 "use client";
 
+import type React from "react";
 import { useDeferredValue, useEffect, useLayoutEffect, useMemo, useRef, useState, useCallback, memo, startTransition } from "react";
 import { useSearchParams, useRouter } from "next/navigation";
 import { toast } from "@/components/toast";
@@ -1894,6 +1895,7 @@ function MissionWorkbenchPanel({
   onOpenSwitcher,
   onViewMission,
   onSetStatus,
+  runSettingsSlot,
   className,
 }: {
   mission: Mission | null;
@@ -1908,6 +1910,12 @@ function MissionWorkbenchPanel({
   onOpenSwitcher: () => void;
   onViewMission: (missionId: string) => void;
   onSetStatus: (status: MissionStatus) => void;
+  /**
+   * Optional slot for the mission's run-settings editor (the
+   * `<NewMissionDialog mode="edit">` trigger). Rendered next to Resume/Stop
+   * so it's accessible without a separate toolbar button.
+   */
+  runSettingsSlot?: React.ReactNode;
   className?: string;
 }) {
   const title = mission?.title?.trim() || (mission ? getMissionShortName(mission.id) : "No mission selected");
@@ -2030,6 +2038,11 @@ function MissionWorkbenchPanel({
                   <Layers className="h-3.5 w-3.5" />
                   Switch
                 </button>
+                {runSettingsSlot && (
+                  <div className="col-span-2 [&>div]:w-full [&>div>button]:w-full [&>div>button]:justify-center">
+                    {runSettingsSlot}
+                  </div>
+                )}
               </div>
             </section>
 
@@ -3671,10 +3684,10 @@ export default function ControlClient() {
    * (so a later "load older" page-replace can find the live tail) and
    * publishes the "more older messages exist" state to the UI.
    */
-  // `historyItemsLen` MUST count only items derived from server events
-  // (i.e. the result of `eventsToItems` / `missionHistoryToItems`), NOT
-  // the post-queue-merge length. `loadOlderHistoryEvents` later splices
-  // via `prev.slice(oldHistoricCount)`; if queued messages were counted
+  // `historyItemsLen` MUST count only the history-derived prefix
+  // (event replay plus any coarse mission-history fallback), NOT the
+  // post-queue-merge length. `loadOlderHistoryEvents` later splices via
+  // `prev.slice(oldHistoricCount)`; if queued messages were counted
   // here, they'd land before the splice point, get rebuilt by
   // `eventsToItems` (which doesn't see queued messages), and silently
   // disappear from the UI on the next page-back.
@@ -4079,7 +4092,13 @@ export default function ControlClient() {
       }
     } catch (error) {
       console.error("Upload failed:", error);
-      toast.error(`Failed to upload ${displayName}`);
+      const detail = error instanceof Error
+        ? error.message.replace(/^Upload failed:\s*/, "").trim()
+        : "";
+      const suffix = detail
+        ? `: ${detail.slice(0, 180)}${detail.length > 180 ? "..." : ""}`
+        : "";
+      toast.error(`Failed to upload ${displayName}${suffix}`);
     } finally {
       setUploadQueue((prev) => prev.filter((name) => name !== displayName));
       setUploadProgress(null);
@@ -4432,6 +4451,35 @@ export default function ControlClient() {
       }
     });
   }, []);
+
+  const mergeEventItemsWithMissionHistoryFallback = useCallback(
+    (eventItems: ChatItem[], mission: Mission): ChatItem[] => {
+      if (eventItems.some((item) => item.kind === "assistant")) {
+        return eventItems;
+      }
+
+      const historyHasAssistant = mission.history.some((entry) => entry.role === "assistant");
+      if (!historyHasAssistant) {
+        return eventItems;
+      }
+
+      const basicItems = missionHistoryToItems(mission);
+      if (eventItems.length === 0) {
+        return basicItems;
+      }
+
+      // Long Codex `/goal` missions can spend thousands of events in
+      // tool/thinking/status loops without a fresh assistant_message.
+      // The latest event page is still valuable: it contains the
+      // completed thought history and tool rows. Keep that replay and
+      // prepend coarse mission history so the chat still has prior
+      // user/assistant context.
+      const basicIds = new Set(basicItems.map((item) => item.id));
+      const eventOnlyItems = eventItems.filter((item) => !basicIds.has(item.id));
+      return [...basicItems, ...eventOnlyItems];
+    },
+    [missionHistoryToItems]
+  );
 
   // Convert stored events (from SQLite) to ChatItems for display
   // This enables full history replay including tool calls on page refresh
@@ -4946,15 +4994,9 @@ export default function ControlClient() {
           }
         }
         // Use events if available, otherwise fall back to basic history
-        let historyItems = events ? eventsToItems(events, mission) : missionHistoryToItems(mission);
-        if (events && !historyItems.some((item) => item.kind === "assistant")) {
-          const historyHasAssistant = mission.history.some(
-            (entry) => entry.role === "assistant"
-          );
-          if (historyHasAssistant) {
-            historyItems = missionHistoryToItems(mission);
-          }
-        }
+        let historyItems = events
+          ? mergeEventItemsWithMissionHistoryFallback(eventsToItems(events, mission), mission)
+          : missionHistoryToItems(mission);
         // Capture the events-derived count BEFORE the queue merge — this is
         // what `loadOlderHistoryEvents` needs to find the live tail
         // correctly (see `seedPaginationStateAfterInitialLoad`).
@@ -5037,15 +5079,10 @@ export default function ControlClient() {
           Promise.all([loadHistoryEvents(mission.id), getQueue().catch(() => [])])
             .then(([events, queuedMessages]) => {
               if (cancelled) return;
-              let historyItems = eventsToItems(events, mission);
-              if (!historyItems.some((item) => item.kind === "assistant")) {
-                const historyHasAssistant = mission.history.some(
-                  (entry) => entry.role === "assistant"
-                );
-                if (historyHasAssistant) {
-                  historyItems = missionHistoryToItems(mission);
-                }
-              }
+              let historyItems = mergeEventItemsWithMissionHistoryFallback(
+                eventsToItems(events, mission),
+                mission
+              );
               // Capture pre-queue length so pagination doesn't clip
               // queued items (see `seedPaginationStateAfterInitialLoad`).
               const historicEventsLen = historyItems.length;
@@ -5102,6 +5139,8 @@ export default function ControlClient() {
     searchParams,
     router,
     missionHistoryToItems,
+    mergeEventItemsWithMissionHistoryFallback,
+    eventsToItems,
     adjustVisibleItemsLimit,
     loadHistoryEvents,
     seedPaginationStateAfterInitialLoad,
@@ -5437,15 +5476,9 @@ export default function ControlClient() {
         }
 
         // Use events if available, otherwise fall back to basic history
-        let historyItems = events ? eventsToItems(events, mission) : missionHistoryToItems(mission);
-        if (events && !historyItems.some((item) => item.kind === "assistant")) {
-          const historyHasAssistant = mission.history.some(
-            (entry) => entry.role === "assistant"
-          );
-          if (historyHasAssistant) {
-            historyItems = missionHistoryToItems(mission);
-          }
-        }
+        let historyItems = events
+          ? mergeEventItemsWithMissionHistoryFallback(eventsToItems(events, mission), mission)
+          : missionHistoryToItems(mission);
 
         // Capture pre-queue length so pagination doesn't clip queued items
         // (see `seedPaginationStateAfterInitialLoad`).
@@ -5524,11 +5557,14 @@ export default function ControlClient() {
     [
       missionItems,
       missionHistoryToItems,
+      mergeEventItemsWithMissionHistoryFallback,
       eventsToItems,
       applyDesktopSessionState,
+      applyDesktopSessionFromEvents,
       adjustVisibleItemsLimit,
       loadHistoryEvents,
       seedPaginationStateAfterInitialLoad,
+      updateMissionItems,
       router,
     ]
   );
@@ -5937,15 +5973,10 @@ export default function ControlClient() {
       // Load full events in background (including tool calls)
       loadHistoryEvents(resumed.id)
         .then((events) => {
-          let fullItems = eventsToItems(events, resumed);
-          if (!fullItems.some((item) => item.kind === "assistant")) {
-            const historyHasAssistant = resumed.history.some(
-              (entry) => entry.role === "assistant"
-            );
-            if (historyHasAssistant) {
-              fullItems = missionHistoryToItems(resumed);
-            }
-          }
+          const fullItems = mergeEventItemsWithMissionHistoryFallback(
+            eventsToItems(events, resumed),
+            resumed
+          );
           setItems(fullItems);
           adjustVisibleItemsLimit(fullItems);
           updateMissionItems(resumed.id, fullItems);
@@ -7493,8 +7524,8 @@ export default function ControlClient() {
         }
 
         // If the mission is in a resumable state (failed/interrupted/blocked),
-        // resume it first to update the status before sending the message.
-        // Use skipMessage to avoid the auto-generated "MISSION RESUMED" message
+        // Resume/sync it first before sending the message.
+        // Use skipMessage to avoid the automatic resume message
         // since the user is about to send their own custom message.
         if (["failed", "interrupted", "blocked"].includes(mission.status)) {
           mission = await resumeMission(mission.id, { skipMessage: true });
@@ -7760,16 +7791,8 @@ export default function ControlClient() {
         if (viewingMissionIdRef.current !== missionId) return;
 
         let historyItems = events
-          ? eventsToItems(events, mission)
+          ? mergeEventItemsWithMissionHistoryFallback(eventsToItems(events, mission), mission)
           : missionHistoryToItems(mission);
-        if (events && !historyItems.some((item) => item.kind === "assistant")) {
-          const historyHasAssistant = mission.history.some(
-            (entry) => entry.role === "assistant"
-          );
-          if (historyHasAssistant) {
-            historyItems = missionHistoryToItems(mission);
-          }
-        }
 
         // Pre-queue length: pagination uses this to find the live tail
         // without clipping queued items (see `seedPaginationStateAfterInitialLoad`).
@@ -7813,6 +7836,7 @@ export default function ControlClient() {
       loadHistoryEvents,
       eventsToItems,
       missionHistoryToItems,
+      mergeEventItemsWithMissionHistoryFallback,
       adjustVisibleItemsLimit,
       seedPaginationStateAfterInitialLoad,
       updateMissionItems,
@@ -8080,25 +8104,8 @@ export default function ControlClient() {
             } : undefined}
           />
 
-          {activeMission && !viewingMissionIsRunning && (
-            <NewMissionDialog
-              workspaces={workspaces}
-              disabled={missionLoading}
-              onCreate={handleUpdateMissionSettings}
-              mode="edit"
-              lockWorkspace
-              initialValues={{
-                workspaceId: activeMission.workspace_id,
-                agent: activeMission.agent || undefined,
-                backend: activeMission.backend,
-                modelOverride: activeMission.model_override || undefined,
-                modelEffort: activeMission.model_effort || undefined,
-                configProfile: activeMission.config_profile,
-              }}
-            />
-          )}
-
           <button
+            type="button"
             onClick={() => setShowWorkbenchPanel((prev) => !prev)}
             className={cn(
               "flex items-center gap-2 rounded-lg border px-3 py-2 text-sm transition-colors",
@@ -9176,6 +9183,25 @@ export default function ControlClient() {
                 onOpenSwitcher={() => setShowMissionSwitcher(true)}
                 onViewMission={handleViewMission}
                 onSetStatus={handleSetStatus}
+                runSettingsSlot={
+                  activeMission && !viewingMissionIsRunning ? (
+                    <NewMissionDialog
+                      workspaces={workspaces}
+                      disabled={missionLoading}
+                      onCreate={handleUpdateMissionSettings}
+                      mode="edit"
+                      lockWorkspace
+                      initialValues={{
+                        workspaceId: activeMission.workspace_id,
+                        agent: activeMission.agent || undefined,
+                        backend: activeMission.backend,
+                        modelOverride: activeMission.model_override || undefined,
+                        modelEffort: activeMission.model_effort || undefined,
+                        configProfile: activeMission.config_profile,
+                      }}
+                    />
+                  ) : undefined
+                }
                 className="flex-1 min-h-0"
               />
             )}

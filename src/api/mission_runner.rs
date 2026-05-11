@@ -41,6 +41,24 @@ use super::control::{
 };
 use super::library::SharedLibrary;
 
+/// Build the synthetic `AgentResult::failure` produced when a turn is
+/// cancelled. If the process has begun a graceful shutdown, return a
+/// friendlier "paused for restart" message and a `ServerShutdown` reason
+/// so the dashboard can render a Resume affordance instead of a
+/// user-cancel banner; otherwise behave as before.
+fn cancel_or_shutdown_failure() -> AgentResult {
+    if super::routes::is_shutdown_initiated() {
+        AgentResult::failure(
+            "Server restart — paused. Click Resume to continue.".to_string(),
+            0,
+        )
+        .with_terminal_reason(TerminalReason::ServerShutdown)
+    } else {
+        AgentResult::failure("Mission cancelled".to_string(), 0)
+            .with_terminal_reason(TerminalReason::Cancelled)
+    }
+}
+
 #[derive(Debug, Default)]
 struct OpencodeSseState {
     message_roles: HashMap<String, String>,
@@ -799,6 +817,27 @@ fn claudecode_incomplete_turn_message(
     message
 }
 
+fn apply_terminal_result_text(final_result: &mut String, terminal_result: Option<String>) {
+    if let Some(result) = terminal_result {
+        if !result.trim().is_empty() || final_result.trim().is_empty() {
+            *final_result = result;
+        }
+    }
+}
+
+fn use_thinking_only_fallback(
+    final_result: &mut String,
+    thinking_fallback: &str,
+    pending_tools_empty: bool,
+) -> bool {
+    if final_result.trim().is_empty() && !thinking_fallback.trim().is_empty() && pending_tools_empty
+    {
+        *final_result = thinking_fallback.to_string();
+        return true;
+    }
+    false
+}
+
 fn claudecode_malformed_startup_message(
     diagnostics: &[String],
     use_resume: bool,
@@ -861,16 +900,26 @@ fn claudecode_pre_turn_transport_message(
 /// with the user's ChatGPT subscription; rotating across distinct
 /// `chatgpt_account_id`s spreads load across separate caps.
 pub(crate) fn collect_codex_credentials(working_dir: &std::path::Path) -> Vec<CodexCredential> {
-    let mut creds: Vec<CodexCredential> =
+    let api_keys: Vec<CodexCredential> =
         super::ai_providers::get_all_openai_keys_for_codex(working_dir)
             .into_iter()
             .map(CodexCredential::ApiKey)
             .collect();
-    creds.extend(
+    let oauths: Vec<CodexCredential> =
         super::ai_providers::get_all_openai_oauth_accounts(working_dir)
             .into_iter()
-            .map(CodexCredential::OAuth),
+            .map(CodexCredential::OAuth)
+            .collect();
+    // Emit at debug so we can correlate rotation behaviour with the pool
+    // state for any given mission. Counts only; never the credentials.
+    tracing::debug!(
+        working_dir = %working_dir.display(),
+        api_keys = api_keys.len(),
+        oauth_accounts = oauths.len(),
+        "collect_codex_credentials"
     );
+    let mut creds = api_keys;
+    creds.extend(oauths);
     creds
 }
 
@@ -3118,114 +3167,17 @@ async fn run_mission_turn(
             // Unified credential pool: API keys + ChatGPT-OAuth identities,
             // de-duplicated by chatgpt_account_id. Empty only when neither
             // an OpenAI API key nor a connected ChatGPT account is available.
-            let all_creds = collect_codex_credentials(&config.working_dir);
-            if all_creds.is_empty() {
-                let mut result = run_codex_turn(
-                    &workspace,
-                    &mission_work_dir,
-                    codex_message,
-                    requested_model,
-                    model_effort.as_deref(),
-                    effective_agent.as_deref(),
-                    mission_id,
-                    events_tx.clone(),
-                    cancel.clone(),
-                    &config.working_dir,
-                    session_id.as_deref(),
-                    None,
-                )
-                .await;
-
-                if let Some(fallback_model) =
-                    codex_chatgpt_fallback_for_result(requested_model, &result)
-                {
-                    tracing::warn!(
-                        mission_id = %mission_id,
-                        requested_model = ?requested_model,
-                        fallback_model,
-                        "Retrying Codex turn with fallback model for ChatGPT account compatibility"
-                    );
-                    result = run_codex_turn(
-                        &workspace,
-                        &mission_work_dir,
-                        codex_message,
-                        Some(fallback_model),
-                        model_effort.as_deref(),
-                        effective_agent.as_deref(),
-                        mission_id,
-                        events_tx.clone(),
-                        cancel.clone(),
-                        &config.working_dir,
-                        session_id.as_deref(),
-                        None,
-                    )
-                    .await;
-                } else if codex_tool_stall_should_retry_with_default_model(requested_model, &result)
-                {
-                    tracing::warn!(
-                        mission_id = %mission_id,
-                        requested_model = ?requested_model,
-                        "Retrying Codex turn with CLI default model after generic GPT model stopped before tool use"
-                    );
-                    result = run_codex_turn(
-                        &workspace,
-                        &mission_work_dir,
-                        codex_message,
-                        None,
-                        model_effort.as_deref(),
-                        effective_agent.as_deref(),
-                        mission_id,
-                        events_tx.clone(),
-                        cancel.clone(),
-                        &config.working_dir,
-                        session_id.as_deref(),
-                        None,
-                    )
-                    .await;
-                }
-
-                result
-            } else {
-                let mut attempted_credentials: HashSet<String> = HashSet::new();
-                let mut attempt_idx = 0usize;
-                let mut last_constrained_result: Option<AgentResult> = None;
-
-                loop {
-                    if cancel.is_cancelled() {
-                        break last_constrained_result.unwrap_or_else(|| {
-                            AgentResult::failure("Mission cancelled".to_string(), 0)
-                                .with_terminal_reason(TerminalReason::Cancelled)
-                        });
-                    }
-
-                    let lease =
-                        lease_codex_account(&config.working_dir, &attempted_credentials, &cancel)
-                            .await;
-                    let Some(lease) = lease else {
-                        if let Some(prev) = last_constrained_result {
-                            break prev;
-                        }
-                        break AgentResult::failure(
-                            "All configured Codex accounts are currently at capacity. Try again shortly."
-                                .to_string(),
-                            0,
-                        )
-                        .with_terminal_reason(TerminalReason::CapacityLimited);
-                    };
-
-                    attempt_idx += 1;
-                    let credential_label = lease.credential.label_for_logs();
-                    attempted_credentials.insert(lease.credential.fingerprint());
-                    let credential_override = lease.credential.as_override();
-
-                    tracing::info!(
-                        mission_id = %mission_id,
-                        attempt = attempt_idx,
-                        credential = %credential_label,
-                        total_credentials = all_creds.len(),
-                        "Running Codex turn with leased account slot"
-                    );
-
+            //
+            // Defensive: if the pool was empty and the turn hits a rate
+            // limit, re-query once and rerun via rotation if credentials are
+            // now visible. The May 2026 incident showed the empty branch can
+            // be taken transiently even when accounts exist on disk, leaving
+            // the user with no rotation. The recheck guards against that
+            // without changing the happy-path behaviour.
+            'codex_arm: {
+                let mut all_creds = collect_codex_credentials(&config.working_dir);
+                let mut prior_empty_result: Option<AgentResult> = None;
+                if all_creds.is_empty() {
                     let mut result = run_codex_turn(
                         &workspace,
                         &mission_work_dir,
@@ -3238,7 +3190,7 @@ async fn run_mission_turn(
                         cancel.clone(),
                         &config.working_dir,
                         session_id.as_deref(),
-                        Some(&credential_override),
+                        None,
                     )
                     .await;
 
@@ -3247,10 +3199,8 @@ async fn run_mission_turn(
                     {
                         tracing::warn!(
                             mission_id = %mission_id,
-                            attempt = attempt_idx,
                             requested_model = ?requested_model,
                             fallback_model,
-                            credential = %credential_label,
                             "Retrying Codex turn with fallback model for ChatGPT account compatibility"
                         );
                         result = run_codex_turn(
@@ -3265,7 +3215,7 @@ async fn run_mission_turn(
                             cancel.clone(),
                             &config.working_dir,
                             session_id.as_deref(),
-                            Some(&credential_override),
+                            None,
                         )
                         .await;
                     } else if codex_tool_stall_should_retry_with_default_model(
@@ -3274,9 +3224,7 @@ async fn run_mission_turn(
                     ) {
                         tracing::warn!(
                             mission_id = %mission_id,
-                            attempt = attempt_idx,
                             requested_model = ?requested_model,
-                            credential = %credential_label,
                             "Retrying Codex turn with CLI default model after generic GPT model stopped before tool use"
                         );
                         result = run_codex_turn(
@@ -3291,30 +3239,168 @@ async fn run_mission_turn(
                             cancel.clone(),
                             &config.working_dir,
                             session_id.as_deref(),
-                            Some(&credential_override),
+                            None,
                         )
                         .await;
                     }
 
-                    drop(lease);
-
-                    match result.terminal_reason {
+                    // Defensive re-query: if this turn was rate/capacity limited
+                    // and a fresh enumeration now returns accounts, fall through
+                    // to the rotation loop instead of surfacing the failure.
+                    let constrained = matches!(
+                        result.terminal_reason,
                         Some(TerminalReason::RateLimited | TerminalReason::CapacityLimited)
-                            if attempted_credentials.len() < all_creds.len() =>
+                    );
+                    if constrained {
+                        let recheck = collect_codex_credentials(&config.working_dir);
+                        if !recheck.is_empty() {
+                            tracing::warn!(
+                                mission_id = %mission_id,
+                                recovered_credentials = recheck.len(),
+                                "Codex credential pool was empty on first attempt but re-query found accounts after a rate-limited turn; retrying with rotation"
+                            );
+                            all_creds = recheck;
+                            prior_empty_result = Some(result);
+                            // fall through to rotation loop below
+                        } else {
+                            break 'codex_arm result;
+                        }
+                    } else {
+                        break 'codex_arm result;
+                    }
+                }
+                {
+                    let mut attempted_credentials: HashSet<String> = HashSet::new();
+                    let mut attempt_idx = 0usize;
+                    let mut last_constrained_result: Option<AgentResult> = prior_empty_result;
+
+                    loop {
+                        if cancel.is_cancelled() {
+                            break last_constrained_result
+                                .unwrap_or_else(cancel_or_shutdown_failure);
+                        }
+
+                        let lease = lease_codex_account(
+                            &config.working_dir,
+                            &attempted_credentials,
+                            &cancel,
+                        )
+                        .await;
+                        let Some(lease) = lease else {
+                            if let Some(prev) = last_constrained_result {
+                                break prev;
+                            }
+                            break AgentResult::failure(
+                            "All configured Codex accounts are currently at capacity. Try again shortly."
+                                .to_string(),
+                            0,
+                        )
+                        .with_terminal_reason(TerminalReason::CapacityLimited);
+                        };
+
+                        attempt_idx += 1;
+                        let credential_label = lease.credential.label_for_logs();
+                        attempted_credentials.insert(lease.credential.fingerprint());
+                        let credential_override = lease.credential.as_override();
+
+                        tracing::info!(
+                            mission_id = %mission_id,
+                            attempt = attempt_idx,
+                            credential = %credential_label,
+                            total_credentials = all_creds.len(),
+                            "Running Codex turn with leased account slot"
+                        );
+
+                        let mut result = run_codex_turn(
+                            &workspace,
+                            &mission_work_dir,
+                            codex_message,
+                            requested_model,
+                            model_effort.as_deref(),
+                            effective_agent.as_deref(),
+                            mission_id,
+                            events_tx.clone(),
+                            cancel.clone(),
+                            &config.working_dir,
+                            session_id.as_deref(),
+                            Some(&credential_override),
+                        )
+                        .await;
+
+                        if let Some(fallback_model) =
+                            codex_chatgpt_fallback_for_result(requested_model, &result)
                         {
-                            let reason = match result.terminal_reason {
-                                Some(TerminalReason::CapacityLimited) => "capacity limited",
-                                _ => "rate limited",
-                            };
-                            tracing::info!(
+                            tracing::warn!(
                                 mission_id = %mission_id,
                                 attempt = attempt_idx,
-                                reason,
-                                "Codex account constrained; leasing next account"
+                                requested_model = ?requested_model,
+                                fallback_model,
+                                credential = %credential_label,
+                                "Retrying Codex turn with fallback model for ChatGPT account compatibility"
                             );
-                            last_constrained_result = Some(result);
+                            result = run_codex_turn(
+                                &workspace,
+                                &mission_work_dir,
+                                codex_message,
+                                Some(fallback_model),
+                                model_effort.as_deref(),
+                                effective_agent.as_deref(),
+                                mission_id,
+                                events_tx.clone(),
+                                cancel.clone(),
+                                &config.working_dir,
+                                session_id.as_deref(),
+                                Some(&credential_override),
+                            )
+                            .await;
+                        } else if codex_tool_stall_should_retry_with_default_model(
+                            requested_model,
+                            &result,
+                        ) {
+                            tracing::warn!(
+                                mission_id = %mission_id,
+                                attempt = attempt_idx,
+                                requested_model = ?requested_model,
+                                credential = %credential_label,
+                                "Retrying Codex turn with CLI default model after generic GPT model stopped before tool use"
+                            );
+                            result = run_codex_turn(
+                                &workspace,
+                                &mission_work_dir,
+                                codex_message,
+                                None,
+                                model_effort.as_deref(),
+                                effective_agent.as_deref(),
+                                mission_id,
+                                events_tx.clone(),
+                                cancel.clone(),
+                                &config.working_dir,
+                                session_id.as_deref(),
+                                Some(&credential_override),
+                            )
+                            .await;
                         }
-                        _ => break result,
+
+                        drop(lease);
+
+                        match result.terminal_reason {
+                            Some(TerminalReason::RateLimited | TerminalReason::CapacityLimited)
+                                if attempted_credentials.len() < all_creds.len() =>
+                            {
+                                let reason = match result.terminal_reason {
+                                    Some(TerminalReason::CapacityLimited) => "capacity limited",
+                                    _ => "rate limited",
+                                };
+                                tracing::info!(
+                                    mission_id = %mission_id,
+                                    attempt = attempt_idx,
+                                    reason,
+                                    "Codex account constrained; leasing next account"
+                                );
+                                last_constrained_result = Some(result);
+                            }
+                            _ => break result,
+                        }
                     }
                 }
             }
@@ -5003,6 +5089,7 @@ pub fn run_claudecode_turn<'a>(
                                         total_cache_read_tokens +=
                                             usage.cache_read_input_tokens.unwrap_or(0);
                                     }
+                                    let mut assistant_thinking_fallback = String::new();
                                     for (content_idx, block) in evt.message.content.into_iter().enumerate() {
                                         let content_idx = content_idx as u32;
                                         match block {
@@ -5149,6 +5236,10 @@ pub fn run_claudecode_turn<'a>(
                                                     && !finalized_thinking_indices
                                                         .contains(&content_idx) =>
                                             {
+                                                if !assistant_thinking_fallback.is_empty() {
+                                                    assistant_thinking_fallback.push('\n');
+                                                }
+                                                assistant_thinking_fallback.push_str(&thinking);
                                                 // Only send done:true for the last active thinking block.
                                                 // Earlier blocks were already finalized during streaming
                                                 // (via the block-transition mechanism) and re-sending them
@@ -5184,6 +5275,17 @@ pub fn run_claudecode_turn<'a>(
                                         tracing::info!(
                                             mission_id = %mission_id,
                                             "Using thinking buffer as final result ({} chars, no text content in this turn)",
+                                            final_result.len()
+                                        );
+                                    }
+                                    if use_thinking_only_fallback(
+                                        &mut final_result,
+                                        &assistant_thinking_fallback,
+                                        pending_tools.is_empty(),
+                                    ) {
+                                        tracing::info!(
+                                            mission_id = %mission_id,
+                                            "Using assistant thinking-only block as final result ({} chars, no text content in this turn)",
                                             final_result.len()
                                         );
                                     }
@@ -5260,8 +5362,8 @@ pub fn run_claudecode_turn<'a>(
                                         // with success=false which the UI displays as a failure message.
                                         // Sending Error here would cause duplicate messages.
                                         final_result = error_msg;
-                                    } else if let Some(result) = res.result {
-                                        final_result = result;
+                                    } else {
+                                        apply_terminal_result_text(&mut final_result, res.result);
                                     }
                                     tracing::info!(
                                         mission_id = %mission_id,
@@ -6190,6 +6292,58 @@ fn is_capacity_limited_error(message: &str) -> bool {
     let has_limit = contains_ascii_case_insensitive(message, "limit")
         || contains_ascii_case_insensitive(message, "exceeded");
     has_concurrent && has_mission && has_limit
+}
+
+const CODEX_PENDING_TOOLS_ERROR_PREFIX: &str = "Codex stopped while tool calls were still pending";
+
+fn is_codex_generic_exit_wrapper(message: &str) -> bool {
+    message.contains("Codex CLI exited before completing the turn")
+}
+
+fn codex_pending_tools_error_message(
+    message: &str,
+    pending_tools: &HashMap<String, String>,
+) -> String {
+    let mut pending_tool_names: Vec<&str> = pending_tools.values().map(String::as_str).collect();
+    pending_tool_names.sort_unstable();
+    pending_tool_names.dedup();
+
+    if pending_tool_names.is_empty() {
+        format!("{CODEX_PENDING_TOOLS_ERROR_PREFIX}: {message}")
+    } else {
+        format!(
+            "{CODEX_PENDING_TOOLS_ERROR_PREFIX} ({}): {message}",
+            pending_tool_names.join(", ")
+        )
+    }
+}
+
+fn codex_error_message_to_surface(
+    assistant_message: &str,
+    pending_tools: &HashMap<String, String>,
+    message: &str,
+) -> Option<String> {
+    if assistant_message.trim().is_empty() {
+        Some(message.to_string())
+    } else if !pending_tools.is_empty() {
+        Some(codex_pending_tools_error_message(message, pending_tools))
+    } else {
+        None
+    }
+}
+
+fn record_codex_error_message(error_message: &mut Option<String>, message: String) -> bool {
+    let new_is_generic_exit_wrapper = is_codex_generic_exit_wrapper(&message);
+    let already_have_specific = error_message
+        .as_deref()
+        .is_some_and(|existing| !is_codex_generic_exit_wrapper(existing));
+
+    if new_is_generic_exit_wrapper && already_have_specific {
+        false
+    } else {
+        *error_message = Some(message);
+        true
+    }
 }
 
 fn strip_opencode_banner_lines(output: &str) -> Cow<'_, str> {
@@ -12690,8 +12844,8 @@ pub async fn run_amp_turn(
                                     // with success=false which the UI displays as a failure message.
                                     // Sending Error here would cause duplicate messages.
                                     final_result = err_msg;
-                                } else if let Some(result) = res.result {
-                                    final_result = result;
+                                } else {
+                                    apply_terminal_result_text(&mut final_result, res.result);
                                 }
 
                                 tracing::debug!(
@@ -13315,9 +13469,16 @@ pub async fn run_codex_turn(
     {
         Ok(result) => result,
         Err(e) => {
+            let message = format!("Codex execution failed: {}", e);
             tracing::error!("Failed to send message to Codex: {}", e);
-            return AgentResult::failure(format!("Codex execution failed: {}", e), 0)
-                .with_terminal_reason(TerminalReason::LlmError);
+            let reason = if is_capacity_limited_error(&message) {
+                TerminalReason::CapacityLimited
+            } else if is_rate_limited_error(&message) {
+                TerminalReason::RateLimited
+            } else {
+                TerminalReason::LlmError
+            };
+            return AgentResult::failure(message, 0).with_terminal_reason(reason);
         }
     };
 
@@ -13340,8 +13501,7 @@ pub async fn run_codex_turn(
             _ = cancel.cancelled() => {
                 tracing::info!("Codex turn cancelled for mission {}", mission_id);
                 // Note: Codex process will be cleaned up automatically when the event stream task ends
-                return AgentResult::failure("Mission cancelled".to_string(), 0)
-                    .with_terminal_reason(TerminalReason::Cancelled);
+                return cancel_or_shutdown_failure();
             }
             Some(event) = event_rx.recv() => {
                 match event {
@@ -13439,11 +13599,13 @@ pub async fn run_codex_turn(
                         //      consequence of the in-stream disconnect we
                         //      already decided to swallow.
                         //
-                        // Rule: if we have assistant output, ignore the error.
-                        // The empty-output branch still surfaces startup /
-                        // auth / config failures (which produce no text at
-                        // all) and mid-turn disconnects that happened before
-                        // any real content streamed.
+                        // Rule: if we have assistant output and no pending
+                        // tools, ignore the error. The empty-output branch
+                        // still surfaces startup / auth / config failures
+                        // (which produce no text at all). If a tool call is
+                        // still pending, the assistant's text is only a
+                        // progress update; swallowing a provider error would
+                        // mark unfinished work as completed.
                         //
                         // When we do surface an error, prefer the *first*
                         // meaningful message we saw — Codex CLI usually emits
@@ -13457,26 +13619,29 @@ pub async fn run_codex_turn(
                         // forces the user (and our `is_*_error` classifiers)
                         // to debug from log lines instead of the surfaced
                         // assistant_message.
-                        if assistant_message.trim().is_empty() {
-                            let new_is_generic_exit_wrapper = message.contains(
-                                "Codex CLI exited before completing the turn",
+                        if let Some(surfaced_message) =
+                            codex_error_message_to_surface(&assistant_message, &pending_tools, &message)
+                        {
+                            let recorded = record_codex_error_message(
+                                &mut error_message,
+                                surfaced_message.clone(),
                             );
-                            let already_have_specific = error_message
-                                .as_deref()
-                                .is_some_and(|existing| {
-                                    !existing.contains(
-                                        "Codex CLI exited before completing the turn",
-                                    )
-                                });
-                            if new_is_generic_exit_wrapper && already_have_specific {
+                            if recorded {
+                                if pending_tools.is_empty() {
+                                    tracing::error!("Codex error: {}", surfaced_message);
+                                } else {
+                                    tracing::warn!(
+                                        pending_tool_count = pending_tools.len(),
+                                        "Treating post-response Codex error as fatal because tool calls are still pending: {}",
+                                        surfaced_message
+                                    );
+                                }
+                            } else {
                                 tracing::warn!(
                                     "Keeping prior specific Codex error over generic exit wrapper: existing={}, ignored={}",
                                     error_message.as_deref().unwrap_or(""),
                                     message
                                 );
-                            } else {
-                                error_message = Some(message.clone());
-                                tracing::error!("Codex error: {}", message);
                             }
                         } else {
                             tracing::warn!(
@@ -13546,6 +13711,8 @@ pub async fn run_codex_turn(
     let stopped_on_progress_update = success
         && tool_activity_required
         && codex_final_message_looks_like_progress_update(&final_message);
+    let stopped_with_pending_tool_error =
+        !success && final_message.starts_with(CODEX_PENDING_TOOLS_ERROR_PREFIX);
     if stopped_before_required_tools || stopped_on_progress_update {
         tracing::warn!(
             mission_id = %mission_id,
@@ -13598,6 +13765,8 @@ Update it to the latest version (`npm install -g @openai/codex@latest`) and retr
             TerminalReason::CapacityLimited
         } else if is_rate_limited_error(&final_message) {
             TerminalReason::RateLimited
+        } else if stopped_with_pending_tool_error {
+            TerminalReason::Stalled
         } else {
             TerminalReason::LlmError
         };
@@ -13837,8 +14006,7 @@ pub async fn run_gemini_turn(
                 backend.kill().await;
                 // Abort the event-conversion task
                 handle.abort();
-                return AgentResult::failure("Mission cancelled".to_string(), 0)
-                    .with_terminal_reason(TerminalReason::Cancelled);
+                return cancel_or_shutdown_failure();
             }
             Some(event) = event_rx.recv() => {
                 match event {
@@ -14359,28 +14527,30 @@ fn cleanup_old_debug_files(
 #[cfg(test)]
 mod tests {
     use super::{
-        actual_cost_cents_from_total_cost_usd, bind_command_params,
+        actual_cost_cents_from_total_cost_usd, apply_terminal_result_text, bind_command_params,
         claudecode_idle_timeout_for_state, claudecode_incomplete_turn_message,
         claudecode_malformed_startup_message, claudecode_pre_turn_transport_message,
         claudecode_resume_current_session_message, claudecode_transport_failure_data,
         claudecode_transport_failure_stage, claudecode_transport_failure_stage_for_incomplete_turn,
         claudecode_transport_recovery_strategy, codex_chatgpt_fallback_for_result,
-        codex_chatgpt_fallback_model, codex_final_message_looks_like_progress_update,
-        codex_key_fingerprint, codex_tool_stall_should_retry_with_default_model,
-        codex_turn_requires_tool_activity, extract_model_from_message, extract_opencode_session_id,
-        extract_part_text, extract_str, extract_thought_line, is_capacity_limited_error,
-        is_codex_chatgpt_account_model_blocked, is_codex_node_wrapper, is_provider_payload_error,
-        is_rate_limited_error, is_session_corruption_error, is_success_path_auth_error,
+        codex_chatgpt_fallback_model, codex_error_message_to_surface,
+        codex_final_message_looks_like_progress_update, codex_key_fingerprint,
+        codex_tool_stall_should_retry_with_default_model, codex_turn_requires_tool_activity,
+        extract_model_from_message, extract_opencode_session_id, extract_part_text, extract_str,
+        extract_thought_line, is_capacity_limited_error, is_codex_chatgpt_account_model_blocked,
+        is_codex_node_wrapper, is_provider_payload_error, is_rate_limited_error,
+        is_session_corruption_error, is_success_path_auth_error,
         is_success_path_provider_payload_error, is_success_path_rate_limited_error,
         is_tool_call_only_output, opencode_idle_timeout_result_message,
         opencode_output_needs_fallback, opencode_session_token_from_line,
         parse_opencode_session_token, parse_opencode_sse_event, parse_opencode_stderr_text_part,
-        preferred_model_for_cost, resolve_cost_cents_and_source, running_health,
-        sanitized_opencode_stdout, stall_severity, strip_ansi_codes, strip_opencode_banner_lines,
-        strip_think_tags, summarize_recent_opencode_stderr, sync_opencode_agent_config,
-        ClaudeIncompleteTurnContext, ClaudeTransportFailureStage, ClaudeTransportRecoveryStrategy,
-        ClaudeTurnWaitState, MissionHealth, MissionRunState, MissionStallSeverity,
-        OpencodeSseState, STALL_SEVERE_SECS, STALL_WARN_SECS,
+        preferred_model_for_cost, record_codex_error_message, resolve_cost_cents_and_source,
+        running_health, sanitized_opencode_stdout, stall_severity, strip_ansi_codes,
+        strip_opencode_banner_lines, strip_think_tags, summarize_recent_opencode_stderr,
+        sync_opencode_agent_config, use_thinking_only_fallback, ClaudeIncompleteTurnContext,
+        ClaudeTransportFailureStage, ClaudeTransportRecoveryStrategy, ClaudeTurnWaitState,
+        MissionHealth, MissionRunState, MissionStallSeverity, OpencodeSseState, STALL_SEVERE_SECS,
+        STALL_WARN_SECS,
     };
     use super::{
         extract_telegram_instructions, inject_telegram_identity_into_claude_md,
@@ -14780,6 +14950,57 @@ mod tests {
         assert!(is_capacity_limited_error(
             "SOMETHING upstream: SELECTED MODEL IS AT CAPACITY. retry later."
         ));
+    }
+
+    #[test]
+    fn codex_post_response_error_with_pending_tool_is_surfaceable() {
+        let mut pending_tools = std::collections::HashMap::new();
+        pending_tools.insert("call_1".to_string(), "bash".to_string());
+
+        let surfaced = codex_error_message_to_surface(
+            "The caller-side destructuring is updated. I’m rebuilding now.",
+            &pending_tools,
+            "Selected model is at capacity. Please try a different model.",
+        )
+        .expect("pending tool error should be surfaced");
+
+        assert!(surfaced.contains("tool calls were still pending (bash)"));
+        assert!(is_capacity_limited_error(&surfaced));
+
+        let mut error_message = None;
+        assert!(record_codex_error_message(
+            &mut error_message,
+            surfaced.clone()
+        ));
+        assert_eq!(error_message.as_deref(), Some(surfaced.as_str()));
+    }
+
+    #[test]
+    fn codex_post_response_error_without_pending_tools_stays_ignored() {
+        let pending_tools = std::collections::HashMap::new();
+
+        assert!(codex_error_message_to_surface(
+            "I completed the requested work.",
+            &pending_tools,
+            "Failed to shutdown rollout recorder",
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn codex_error_recording_keeps_specific_error_over_exit_wrapper() {
+        let mut error_message =
+            Some("Selected model is at capacity. Please try a different model.".to_string());
+
+        assert!(!record_codex_error_message(
+            &mut error_message,
+            "Codex CLI exited before completing the turn (exit_status: exit status: 1)."
+                .to_string(),
+        ));
+        assert_eq!(
+            error_message.as_deref(),
+            Some("Selected model is at capacity. Please try a different model.")
+        );
     }
 
     #[test]
@@ -15852,6 +16073,51 @@ mod tests {
         let message = claudecode_resume_current_session_message();
         assert!(message.contains("Continue from the current session state"));
         assert!(message.contains("without restarting completed tool calls"));
+    }
+
+    #[test]
+    fn terminal_result_empty_text_does_not_erase_captured_assistant_output() {
+        let mut final_result = "Captured assistant output from stream".to_string();
+
+        apply_terminal_result_text(&mut final_result, Some(String::new()));
+
+        assert_eq!(final_result, "Captured assistant output from stream");
+    }
+
+    #[test]
+    fn terminal_result_non_empty_text_replaces_stream_fallback() {
+        let mut final_result = "stream fallback".to_string();
+
+        apply_terminal_result_text(&mut final_result, Some("terminal result".to_string()));
+
+        assert_eq!(final_result, "terminal result");
+    }
+
+    #[test]
+    fn thinking_only_fallback_can_supply_final_result_when_no_tools_pending() {
+        let mut final_result = String::new();
+
+        let used = use_thinking_only_fallback(
+            &mut final_result,
+            "Final answer emitted as a thinking-only assistant block.",
+            true,
+        );
+
+        assert!(used);
+        assert_eq!(
+            final_result,
+            "Final answer emitted as a thinking-only assistant block."
+        );
+    }
+
+    #[test]
+    fn thinking_only_fallback_waits_when_tools_are_pending() {
+        let mut final_result = String::new();
+
+        let used = use_thinking_only_fallback(&mut final_result, "Need tool output first.", false);
+
+        assert!(!used);
+        assert!(final_result.is_empty());
     }
 
     #[test]

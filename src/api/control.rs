@@ -46,6 +46,9 @@ use super::mission_store::{
 };
 use super::routes::AppState;
 
+const SERVER_SHUTDOWN_AUTO_RESUME_MAX_AGE_HOURS: u64 = 48;
+const INTERRUPTED_RESUME_PROMPT: &str = "You were interrupted, resume your work.";
+
 /// Returns a safe index to truncate a string at, ensuring we don't cut UTF-8 characters.
 pub(super) fn safe_truncate_index(s: &str, max: usize) -> usize {
     if s.len() <= max {
@@ -2943,7 +2946,7 @@ pub enum ControlCommand {
         mission_id: Uuid,
         /// If true, clean the mission's work directory before resuming
         clean_workspace: bool,
-        /// If true, only update status without sending the "MISSION RESUMED" message
+        /// If true, only update status without sending the automatic resume message
         skip_message: bool,
         respond: oneshot::Sender<Result<Mission, String>>,
     },
@@ -4699,7 +4702,7 @@ pub struct ResumeMissionRequest {
     /// If true, clean the mission's work directory before resuming
     #[serde(default)]
     pub clean_workspace: bool,
-    /// If true, only update the mission status without sending the "MISSION RESUMED" message.
+    /// If true, do not send the automatic resume message.
     /// Useful when the user is about to send their own custom message.
     #[serde(default)]
     pub skip_message: bool,
@@ -5017,63 +5020,15 @@ fn spawn_control_session(
         secrets,
     ));
 
-    // Recover orphaned missions from previous run.
-    // Any mission still marked "active" in the DB cannot be running because
-    // we just started — mark them as interrupted.
+    // Recover missions stopped by the previous backend process. Graceful
+    // shutdown marks live runners as `interrupted/server_shutdown`; a hard
+    // stop can leave task-mode missions as `active`.
     if state.mission_store.is_persistent() {
         let store = Arc::clone(&state.mission_store);
         let tx = events_tx.clone();
+        let cmd = state.cmd_tx.clone();
         tokio::spawn(async move {
-            match store.get_all_active_missions().await {
-                Ok(orphans) if !orphans.is_empty() => {
-                    tracing::info!(
-                        "Startup recovery: marking {} orphaned active missions as interrupted",
-                        orphans.len()
-                    );
-                    for mission in orphans {
-                        tracing::info!(
-                            "  → {} '{}' (last update: {})",
-                            mission.id,
-                            mission.title.as_deref().unwrap_or("Untitled"),
-                            mission.updated_at
-                        );
-                        if let Err(e) = store
-                            .update_mission_status(mission.id, MissionStatus::Interrupted)
-                            .await
-                        {
-                            tracing::warn!(
-                                "Failed to mark orphaned mission {} as interrupted: {}",
-                                mission.id,
-                                e
-                            );
-                        } else {
-                            maybe_schedule_mission_metadata_refresh_for_status(
-                                &store,
-                                &tx,
-                                mission.id,
-                                MissionStatus::Interrupted,
-                            );
-                            let _ = tx.send(AgentEvent::MissionStatusChanged {
-                                mission_id: mission.id,
-                                status: MissionStatus::Interrupted,
-                                summary: Some(
-                                    "Interrupted: server restarted while mission was active"
-                                        .to_string(),
-                                ),
-                            });
-                        }
-                    }
-                }
-                Ok(_) => {
-                    tracing::debug!("Startup recovery: no orphaned active missions found");
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "Startup recovery: failed to check for orphaned missions: {}",
-                        e
-                    );
-                }
-            }
+            recover_server_shutdown_missions(store, tx, cmd).await;
         });
     }
 
@@ -5162,6 +5117,147 @@ fn spawn_control_session(
     }
 
     state
+}
+
+async fn recover_server_shutdown_missions(
+    mission_store: Arc<dyn MissionStore>,
+    events_tx: broadcast::Sender<AgentEvent>,
+    cmd_tx: mpsc::Sender<ControlCommand>,
+) {
+    let mut to_resume = Vec::new();
+    let mut seen = HashSet::new();
+
+    match mission_store.get_all_active_missions().await {
+        Ok(active_missions) => {
+            for mission in active_missions {
+                if mission.mission_mode == super::mission_store::MissionMode::Assistant {
+                    tracing::debug!(
+                        mission_id = %mission.id,
+                        "Startup recovery: leaving assistant-mode active mission idle"
+                    );
+                    continue;
+                }
+
+                tracing::warn!(
+                    mission_id = %mission.id,
+                    title = %mission.title.as_deref().unwrap_or("Untitled"),
+                    updated_at = %mission.updated_at,
+                    "Startup recovery: active task mission survived restart; marking server_shutdown and auto-resuming"
+                );
+                if let Err(e) = mission_store
+                    .update_mission_status_with_reason(
+                        mission.id,
+                        MissionStatus::Interrupted,
+                        Some("server_shutdown"),
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        mission_id = %mission.id,
+                        "Startup recovery: failed to mark active mission interrupted: {}",
+                        e
+                    );
+                    continue;
+                }
+
+                maybe_schedule_mission_metadata_refresh_for_status(
+                    &mission_store,
+                    &events_tx,
+                    mission.id,
+                    MissionStatus::Interrupted,
+                );
+                let _ = events_tx.send(AgentEvent::MissionStatusChanged {
+                    mission_id: mission.id,
+                    status: MissionStatus::Interrupted,
+                    summary: Some(
+                        "Interrupted: server restarted while mission was active".to_string(),
+                    ),
+                });
+
+                if seen.insert(mission.id) {
+                    to_resume.push(mission.id);
+                }
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                "Startup recovery: failed to check for active missions: {}",
+                e
+            );
+        }
+    }
+
+    match mission_store
+        .get_recent_server_shutdown_mission_ids(SERVER_SHUTDOWN_AUTO_RESUME_MAX_AGE_HOURS)
+        .await
+    {
+        Ok(mission_ids) => {
+            for mission_id in mission_ids {
+                if seen.insert(mission_id) {
+                    to_resume.push(mission_id);
+                }
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                "Startup recovery: failed to check for server-shutdown missions: {}",
+                e
+            );
+        }
+    }
+
+    if to_resume.is_empty() {
+        tracing::debug!("Startup recovery: no server-shutdown missions to auto-resume");
+        return;
+    }
+
+    tracing::warn!(
+        count = to_resume.len(),
+        "Startup recovery: auto-resuming server-shutdown mission(s)"
+    );
+
+    for mission_id in to_resume {
+        let (tx, rx) = oneshot::channel();
+        if let Err(e) = cmd_tx
+            .send(ControlCommand::ResumeMission {
+                mission_id,
+                clean_workspace: false,
+                skip_message: false,
+                respond: tx,
+            })
+            .await
+        {
+            tracing::warn!(
+                mission_id = %mission_id,
+                "Startup recovery: failed to enqueue auto-resume: {}",
+                e
+            );
+            continue;
+        }
+
+        match rx.await {
+            Ok(Ok(_)) => {
+                tracing::info!(
+                    mission_id = %mission_id,
+                    "Startup recovery: auto-resume queued"
+                );
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    mission_id = %mission_id,
+                    "Startup recovery: auto-resume failed: {}",
+                    e
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    mission_id = %mission_id,
+                    "Startup recovery: auto-resume response dropped: {}",
+                    e
+                );
+            }
+        }
+    }
 }
 
 /// Apply the stale-mission safety net once.
@@ -6084,6 +6180,7 @@ fn mission_status_for_terminal_reason(
         TerminalReason::TurnComplete => None,
         TerminalReason::Completed => Some((MissionStatus::Completed, "completed")),
         TerminalReason::Cancelled => Some((MissionStatus::Interrupted, "cancelled")),
+        TerminalReason::ServerShutdown => Some((MissionStatus::Interrupted, "server_shutdown")),
         TerminalReason::MaxIterations => Some((MissionStatus::Blocked, "max_iterations")),
         TerminalReason::LlmError => Some((MissionStatus::Failed, "llm_error")),
         TerminalReason::Stalled => Some((MissionStatus::Failed, "stalled")),
@@ -6099,6 +6196,9 @@ fn mission_status_summary_for_terminal_reason(reason: TerminalReason) -> Option<
         TerminalReason::TurnComplete | TerminalReason::Completed => None,
         TerminalReason::MaxIterations => Some("Reached iteration limit".to_string()),
         TerminalReason::Cancelled => Some("Cancelled by user".to_string()),
+        TerminalReason::ServerShutdown => {
+            Some("Paused for server restart — click Resume to continue".to_string())
+        }
         TerminalReason::Stalled => Some("No progress detected".to_string()),
         TerminalReason::InfiniteLoop => Some("Detected repetitive behavior".to_string()),
         TerminalReason::LlmError => Some("Model error".to_string()),
@@ -6106,6 +6206,15 @@ fn mission_status_summary_for_terminal_reason(reason: TerminalReason) -> Option<
         TerminalReason::CapacityLimited => Some("Provider capacity limit reached".to_string()),
         TerminalReason::AuthError => Some("Authentication failed".to_string()),
     }
+}
+
+fn parse_goal_objective(message: &str) -> Option<String> {
+    message
+        .trim_start()
+        .strip_prefix("/goal ")
+        .map(str::trim)
+        .filter(|objective| !objective.is_empty())
+        .map(ToString::to_string)
 }
 
 /// If the turn ended with `LlmError` or `AuthError` but the agent produced
@@ -6787,11 +6896,10 @@ async fn control_actor_loop(
             .await
     }
 
-    // Helper to build resume context for an interrupted or blocked mission
+    // Helper to validate and prepare an interrupted or blocked mission for resume.
     async fn resume_mission_impl(
         mission_store: &Arc<dyn MissionStore>,
         config: &Config,
-        workspaces: &workspace::SharedWorkspaceStore,
         mission_id: Uuid,
         clean_workspace: bool,
     ) -> Result<(Mission, String), String> {
@@ -6808,9 +6916,6 @@ async fn control_actor_loop(
                 mission_id, mission.status
             ));
         }
-
-        let workspace_root =
-            workspace::resolve_workspace_root(workspaces, config, Some(mission.workspace_id)).await;
 
         // Clean mission context if requested.
         // Missions share the workspace directory, so we avoid deleting project files.
@@ -6834,133 +6939,7 @@ async fn control_actor_loop(
             let _ = std::fs::remove_file(runtime_file);
         }
 
-        // Build resume context
-        let mut resume_parts = Vec::new();
-
-        // Add resumption notice based on status
-        let resume_reason = match mission.status {
-            MissionStatus::Blocked => "reached its iteration limit",
-            MissionStatus::Failed => "failed due to an error (retrying)",
-            _ => "was interrupted",
-        };
-
-        let workspace_note = if clean_workspace {
-            " (context cleaned)"
-        } else {
-            ""
-        };
-
-        if let Some(interrupted_at) = &mission.interrupted_at {
-            resume_parts.push(format!(
-                "**MISSION RESUMED**{}\nThis mission {} at {} and is now being continued.",
-                workspace_note, resume_reason, interrupted_at
-            ));
-        } else {
-            resume_parts.push(format!(
-                "**MISSION RESUMED**{}\nThis mission {} and is now being continued.",
-                workspace_note, resume_reason
-            ));
-        }
-
-        // Add history summary
-        if !mission.history.is_empty() {
-            resume_parts.push("\n## Previous Conversation Summary".to_string());
-
-            // Include the original user request
-            if let Some(first_user) = mission.history.iter().find(|h| h.role == "user") {
-                resume_parts.push(format!("\n**Original Request:**\n{}", first_user.content));
-            }
-
-            // Include last assistant response (what was being worked on)
-            if let Some(last_assistant) =
-                mission.history.iter().rev().find(|h| h.role == "assistant")
-            {
-                let truncated = if last_assistant.content.len() > 2000 {
-                    let end = safe_truncate_index(&last_assistant.content, 2000);
-                    format!("{}...", &last_assistant.content[..end])
-                } else {
-                    last_assistant.content.clone()
-                };
-                resume_parts.push(format!("\n**Last Progress:**\n{}", truncated));
-            }
-        }
-
-        // Scan work directory for a compact top-level overview (not full file listing)
-        if workspace_root.exists() {
-            resume_parts.push("\n## Workspace Layout".to_string());
-
-            let mut top_level_dirs = Vec::new();
-            let mut top_level_files = Vec::new();
-            const SKIP_DIRS: &[&str] = &[
-                "venv",
-                ".venv",
-                ".sandboxed_sh",
-                ".sandboxed-sh",
-                ".git",
-                ".claude",
-                ".cargo",
-                ".rustup",
-                "node_modules",
-                "target",
-                "__pycache__",
-                ".next",
-                ".cache",
-                "temp",
-                ".local",
-                ".config",
-            ];
-
-            if let Ok(entries) = std::fs::read_dir(&workspace_root) {
-                for entry in entries.filter_map(|e| e.ok()) {
-                    let name = entry.file_name().to_string_lossy().to_string();
-                    let path = entry.path();
-                    if path.is_dir() {
-                        if SKIP_DIRS.contains(&name.as_str()) {
-                            continue;
-                        }
-                        top_level_dirs.push(format!("{}/ ", name));
-                    } else if path.is_file() {
-                        top_level_files.push(name);
-                    }
-                }
-            }
-
-            top_level_dirs.sort();
-            top_level_files.sort();
-
-            if top_level_dirs.is_empty() && top_level_files.is_empty() {
-                resume_parts.push("Empty workspace.".to_string());
-            } else {
-                let mut listing = Vec::new();
-                for d in &top_level_dirs {
-                    listing.push(format!("- {}", d));
-                }
-                // Cap files at 20 to avoid token bloat
-                let file_cap = 20;
-                for f in top_level_files.iter().take(file_cap) {
-                    listing.push(format!("- {}", f));
-                }
-                if top_level_files.len() > file_cap {
-                    listing.push(format!(
-                        "- ... and {} more files",
-                        top_level_files.len() - file_cap
-                    ));
-                }
-                resume_parts.push(listing.join("\n"));
-            }
-        }
-
-        // Add instructions
-        resume_parts.push("\n## Instructions".to_string());
-        resume_parts.push(
-            "Please continue from where you left off. Review the previous progress and work directory contents, \
-            then continue working towards completing the original request. Do not repeat work that was already done."
-                .to_string()
-        );
-
-        let resume_prompt = resume_parts.join("\n");
-
-        Ok((mission, resume_prompt))
+        Ok((mission, INTERRUPTED_RESUME_PROMPT.to_string()))
     }
 
     loop {
@@ -7951,12 +7930,127 @@ async fn control_actor_loop(
                         match resume_mission_impl(
                             &mission_store,
                             &config,
-                            &workspaces,
                             mission_id,
                             clean_workspace,
                         )
                         .await {
                             Ok((mission, resume_prompt)) => {
+                                let already_running_main =
+                                    running.is_some() && running_mission_id == Some(mission_id);
+                                let already_running_parallel = parallel_runners
+                                    .get(&mission_id)
+                                    .is_some_and(|runner| runner.is_running());
+                                if already_running_main || already_running_parallel {
+                                    let _ = respond.send(Err(format!(
+                                        "Mission {} is already running",
+                                        mission_id
+                                    )));
+                                    continue;
+                                }
+
+                                // If another main mission is running, resume this one in a
+                                // parallel runner so its history stays isolated. This is
+                                // important for startup recovery when several missions were
+                                // interrupted by the same service restart.
+                                if running.is_some() {
+                                    if skip_message {
+                                        tracing::info!(
+                                            mission_id = %mission_id,
+                                            "Deferring parallel resume until the caller sends a custom message"
+                                        );
+                                        let _ = respond.send(Ok(mission));
+                                        continue;
+                                    }
+
+                                    let parallel_running = parallel_runners
+                                        .values()
+                                        .filter(|runner| runner.is_running())
+                                        .count();
+                                    let total_running = parallel_running + 1;
+                                    let max_parallel =
+                                        crate::settings::max_parallel_missions_cached_or(
+                                            config.max_parallel_missions,
+                                        );
+
+                                    if total_running >= max_parallel {
+                                        let _ = respond.send(Err(format!(
+                                            "Maximum parallel missions ({}) reached. {} running.",
+                                            max_parallel, total_running
+                                        )));
+                                        continue;
+                                    }
+
+                                    let mut runner = super::mission_runner::MissionRunner::new(
+                                        mission_id,
+                                        mission.workspace_id,
+                                        mission.agent.clone(),
+                                        Some(mission.backend.clone()),
+                                        mission.session_id.clone(),
+                                        mission.config_profile.clone(),
+                                        mission.model_override.clone(),
+                                        mission.model_effort.clone(),
+                                    );
+                                    runner.working_directory = mission.working_directory.clone();
+                                    for entry in &mission.history {
+                                        runner
+                                            .history
+                                            .push((entry.role.clone(), entry.content.clone()));
+                                    }
+                                    runner.queue_message(Uuid::new_v4(), resume_prompt, None);
+
+                                    let started = runner.start_next(
+                                        config.clone(),
+                                        Arc::clone(&root_agent),
+                                        Arc::clone(&mcp),
+                                        Arc::clone(&workspaces),
+                                        library.clone(),
+                                        events_tx.clone(),
+                                        Arc::clone(&tool_hub),
+                                        Arc::clone(&status),
+                                        mission_cmd_tx.clone(),
+                                        Arc::new(RwLock::new(Some(mission_id))),
+                                        secrets.clone(),
+                                    );
+
+                                    if !started {
+                                        let _ = respond.send(Err(
+                                            "Failed to start mission execution".to_string(),
+                                        ));
+                                        continue;
+                                    }
+
+                                    if let Err(e) = mission_store
+                                        .update_mission_status(mission_id, MissionStatus::Active)
+                                        .await
+                                    {
+                                        tracing::warn!(
+                                            "Failed to resume parallel mission {}: {}",
+                                            mission_id,
+                                            e
+                                        );
+                                    } else {
+                                        maybe_schedule_mission_metadata_refresh_for_status(
+                                            &mission_store,
+                                            &events_tx,
+                                            mission_id,
+                                            MissionStatus::Active,
+                                        );
+                                        let _ = events_tx.send(AgentEvent::MissionStatusChanged {
+                                            mission_id,
+                                            status: MissionStatus::Active,
+                                            summary: None,
+                                        });
+                                    }
+
+                                    parallel_runners.insert(mission_id, runner);
+                                    let mut updated_mission = mission;
+                                    updated_mission.status = MissionStatus::Active;
+                                    updated_mission.resumable = false;
+                                    updated_mission.interrupted_at = None;
+                                    let _ = respond.send(Ok(updated_mission));
+                                    continue;
+                                }
+
                                 // First persist current mission history (if any)
                                 persist_mission_history(
                                     &mission_store,
@@ -8116,7 +8210,11 @@ async fn control_actor_loop(
                                 // belongs to current_mission, not running_mission_id
 
                                 if mission_store
-                                    .update_mission_status(mission_id, MissionStatus::Interrupted)
+                                    .update_mission_status_with_reason(
+                                        mission_id,
+                                        MissionStatus::Interrupted,
+                                        Some("server_shutdown"),
+                                    )
                                     .await
                                     .is_ok()
                                 {
@@ -8156,7 +8254,11 @@ async fn control_actor_loop(
                             )
                             .await;
                             if mission_store
-                                .update_mission_status(*mission_id, MissionStatus::Interrupted)
+                                .update_mission_status_with_reason(
+                                    *mission_id,
+                                    MissionStatus::Interrupted,
+                                    Some("server_shutdown"),
+                                )
                                 .await
                                 .is_ok()
                             {
@@ -9018,6 +9120,8 @@ async fn control_actor_loop(
                         AgentEvent::Progress { mission_id, .. } => *mission_id,
                         AgentEvent::MissionActivity { mission_id, .. } => *mission_id,
                         AgentEvent::SessionIdUpdate { mission_id, .. } => Some(*mission_id),
+                        AgentEvent::GoalIteration { mission_id, .. } => *mission_id,
+                        AgentEvent::GoalStatus { mission_id, .. } => *mission_id,
                         _ => None,
                     };
                     // Update last_activity for matching runner (main or parallel)
@@ -9343,6 +9447,49 @@ async fn control_actor_loop(
                         // next turn picks up the new value instead of the stale one.
                         if let Some(runner) = parallel_runners.get_mut(mission_id) {
                             runner.session_id = Some(session_id.clone());
+                        }
+                    }
+
+                    // Persist `/goal` metadata so refreshes and restart recovery
+                    // can continue through codex goal mode instead of a plain turn.
+                    if let AgentEvent::UserMessage {
+                        content,
+                        mission_id: Some(mid),
+                        ..
+                    } = &event
+                    {
+                        if let Some(objective) = parse_goal_objective(content) {
+                            if let Err(err) = mission_store
+                                .update_mission_goal(*mid, true, Some(&objective))
+                                .await
+                            {
+                                tracing::warn!(
+                                    mission_id = %mid,
+                                    "Failed to persist goal metadata from user message: {}",
+                                    err
+                                );
+                            }
+                        }
+                    }
+
+                    if let AgentEvent::GoalStatus {
+                        status,
+                        objective,
+                        mission_id: Some(mid),
+                    } = &event
+                    {
+                        let goal_mode = status != "cleared";
+                        let objective = goal_mode.then_some(objective.as_str());
+                        if let Err(err) = mission_store
+                            .update_mission_goal(*mid, goal_mode, objective)
+                            .await
+                        {
+                            tracing::warn!(
+                                mission_id = %mid,
+                                status = %status,
+                                "Failed to persist goal metadata from goal status: {}",
+                                err
+                            );
                         }
                     }
                 }
