@@ -585,6 +585,16 @@ impl OrchestratorMcp {
     }
 
     async fn create_worker(&self, params: CreateWorkerParams) -> Result<Value, String> {
+        // Fail fast if working_directory points outside the boss's container
+        // workspace mount: the worker container will not be able to see paths
+        // outside the bind-mounted workspace root, so accepting the request
+        // would silently produce a worker that fails on first cd/Read.
+        if let Some(wd) = params.working_directory.as_deref() {
+            if let Err(e) = validate_working_directory_visible_to_worker(wd) {
+                return Err(e);
+            }
+        }
+
         let body = json!({
             "title": params.title,
             "agent": params.agent,
@@ -890,6 +900,13 @@ impl OrchestratorMcp {
         let path = &params.path;
         let branch = &params.branch;
         let repo_dir = resolve_repo_path(params.repo_path.as_deref());
+
+        // Fail fast if the worktree path is outside the workspace mount: a
+        // worker container assigned this worktree as its working_directory
+        // would not be able to see it.
+        if let Err(e) = validate_working_directory_visible_to_worker(path) {
+            return Err(e);
+        }
 
         // Check if branch exists
         let branch_exists = Command::new("git")
@@ -1545,6 +1562,55 @@ fn find_git_root(path: &str) -> Option<String> {
     }
 }
 
+/// Validate that the requested `working_directory` is visible to a worker
+/// container.
+///
+/// Worker missions inherit the boss workspace, but their container bind-mounts
+/// only the workspace root. A `working_directory` that resolves outside the
+/// workspace mount is invisible to the worker and will cause it to fail on
+/// first filesystem access. When we detect this, return an error instructing
+/// the caller to use the "clone-yourself" pattern instead.
+///
+/// The check is best-effort: if no workspace mount is configured (Host
+/// workspace) we accept any path. The check uses prefix matching on the
+/// canonical path string — symlinks are not resolved because the worker side
+/// also operates on string paths.
+fn validate_working_directory_visible_to_worker(working_directory: &str) -> Result<(), String> {
+    let workspace_type = std::env::var("SANDBOXED_SH_WORKSPACE_TYPE")
+        .ok()
+        .map(|s| s.to_lowercase());
+    if workspace_type.as_deref() != Some("container") {
+        return Ok(());
+    }
+
+    let workspace_mount = match std::env::var("SANDBOXED_SH_WORKSPACE") {
+        Ok(m) if !m.is_empty() => m,
+        _ => return Ok(()),
+    };
+
+    if path_is_within(working_directory, &workspace_mount) {
+        return Ok(());
+    }
+
+    Err(format!(
+        "error: working_directory '{}' is outside the workspace mount '{}' and will not be visible to the worker container; clone-yourself pattern required",
+        working_directory, workspace_mount
+    ))
+}
+
+/// Return true if `candidate` is the same as `root` or a descendant of it.
+///
+/// Pure string comparison on normalised paths so the check works without
+/// touching the filesystem. Handles trailing slashes on both arguments.
+fn path_is_within(candidate: &str, root: &str) -> bool {
+    let cand = candidate.trim_end_matches('/');
+    let r = root.trim_end_matches('/');
+    if cand == r {
+        return true;
+    }
+    cand.starts_with(&format!("{}/", r))
+}
+
 fn openagent_data_dir() -> std::path::PathBuf {
     std::env::var("OPENAGENT_DATA_DIR")
         .map(std::path::PathBuf::from)
@@ -1696,5 +1762,120 @@ async fn main() {
             writeln!(stdout, "{}", json).ok();
         }
         stdout.flush().ok();
+    }
+}
+
+#[cfg(test)]
+mod working_directory_tests {
+    use super::{path_is_within, validate_working_directory_visible_to_worker};
+
+    fn with_env<F: FnOnce()>(workspace_type: Option<&str>, workspace: Option<&str>, f: F) {
+        // SAFETY: tests in this module are run serially via `#[test]` with
+        // env var manipulation; cargo test parallelism may interleave but
+        // every test sets both vars before calling the function, so as long
+        // as each test only uses its own scoped values the result is stable
+        // enough for the assertions below. To make this rock-solid we wrap
+        // with a global mutex.
+        use std::sync::Mutex;
+        static LOCK: Mutex<()> = Mutex::new(());
+        let _g = LOCK.lock().unwrap();
+        // Stash existing values
+        let prev_type = std::env::var("SANDBOXED_SH_WORKSPACE_TYPE").ok();
+        let prev_ws = std::env::var("SANDBOXED_SH_WORKSPACE").ok();
+        match workspace_type {
+            Some(v) => std::env::set_var("SANDBOXED_SH_WORKSPACE_TYPE", v),
+            None => std::env::remove_var("SANDBOXED_SH_WORKSPACE_TYPE"),
+        }
+        match workspace {
+            Some(v) => std::env::set_var("SANDBOXED_SH_WORKSPACE", v),
+            None => std::env::remove_var("SANDBOXED_SH_WORKSPACE"),
+        }
+        f();
+        // Restore
+        match prev_type {
+            Some(v) => std::env::set_var("SANDBOXED_SH_WORKSPACE_TYPE", v),
+            None => std::env::remove_var("SANDBOXED_SH_WORKSPACE_TYPE"),
+        }
+        match prev_ws {
+            Some(v) => std::env::set_var("SANDBOXED_SH_WORKSPACE", v),
+            None => std::env::remove_var("SANDBOXED_SH_WORKSPACE"),
+        }
+    }
+
+    #[test]
+    fn path_within_root_exact_match() {
+        assert!(path_is_within("/workspaces/foo", "/workspaces/foo"));
+    }
+
+    #[test]
+    fn path_within_root_descendant() {
+        assert!(path_is_within(
+            "/workspaces/foo/bar/baz",
+            "/workspaces/foo"
+        ));
+    }
+
+    #[test]
+    fn path_within_root_trailing_slash_root() {
+        assert!(path_is_within("/workspaces/foo/bar", "/workspaces/foo/"));
+    }
+
+    #[test]
+    fn path_within_root_rejects_prefix_match_without_separator() {
+        // /workspaces/foobar must NOT be considered inside /workspaces/foo
+        assert!(!path_is_within("/workspaces/foobar", "/workspaces/foo"));
+    }
+
+    #[test]
+    fn path_within_root_rejects_sibling() {
+        assert!(!path_is_within("/workspaces/other", "/workspaces/foo"));
+    }
+
+    #[test]
+    fn validate_accepts_when_not_container() {
+        with_env(Some("host"), Some("/workspaces/foo"), || {
+            assert!(validate_working_directory_visible_to_worker("/tmp/elsewhere").is_ok());
+        });
+    }
+
+    #[test]
+    fn validate_accepts_when_no_mount_configured() {
+        with_env(Some("container"), None, || {
+            assert!(validate_working_directory_visible_to_worker("/tmp/elsewhere").is_ok());
+        });
+    }
+
+    #[test]
+    fn validate_accepts_path_inside_mount() {
+        with_env(Some("container"), Some("/workspaces/foo"), || {
+            assert!(validate_working_directory_visible_to_worker(
+                "/workspaces/foo/worker-1"
+            )
+            .is_ok());
+        });
+    }
+
+    #[test]
+    fn validate_rejects_path_outside_mount() {
+        with_env(Some("container"), Some("/workspaces/foo"), || {
+            let err = validate_working_directory_visible_to_worker("/tmp/elsewhere")
+                .expect_err("should reject path outside mount");
+            assert!(
+                err.contains("clone-yourself pattern required"),
+                "error message did not mention clone-yourself: {}",
+                err
+            );
+            assert!(err.contains("/tmp/elsewhere"));
+            assert!(err.contains("/workspaces/foo"));
+        });
+    }
+
+    #[test]
+    fn validate_rejects_sibling_workspace() {
+        with_env(Some("container"), Some("/workspaces/foo"), || {
+            let err = validate_working_directory_visible_to_worker("/workspaces/foobar/sub")
+                .expect_err("sibling path with prefix match should be rejected");
+            assert!(err.contains("not be visible to the worker"));
+        });
     }
 }
