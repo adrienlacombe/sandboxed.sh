@@ -642,10 +642,15 @@ impl OrchestratorMcp {
 
         // Filter to only child missions of this boss
         let boss_id = self.mission_id.to_string();
-        let workers: Vec<&Value> = missions
-            .iter()
+        let mut workers: Vec<Value> = missions
+            .into_iter()
             .filter(|m| m["parent_mission_id"].as_str() == Some(&boss_id))
             .collect();
+
+        // Enrich completed workers with push verification.
+        for worker in workers.iter_mut() {
+            enrich_with_push_claims(worker);
+        }
 
         Ok(json!({
             "boss_mission_id": boss_id,
@@ -666,10 +671,14 @@ impl OrchestratorMcp {
             return Err(format!("Worker mission not found: {}", response.status()));
         }
 
-        let mission: Value = response
+        let mut mission: Value = response
             .json()
             .await
             .map_err(|e| format!("Failed to parse response: {}", e))?;
+
+        // Enrich with push verification if the worker is completed and the
+        // last assistant message claims to have pushed a branch.
+        enrich_with_push_claims(&mut mission);
 
         Ok(mission)
     }
@@ -1545,6 +1554,195 @@ fn find_git_root(path: &str) -> Option<String> {
     }
 }
 
+/// Enrich a mission JSON object with a `push_claims` array if the mission is
+/// completed AND the last assistant message claims to have pushed a branch.
+///
+/// Each entry has shape `{ branch, claimed_sha, remote_sha, verified }`.
+/// `claimed_sha` is the local SHA at `working_directory` (when readable);
+/// `remote_sha` comes from `git ls-remote origin <branch>` (when reachable);
+/// `verified` is true iff both are present and equal.
+///
+/// Best-effort: never fails. Synchronous git operations with a short timeout.
+/// If the worker did not push, the field is omitted.
+fn enrich_with_push_claims(mission: &mut Value) {
+    let status = mission
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    if status != "completed" {
+        return;
+    }
+
+    let last_assistant = mission
+        .get("history")
+        .and_then(Value::as_array)
+        .and_then(|h| {
+            h.iter()
+                .rev()
+                .find(|entry| entry.get("role").and_then(Value::as_str) == Some("assistant"))
+                .and_then(|entry| entry.get("content").and_then(Value::as_str))
+                .map(|s| s.to_string())
+        });
+
+    let Some(content) = last_assistant else {
+        return;
+    };
+
+    if !looks_like_push_claim(&content) {
+        return;
+    }
+
+    let branches = extract_branch_candidates(&content);
+    if branches.is_empty() {
+        return;
+    }
+
+    let working_directory = mission
+        .get("working_directory")
+        .and_then(Value::as_str)
+        .map(|s| s.to_string());
+
+    let mut claims = Vec::new();
+    for branch in branches {
+        let claimed_sha = working_directory
+            .as_deref()
+            .and_then(|wd| git_local_sha(wd, &branch));
+        let remote_sha = working_directory
+            .as_deref()
+            .and_then(|wd| git_remote_sha(wd, "origin", &branch));
+        let verified =
+            claimed_sha.is_some() && remote_sha.is_some() && claimed_sha == remote_sha;
+        claims.push(json!({
+            "branch": branch,
+            "claimed_sha": claimed_sha,
+            "remote_sha": remote_sha,
+            "verified": verified,
+        }));
+    }
+
+    if let Some(obj) = mission.as_object_mut() {
+        obj.insert("push_claims".to_string(), Value::Array(claims));
+    }
+}
+
+/// Heuristic: did the worker claim to have pushed?
+fn looks_like_push_claim(content: &str) -> bool {
+    let lower = content.to_lowercase();
+    lower.contains("pushed branch")
+        || lower.contains("pushed to")
+        || lower.contains("git push")
+        || lower.contains("push successful")
+        || lower.contains("`git push")
+}
+
+/// Extract plausible branch names from an assistant message.
+///
+/// Looks for patterns like "Pushed branch `name`", "git push origin name",
+/// "fix/...", "feat/...", "feature/...", and backtick-wrapped tokens that
+/// look like git refs.
+fn extract_branch_candidates(content: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut push = |s: &str| {
+        let s = s.trim().trim_matches(|c: char| matches!(c, '`' | '"' | '\'' | ',' | '.' | ')' | '('));
+        if !s.is_empty() && is_plausible_branch(s) && !out.iter().any(|x| x == s) {
+            out.push(s.to_string());
+        }
+    };
+
+    // Pattern: "git push origin <branch>"
+    for cap in content.split("git push origin ").skip(1) {
+        if let Some(token) = cap.split_whitespace().next() {
+            push(token);
+        }
+    }
+    // Pattern: "Pushed branch <branch>" / "Pushed branch `<branch>`"
+    for cap in content.split("ushed branch ").skip(1) {
+        // matches "pushed branch" and "Pushed branch"
+        if let Some(token) = cap.split_whitespace().next() {
+            push(token);
+        }
+    }
+    // Pattern: bare ref-like tokens fix/... feat/... feature/...
+    for word in content.split_whitespace() {
+        let trimmed = word.trim_matches(|c: char| {
+            matches!(c, '`' | '"' | '\'' | ',' | '.' | ')' | '(' | ':' | ';')
+        });
+        if trimmed.starts_with("fix/")
+            || trimmed.starts_with("feat/")
+            || trimmed.starts_with("feature/")
+            || trimmed.starts_with("chore/")
+            || trimmed.starts_with("refactor/")
+        {
+            push(trimmed);
+        }
+    }
+
+    out
+}
+
+/// A plausible git branch ref: ASCII, no whitespace, no leading dash, no
+/// double slashes, length 1..=200.
+fn is_plausible_branch(s: &str) -> bool {
+    if s.is_empty() || s.len() > 200 {
+        return false;
+    }
+    if s.starts_with('-') {
+        return false;
+    }
+    if s.contains("//") {
+        return false;
+    }
+    s.chars().all(|c| {
+        c.is_ascii_alphanumeric() || matches!(c, '/' | '_' | '-' | '.' | '+')
+    })
+}
+
+/// Read the local SHA for `<branch>` (or `refs/heads/<branch>`) in `repo`.
+fn git_local_sha(repo: &str, branch: &str) -> Option<String> {
+    if !std::path::Path::new(repo).exists() {
+        return None;
+    }
+    let output = Command::new("git")
+        .current_dir(repo)
+        .args(["rev-parse", "--verify", branch])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let sha = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if sha.len() < 7 {
+        None
+    } else {
+        Some(sha)
+    }
+}
+
+/// Read the remote SHA for `<branch>` from `<remote>` via git ls-remote.
+/// Returns None on any failure or if the remote does not have the branch.
+fn git_remote_sha(repo: &str, remote: &str, branch: &str) -> Option<String> {
+    if !std::path::Path::new(repo).exists() {
+        return None;
+    }
+    let output = Command::new("git")
+        .current_dir(repo)
+        .args(["ls-remote", "--heads", remote, branch])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let first = stdout.lines().next()?;
+    let sha = first.split_whitespace().next()?;
+    if sha.len() < 7 {
+        None
+    } else {
+        Some(sha.to_string())
+    }
+}
+
 fn openagent_data_dir() -> std::path::PathBuf {
     std::env::var("OPENAGENT_DATA_DIR")
         .map(std::path::PathBuf::from)
@@ -1696,5 +1894,125 @@ async fn main() {
             writeln!(stdout, "{}", json).ok();
         }
         stdout.flush().ok();
+    }
+}
+
+#[cfg(test)]
+mod push_claim_tests {
+    use super::{
+        enrich_with_push_claims, extract_branch_candidates, is_plausible_branch,
+        looks_like_push_claim,
+    };
+    use serde_json::json;
+
+    #[test]
+    fn looks_like_push_claim_recognises_common_phrases() {
+        assert!(looks_like_push_claim("Pushed branch feat/foo"));
+        assert!(looks_like_push_claim("I ran `git push origin fix/bar`"));
+        assert!(looks_like_push_claim("Push successful."));
+        assert!(!looks_like_push_claim("Nothing to push."));
+        assert!(!looks_like_push_claim("Hello world"));
+    }
+
+    #[test]
+    fn extract_branch_from_pushed_branch_marker() {
+        let s = "Pushed branch fix/session-id-collision-recovery to origin.";
+        let v = extract_branch_candidates(s);
+        assert!(
+            v.contains(&"fix/session-id-collision-recovery".to_string()),
+            "got {:?}",
+            v
+        );
+    }
+
+    #[test]
+    fn extract_branch_from_git_push_command() {
+        let s = "ran: git push origin feat/new-thing";
+        let v = extract_branch_candidates(s);
+        assert!(v.contains(&"feat/new-thing".to_string()), "got {:?}", v);
+    }
+
+    #[test]
+    fn extract_branch_dedupes_and_strips_backticks() {
+        let s = "Pushed branch `fix/foo` (git push origin fix/foo).";
+        let v = extract_branch_candidates(s);
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0], "fix/foo");
+    }
+
+    #[test]
+    fn is_plausible_branch_rejects_garbage() {
+        assert!(is_plausible_branch("fix/foo"));
+        assert!(is_plausible_branch("master"));
+        assert!(!is_plausible_branch(""));
+        assert!(!is_plausible_branch("-rf"));
+        assert!(!is_plausible_branch("foo//bar"));
+        assert!(!is_plausible_branch("foo bar"));
+    }
+
+    #[test]
+    fn enrich_skips_non_completed_status() {
+        let mut m = json!({
+            "status": "running",
+            "history": [
+                { "role": "assistant", "content": "Pushed branch fix/foo." }
+            ]
+        });
+        enrich_with_push_claims(&mut m);
+        assert!(m.get("push_claims").is_none());
+    }
+
+    #[test]
+    fn enrich_skips_when_no_push_claim() {
+        let mut m = json!({
+            "status": "completed",
+            "history": [
+                { "role": "assistant", "content": "All done." }
+            ]
+        });
+        enrich_with_push_claims(&mut m);
+        assert!(m.get("push_claims").is_none());
+    }
+
+    #[test]
+    fn enrich_adds_unverified_claim_when_repo_missing() {
+        // No working_directory, so claimed_sha and remote_sha will be None
+        // and verified must be false; the claim entry must still be present.
+        let mut m = json!({
+            "status": "completed",
+            "history": [
+                { "role": "assistant", "content": "Pushed branch fix/foo to origin." }
+            ]
+        });
+        enrich_with_push_claims(&mut m);
+        let claims = m
+            .get("push_claims")
+            .and_then(|v| v.as_array())
+            .expect("push_claims should be present");
+        assert_eq!(claims.len(), 1);
+        assert_eq!(claims[0]["branch"], "fix/foo");
+        assert_eq!(claims[0]["verified"], false);
+        assert!(claims[0]["claimed_sha"].is_null());
+        assert!(claims[0]["remote_sha"].is_null());
+    }
+
+    #[test]
+    fn enrich_picks_last_assistant_message() {
+        let mut m = json!({
+            "status": "completed",
+            "history": [
+                { "role": "user", "content": "go push something" },
+                { "role": "assistant", "content": "Nothing pushed yet." },
+                { "role": "user", "content": "retry" },
+                { "role": "assistant", "content": "Pushed branch fix/final." }
+            ]
+        });
+        enrich_with_push_claims(&mut m);
+        let claims = m
+            .get("push_claims")
+            .and_then(|v| v.as_array())
+            .expect("push_claims should be present");
+        assert_eq!(claims.len(), 1);
+        assert_eq!(claims[0]["branch"], "fix/final");
     }
 }
