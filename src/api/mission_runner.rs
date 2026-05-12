@@ -4605,8 +4605,6 @@ pub fn run_claudecode_turn<'a>(
                 {
                     let force_bun = env_var_bool("SANDBOXED_SH_CLAUDECODE_FORCE_BUN", false);
                     let prefers_bun = force_bun
-                        || claude_path.contains("/.bun/")
-                        || claude_path.contains("/.cache/.bun/")
                         || claude_cli_shebang_contains(
                             &workspace_exec,
                             work_dir,
@@ -8959,6 +8957,8 @@ async fn ensure_claudecode_cli_available(
     cwd: &std::path::Path,
     cli_path: &str,
 ) -> Result<String, String> {
+    let desired_version = desired_claudecode_version();
+
     // Allow wrapper commands like `bun /path/to/claude` by validating the
     // leading program (and optionally the first argument if it looks like a program).
     let mut parts = cli_path.split_whitespace();
@@ -8972,15 +8972,36 @@ async fn ensure_claudecode_cli_available(
         if let Some(arg0) = arg0 {
             // Skip flags like `--something`; only validate likely program/path tokens.
             if !arg0.starts_with('-') && command_available(workspace_exec, cwd, arg0).await {
-                return Ok(cli_path.to_string());
+                if claude_cli_matches_desired_version(
+                    workspace_exec,
+                    cwd,
+                    cli_path,
+                    &desired_version,
+                )
+                .await
+                {
+                    return Ok(cli_path.to_string());
+                }
             }
         } else {
-            return Ok(cli_path.to_string());
+            if claude_cli_matches_desired_version(workspace_exec, cwd, cli_path, &desired_version)
+                .await
+            {
+                return Ok(cli_path.to_string());
+            }
         }
     }
 
     for direct_claude_path in ["/usr/local/bin/claude", "/usr/bin/claude"] {
-        if command_available(workspace_exec, cwd, direct_claude_path).await {
+        if command_available(workspace_exec, cwd, direct_claude_path).await
+            && claude_cli_matches_desired_version(
+                workspace_exec,
+                cwd,
+                direct_claude_path,
+                &desired_version,
+            )
+            .await
+        {
             return Ok(direct_claude_path.to_string());
         }
     }
@@ -8999,7 +9020,15 @@ async fn ensure_claudecode_cli_available(
         .copied()
         .chain(std::iter::once(BUN_GLOBAL_CLAUDE_CLI_JS))
     {
-        if command_available(workspace_exec, cwd, bun_claude_path).await {
+        if command_available(workspace_exec, cwd, bun_claude_path).await
+            && claude_cli_matches_desired_version(
+                workspace_exec,
+                cwd,
+                bun_claude_path,
+                &desired_version,
+            )
+            .await
+        {
             // cli.js is a raw JS file — it needs an explicit node/bun prefix.
             // Bin symlinks (e.g. /root/.bun/bin/claude) have shebangs and can run directly.
             let is_raw_js = bun_claude_path == BUN_GLOBAL_CLAUDE_CLI_JS;
@@ -9069,11 +9098,15 @@ async fn ensure_claudecode_cli_available(
     // the bin symlink, so we manually link it as a workaround.
     let install_cmd = if let Some(bun) = bun_command.as_deref() {
         format!(
-            r#"export PATH="/usr/local/bin:/root/.bun/bin:/root/.cache/.bun/bin:$PATH" && {} install -g @anthropic-ai/claude-code@latest && {{ test -x /root/.bun/bin/claude || test -x /root/.cache/.bun/bin/claude || ln -sf ../install/global/node_modules/@anthropic-ai/claude-code/cli.js /root/.bun/bin/claude 2>/dev/null || true; }}"#,
-            shell_quote(bun)
+            r#"export PATH="/usr/local/bin:/root/.bun/bin:/root/.cache/.bun/bin:$PATH" && {} install -g @anthropic-ai/claude-code@{} && {{ test -x /root/.bun/bin/claude || test -x /root/.cache/.bun/bin/claude || ln -sf ../install/global/node_modules/@anthropic-ai/claude-code/cli.js /root/.bun/bin/claude 2>/dev/null || true; }}"#,
+            shell_quote(bun),
+            shell_quote(&desired_version)
         )
     } else {
-        "npm install -g @anthropic-ai/claude-code@latest".to_string()
+        format!(
+            "npm install -g @anthropic-ai/claude-code@{}",
+            shell_quote(&desired_version)
+        )
     };
 
     let args = vec!["-lc".to_string(), install_cmd.to_string()];
@@ -9102,7 +9135,9 @@ async fn ensure_claudecode_cli_available(
     }
 
     // Check if claude is available in PATH or in bun's global bin
-    if command_available(workspace_exec, cwd, cli_path).await {
+    if command_available(workspace_exec, cwd, cli_path).await
+        && claude_cli_matches_desired_version(workspace_exec, cwd, cli_path, &desired_version).await
+    {
         return Ok(cli_path.to_string());
     }
     for bun_claude_path in BUN_GLOBAL_CLAUDE_PATHS
@@ -9110,7 +9145,15 @@ async fn ensure_claudecode_cli_available(
         .copied()
         .chain(std::iter::once(BUN_GLOBAL_CLAUDE_CLI_JS))
     {
-        if command_available(workspace_exec, cwd, bun_claude_path).await {
+        if command_available(workspace_exec, cwd, bun_claude_path).await
+            && claude_cli_matches_desired_version(
+                workspace_exec,
+                cwd,
+                bun_claude_path,
+                &desired_version,
+            )
+            .await
+        {
             let is_raw_js = bun_claude_path == BUN_GLOBAL_CLAUDE_CLI_JS;
             if command_available(workspace_exec, cwd, "node").await {
                 return Ok(if is_raw_js {
@@ -9128,6 +9171,62 @@ async fn ensure_claudecode_cli_available(
         "Claude Code install completed but '{}' is still not available in workspace PATH. Checked: {:?} and {}",
         cli_path, BUN_GLOBAL_CLAUDE_PATHS, BUN_GLOBAL_CLAUDE_CLI_JS,
     ))
+}
+
+fn desired_claudecode_version() -> String {
+    std::env::var("SANDBOXED_SH_CLAUDECODE_VERSION")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| "2.1.139".to_string())
+}
+
+async fn claude_cli_matches_desired_version(
+    workspace_exec: &WorkspaceExec,
+    cwd: &std::path::Path,
+    cli_path: &str,
+    desired_version: &str,
+) -> bool {
+    let args = vec!["-lc".to_string(), format!("{} --version", cli_path)];
+    match workspace_exec
+        .output(cwd, "/bin/sh", &args, HashMap::new())
+        .await
+    {
+        Ok(output) if output.status.success() => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let version_output = format!("{}{}", stdout, stderr);
+            if version_output.contains(desired_version) {
+                true
+            } else {
+                tracing::info!(
+                    cli_path,
+                    desired_version,
+                    observed = %version_output.trim(),
+                    "Claude Code CLI version mismatch; reinstalling desired version"
+                );
+                false
+            }
+        }
+        Ok(output) => {
+            tracing::info!(
+                cli_path,
+                desired_version,
+                status = ?output.status,
+                stderr = %String::from_utf8_lossy(&output.stderr).trim(),
+                "Claude Code CLI version probe failed; reinstalling desired version"
+            );
+            false
+        }
+        Err(err) => {
+            tracing::info!(
+                cli_path,
+                desired_version,
+                error = %err,
+                "Claude Code CLI version probe errored; reinstalling desired version"
+            );
+            false
+        }
+    }
 }
 
 /// Returns the path to the Codex CLI that should be used.

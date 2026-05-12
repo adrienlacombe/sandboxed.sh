@@ -4490,6 +4490,16 @@ if [ -x /root/.bun/bin/bun ] && ! command -v bun >/dev/null 2>&1; then
   echo "[sandboxed] Linked bun into /usr/local/bin"
 fi
 
+CLAUDE_CODE_VERSION="${{SANDBOXED_SH_CLAUDECODE_VERSION:-2.1.139}}"
+claude_needs_install=true
+if command -v claude >/dev/null 2>&1; then
+  if claude --version 2>&1 | grep -F "$CLAUDE_CODE_VERSION" >/dev/null 2>&1; then
+    claude_needs_install=false
+  else
+    echo "[sandboxed] Claude Code version mismatch; installing $CLAUDE_CODE_VERSION"
+  fi
+fi
+
 # Detect package manager: prefer bun, fallback to npm
 if command -v bun >/dev/null 2>&1; then
   PKG_MGR="bun"
@@ -4511,9 +4521,9 @@ if [ -n "$PKG_MGR" ]; then
   if [ "$PKG_MGR" = "bun" ] && command -v npm >/dev/null 2>&1; then
     CLAUDE_PKG_MGR="npm"
   fi
-  if [ "{install_claudecode}" = "true" ] && ! command -v claude >/dev/null 2>&1; then
-    echo "[sandboxed] Installing Claude Code via $CLAUDE_PKG_MGR..."
-    if ! $CLAUDE_PKG_MGR install -g @anthropic-ai/claude-code@latest; then
+  if [ "{install_claudecode}" = "true" ] && [ "$claude_needs_install" = "true" ]; then
+    echo "[sandboxed] Installing Claude Code $CLAUDE_CODE_VERSION via $CLAUDE_PKG_MGR..."
+    if ! $CLAUDE_PKG_MGR install -g @anthropic-ai/claude-code@"$CLAUDE_CODE_VERSION"; then
       echo "[sandboxed] Claude Code install failed"
     fi
   fi

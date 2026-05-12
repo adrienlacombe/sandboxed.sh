@@ -576,10 +576,22 @@ async fn check_amp_update(current_version: Option<&str>) -> Option<String> {
 /// Check if there's a newer version of Claude Code available.
 async fn check_claude_code_update(current_version: Option<&str>) -> Option<String> {
     let current = extract_version_token(current_version?)?;
+    let desired = desired_claude_code_version();
+    if current != desired {
+        return Some(desired);
+    }
+
     let latest_raw = fetch_npm_latest_version("@anthropic-ai/claude-code").await?;
     let latest = extract_version_token(&latest_raw)
         .unwrap_or_else(|| latest_raw.trim_start_matches('v').to_string());
     (latest != current && version_is_newer(&latest, &current)).then_some(latest)
+}
+
+fn desired_claude_code_version() -> String {
+    std::env::var("SANDBOXED_SH_CLAUDECODE_VERSION")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| "2.1.139".to_string())
 }
 
 /// Check if there's a newer version of Codex available.
@@ -1178,6 +1190,7 @@ fn stream_opencode_update() -> impl Stream<Item = Result<Event, std::convert::In
 fn stream_claude_code_update() -> impl Stream<Item = Result<Event, std::convert::Infallible>> {
     async_stream::stream! {
         yield sse("log", "Starting Claude Code installation/update...", Some(0));
+        let desired_version = desired_claude_code_version();
 
         let pm = crate::pkg_manager::preferred().await;
         let Some(pm) = pm else {
@@ -1185,10 +1198,11 @@ fn stream_claude_code_update() -> impl Stream<Item = Result<Event, std::convert:
             return;
         };
 
-        yield sse("log", format!("Installing @anthropic-ai/claude-code globally via {}...", pm.bin()), Some(20));
+        yield sse("log", format!("Installing @anthropic-ai/claude-code@{} globally via {}...", desired_version, pm.bin()), Some(20));
+        let package = format!("@anthropic-ai/claude-code@{}", desired_version);
 
         match Command::new(pm.bin())
-            .args(pm.global_install_args("@anthropic-ai/claude-code@latest"))
+            .args(pm.global_install_args(&package))
             .output()
             .await
         {
