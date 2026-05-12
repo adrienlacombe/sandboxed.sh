@@ -6769,6 +6769,11 @@ async fn control_actor_loop(
     let mut main_runner_activity: Option<String> = None;
     // Track subtasks for the main runner
     let mut main_runner_subtasks: Vec<super::mission_runner::SubtaskInfo> = Vec::new();
+    // Track number of in-flight tool calls on the main runner so the stall
+    // classifier can distinguish "model is hung" from "tool is honestly
+    // running" (e.g. a 12-minute `lake build`). See stall_severity().
+    let main_runner_active_tool_calls: std::sync::Arc<std::sync::atomic::AtomicUsize> =
+        std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     // Deadline for force-reaping a runner whose cancel token was fired
     // but whose JoinHandle never resolved. This handles the "zombie
     // runner" case: the underlying CLI subprocess died (or never reacts
@@ -7922,6 +7927,9 @@ async fn control_actor_loop(
                                     health: super::mission_runner::running_health(
                                         mission_state,
                                         seconds_since_activity,
+                                        main_runner_active_tool_calls
+                                            .load(std::sync::atomic::Ordering::Relaxed)
+                                            > 0,
                                     ),
                                     expected_deliverables: 0,
                                     current_activity: main_runner_activity.clone(),
@@ -9157,8 +9165,13 @@ async fn control_actor_loop(
                                 // Update activity on runner
                                 if running_mission_id == Some(*mid) {
                                     main_runner_activity = Some(label.clone());
+                                    main_runner_active_tool_calls
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                 } else if let Some(runner) = parallel_runners.get_mut(mid) {
                                     runner.current_activity = Some(label.clone());
+                                    runner
+                                        .active_tool_calls
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                 }
 
                                 // Emit activity event for real-time SSE
@@ -9284,8 +9297,21 @@ async fn control_actor_loop(
                                 // Clear activity label (tool finished)
                                 if running_mission_id == Some(*mid) {
                                     main_runner_activity = None;
+                                    // Saturating decrement: never go below 0
+                                    // if we somehow see a stray ToolResult.
+                                    let _ = main_runner_active_tool_calls
+                                        .fetch_update(
+                                            std::sync::atomic::Ordering::Relaxed,
+                                            std::sync::atomic::Ordering::Relaxed,
+                                            |c| if c > 0 { Some(c - 1) } else { None },
+                                        );
                                 } else if let Some(runner) = parallel_runners.get_mut(mid) {
                                     runner.current_activity = None;
+                                    let _ = runner.active_tool_calls.fetch_update(
+                                        std::sync::atomic::Ordering::Relaxed,
+                                        std::sync::atomic::Ordering::Relaxed,
+                                        |c| if c > 0 { Some(c - 1) } else { None },
+                                    );
                                 }
 
                                 // Mark subtask complete if applicable

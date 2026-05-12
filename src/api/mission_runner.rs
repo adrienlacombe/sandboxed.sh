@@ -1803,9 +1803,34 @@ pub enum MissionHealth {
     UnexpectedEnd { reason: String },
 }
 
-fn stall_severity(seconds_since_activity: u64) -> Option<MissionStallSeverity> {
+/// Classify how long a turn has been quiet.
+///
+/// `tool_subprocess_alive` reports whether the worker is currently inside a
+/// tool call (e.g. `Bash` running `lake build` / `make check`).  Long tool
+/// subprocesses are expected to produce ~zero model tokens for many minutes;
+/// without this signal the watchdog would mark them as Severe-stalled at
+/// 5 minutes and terminate the mission mid-build (issue: workers tripped
+/// killed during honest subprocess work).
+///
+/// Rule:
+///   Severe ⇔ (seconds_since_activity > STALL_SEVERE_SECS)
+///              AND no live tool subprocess.
+///
+/// When a tool is in flight we degrade Severe to Warning so the operator
+/// still sees the mission is quiet, but the auto-terminate watchdog
+/// (which only fires on Severe) does not interrupt the build.
+fn stall_severity(
+    seconds_since_activity: u64,
+    tool_subprocess_alive: bool,
+) -> Option<MissionStallSeverity> {
     if seconds_since_activity > STALL_SEVERE_SECS {
-        Some(MissionStallSeverity::Severe)
+        if tool_subprocess_alive {
+            // Long-running tool: keep the user informed via Warning, but
+            // do not escalate to Severe (which would trip the watchdog).
+            Some(MissionStallSeverity::Warning)
+        } else {
+            Some(MissionStallSeverity::Severe)
+        }
     } else if seconds_since_activity > STALL_WARN_SECS {
         Some(MissionStallSeverity::Warning)
     } else {
@@ -1813,12 +1838,16 @@ fn stall_severity(seconds_since_activity: u64) -> Option<MissionStallSeverity> {
     }
 }
 
-pub fn running_health(state: MissionRunState, seconds_since_activity: u64) -> MissionHealth {
+pub fn running_health(
+    state: MissionRunState,
+    seconds_since_activity: u64,
+    tool_subprocess_alive: bool,
+) -> MissionHealth {
     if matches!(
         state,
         MissionRunState::Running | MissionRunState::WaitingForTool
     ) {
-        if let Some(severity) = stall_severity(seconds_since_activity) {
+        if let Some(severity) = stall_severity(seconds_since_activity, tool_subprocess_alive) {
             return MissionHealth::Stalled {
                 seconds_since_activity,
                 last_state: format!("{:?}", state),
@@ -1910,6 +1939,13 @@ pub struct MissionRunner {
 
     /// Optional working directory override (e.g. git worktree path for orchestrated workers)
     pub working_directory: Option<String>,
+
+    /// Number of tool calls currently in flight (tool_use seen, no tool_result
+    /// yet). Used by the stall classifier to avoid Severe-stalling a worker
+    /// that is honestly inside a long Bash subprocess (e.g. `lake build`).
+    /// Shared with the turn loops via Arc so they can increment/decrement
+    /// without holding the runner's outer lock.
+    pub active_tool_calls: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl MissionRunner {
@@ -1947,6 +1983,7 @@ impl MissionRunner {
             current_activity: None,
             subtasks: Vec::new(),
             working_directory: None,
+            active_tool_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 
@@ -1971,10 +2008,17 @@ impl MissionRunner {
     /// Check the health of this mission.
     pub async fn check_health(&self) -> MissionHealth {
         let seconds_since = self.last_activity.elapsed().as_secs();
+        let tool_alive = self
+            .active_tool_calls
+            .load(std::sync::atomic::Ordering::Relaxed)
+            > 0;
 
-        // If running and no activity for a while, consider stalled
+        // If running and no activity for a while, consider stalled.
+        // Severe stall requires BOTH no recent activity AND no live tool
+        // subprocess — otherwise long honest `lake build` / `make check`
+        // calls get killed at 5 minutes.
         if self.is_running() {
-            if let Some(severity) = stall_severity(seconds_since) {
+            if let Some(severity) = stall_severity(seconds_since, tool_alive) {
                 return MissionHealth::Stalled {
                     seconds_since_activity: seconds_since,
                     last_state: format!("{:?}", self.state),
@@ -2347,6 +2391,11 @@ pub fn is_session_corruption_error(result: &AgentResult) -> bool {
     || out.contains("must have a corresponding tool_use block")
     // Session was lost (e.g. after service restart or session expiry)
     || out.contains("No conversation found with session ID")
+    // Session ID collision: the CLI refused to start because the requested
+    // --session-id is already in use (e.g. after an interrupted previous turn
+    // that did not cleanly release the ID, or after a resume that races with
+    // a still-attached process). Recoverable by rotating to a fresh UUID.
+    || (out.contains("Session ID") && out.contains("is already in use"))
     // Context window exhausted — too many turns/tool calls filled the context
     || out.contains("Prompt is too long")
 }
@@ -8971,24 +9020,27 @@ async fn ensure_claudecode_cli_available(
         // wrapped target exists so we don't claim success and then fail at spawn time.
         if let Some(arg0) = arg0 {
             // Skip flags like `--something`; only validate likely program/path tokens.
-            if !arg0.starts_with('-') && command_available(workspace_exec, cwd, arg0).await {
-                if claude_cli_matches_desired_version(
+            if !arg0.starts_with('-')
+                && command_available(workspace_exec, cwd, arg0).await
+                && claude_cli_matches_desired_version(
                     workspace_exec,
                     cwd,
                     cli_path,
                     &desired_version,
                 )
                 .await
-                {
-                    return Ok(cli_path.to_string());
-                }
-            }
-        } else {
-            if claude_cli_matches_desired_version(workspace_exec, cwd, cli_path, &desired_version)
-                .await
             {
                 return Ok(cli_path.to_string());
             }
+        } else if claude_cli_matches_desired_version(
+            workspace_exec,
+            cwd,
+            cli_path,
+            &desired_version,
+        )
+        .await
+        {
+            return Ok(cli_path.to_string());
         }
     }
 
@@ -13155,7 +13207,14 @@ impl From<&MissionRunner> for RunningMissionInfo {
             queue_len: runner.queue.len(),
             history_len: runner.history.len(),
             seconds_since_activity,
-            health: running_health(runner.state, seconds_since_activity),
+            health: running_health(
+                runner.state,
+                seconds_since_activity,
+                runner
+                    .active_tool_calls
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    > 0,
+            ),
             expected_deliverables: runner.deliverables.deliverables.len(),
             current_activity: runner.current_activity.clone(),
             subtask_total: runner.subtasks.len(),
@@ -15823,40 +15882,78 @@ mod tests {
 
     #[test]
     fn stall_severity_none_below_warning_threshold() {
-        assert!(stall_severity(0).is_none());
-        assert!(stall_severity(60).is_none());
-        assert!(stall_severity(STALL_WARN_SECS).is_none());
+        assert!(stall_severity(0, false).is_none());
+        assert!(stall_severity(60, false).is_none());
+        assert!(stall_severity(STALL_WARN_SECS, false).is_none());
     }
 
     #[test]
     fn stall_severity_warning_above_warn_threshold() {
-        let result = stall_severity(STALL_WARN_SECS + 1).unwrap();
+        let result = stall_severity(STALL_WARN_SECS + 1, false).unwrap();
         assert!(matches!(result, MissionStallSeverity::Warning));
     }
 
     #[test]
     fn stall_severity_severe_above_severe_threshold() {
-        let result = stall_severity(STALL_SEVERE_SECS + 1).unwrap();
+        let result = stall_severity(STALL_SEVERE_SECS + 1, false).unwrap();
         assert!(matches!(result, MissionStallSeverity::Severe));
     }
 
     #[test]
     fn stall_severity_at_exact_severe_threshold_is_still_warning() {
-        let result = stall_severity(STALL_SEVERE_SECS).unwrap();
+        let result = stall_severity(STALL_SEVERE_SECS, false).unwrap();
         assert!(matches!(result, MissionStallSeverity::Warning));
+    }
+
+    // ── subprocess-aware stall classifier tests (TASK 2) ──────────────
+
+    #[test]
+    fn stall_severity_severe_downgraded_to_warning_when_tool_alive() {
+        // A 12-minute `lake build` produces no model tokens but is honest
+        // work. The classifier must not escalate this to Severe (which
+        // trips the auto-terminate watchdog) just because of token silence.
+        let result = stall_severity(STALL_SEVERE_SECS + 1, true).unwrap();
+        assert!(
+            matches!(result, MissionStallSeverity::Warning),
+            "expected Warning when a tool subprocess is alive, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn stall_severity_warning_still_warning_when_tool_alive() {
+        // The Warning band is unaffected by tool liveness — operators
+        // should still see the mission is quiet.
+        let result = stall_severity(STALL_WARN_SECS + 1, true).unwrap();
+        assert!(matches!(result, MissionStallSeverity::Warning));
+    }
+
+    #[test]
+    fn stall_severity_no_severe_when_tool_alive_even_at_extreme_quiet() {
+        // 30 minutes of silence with a live subprocess (e.g. a long
+        // `make check`) is still classified as Warning, never Severe.
+        let result = stall_severity(STALL_SEVERE_SECS * 6, true).unwrap();
+        assert!(matches!(result, MissionStallSeverity::Warning));
+    }
+
+    #[test]
+    fn stall_severity_severe_when_no_tool_alive() {
+        // Without a live tool subprocess, normal Severe escalation applies.
+        let result = stall_severity(STALL_SEVERE_SECS + 1, false).unwrap();
+        assert!(matches!(result, MissionStallSeverity::Severe));
     }
 
     // ── running_health tests ──────────────────────────────────────────
 
     #[test]
     fn running_health_healthy_when_running_below_threshold() {
-        let health = running_health(MissionRunState::Running, 10);
+        let health = running_health(MissionRunState::Running, 10, false);
         assert!(matches!(health, MissionHealth::Healthy));
     }
 
     #[test]
     fn running_health_stalled_when_running_above_threshold() {
-        let health = running_health(MissionRunState::Running, STALL_WARN_SECS + 1);
+        let health = running_health(MissionRunState::Running, STALL_WARN_SECS + 1, false);
         match health {
             MissionHealth::Stalled {
                 seconds_since_activity,
@@ -15873,7 +15970,11 @@ mod tests {
 
     #[test]
     fn running_health_stalled_when_waiting_for_tool_above_threshold() {
-        let health = running_health(MissionRunState::WaitingForTool, STALL_SEVERE_SECS + 1);
+        let health = running_health(
+            MissionRunState::WaitingForTool,
+            STALL_SEVERE_SECS + 1,
+            false,
+        );
         match health {
             MissionHealth::Stalled {
                 last_state,
@@ -15888,14 +15989,31 @@ mod tests {
     }
 
     #[test]
+    fn running_health_warning_when_tool_alive_at_severe_threshold() {
+        // The end-to-end claim of TASK 2: when the mission is well past
+        // the severe stall threshold *and* a tool subprocess is in flight,
+        // the public health classification stays at Warning.
+        let health = running_health(MissionRunState::Running, STALL_SEVERE_SECS + 1, true);
+        match health {
+            MissionHealth::Stalled { severity, .. } => {
+                assert!(
+                    matches!(severity, MissionStallSeverity::Warning),
+                    "tool-alive must keep severity at Warning"
+                );
+            }
+            other => panic!("Expected Stalled (Warning), got {:?}", other),
+        }
+    }
+
+    #[test]
     fn running_health_healthy_for_queued_state_even_if_stale() {
-        let health = running_health(MissionRunState::Queued, STALL_SEVERE_SECS + 100);
+        let health = running_health(MissionRunState::Queued, STALL_SEVERE_SECS + 100, false);
         assert!(matches!(health, MissionHealth::Healthy));
     }
 
     #[test]
     fn running_health_healthy_for_finished_state() {
-        let health = running_health(MissionRunState::Finished, STALL_SEVERE_SECS + 100);
+        let health = running_health(MissionRunState::Finished, STALL_SEVERE_SECS + 100, false);
         assert!(matches!(health, MissionHealth::Healthy));
     }
 
@@ -15969,6 +16087,44 @@ mod tests {
         let result = AgentResult::failure("No conversation found with session ID ses_abc", 0)
             .with_terminal_reason(TerminalReason::LlmError);
         assert!(is_session_corruption_error(&result));
+    }
+
+    #[test]
+    fn is_session_corruption_error_detects_session_id_collision() {
+        // The Claude CLI emits this when `--session-id <uuid>` is reused
+        // before the previous attached process has released the slot.
+        let result = AgentResult::failure(
+            "Claude Code ended before startup completed and did not emit any parseable stream-json turn events. Exit status: code: 1.\n\nDiagnostics: use_resume=false, session_id=abcdef\nClaude CLI stderr: Session ID abcdef-1234 is already in use\n",
+            0,
+        )
+        .with_terminal_reason(TerminalReason::LlmError);
+        assert!(is_session_corruption_error(&result));
+    }
+
+    #[test]
+    fn is_session_corruption_error_requires_both_session_id_substrings() {
+        // "Session ID" alone (without "is already in use") should not trip
+        // the collision matcher, to avoid false positives on benign diagnostics.
+        let result = AgentResult::failure("Session ID abcdef created. Mission idle.", 0)
+            .with_terminal_reason(TerminalReason::LlmError);
+        assert!(!is_session_corruption_error(&result));
+    }
+
+    #[test]
+    fn claudecode_transport_recovery_strategy_resets_on_session_id_collision() {
+        // A session-id collision is a startup-stage failure with no recoverable
+        // session state, so the strategy must rotate the UUID via ResetSessionFresh
+        // (rather than try to resume the already-in-use session).
+        let result = AgentResult::failure(
+            "Claude Code ended before startup completed and did not emit any parseable stream-json turn events. Exit status: code: 1.\n\nClaude CLI stderr: Session ID abcdef-1234 is already in use\n",
+            0,
+        )
+        .with_terminal_reason(TerminalReason::LlmError);
+
+        assert_eq!(
+            claudecode_transport_recovery_strategy(&result, true, false, false),
+            ClaudeTransportRecoveryStrategy::ResetSessionFresh
+        );
     }
 
     #[test]

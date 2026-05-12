@@ -151,9 +151,35 @@ impl ClaudeCodeClient {
             .take()
             .ok_or_else(|| anyhow!("Failed to capture Claude stdout"))?;
 
+        // Capture stderr so that early-exit error strings (e.g. "Session ID
+        // <uuid> is already in use") are not lost. The Claude CLI writes
+        // these to stderr before exiting 1, and if we drop the pipe the
+        // mission runner's failure output ends up empty.
+        let stderr = child.stderr.take();
+        let stderr_buf: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let stderr_buf_for_task = Arc::clone(&stderr_buf);
+        if let Some(stderr) = stderr {
+            tokio::spawn(async move {
+                let reader = BufReader::new(stderr);
+                let mut lines = reader.lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    if line.trim().is_empty() {
+                        continue;
+                    }
+                    warn!("Claude CLI stderr: {}", line);
+                    let mut buf = stderr_buf_for_task.lock().await;
+                    if buf.len() < 32 {
+                        buf.push(line);
+                    }
+                }
+            });
+        }
+
         // Wrap child in Arc<Mutex> so it can be killed from outside the task
         let child_handle = Arc::new(Mutex::new(Some(child)));
         let child_for_task = Arc::clone(&child_handle);
+        let stderr_for_exit = Arc::clone(&stderr_buf);
+        let session_id_for_exit = session_id.map(|s| s.to_string());
 
         let task_handle = tokio::spawn(async move {
             let reader = BufReader::new(stdout);
@@ -196,7 +222,27 @@ impl ClaudeCodeClient {
                 match child.wait().await {
                     Ok(status) => {
                         if !status.success() {
-                            warn!("Claude CLI exited with status: {}", status);
+                            let stderr_lines = stderr_for_exit.lock().await.clone();
+                            let stderr_blob = stderr_lines.join("\n");
+                            // Surface the session-id collision string exactly
+                            // so the mission runner's classifier can recognise
+                            // it and rotate to a fresh session ID.
+                            if session_id_for_exit.is_some()
+                                && stderr_blob.contains("Session ID")
+                                && stderr_blob.contains("is already in use")
+                            {
+                                error!(
+                                    "Claude CLI rejected --session-id ({}): {}",
+                                    status, stderr_blob
+                                );
+                            } else if !stderr_blob.is_empty() {
+                                warn!(
+                                    "Claude CLI exited with status: {} stderr: {}",
+                                    status, stderr_blob
+                                );
+                            } else {
+                                warn!("Claude CLI exited with status: {}", status);
+                            }
                         } else {
                             debug!("Claude CLI exited successfully");
                         }
