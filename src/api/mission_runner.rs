@@ -2347,6 +2347,11 @@ pub fn is_session_corruption_error(result: &AgentResult) -> bool {
     || out.contains("must have a corresponding tool_use block")
     // Session was lost (e.g. after service restart or session expiry)
     || out.contains("No conversation found with session ID")
+    // Session ID collision: the CLI refused to start because the requested
+    // --session-id is already in use (e.g. after an interrupted previous turn
+    // that did not cleanly release the ID, or after a resume that races with
+    // a still-attached process). Recoverable by rotating to a fresh UUID.
+    || (out.contains("Session ID") && out.contains("is already in use"))
     // Context window exhausted — too many turns/tool calls filled the context
     || out.contains("Prompt is too long")
 }
@@ -15870,6 +15875,47 @@ mod tests {
         let result = AgentResult::failure("No conversation found with session ID ses_abc", 0)
             .with_terminal_reason(TerminalReason::LlmError);
         assert!(is_session_corruption_error(&result));
+    }
+
+    #[test]
+    fn is_session_corruption_error_detects_session_id_collision() {
+        // The Claude CLI emits this when `--session-id <uuid>` is reused
+        // before the previous attached process has released the slot.
+        let result = AgentResult::failure(
+            "Claude Code ended before startup completed and did not emit any parseable stream-json turn events. Exit status: code: 1.\n\nDiagnostics: use_resume=false, session_id=abcdef\nClaude CLI stderr: Session ID abcdef-1234 is already in use\n",
+            0,
+        )
+        .with_terminal_reason(TerminalReason::LlmError);
+        assert!(is_session_corruption_error(&result));
+    }
+
+    #[test]
+    fn is_session_corruption_error_requires_both_session_id_substrings() {
+        // "Session ID" alone (without "is already in use") should not trip
+        // the collision matcher, to avoid false positives on benign diagnostics.
+        let result = AgentResult::failure(
+            "Session ID abcdef created. Mission idle.",
+            0,
+        )
+        .with_terminal_reason(TerminalReason::LlmError);
+        assert!(!is_session_corruption_error(&result));
+    }
+
+    #[test]
+    fn claudecode_transport_recovery_strategy_resets_on_session_id_collision() {
+        // A session-id collision is a startup-stage failure with no recoverable
+        // session state, so the strategy must rotate the UUID via ResetSessionFresh
+        // (rather than try to resume the already-in-use session).
+        let result = AgentResult::failure(
+            "Claude Code ended before startup completed and did not emit any parseable stream-json turn events. Exit status: code: 1.\n\nClaude CLI stderr: Session ID abcdef-1234 is already in use\n",
+            0,
+        )
+        .with_terminal_reason(TerminalReason::LlmError);
+
+        assert_eq!(
+            claudecode_transport_recovery_strategy(&result, true, false, false),
+            ClaudeTransportRecoveryStrategy::ResetSessionFresh
+        );
     }
 
     #[test]
