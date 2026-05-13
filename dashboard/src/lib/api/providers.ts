@@ -103,13 +103,17 @@ export interface BackendProviderResponse {
   configured: boolean;
   provider_type: string | null;
   provider_name: string | null;
+  /** @deprecated raw key no longer returned by this endpoint — always null. */
   api_key: string | null;
+  /** @deprecated raw token no longer returned by this endpoint — always null. */
   oauth: {
     access_token: string;
     refresh_token: string;
     expires_at: number;
   } | null;
   has_credentials: boolean;
+  /** Credential type (`"api_key"` | `"oauth"`) without secret material. */
+  auth_method: string | null;
 }
 
 // ---------------------------------------------------------------------------

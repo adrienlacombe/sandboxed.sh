@@ -494,9 +494,9 @@ export default function BackendsPage() {
                   <span className="text-base">🧠</span>
                   <span className="text-sm text-white/70">
                     {claudecodeProvider?.configured
-                      ? claudecodeProvider.oauth
+                      ? claudecodeProvider.auth_method === 'oauth'
                         ? 'OAuth'
-                        : claudecodeProvider.api_key
+                        : claudecodeProvider.auth_method === 'api_key'
                         ? 'API Key'
                         : 'Anthropic'
                       : 'Anthropic'}

@@ -2524,12 +2524,15 @@ pub struct BackendProviderResponse {
     pub provider_type: Option<String>,
     /// The provider name
     pub provider_name: Option<String>,
-    /// API key (if using API key auth)
+    /// Deprecated: raw API keys are no longer returned by this status endpoint.
     pub api_key: Option<String>,
-    /// OAuth credentials (if using OAuth)
+    /// Deprecated: raw OAuth tokens are no longer returned by this status endpoint.
     pub oauth: Option<BackendOAuthCredentials>,
     /// Whether the provider has valid credentials
     pub has_credentials: bool,
+    /// Credential type configured for this backend, without secret material.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auth_method: Option<String>,
 }
 
 /// OAuth credentials for backend provider.
@@ -2538,6 +2541,29 @@ pub struct BackendOAuthCredentials {
     pub access_token: String,
     pub refresh_token: String,
     pub expires_at: i64,
+}
+
+fn backend_auth_status_from_entry(
+    auth_entry: Option<&serde_json::Value>,
+) -> (Option<String>, bool) {
+    let Some(auth_entry) = auth_entry else {
+        return (None, false);
+    };
+
+    let auth_type = auth_entry.get("type").and_then(|v| v.as_str());
+    match auth_type {
+        Some("api_key") | Some("api") => (Some("api_key".to_string()), true),
+        Some("oauth") => (Some("oauth".to_string()), true),
+        _ => {
+            if auth_entry.get("refresh").is_some() {
+                (Some("oauth".to_string()), true)
+            } else if auth_entry.get("key").is_some() || auth_entry.get("api_key").is_some() {
+                (Some("api_key".to_string()), true)
+            } else {
+                (None, false)
+            }
+        }
+    }
 }
 
 /// Request to initiate OAuth authorization.
@@ -4945,6 +4971,7 @@ async fn get_provider_for_backend(
             api_key: None,
             oauth: None,
             has_credentials: false,
+            auth_method: None,
         }));
     }
 
@@ -4963,77 +4990,15 @@ async fn get_provider_for_backend(
             api_key: None,
             oauth: None,
             has_credentials: false,
+            auth_method: None,
         }));
     }
 
-    // Get the Anthropic provider credentials from auth.json
+    // Check whether Anthropic credentials exist without returning secret material.
     let auth = read_opencode_auth().map_err(internal_error)?;
     let anthropic_auth = auth.get("anthropic");
 
-    let (api_key, oauth, has_credentials) = if let Some(auth_entry) = anthropic_auth {
-        let auth_type = auth_entry.get("type").and_then(|v| v.as_str());
-        match auth_type {
-            Some("api_key") | Some("api") => {
-                let key = auth_entry
-                    .get("key")
-                    .or_else(|| auth_entry.get("api_key"))
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
-                (key, None, true)
-            }
-            Some("oauth") => {
-                let oauth_creds = BackendOAuthCredentials {
-                    access_token: auth_entry
-                        .get("access")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string(),
-                    refresh_token: auth_entry
-                        .get("refresh")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string(),
-                    expires_at: auth_entry
-                        .get("expires")
-                        .and_then(|v| v.as_i64())
-                        .unwrap_or(0),
-                };
-                (None, Some(oauth_creds), true)
-            }
-            _ => {
-                // Check for OAuth credentials without type field
-                if auth_entry.get("refresh").is_some() {
-                    let oauth_creds = BackendOAuthCredentials {
-                        access_token: auth_entry
-                            .get("access")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string(),
-                        refresh_token: auth_entry
-                            .get("refresh")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string(),
-                        expires_at: auth_entry
-                            .get("expires")
-                            .and_then(|v| v.as_i64())
-                            .unwrap_or(0),
-                    };
-                    (None, Some(oauth_creds), true)
-                } else if auth_entry.get("key").is_some() {
-                    let key = auth_entry
-                        .get("key")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string());
-                    (key, None, true)
-                } else {
-                    (None, None, false)
-                }
-            }
-        }
-    } else {
-        (None, None, false)
-    };
+    let (auth_method, has_credentials) = backend_auth_status_from_entry(anthropic_auth);
 
     // Get provider name from OpenCode config if available
     let config_path = get_opencode_config_path(&state.config.working_dir);
@@ -5047,9 +5012,10 @@ async fn get_provider_for_backend(
         configured: true,
         provider_type: Some("anthropic".to_string()),
         provider_name: Some(provider_name),
-        api_key,
-        oauth,
+        api_key: None,
+        oauth: None,
         has_credentials,
+        auth_method,
     }))
 }
 
