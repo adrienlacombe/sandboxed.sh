@@ -3436,6 +3436,13 @@ private struct SharedFileCardView: View {
                 request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
             }
 
+            // Per-request timeout for image downloads — `URLSession.shared`'s
+            // 60s default leaves the spinner running for a full minute on a
+            // stalled image fetch. 15s matches the JSON path; if the user
+            // ever scrolls past this in a slow gallery the failed-image
+            // placeholder still surfaces fast enough to feel responsive.
+            request.timeoutInterval = 15
+
             let (data, response) = try await URLSession.shared.data(for: request)
 
             // Check response status
