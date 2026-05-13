@@ -49,6 +49,12 @@ use super::routes::AppState;
 const SERVER_SHUTDOWN_AUTO_RESUME_MAX_AGE_HOURS: u64 = 48;
 const INTERRUPTED_RESUME_PROMPT: &str = "You were interrupted, resume your work.";
 
+/// Silence threshold before declaring a mission stuck. Conservative so
+/// legitimately long codex turns (Lean compiles, CI polls) don't trigger
+/// false positives. Shared between the watchdog loop and the actor's
+/// CancelMission re-check to keep the two views of "stalled" consistent.
+const STUCK_SECONDS: u64 = 900;
+
 /// Returns a safe index to truncate a string at, ensuring we don't cut UTF-8 characters.
 pub(super) fn safe_truncate_index(s: &str, max: usize) -> usize {
     if s.len() <= max {
@@ -2935,6 +2941,12 @@ pub enum ControlCommand {
     /// Cancel a specific mission
     CancelMission {
         mission_id: Uuid,
+        /// If `Some(d)`, only cancel when the runner has been idle for at
+        /// least `d`. Race-protects watchdog/cleanup from killing a
+        /// mission that has already resumed activity in the time between
+        /// the caller's "stalled" observation and the actor processing
+        /// this command. User-initiated cancels pass `None`.
+        min_idle: Option<std::time::Duration>,
         respond: oneshot::Sender<Result<(), String>>,
     },
     /// List currently running missions
@@ -4685,6 +4697,7 @@ pub async fn cancel_mission(
         .cmd_tx
         .send(ControlCommand::CancelMission {
             mission_id,
+            min_idle: None,
             respond: tx,
         })
         .await
@@ -5310,6 +5323,7 @@ async fn cleanup_stale_active_missions_once(
                 if cmd_tx
                     .send(ControlCommand::CancelMission {
                         mission_id: mission.id,
+                        min_idle: Some(std::time::Duration::from_secs(STUCK_SECONDS)),
                         respond: tx,
                     })
                     .await
@@ -5372,10 +5386,6 @@ async fn stuck_mission_watchdog_loop(
     use std::collections::HashSet;
 
     const CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
-    /// Silence threshold before declaring a mission stuck. Conservative
-    /// so legitimately long codex turns (Lean compiles, CI polls) don't
-    /// trigger false positives.
-    const STUCK_SECONDS: u64 = 900;
 
     tracing::info!(
         "Stuck-mission watchdog started: threshold {}s, poll every {}s",
@@ -5428,6 +5438,7 @@ async fn stuck_mission_watchdog_loop(
                 if cmd_tx
                     .send(ControlCommand::CancelMission {
                         mission_id: info.mission_id,
+                        min_idle: Some(std::time::Duration::from_secs(STUCK_SECONDS)),
                         respond: cancel_tx,
                     })
                     .await
@@ -7772,7 +7783,34 @@ async fn control_actor_loop(
                             )));
                         }
                     }
-                    ControlCommand::CancelMission { mission_id, respond } => {
+                    ControlCommand::CancelMission { mission_id, min_idle, respond } => {
+                        // Race-protect background cancels (watchdog, stale-cleanup):
+                        // if the caller asked us to only cancel when truly idle and the
+                        // mission has touched activity in the meantime, skip the cancel.
+                        // This catches the case where the watchdog observed N seconds of
+                        // silence, sent CancelMission, and a streaming response arrived
+                        // before the actor got around to processing the command.
+                        if let Some(min_idle) = min_idle {
+                            let idle = if let Some(runner) = parallel_runners.get(&mission_id) {
+                                Some(runner.last_activity.elapsed())
+                            } else if running_mission_id == Some(mission_id) {
+                                Some(main_runner_last_activity.elapsed())
+                            } else {
+                                None
+                            };
+                            if let Some(idle) = idle {
+                                if idle < min_idle {
+                                    tracing::info!(
+                                        mission_id = %mission_id,
+                                        idle_secs = idle.as_secs(),
+                                        threshold_secs = min_idle.as_secs(),
+                                        "Skipping watchdog/cleanup cancel: mission resumed activity before cancel was processed"
+                                    );
+                                    let _ = respond.send(Ok(()));
+                                    continue;
+                                }
+                            }
+                        }
                         // Helper: cascade-cancel all child missions of the given parent.
                         async fn cancel_child_missions(
                             parent_id: Uuid,
