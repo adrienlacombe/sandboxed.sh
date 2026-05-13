@@ -2343,6 +2343,14 @@ fn normalize_sse_line(line: &[u8]) -> Vec<u8> {
 ///
 /// Records `record_success` when the stream ends cleanly, or `record_failure`
 /// if the stream terminates with an I/O error mid-flight.
+/// Idle gap allowed between SSE chunks before we treat the upstream as stalled.
+/// LLM token streaming should produce a chunk every few seconds at most; if a
+/// provider goes silent for longer than this mid-stream, the connection is
+/// effectively dead. We close it so the account is marked failed and downstream
+/// retry logic can engage, instead of letting the harness's 120s text-idle
+/// timeout fire and fail the whole mission turn.
+const STREAM_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 fn track_stream_health(
     inner: impl futures::Stream<Item = Result<bytes::Bytes, std::io::Error>> + Send + 'static,
     health_tracker: crate::provider_health::SharedProviderHealthTracker,
@@ -2354,42 +2362,70 @@ fn track_stream_health(
         let mut stream = std::pin::pin!(inner);
         let mut errored = false;
         let mut received_any = false;
+        let mut idle_timeout = false;
         let mut input_tokens: u64 = 0;
         let mut output_tokens: u64 = 0;
-        while let Some(item) = stream.next().await {
-            received_any = true;
-            match &item {
-                Ok(chunk) => {
-                    // Scan SSE data lines for usage in the final chunk.
-                    // OpenAI-compatible providers include a `usage` object
-                    // in the last `data:` event of the stream.
-                    if let Ok(text) = std::str::from_utf8(chunk) {
-                        for line in text.lines() {
-                            if let Some(json_str) = line.strip_prefix("data: ") {
-                                if let Ok(v) = serde_json::from_str::<serde_json::Value>(json_str) {
-                                    if let Some(usage) = v.get("usage") {
-                                        if let Some(pt) = usage.get("prompt_tokens").and_then(|v| v.as_u64()) {
-                                            input_tokens = pt;
-                                        }
-                                        if let Some(ct) = usage.get("completion_tokens").and_then(|v| v.as_u64()) {
-                                            output_tokens = ct;
+        loop {
+            match tokio::time::timeout(STREAM_IDLE_TIMEOUT, stream.next()).await {
+                Err(_) => {
+                    tracing::warn!(
+                        account_id = %account_id,
+                        idle_secs = STREAM_IDLE_TIMEOUT.as_secs(),
+                        "Upstream stream stalled mid-stream; closing connection"
+                    );
+                    errored = true;
+                    idle_timeout = true;
+                    yield Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        format!(
+                            "upstream stream idle for >{}s",
+                            STREAM_IDLE_TIMEOUT.as_secs()
+                        ),
+                    ));
+                    break;
+                }
+                Ok(None) => break,
+                Ok(Some(item)) => {
+                    received_any = true;
+                    match &item {
+                        Ok(chunk) => {
+                            // Scan SSE data lines for usage in the final chunk.
+                            // OpenAI-compatible providers include a `usage` object
+                            // in the last `data:` event of the stream.
+                            if let Ok(text) = std::str::from_utf8(chunk) {
+                                for line in text.lines() {
+                                    if let Some(json_str) = line.strip_prefix("data: ") {
+                                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(json_str) {
+                                            if let Some(usage) = v.get("usage") {
+                                                if let Some(pt) = usage.get("prompt_tokens").and_then(|v| v.as_u64()) {
+                                                    input_tokens = pt;
+                                                }
+                                                if let Some(ct) = usage.get("completion_tokens").and_then(|v| v.as_u64()) {
+                                                    output_tokens = ct;
+                                                }
+                                            }
                                         }
                                     }
                                 }
                             }
                         }
+                        Err(_) => errored = true,
                     }
+                    yield item;
                 }
-                Err(_) => errored = true,
             }
-            yield item;
         }
         if errored || !received_any {
+            let reason = if idle_timeout {
+                CooldownReason::Timeout
+            } else {
+                CooldownReason::ServerError
+            };
             health_tracker
                 .record_failure_with_subscription(
                     account_id,
                     subscription_key.as_ref(),
-                    CooldownReason::ServerError,
+                    reason,
                     None,
                 )
                 .await;
@@ -4374,5 +4410,76 @@ mod tests {
         assert!(value.get("top_p").is_none());
         assert!(value.get("top_k").is_none());
         assert_eq!(value["thinking"], serde_json::json!({ "type": "disabled" }));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn track_stream_health_times_out_when_upstream_stalls() {
+        let tracker = std::sync::Arc::new(crate::provider_health::ProviderHealthTracker::new());
+        let account_id = uuid::Uuid::new_v4();
+
+        // Stream that emits one chunk then sleeps far longer than the
+        // idle timeout. With the paused tokio clock the sleep only
+        // advances when the test advances time, so the idle watchdog
+        // inside `track_stream_health` should win the race.
+        let inner = async_stream::stream! {
+            yield Ok::<bytes::Bytes, std::io::Error>(bytes::Bytes::from("data: {}\n\n"));
+            tokio::time::sleep(STREAM_IDLE_TIMEOUT * 10).await;
+            yield Ok::<bytes::Bytes, std::io::Error>(bytes::Bytes::from("never sent"));
+        };
+
+        let tracked = track_stream_health(inner, tracker.clone(), account_id, None, None);
+        let mut tracked = std::pin::pin!(tracked);
+
+        // First chunk should pass through immediately.
+        let first = tracked.next().await.expect("first chunk").expect("ok");
+        assert_eq!(first.as_ref(), b"data: {}\n\n");
+
+        // Advance virtual time past the idle timeout. The watchdog
+        // inside the stream should fire and yield a TimedOut error.
+        tokio::time::advance(STREAM_IDLE_TIMEOUT + std::time::Duration::from_secs(1)).await;
+
+        let second = tracked.next().await.expect("error item");
+        let err = second.expect_err("idle timeout should produce error");
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+
+        // Stream is closed after the error.
+        assert!(tracked.next().await.is_none());
+
+        // Health tracker should have recorded a Timeout-cause failure.
+        let h = tracker.get_health(account_id).await;
+        assert_eq!(h.last_failure_reason.as_deref(), Some("timeout"));
+        assert!(!h.is_healthy, "account should be in cooldown after timeout");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn track_stream_health_passes_through_when_upstream_streams_normally() {
+        let tracker = std::sync::Arc::new(crate::provider_health::ProviderHealthTracker::new());
+        let account_id = uuid::Uuid::new_v4();
+
+        let inner = async_stream::stream! {
+            for i in 0..3 {
+                yield Ok::<bytes::Bytes, std::io::Error>(bytes::Bytes::from(format!(
+                    "data: {{\"chunk\":{}}}\n\n",
+                    i
+                )));
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        };
+
+        let tracked = track_stream_health(inner, tracker.clone(), account_id, None, None);
+        let mut tracked = std::pin::pin!(tracked);
+        let mut count = 0;
+        while let Some(item) = tracked.next().await {
+            let bytes = item.expect("chunk should be ok");
+            assert!(bytes.starts_with(b"data:"));
+            count += 1;
+            tokio::time::advance(std::time::Duration::from_millis(100)).await;
+        }
+        assert_eq!(count, 3);
+
+        // Healthy account should not be cooled down.
+        let h = tracker.get_health(account_id).await;
+        assert_eq!(h.last_failure_reason, None);
+        assert!(h.is_healthy);
     }
 }

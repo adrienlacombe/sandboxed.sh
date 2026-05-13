@@ -2132,6 +2132,7 @@ async fn stop_policy_matches_status(
     stop_policy: &mission_store::StopPolicy,
     _status: MissionStatus,
     consecutive_failures: u32,
+    has_fired: bool,
 ) -> bool {
     match stop_policy {
         mission_store::StopPolicy::Never => false,
@@ -2140,6 +2141,27 @@ async fn stop_policy_matches_status(
         }
         mission_store::StopPolicy::WhenAllIssuesClosedAndPRsMerged { repo } => {
             check_github_all_issues_closed_and_prs_merged(repo).await
+        }
+        mission_store::StopPolicy::AfterFirstFire => has_fired,
+    }
+}
+
+async fn automation_has_fired(
+    mission_store: &Arc<dyn mission_store::MissionStore>,
+    automation_id: Uuid,
+) -> bool {
+    match mission_store
+        .get_automation_executions(automation_id, Some(1))
+        .await
+    {
+        Ok(executions) => !executions.is_empty(),
+        Err(e) => {
+            tracing::warn!(
+                "Failed to load executions for automation {} while evaluating stop policy: {}",
+                automation_id,
+                e
+            );
+            false
         }
     }
 }
@@ -5714,11 +5736,20 @@ async fn automation_scheduler_loop(
 
             let consecutive_failures =
                 consecutive_failure_count_for_automation(&mission_store, &automation).await;
+            let has_fired = if matches!(
+                automation.stop_policy,
+                mission_store::StopPolicy::AfterFirstFire
+            ) {
+                automation_has_fired(&mission_store, automation.id).await
+            } else {
+                false
+            };
 
             if stop_policy_matches_status(
                 &automation.stop_policy,
                 mission.status,
                 consecutive_failures,
+                has_fired,
             )
             .await
             {
@@ -6578,11 +6609,20 @@ async fn agent_finished_automation_messages(
     for automation in active {
         let consecutive_failures =
             consecutive_failure_count_for_automation(mission_store, &automation).await;
+        let has_fired = if matches!(
+            automation.stop_policy,
+            mission_store::StopPolicy::AfterFirstFire
+        ) {
+            automation_has_fired(mission_store, automation.id).await
+        } else {
+            false
+        };
 
         if stop_policy_matches_status(
             &automation.stop_policy,
             mission.status,
             consecutive_failures,
+            has_fired,
         )
         .await
         {
@@ -10194,17 +10234,19 @@ async fn run_single_control_turn(
         _ => {
             // Default to opencode using per-workspace CLI execution
             let mid = mission_id.unwrap_or_else(Uuid::nil);
-            // Check profile's sandboxed config for disable_oh_my_opencode flag
+            // Check profile's sandboxed config for the oh-my-opencode opt-in flag.
+            // Vanilla opencode is the default; oh-my-opencode is only used when the
+            // profile (or workspace config) explicitly enables it.
             let mut opencode_workspace = exec_workspace.clone();
             if let Some(ref profile) = effective_config_profile {
                 let lib_guard = library.read().await;
                 if let Some(lib) = lib_guard.as_ref() {
                     if let Ok(profile_data) = lib.get_config_profile(profile).await {
-                        if profile_data.sandboxed_config.disable_oh_my_opencode {
+                        if profile_data.sandboxed_config.enable_oh_my_opencode {
                             tracing::info!(
                                 mission_id = ?mission_id,
                                 profile = %profile,
-                                "Enabling plain opencode mode from config profile"
+                                "Enabling oh-my-opencode wrapper from config profile"
                             );
                             let mut obj = opencode_workspace
                                 .config
@@ -10212,7 +10254,7 @@ async fn run_single_control_turn(
                                 .cloned()
                                 .unwrap_or_default();
                             obj.insert(
-                                "disable_oh_my_opencode".to_string(),
+                                "enable_oh_my_opencode".to_string(),
                                 serde_json::json!(true),
                             );
                             opencode_workspace.config = serde_json::Value::Object(obj);
@@ -10403,8 +10445,8 @@ pub async fn create_automation(
         )
     {
         if let Ok(Some(mission)) = control.mission_store.get_mission(mission_id).await {
-            // Newly created automation has 0 consecutive failures
-            if stop_policy_matches_status(&automation.stop_policy, mission.status, 0).await {
+            // Newly created automation has 0 consecutive failures and has never fired.
+            if stop_policy_matches_status(&automation.stop_policy, mission.status, 0, false).await {
                 let mut updated = automation.clone();
                 updated.active = false;
                 if let Err(e) = control.mission_store.update_automation(updated).await {
@@ -11536,11 +11578,20 @@ pub async fn webhook_receiver(
 
     let consecutive_failures =
         consecutive_failure_count_for_automation(&control.mission_store, &automation).await;
+    let has_fired = if matches!(
+        automation.stop_policy,
+        mission_store::StopPolicy::AfterFirstFire
+    ) {
+        automation_has_fired(&control.mission_store, automation.id).await
+    } else {
+        false
+    };
 
     if stop_policy_matches_status(
         &automation.stop_policy,
         mission.status,
         consecutive_failures,
+        has_fired,
     )
     .await
     {
@@ -12902,6 +12953,35 @@ mod tests {
     use crate::api::mission_store::MissionMode;
     use std::sync::Arc;
 
+    static METADATA_REFRESH_TEST_LOCK: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+        std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+
+    async fn metadata_refresh_test_guard() -> tokio::sync::MutexGuard<'static, ()> {
+        let guard = METADATA_REFRESH_TEST_LOCK.lock().await;
+        reset_metadata_refresh_test_state();
+        guard
+    }
+
+    fn reset_metadata_refresh_test_state() {
+        let stale_tasks = {
+            let mut tasks = MISSION_METADATA_REFRESH_TASKS
+                .lock()
+                .expect("metadata refresh task registry lock poisoned");
+            tasks
+                .drain()
+                .map(|(_, entry)| entry.handle)
+                .collect::<Vec<_>>()
+        };
+        for task in stale_tasks {
+            task.abort();
+        }
+
+        let mut baselines = MISSION_METADATA_REFRESH_BASELINES
+            .lock()
+            .expect("metadata refresh baseline lock poisoned");
+        baselines.clear();
+    }
+
     fn test_automation_with_mode(
         fresh_session: mission_store::FreshSession,
         variables: HashMap<String, String>,
@@ -14148,6 +14228,7 @@ And the report:
 
     #[tokio::test]
     async fn test_schedule_mission_metadata_refresh_for_milestone_updates_store_and_emits_event() {
+        let _guard = metadata_refresh_test_guard().await;
         let store: Arc<dyn MissionStore> = Arc::new(mission_store::InMemoryMissionStore::new());
         let mission = store
             .create_mission(Some("Legacy title"), None, None, None, None, None, None)
@@ -14221,6 +14302,7 @@ And the report:
 
     #[tokio::test]
     async fn test_maybe_schedule_mission_metadata_refresh_for_status_forces_terminal_statuses() {
+        let _guard = metadata_refresh_test_guard().await;
         let store: Arc<dyn MissionStore> = Arc::new(mission_store::InMemoryMissionStore::new());
         let mission = store
             .create_mission(Some("Legacy title"), None, None, None, None, None, None)
@@ -14304,6 +14386,7 @@ And the report:
     #[tokio::test]
     async fn test_maybe_schedule_mission_metadata_refresh_for_status_skips_non_milestone_statuses()
     {
+        let _guard = metadata_refresh_test_guard().await;
         let store: Arc<dyn MissionStore> = Arc::new(mission_store::InMemoryMissionStore::new());
         let mission = store
             .create_mission(
@@ -14406,6 +14489,7 @@ And the report:
 
     #[tokio::test]
     async fn test_schedule_mission_metadata_refresh_updates_store_without_force_refresh() {
+        let _guard = metadata_refresh_test_guard().await;
         let store: Arc<dyn MissionStore> = Arc::new(mission_store::InMemoryMissionStore::new());
         let mission = store
             .create_mission(None, None, None, None, None, None, None)
@@ -14468,6 +14552,7 @@ And the report:
 
     #[tokio::test]
     async fn test_persist_mission_history_and_schedule_metadata_refresh_emits_metadata_update() {
+        let _guard = metadata_refresh_test_guard().await;
         let store: Arc<dyn MissionStore> = Arc::new(mission_store::InMemoryMissionStore::new());
         let mission = store
             .create_mission(None, None, None, None, None, None, None)
@@ -14528,6 +14613,7 @@ And the report:
     #[tokio::test]
     async fn test_schedule_mission_metadata_refresh_skips_non_cadence_updates_without_force_refresh(
     ) {
+        let _guard = metadata_refresh_test_guard().await;
         let store: Arc<dyn MissionStore> = Arc::new(mission_store::InMemoryMissionStore::new());
         let mission = store
             .create_mission(None, None, None, None, None, None, None)
@@ -14621,6 +14707,7 @@ And the report:
     #[tokio::test]
     async fn test_schedule_mission_metadata_refresh_ignores_non_conversational_entries_for_cadence()
     {
+        let _guard = metadata_refresh_test_guard().await;
         let store: Arc<dyn MissionStore> = Arc::new(mission_store::InMemoryMissionStore::new());
         let mission = store
             .create_mission(None, None, None, None, None, None, None)
@@ -14737,6 +14824,7 @@ And the report:
 
     #[tokio::test]
     async fn test_schedule_mission_metadata_refresh_uses_last_refresh_baseline_not_global_modulo() {
+        let _guard = metadata_refresh_test_guard().await;
         let store: Arc<dyn MissionStore> = Arc::new(mission_store::InMemoryMissionStore::new());
         let mission = store
             .create_mission(Some("Legacy title"), None, None, None, None, None, None)
@@ -14818,6 +14906,7 @@ And the report:
 
     #[tokio::test]
     async fn test_should_refresh_metadata_by_cadence_rebases_when_history_is_rewritten_shorter() {
+        let _guard = metadata_refresh_test_guard().await;
         let store: Arc<dyn MissionStore> = Arc::new(mission_store::InMemoryMissionStore::new());
         let mission = store
             .create_mission(Some("Existing mission"), None, None, None, None, None, None)
@@ -14860,6 +14949,7 @@ And the report:
 
     #[tokio::test]
     async fn test_record_metadata_refresh_baseline_from_mission_rebases_manual_title_updates() {
+        let _guard = metadata_refresh_test_guard().await;
         let store: Arc<dyn MissionStore> = Arc::new(mission_store::InMemoryMissionStore::new());
         let mission = store
             .create_mission(Some("Existing mission"), None, None, None, None, None, None)
@@ -15100,6 +15190,7 @@ And the report:
 
     #[tokio::test]
     async fn test_clear_mission_metadata_refresh_state_removes_task_and_baseline() {
+        let _guard = metadata_refresh_test_guard().await;
         let mission_id = Uuid::new_v4();
         let other_mission_id = Uuid::new_v4();
 
@@ -15163,6 +15254,7 @@ And the report:
 
     #[tokio::test]
     async fn test_clear_stale_mission_metadata_refresh_state_prunes_deleted_missions() {
+        let _guard = metadata_refresh_test_guard().await;
         let store: Arc<dyn MissionStore> = Arc::new(mission_store::InMemoryMissionStore::new());
 
         let deleted_mission = store
@@ -16188,7 +16280,8 @@ Investigate <service/> failures.
             stop_policy_matches_status(
                 &mission_store::StopPolicy::WhenFailingConsecutively { count: 2 },
                 MissionStatus::Failed,
-                2
+                2,
+                false,
             )
             .await
         );
@@ -16196,7 +16289,8 @@ Investigate <service/> failures.
             !stop_policy_matches_status(
                 &mission_store::StopPolicy::WhenFailingConsecutively { count: 2 },
                 MissionStatus::Failed,
-                1
+                1,
+                false,
             )
             .await
         );
@@ -16204,7 +16298,8 @@ Investigate <service/> failures.
             stop_policy_matches_status(
                 &mission_store::StopPolicy::WhenFailingConsecutively { count: 3 },
                 MissionStatus::Failed,
-                3
+                3,
+                false,
             )
             .await
         );
@@ -16212,7 +16307,8 @@ Investigate <service/> failures.
             !stop_policy_matches_status(
                 &mission_store::StopPolicy::WhenFailingConsecutively { count: 3 },
                 MissionStatus::Failed,
-                2
+                2,
+                false,
             )
             .await
         );
@@ -16224,7 +16320,8 @@ Investigate <service/> failures.
             !stop_policy_matches_status(
                 &mission_store::StopPolicy::Never,
                 MissionStatus::Completed,
-                0
+                0,
+                false,
             )
             .await
         );
@@ -16232,9 +16329,34 @@ Investigate <service/> failures.
             !stop_policy_matches_status(
                 &mission_store::StopPolicy::Never,
                 MissionStatus::Failed,
-                5
+                5,
+                false,
             )
             .await
+        );
+    }
+
+    #[tokio::test]
+    async fn test_stop_policy_after_first_fire() {
+        assert!(
+            !stop_policy_matches_status(
+                &mission_store::StopPolicy::AfterFirstFire,
+                MissionStatus::Active,
+                0,
+                false,
+            )
+            .await,
+            "never-fired one-shot stays armed"
+        );
+        assert!(
+            stop_policy_matches_status(
+                &mission_store::StopPolicy::AfterFirstFire,
+                MissionStatus::Active,
+                0,
+                true,
+            )
+            .await,
+            "one-shot disables on the tick after it fires"
         );
     }
 

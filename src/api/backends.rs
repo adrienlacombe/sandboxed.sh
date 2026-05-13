@@ -102,6 +102,9 @@ pub struct BackendConfig {
     /// Whether the CLI for this backend is available on the system
     #[serde(default)]
     pub cli_available: bool,
+    /// Whether authentication for this backend is configured (None = not applicable / not checked)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_configured: Option<bool>,
 }
 
 /// Check if a CLI command is available on the system
@@ -119,6 +122,22 @@ fn check_cli_available(cli_name: &str) -> bool {
         .output()
         .map(|output| output.status.success())
         .unwrap_or(false)
+}
+
+/// Probe a backend's declared CLI names — true if any are on PATH.
+///
+/// Honours an explicit `cli_path` override in `settings`, otherwise tries each
+/// name from `declared` (typically `Backend::cli_names()`) in order.
+fn probe_backend_cli(settings: &serde_json::Value, declared: &[&'static str]) -> bool {
+    if let Some(custom) = settings
+        .get("cli_path")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        return check_cli_available(custom);
+    }
+    declared.iter().any(|name| check_cli_available(name))
 }
 
 /// Get backend configuration
@@ -142,81 +161,46 @@ pub async fn get_backend_config(
 
     let mut settings = config_entry.settings.clone();
 
-    if id == "claudecode" {
-        let api_key_configured = if let Some(store) = state.secrets.as_ref() {
-            match store.list_secrets("claudecode").await {
-                Ok(secrets) => secrets.iter().any(|s| s.key == "api_key" && !s.is_expired),
-                Err(_) => false,
-            }
-        } else {
-            false
-        };
+    let auth_ctx = crate::backend::AuthContext {
+        working_dir: &state.config.working_dir,
+        settings: &settings,
+        secrets: state.secrets.as_deref(),
+    };
+    let auth_configured = backend.check_auth_configured(&auth_ctx).await;
 
+    // Per-backend settings shaping: surface "api_key_configured" for the
+    // backends whose frontend cards still read it, and mask the persisted
+    // amp api_key so it never leaves the server.
+    if id == "claudecode" {
         let mut obj = settings.as_object().cloned().unwrap_or_default();
         obj.insert(
             "api_key_configured".to_string(),
-            serde_json::Value::Bool(api_key_configured),
+            serde_json::Value::Bool(auth_configured.unwrap_or(false)),
         );
         settings = serde_json::Value::Object(obj);
-    }
-
-    // For amp backend, mask the api_key but indicate if configured
-    if id == "amp" {
+    } else if id == "amp" {
         let mut obj = settings.as_object().cloned().unwrap_or_default();
-        let has_api_key = obj
-            .get("api_key")
-            .and_then(|v| v.as_str())
-            .map(|s| !s.is_empty() && !s.starts_with("[REDACTED") && s != "********")
-            .unwrap_or(false);
+        let configured = auth_configured.unwrap_or(false);
         obj.insert(
             "api_key_configured".to_string(),
-            serde_json::Value::Bool(has_api_key),
+            serde_json::Value::Bool(configured),
         );
-        // Mask the actual api_key value if present and valid, or clear invalid values
-        if has_api_key {
+        if configured {
             obj.insert(
                 "api_key".to_string(),
                 serde_json::Value::String("********".to_string()),
             );
         } else {
-            // Clear invalid/redacted values so frontend shows empty field
             obj.remove("api_key");
         }
         settings = serde_json::Value::Object(obj);
     }
 
-    // Check CLI availability based on backend type
-    let cli_available = match id.as_str() {
-        "claudecode" => {
-            // Check for custom cli_path first, then default 'claude'
-            let cli_path = settings
-                .get("cli_path")
-                .and_then(|v| v.as_str())
-                .filter(|s| !s.is_empty())
-                .unwrap_or("claude");
-            check_cli_available(cli_path)
-        }
-        "amp" => {
-            let cli_path = settings
-                .get("cli_path")
-                .and_then(|v| v.as_str())
-                .filter(|s| !s.is_empty())
-                .unwrap_or("amp");
-            check_cli_available(cli_path)
-        }
-        "codex" => {
-            let cli_path = settings
-                .get("cli_path")
-                .and_then(|v| v.as_str())
-                .filter(|s| !s.is_empty())
-                .unwrap_or("codex");
-            check_cli_available(cli_path)
-        }
-        "opencode" => {
-            // OpenCode uses oh-my-opencode or opencode CLI
-            check_cli_available("oh-my-opencode") || check_cli_available("opencode")
-        }
-        _ => true,
+    let cli_names = backend.cli_names();
+    let cli_available = if cli_names.is_empty() {
+        true
+    } else {
+        probe_backend_cli(&settings, cli_names)
     };
 
     Ok(Json(BackendConfig {
@@ -225,6 +209,7 @@ pub async fn get_backend_config(
         enabled: config_entry.enabled,
         settings,
         cli_available,
+        auth_configured,
     }))
 }
 

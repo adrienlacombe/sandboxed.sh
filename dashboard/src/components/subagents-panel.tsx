@@ -24,21 +24,36 @@ export interface SubagentEntry {
   endTime?: number;
 }
 
-function extractAgentName(args: unknown): string | null {
-  if (!args || typeof args !== 'object') return null;
-  const obj = args as Record<string, unknown>;
-  for (const key of ['agent', 'subagent_type', 'name']) {
-    const v = obj[key];
-    if (typeof v === 'string' && v.trim()) return v;
+/** Heading text for a sub-agent card.
+ *  Preference order: `args.subagent_type` (Claude Code Task) →
+ *  `args.agent` / `args.name` → a friendly tool label. */
+function extractAgentName(args: unknown, toolName: string): string {
+  if (args && typeof args === 'object') {
+    const obj = args as Record<string, unknown>;
+    for (const key of ['subagent_type', 'agent', 'name']) {
+      const v = obj[key];
+      if (typeof v === 'string' && v.trim()) return v.trim();
+    }
   }
-  return null;
+  return prettyToolName(toolName);
+}
+
+function prettyToolName(toolName: string): string {
+  const stripped = toolName.replace(/^mcp__[^_]+__/, '');
+  switch (stripped.toLowerCase()) {
+    case 'background_task':
+    case 'task':
+      return 'Task';
+    default:
+      return stripped || toolName;
+  }
 }
 
 function extractDescription(args: unknown): string | null {
   if (!args || typeof args !== 'object') return null;
   const obj = args as Record<string, unknown>;
   const d = obj['description'];
-  if (typeof d === 'string' && d.trim()) return d;
+  if (typeof d === 'string' && d.trim()) return d.trim();
   const p = obj['prompt'];
   if (typeof p === 'string' && p.trim()) return p.slice(0, 140);
   return null;
@@ -240,9 +255,13 @@ export function SubagentsPanel({
           <>
             {visible.map(({ entry, status }) => {
               const badge = statusBadge(status);
-              const agentName = extractAgentName(entry.args);
+              const agentName = extractAgentName(entry.args, entry.name);
               const description = extractDescription(entry.args);
               const duration = formatDuration(entry.startTime, entry.endTime);
+              const toolLabel = prettyToolName(entry.name);
+              // Show the tool label as a tiny tag only when it differs from
+              // the heading — otherwise it's redundant noise.
+              const showToolTag = toolLabel !== agentName;
               return (
                 // `content-visibility: auto` lets the browser skip layout
                 // and paint for off-screen rows — significant on missions
@@ -266,7 +285,7 @@ export function SubagentsPanel({
                     <div className="flex items-center gap-2">
                       <span className={cn('shrink-0', badge.color)}>{badge.icon}</span>
                       <span className="text-xs font-medium text-white/90 truncate">
-                        {agentName ?? entry.name ?? 'Task'}
+                        {agentName}
                       </span>
                       <span className={cn('ml-auto text-[10px] shrink-0', badge.color)}>
                         {badge.label}
@@ -277,8 +296,11 @@ export function SubagentsPanel({
                         {description}
                       </p>
                     )}
-                    {duration && (
-                      <p className="mt-1 text-[10px] text-white/30 font-mono">{duration}</p>
+                    {(showToolTag || duration) && (
+                      <div className="mt-1 flex items-center gap-2 text-[10px] text-white/30 font-mono">
+                        {showToolTag && <span>{toolLabel}</span>}
+                        {duration && <span>{duration}</span>}
+                      </div>
                     )}
                   </button>
                 </div>
