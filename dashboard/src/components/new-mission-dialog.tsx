@@ -12,6 +12,23 @@ import { isBackendAvailable, useBackendConfigs } from '@/lib/use-backend-configs
 
 const KNOWN_BACKEND_IDS = ['opencode', 'claudecode', 'amp', 'codex', 'gemini'] as const;
 
+// Kept in sync with src/api/control.rs `normalize_model_effort_for_backend`.
+// Codex only accepts the three baseline levels; claudecode also accepts
+// xhigh/max. Other backends ignore effort entirely.
+const SUPPORTED_EFFORTS_BY_BACKEND: Record<string, readonly ModelEffort[]> = {
+  codex: ['low', 'medium', 'high'],
+  claudecode: ['low', 'medium', 'high', 'xhigh', 'max'],
+};
+
+const isEffortSupportedByBackend = (
+  effort: ModelEffort | '',
+  backend: string,
+): boolean => {
+  if (!effort) return true;
+  const supported = SUPPORTED_EFFORTS_BY_BACKEND[backend];
+  return !!supported && (supported as readonly string[]).includes(effort);
+};
+
 /** Options returned by the dialog's getCreateOptions() method */
 export interface NewMissionDialogOptions {
   workspaceId?: string;
@@ -538,7 +555,12 @@ export function NewMissionDialog({
     if (selectedBackend === 'amp' && modelOverride) {
       setModelOverride('');
     }
-    if (selectedBackend !== 'codex' && selectedBackend !== 'claudecode' && modelEffort) {
+    // Clear effort if the current selection isn't valid for the selected
+    // backend. Codex only supports low/medium/high — leaving "xhigh"/"max"
+    // in state when switching from claudecode would silently render as
+    // "Default effort" in the dropdown (no matching <option>) while POSTing
+    // the stale invalid value.
+    if (modelEffort && !isEffortSupportedByBackend(modelEffort, selectedBackend)) {
       setModelEffort('');
     }
     // When switching backends, clear model override if current value isn't valid for the new backend
@@ -594,7 +616,9 @@ export function NewMissionDialog({
     const modelOverrideValue =
       selectedBackend === 'amp' || !normalizedModel ? undefined : normalizedModel;
     const modelEffortValue =
-      (selectedBackend === 'codex' || selectedBackend === 'claudecode') && modelEffort ? modelEffort : undefined;
+      modelEffort && isEffortSupportedByBackend(modelEffort, selectedBackend)
+        ? modelEffort
+        : undefined;
     return {
       workspaceId: newMissionWorkspace || undefined,
       agent: agentValue,
