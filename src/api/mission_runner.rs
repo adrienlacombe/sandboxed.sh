@@ -3448,7 +3448,9 @@ async fn run_mission_turn(
                             ) if attempted_credentials.len() < all_creds.len() => {
                                 let reason = match result.terminal_reason {
                                     Some(TerminalReason::CapacityLimited) => "capacity limited",
-                                    Some(TerminalReason::AuthError) => "auth failed (likely refresh-token reuse)",
+                                    Some(TerminalReason::AuthError) => {
+                                        "auth failed (likely refresh-token reuse)"
+                                    }
                                     _ => "rate limited",
                                 };
                                 tracing::info!(
@@ -9107,19 +9109,15 @@ async fn ensure_claudecode_cli_available(
     }
 
     // Check bun's global bin directories. Depending on bun version and config,
-    // globals may be in ~/.bun/bin/ or ~/.cache/.bun/bin/.
+    // globals may be in ~/.bun/bin/ or ~/.cache/.bun/bin/. We rely exclusively on
+    // bun's bin symlink — its target tracks the package's `bin` field in
+    // package.json, which changed in newer claude-code releases (cli.js → bin/claude.exe).
+    // Hard-coding `cli.js` here is wrong for 2.1.10x+ and probing it directly
+    // created dangling-symlink poisoning on hosts running bun ≥1.3.5.
     const BUN_GLOBAL_CLAUDE_PATHS: &[&str] =
         &["/root/.bun/bin/claude", "/root/.cache/.bun/bin/claude"];
-    // Also check the direct cli.js path as a fallback — some bun versions
-    // install the package but fail to create the bin symlink.
-    const BUN_GLOBAL_CLAUDE_CLI_JS: &str =
-        "/root/.bun/install/global/node_modules/@anthropic-ai/claude-code/cli.js";
 
-    for bun_claude_path in BUN_GLOBAL_CLAUDE_PATHS
-        .iter()
-        .copied()
-        .chain(std::iter::once(BUN_GLOBAL_CLAUDE_CLI_JS))
-    {
+    for bun_claude_path in BUN_GLOBAL_CLAUDE_PATHS.iter().copied() {
         if command_available(workspace_exec, cwd, bun_claude_path).await
             && claude_cli_matches_desired_version(
                 workspace_exec,
@@ -9129,36 +9127,8 @@ async fn ensure_claudecode_cli_available(
             )
             .await
         {
-            // cli.js is a raw JS file — it needs an explicit node/bun prefix.
-            // Bin symlinks (e.g. /root/.bun/bin/claude) have shebangs and can run directly.
-            let is_raw_js = bun_claude_path == BUN_GLOBAL_CLAUDE_CLI_JS;
-
-            if command_available(workspace_exec, cwd, "node").await {
-                let cmd = if is_raw_js {
-                    format!("node {}", bun_claude_path)
-                } else {
-                    bun_claude_path.to_string()
-                };
-                tracing::debug!(
-                    "Found Claude Code at {} (resolved: {})",
-                    bun_claude_path,
-                    cmd
-                );
-                return Ok(cmd);
-            } else if let Some(bun) = available_bun_command(workspace_exec, cwd).await {
-                let bun_cmd = format!("{} {}", bun, bun_claude_path);
-                tracing::debug!(
-                    "Found Claude Code at {} (using bun to run it: {})",
-                    bun_claude_path,
-                    bun_cmd
-                );
-                return Ok(bun_cmd);
-            } else {
-                tracing::debug!(
-                    "Found Claude Code at {} but neither node nor bun available to run it",
-                    bun_claude_path
-                );
-            }
+            tracing::debug!("Found Claude Code at {}", bun_claude_path);
+            return Ok(bun_claude_path.to_string());
         }
     }
 
@@ -9193,14 +9163,21 @@ async fn ensure_claudecode_cli_available(
     }
 
     // Use bun if available (faster), otherwise npm.
-    // Bun installs globals to ~/.bun/install/global/ with bin symlinks in ~/.bun/bin/.
-    // Some bun versions (e.g. 1.3.x) report success but silently fail to create
-    // the bin symlink, so we manually link it as a workaround.
+    //
+    // Bun-specific quirks we have to handle:
+    //   1. A prior install attempt may have left a dangling symlink at
+    //      /root/.bun/bin/claude (e.g. pointing at an old cli.js path that no
+    //      longer exists in claude-code ≥2.1.10x). Remove broken symlinks
+    //      before install so bun can recreate them cleanly.
+    //   2. Bun ≥1.3 blocks postinstall scripts by default ("untrusted").
+    //      claude-code's postinstall (install.cjs) is what downloads the
+    //      platform-native binary; without it the bin shim prints
+    //      "claude native binary not installed." `bun pm -g trust` runs it.
     let install_cmd = if let Some(bun) = bun_command.as_deref() {
         format!(
-            r#"export PATH="/usr/local/bin:/root/.bun/bin:/root/.cache/.bun/bin:$PATH" && {} install -g @anthropic-ai/claude-code@{} && {{ test -x /root/.bun/bin/claude || test -x /root/.cache/.bun/bin/claude || ln -sf ../install/global/node_modules/@anthropic-ai/claude-code/cli.js /root/.bun/bin/claude 2>/dev/null || true; }}"#,
-            shell_quote(bun),
-            shell_quote(&desired_version)
+            r#"export PATH="/usr/local/bin:/root/.bun/bin:/root/.cache/.bun/bin:$PATH" && for p in /root/.bun/bin/claude /root/.cache/.bun/bin/claude; do [ -L "$p" ] && [ ! -e "$p" ] && rm -f "$p"; done; {bun} install -g @anthropic-ai/claude-code@{ver} && {{ {bun} pm -g trust @anthropic-ai/claude-code 2>/dev/null || true; }}"#,
+            bun = shell_quote(bun),
+            ver = shell_quote(&desired_version)
         )
     } else {
         format!(
@@ -9240,11 +9217,7 @@ async fn ensure_claudecode_cli_available(
     {
         return Ok(cli_path.to_string());
     }
-    for bun_claude_path in BUN_GLOBAL_CLAUDE_PATHS
-        .iter()
-        .copied()
-        .chain(std::iter::once(BUN_GLOBAL_CLAUDE_CLI_JS))
-    {
+    for bun_claude_path in BUN_GLOBAL_CLAUDE_PATHS.iter().copied() {
         if command_available(workspace_exec, cwd, bun_claude_path).await
             && claude_cli_matches_desired_version(
                 workspace_exec,
@@ -9254,22 +9227,13 @@ async fn ensure_claudecode_cli_available(
             )
             .await
         {
-            let is_raw_js = bun_claude_path == BUN_GLOBAL_CLAUDE_CLI_JS;
-            if command_available(workspace_exec, cwd, "node").await {
-                return Ok(if is_raw_js {
-                    format!("node {}", bun_claude_path)
-                } else {
-                    bun_claude_path.to_string()
-                });
-            } else if let Some(bun) = available_bun_command(workspace_exec, cwd).await {
-                return Ok(format!("{} {}", bun, bun_claude_path));
-            }
+            return Ok(bun_claude_path.to_string());
         }
     }
 
     Err(format!(
-        "Claude Code install completed but '{}' is still not available in workspace PATH. Checked: {:?} and {}",
-        cli_path, BUN_GLOBAL_CLAUDE_PATHS, BUN_GLOBAL_CLAUDE_CLI_JS,
+        "Claude Code install completed but '{}' is still not available in workspace PATH. Checked: {:?}",
+        cli_path, BUN_GLOBAL_CLAUDE_PATHS,
     ))
 }
 
