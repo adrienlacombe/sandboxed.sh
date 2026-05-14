@@ -3441,11 +3441,14 @@ async fn run_mission_turn(
                         drop(lease);
 
                         match result.terminal_reason {
-                            Some(TerminalReason::RateLimited | TerminalReason::CapacityLimited)
-                                if attempted_credentials.len() < all_creds.len() =>
-                            {
+                            Some(
+                                TerminalReason::RateLimited
+                                | TerminalReason::CapacityLimited
+                                | TerminalReason::AuthError,
+                            ) if attempted_credentials.len() < all_creds.len() => {
                                 let reason = match result.terminal_reason {
                                     Some(TerminalReason::CapacityLimited) => "capacity limited",
+                                    Some(TerminalReason::AuthError) => "auth failed (likely refresh-token reuse)",
                                     _ => "rate limited",
                                 };
                                 tracing::info!(
@@ -6108,13 +6111,21 @@ fn ascii_lower(byte: u8) -> u8 {
 }
 
 fn is_auth_error(message: &str) -> bool {
-    const AUTH_MARKERS: [&str; 6] = [
+    const AUTH_MARKERS: [&str; 10] = [
         "invalid authentication credentials",
         "authentication_error",
         "invalid api key",
         "invalid x-api-key",
         "failed to authenticate",
         "error: 401",
+        // Codex/ChatGPT OAuth surfaces refresh-token reuse with these
+        // phrasings; both should drive account rotation rather than failing
+        // the mission outright (the user may have another configured account
+        // whose refresh_token is still valid).
+        "refresh token was already used",
+        "refresh_token was already used",
+        "refresh_token_reused",
+        "please log out and sign in again",
     ];
 
     AUTH_MARKERS
@@ -13971,12 +13982,17 @@ Update it to the latest version (`npm install -g @openai/codex@latest`) and retr
             .with_terminal_reason(TerminalReason::TurnComplete)
     } else {
         // Distinguish provider concurrency exhaustion from classic rate limits.
+        // Refresh-token reuse (ChatGPT OAuth races between sibling missions)
+        // is_auth_error-classified so the codex arm rotates to another
+        // configured account instead of surfacing the bare error.
         let reason = if stopped_before_required_tools || stopped_on_progress_update {
             TerminalReason::Stalled
         } else if is_capacity_limited_error(&final_message) {
             TerminalReason::CapacityLimited
         } else if is_rate_limited_error(&final_message) {
             TerminalReason::RateLimited
+        } else if is_auth_error(&final_message) {
+            TerminalReason::AuthError
         } else if stopped_with_pending_tool_error {
             TerminalReason::Stalled
         } else {
