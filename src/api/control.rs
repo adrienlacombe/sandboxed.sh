@@ -6377,6 +6377,15 @@ fn is_bare_llm_error_output(output: &str) -> bool {
             && (normalized.contains("api error: 401")
                 || normalized.contains("api error: 403")
                 || normalized.contains("api error: 407")))
+        // Codex / ChatGPT-OAuth refresh-token reuse surfaces as a short
+        // user-visible string. Without these the soft-error recovery
+        // fake-promoted the mission to TurnComplete after rotation had
+        // already exhausted every configured account, hiding the real
+        // failure from the UI.
+        || (normalized.len() < 400
+            && (normalized.contains("refresh token was already used")
+                || normalized.contains("refresh_token_reused")
+                || normalized.contains("please log out and sign in again")))
 }
 
 fn looks_like_structured_provider_error(output: &str) -> bool {

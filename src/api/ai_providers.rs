@@ -1723,6 +1723,199 @@ fn write_codex_auth_json_chatgpt(config_dir: &std::path::Path) -> Result<(), Str
     )
 }
 
+/// Parsed view of a workspace's `auth.json` for codex (chatgpt mode).
+#[derive(Debug, Clone)]
+struct CodexWorkspaceAuth {
+    access_token: String,
+    refresh_token: String,
+    chatgpt_account_id: Option<String>,
+    /// Best-effort parse of the access_token's `exp` claim (ms since epoch).
+    /// Codex never persists a separate expiry field — we derive it from the JWT
+    /// so we can compare freshness with the central store's `expires_at`.
+    expires_at_ms: Option<i64>,
+}
+
+/// Read `<codex_dir>/auth.json` and parse the chatgpt token block if present.
+fn read_codex_workspace_auth(codex_dir: &std::path::Path) -> Option<CodexWorkspaceAuth> {
+    let path = codex_dir.join("auth.json");
+    let contents = std::fs::read_to_string(&path).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&contents).ok()?;
+    if value.get("auth_mode").and_then(|v| v.as_str()) != Some("chatgpt") {
+        return None;
+    }
+    let tokens = value.get("tokens")?.as_object()?;
+    let access_token = tokens
+        .get("access_token")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .filter(|s| !s.trim().is_empty())?;
+    let refresh_token = tokens
+        .get("refresh_token")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .filter(|s| !s.trim().is_empty())?;
+    let chatgpt_account_id = extract_chatgpt_account_id(&access_token);
+    let expires_at_ms = extract_jwt_exp_ms(&access_token);
+    Some(CodexWorkspaceAuth {
+        access_token,
+        refresh_token,
+        chatgpt_account_id,
+        expires_at_ms,
+    })
+}
+
+/// Decode a JWT's `exp` claim (seconds-since-epoch) and convert to ms.
+fn extract_jwt_exp_ms(jwt: &str) -> Option<i64> {
+    let parts: Vec<&str> = jwt.split('.').collect();
+    if parts.len() < 2 {
+        return None;
+    }
+    let decoded = URL_SAFE_NO_PAD.decode(parts[1]).ok()?;
+    let claims: serde_json::Value = serde_json::from_slice(&decoded).ok()?;
+    claims.get("exp").and_then(|v| v.as_i64()).map(|s| s * 1000)
+}
+
+/// Update the `ai_providers.json` entry whose `oauth.chatgpt_account_id`
+/// matches `account_id` with the supplied tokens. No-op if no entry matches.
+/// Returns `true` when an entry was updated.
+fn update_provider_oauth_for_chatgpt_account(
+    working_dir: &Path,
+    account_id: &str,
+    access_token: &str,
+    refresh_token: &str,
+    expires_at_ms: i64,
+) -> bool {
+    let providers_path = working_dir.join(".sandboxed-sh").join("ai_providers.json");
+    let raw = match std::fs::read_to_string(&providers_path) {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    let mut value: serde_json::Value = match serde_json::from_str(&raw) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+
+    let target_array = if value.is_array() {
+        value.as_array_mut()
+    } else {
+        value.get_mut("providers").and_then(|v| v.as_array_mut())
+    };
+    let Some(items) = target_array else {
+        return false;
+    };
+
+    let mut updated = false;
+    for provider in items.iter_mut() {
+        let matches = provider
+            .get("provider_type")
+            .and_then(|v| v.as_str())
+            .map(|s| s == "openai")
+            .unwrap_or(false)
+            && provider
+                .get("oauth")
+                .and_then(|o| o.get("chatgpt_account_id"))
+                .and_then(|v| v.as_str())
+                .map(|s| s == account_id)
+                .unwrap_or(false);
+        if !matches {
+            continue;
+        }
+        let Some(obj) = provider.as_object_mut() else {
+            continue;
+        };
+        let oauth_entry = obj
+            .entry("oauth".to_string())
+            .or_insert_with(|| serde_json::json!({}));
+        if let Some(oauth_obj) = oauth_entry.as_object_mut() {
+            oauth_obj.insert(
+                "access_token".to_string(),
+                serde_json::Value::String(access_token.to_string()),
+            );
+            oauth_obj.insert(
+                "refresh_token".to_string(),
+                serde_json::Value::String(refresh_token.to_string()),
+            );
+            oauth_obj.insert(
+                "expires_at".to_string(),
+                serde_json::Value::from(expires_at_ms),
+            );
+            updated = true;
+        }
+    }
+
+    if !updated {
+        return false;
+    }
+
+    let serialized = match serde_json::to_string_pretty(&value) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    if let Some(parent) = providers_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let tmp_path = providers_path.with_extension("json.tmp");
+    if std::fs::write(&tmp_path, serialized).is_err() {
+        return false;
+    }
+    std::fs::rename(&tmp_path, &providers_path).is_ok()
+}
+
+/// Pull any locally-rotated codex tokens back into the central store before
+/// overwriting the workspace's `auth.json`. The codex CLI refreshes its own
+/// access/refresh tokens inside the container; without this back-sync the
+/// host file keeps the old (now-revoked) refresh_token, and the next mission
+/// or backend-side `refresh_openai_oauth_token` hits `refresh_token_reused`.
+fn back_propagate_codex_workspace_auth(codex_dir: &std::path::Path, working_dir: &Path) {
+    let Some(local) = read_codex_workspace_auth(codex_dir) else {
+        return;
+    };
+    let Some(local_expires) = local.expires_at_ms else {
+        return;
+    };
+
+    let central_expires = read_oauth_token_entry(ProviderType::OpenAI)
+        .map(|e| e.expires_at)
+        .unwrap_or(i64::MIN);
+    if local_expires <= central_expires {
+        return;
+    }
+
+    // For the central provider store, only update when we can pin the
+    // rotation back to a specific account_id.
+    if let Some(account_id) = local.chatgpt_account_id.as_deref() {
+        if update_provider_oauth_for_chatgpt_account(
+            working_dir,
+            account_id,
+            &local.access_token,
+            &local.refresh_token,
+            local_expires,
+        ) {
+            tracing::info!(
+                codex_dir = %codex_dir.display(),
+                account_id,
+                "Back-propagated codex-rotated OAuth tokens into ai_providers.json"
+            );
+        }
+    }
+
+    // Sync to the canonical tiers (opencode auth.json + sandboxed credential
+    // store) so the next backend-side refresh sees the freshly rotated
+    // refresh_token.
+    if let Err(e) = sync_oauth_to_all_tiers(
+        ProviderType::OpenAI,
+        &local.refresh_token,
+        &local.access_token,
+        local_expires,
+    ) {
+        tracing::warn!(
+            codex_dir = %codex_dir.display(),
+            error = %e,
+            "Failed to back-propagate codex-rotated tokens to central tiers"
+        );
+    }
+}
+
 /// Extract `chatgpt_account_id` from an OpenAI JWT access token.
 fn extract_chatgpt_account_id(jwt: &str) -> Option<String> {
     let parts: Vec<&str> = jwt.split('.').collect();
@@ -1958,6 +2151,12 @@ pub fn write_codex_credentials_for_workspace(
             std::path::PathBuf::from(home).join(".codex")
         }
     };
+
+    // Pull any locally-rotated tokens back into the central store before we
+    // overwrite this workspace's auth.json. Codex CLIs refresh in-place inside
+    // their container; without this back-sync the host store keeps the stale
+    // refresh_token forever and the next mission hits `refresh_token_reused`.
+    back_propagate_codex_workspace_auth(&codex_dir, working_dir);
 
     // Priority 0a: Explicit override (rotation path).
     match override_credential {
