@@ -3726,43 +3726,38 @@ pub fn run_claudecode_turn<'a>(
         }
 
         fn claude_cli_credentials_info(path: &std::path::Path) -> Option<(i64, bool)> {
-            let metadata = match std::fs::metadata(path) {
-                Ok(m) => m,
-                Err(_) => return None,
-            };
+            let (_, expires_at, _, has_refresh) = read_claude_cli_credentials(path)?;
+            Some((expires_at, has_refresh))
+        }
+
+        /// Read the full claudeAiOauth payload from a credentials file.
+        /// Returns `(access_token, expires_at, refresh_token, has_refresh)`.
+        fn read_claude_cli_credentials(
+            path: &std::path::Path,
+        ) -> Option<(String, i64, String, bool)> {
+            let metadata = std::fs::metadata(path).ok()?;
             if metadata.len() == 0 {
                 return None;
             }
-            let contents = match std::fs::read_to_string(path) {
-                Ok(c) => c,
-                Err(_) => return None,
-            };
-            let creds: serde_json::Value = match serde_json::from_str(&contents) {
-                Ok(v) => v,
-                Err(_) => return None,
-            };
-            let oauth = match creds.get("claudeAiOauth") {
-                Some(o) => o,
-                None => return None,
-            };
-            let has_access_token = oauth
+            let contents = std::fs::read_to_string(path).ok()?;
+            let creds: serde_json::Value = serde_json::from_str(&contents).ok()?;
+            let oauth = creds.get("claudeAiOauth")?;
+            let access_token = oauth
                 .get("accessToken")
                 .and_then(|v| v.as_str())
-                .map(|s| !s.trim().is_empty())
-                .unwrap_or(false);
-            if !has_access_token {
-                return None;
-            }
+                .map(|s| s.to_string())
+                .filter(|s| !s.trim().is_empty())?;
             let expires_at = oauth
                 .get("expiresAt")
                 .and_then(|v| v.as_i64())
                 .unwrap_or(i64::MAX);
-            let has_refresh = oauth
+            let refresh_token = oauth
                 .get("refreshToken")
                 .and_then(|v| v.as_str())
-                .map(|s| !s.trim().is_empty())
-                .unwrap_or(false);
-            Some((expires_at, has_refresh))
+                .map(|s| s.to_string())
+                .unwrap_or_default();
+            let has_refresh = !refresh_token.trim().is_empty();
+            Some((access_token, expires_at, refresh_token, has_refresh))
         }
 
         fn looks_like_claude_cli_credentials(path: &std::path::Path) -> bool {
@@ -3825,6 +3820,46 @@ pub fn run_claudecode_turn<'a>(
                 }
             }
         }
+        // Propagate mission → host BEFORE deciding whether to copy host → mission.
+        // Anthropic's OAuth uses rotating refresh tokens (each refresh returns a
+        // new refresh_token and invalidates the old one). If a previous turn's
+        // Claude CLI rotated tokens inside the mission directory, the host file
+        // still holds the old (now-invalid) refresh_token. Without this back-sync
+        // the next backend refresh — or any sibling mission that copies host
+        // creds — would hit "refresh_token already used" / invalid_grant.
+        if !using_override_auth {
+            if let (Some(host_path), Some((m_access, m_expires, m_refresh, m_has_refresh))) = (
+                find_host_claude_cli_credentials(),
+                read_claude_cli_credentials(&mission_creds_path),
+            ) {
+                if m_has_refresh {
+                    let host_expires = claude_cli_credentials_info(&host_path)
+                        .map(|(e, _)| e)
+                        .unwrap_or(i64::MIN);
+                    if m_expires > host_expires {
+                        tracing::info!(
+                            mission_id = %mission_id,
+                            mission_expires_at = m_expires,
+                            host_expires_at = host_expires,
+                            "Mission credentials are fresher than host; syncing back to all storage tiers"
+                        );
+                        if let Err(e) = super::ai_providers::sync_oauth_to_all_tiers(
+                            crate::ai_providers::ProviderType::Anthropic,
+                            &m_refresh,
+                            &m_access,
+                            m_expires,
+                        ) {
+                            tracing::warn!(
+                                mission_id = %mission_id,
+                                error = %e,
+                                "Failed to write mission-rotated Anthropic credentials back to host"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
         // Copy host credentials if missing OR if the existing ones are expired/near-expiry.
         let needs_copy = if using_override_auth {
             false
@@ -3835,13 +3870,15 @@ pub fn run_claudecode_turn<'a>(
             if expires_at < now_ms + 120_000 {
                 true // expired or about to expire
             } else {
-                // Even if not expired, re-copy if host credentials have a different
-                // (newer) expiry.  This catches server-side token revocations: the
-                // old token's expiry hasn't passed yet but the token itself was
-                // revoked when a new one was minted via OAuth refresh.
+                // Re-copy only when host credentials are STRICTLY newer than the
+                // mission's local copy. The previous `!=` check overwrote a
+                // mission's freshly-rotated tokens with the host's stale ones
+                // whenever the two diverged, which destroyed the only valid
+                // refresh_token and triggered the invalid_grant we're guarding
+                // against.
                 if let Some(host_path) = find_host_claude_cli_credentials() {
                     if let Some((host_expires, _)) = claude_cli_credentials_info(&host_path) {
-                        host_expires != expires_at
+                        host_expires > expires_at
                     } else {
                         false
                     }
