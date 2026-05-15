@@ -15,9 +15,11 @@ import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.booleanOrNull
+import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.intOrNull
 import kotlinx.serialization.json.jsonPrimitive
 import sh.sandboxed.dashboard.data.AppContainer
+import sh.sandboxed.dashboard.data.BuiltinCommandsResponse
 import sh.sandboxed.dashboard.data.ChatMessage
 import sh.sandboxed.dashboard.data.ChatMessageKind
 import sh.sandboxed.dashboard.data.CreateMissionRequest
@@ -26,6 +28,7 @@ import sh.sandboxed.dashboard.data.MissionStatus
 import sh.sandboxed.dashboard.data.QueuedMessage
 import sh.sandboxed.dashboard.data.RunningMissionInfo
 import sh.sandboxed.dashboard.data.SharedFile
+import sh.sandboxed.dashboard.data.SlashCommand
 import sh.sandboxed.dashboard.data.SseEvent
 import sh.sandboxed.dashboard.data.ToolUiParser
 import java.util.UUID
@@ -36,6 +39,27 @@ data class NewMissionOptions(
     val modelOverride: String? = null,
     val backend: String? = null,
 )
+
+data class ExecutionProgress(
+    val total: Int,
+    val completed: Int,
+    val current: String? = null,
+    val depth: Int = 0,
+) {
+    val displayText: String get() = "Subtask ${completed + 1}/$total"
+}
+
+enum class ControlRunState(val wireValue: String, val label: String) {
+    IDLE("idle", "Idle"),
+    RUNNING("running", "Running"),
+    WAITING_FOR_TOOL("waiting_for_tool", "Waiting"),
+    ;
+
+    companion object {
+        fun fromWire(value: String): ControlRunState =
+            entries.firstOrNull { it.wireValue == value } ?: IDLE
+    }
+}
 
 data class ControlState(
     val mission: Mission? = null,
@@ -50,6 +74,10 @@ data class ControlState(
     val isConnected: Boolean = false,
     val error: String? = null,
     val goalStatus: String? = null,
+    val runState: ControlRunState = ControlRunState.IDLE,
+    val progress: ExecutionProgress? = null,
+    val slashCommands: BuiltinCommandsResponse? = null,
+    val slashCommandsLoading: Boolean = false,
     val desktopDisplay: String = ":101",
     val desktopOpenRequest: Long = 0,
     val loadingRecent: Boolean = false,
@@ -61,6 +89,7 @@ class ControlViewModel(private val container: AppContainer) : ViewModel() {
 
     private var streamJob: Job? = null
     private var pollJob: Job? = null
+    private var slashCommandsJob: Job? = null
     @Volatile private var lastSeq: Long? = null
 
     init {
@@ -78,6 +107,11 @@ class ControlViewModel(private val container: AppContainer) : ViewModel() {
     fun setDraft(text: String) {
         _state.update { it.copy(draft = text) }
         viewModelScope.launch { container.settings.setDraft(text) }
+        if (text.trim().startsWith("/")) loadSlashCommandsIfNeeded()
+    }
+
+    fun applySlashCommand(command: SlashCommand) {
+        setDraft("/${command.name} ")
     }
 
     fun send() {
@@ -98,7 +132,7 @@ class ControlViewModel(private val container: AppContainer) : ViewModel() {
                         agent = s.defaultAgent.takeIf { it.isNotBlank() },
                         backend = s.defaultBackend.takeIf { it.isNotBlank() },
                     ))
-                    _state.update { it.copy(mission = mission, childMissions = emptyList()) }
+                    _state.update { it.copy(mission = mission, childMissions = emptyList(), progress = null) }
                     container.settings.setLastMission(mission.id)
                 }
                 container.api.sendMessage(text)
@@ -153,7 +187,7 @@ class ControlViewModel(private val container: AppContainer) : ViewModel() {
                 )
             }.onSuccess { mission ->
                 lastSeq = null
-                _state.update { it.copy(mission = mission, messages = emptyList(), childMissions = emptyList(), goalStatus = null) }
+                _state.update { it.copy(mission = mission, messages = emptyList(), childMissions = emptyList(), goalStatus = null, progress = null) }
                 container.settings.setLastMission(mission.id)
                 refreshRunning()
             }.onFailure { e ->
@@ -188,6 +222,7 @@ class ControlViewModel(private val container: AppContainer) : ViewModel() {
                         childMissions = emptyList(),
                         draft = prompt,
                         goalStatus = null,
+                        progress = null,
                     )
                 }
                 container.settings.setLastMission(mission.id)
@@ -209,7 +244,7 @@ class ControlViewModel(private val container: AppContainer) : ViewModel() {
         viewModelScope.launch {
             runCatching {
                 val mission = container.api.loadMission(missionId)
-                _state.update { it.copy(mission = mission, messages = mapHistory(mission), goalStatus = null) }
+                _state.update { it.copy(mission = mission, messages = mapHistory(mission), goalStatus = null, progress = null) }
                 container.settings.setLastMission(mission.id)
                 lastSeq = null
                 runCatching {
@@ -248,9 +283,20 @@ class ControlViewModel(private val container: AppContainer) : ViewModel() {
             it.copy(
                 mission = cur,
                 messages = mapHistory(cur),
+                progress = null,
             )
         }
         refreshChildMissions(cur.id)
+    }
+
+    private fun loadSlashCommandsIfNeeded() {
+        if (_state.value.slashCommands != null || _state.value.slashCommandsLoading || slashCommandsJob?.isActive == true) return
+        slashCommandsJob = viewModelScope.launch {
+            _state.update { it.copy(slashCommandsLoading = true) }
+            runCatching { container.api.listBuiltinCommands() }
+                .onSuccess { commands -> _state.update { it.copy(slashCommands = commands, slashCommandsLoading = false) } }
+                .onFailure { _state.update { it.copy(slashCommandsLoading = false) } }
+        }
     }
 
     private suspend fun refreshQueue() {
@@ -317,8 +363,13 @@ class ControlViewModel(private val container: AppContainer) : ViewModel() {
         fun s(k: String): String? = obj[k]?.jsonPrimitive?.content
         fun b(k: String): Boolean? = obj[k]?.jsonPrimitive?.booleanOrNull
         fun i(k: String): Int? = obj[k]?.jsonPrimitive?.intOrNull
-        val missionId = s("mission_id") ?: _state.value.mission?.id
-        if (missionId != null && missionId != _state.value.mission?.id) return
+        val eventMissionId = s("mission_id")
+        val currentMissionId = _state.value.mission?.id
+        val isMissionLevelEvent = evt.type == "status" ||
+            evt.type == "mission_status_changed" ||
+            evt.type == "mission_title_changed" ||
+            evt.type == "mission_metadata_updated"
+        if (!isMissionLevelEvent && eventMissionId != null && eventMissionId != currentMissionId) return
 
         when (evt.type) {
             "user_message" -> appendMessage(ChatMessage(kind = ChatMessageKind.User, content = s("content") ?: return))
@@ -381,16 +432,66 @@ class ControlViewModel(private val container: AppContainer) : ViewModel() {
                 appendMessage(ChatMessage(kind = ChatMessageKind.Goal(iter, status, obj0), content = ""))
             }
             "goal_status" -> _state.update { it.copy(goalStatus = s("status")) }
+            "progress" -> {
+                val total = i("total_subtasks") ?: 0
+                val completed = i("completed_subtasks") ?: 0
+                val current = s("current_subtask")
+                val depth = i("depth") ?: i("current_depth") ?: 0
+                if (total > 0) {
+                    _state.update {
+                        it.copy(progress = ExecutionProgress(total = total, completed = completed, current = current, depth = depth))
+                    }
+                }
+            }
             "mission_status_changed" -> {
                 val status = s("status") ?: return
-                _state.update { it.copy(mission = it.mission?.copy(status = parseStatus(status))) }
+                val parsed = parseStatus(status)
+                _state.update { st ->
+                    val appliesToCurrent = eventMissionId == null || st.mission?.id == eventMissionId
+                    st.copy(
+                        mission = st.mission?.let { if (appliesToCurrent) it.copy(status = parsed) else it },
+                        recentMissions = st.recentMissions.map { if (it.id == eventMissionId) it.copy(status = parsed) else it },
+                        childMissions = st.childMissions.map { if (it.id == eventMissionId) it.copy(status = parsed) else it },
+                        progress = if (appliesToCurrent && parsed != MissionStatus.ACTIVE && parsed != MissionStatus.PENDING) {
+                            null
+                        } else {
+                            st.progress
+                        },
+                    )
+                }
                 viewModelScope.launch { refreshRunning() }
             }
             "mission_title_changed" -> {
                 val t = s("title") ?: return
-                _state.update { it.copy(mission = it.mission?.copy(title = t)) }
+                _state.update { st ->
+                    val appliesToCurrent = eventMissionId == null || st.mission?.id == eventMissionId
+                    st.copy(
+                        mission = st.mission?.let { if (appliesToCurrent) it.copy(title = t) else it },
+                        recentMissions = st.recentMissions.map { if (it.id == eventMissionId) it.copy(title = t) else it },
+                        childMissions = st.childMissions.map { if (it.id == eventMissionId) it.copy(title = t) else it },
+                    )
+                }
+                if (live) viewModelScope.launch { refreshRunning() }
             }
-            "status" -> {}
+            "mission_metadata_updated" -> {
+                val id = s("mission_id") ?: return
+                applyMissionMetadataUpdate(id, obj)
+                if (live) viewModelScope.launch { refreshRunning() }
+            }
+            "status" -> {
+                if (eventMissionId != null && eventMissionId != _state.value.mission?.id) return
+                val runState = s("state")?.let { ControlRunState.fromWire(it) }
+                val queueLen = i("queue_len")
+                val shouldRefreshQueue = live && queueLen != null && queueLen > 0 && queueLen != _state.value.queue.size
+                _state.update { st ->
+                    st.copy(
+                        runState = runState ?: st.runState,
+                        queue = if (queueLen == 0) emptyList() else st.queue,
+                        progress = if (runState == ControlRunState.IDLE) null else st.progress,
+                    )
+                }
+                if (shouldRefreshQueue) viewModelScope.launch { refreshQueue() }
+            }
             "error" -> _state.update { it.copy(error = s("message")) }
         }
     }
@@ -442,6 +543,30 @@ class ControlViewModel(private val container: AppContainer) : ViewModel() {
     }
 
     private fun appendMessage(m: ChatMessage) { _state.update { it.copy(messages = it.messages + m) } }
+
+    private fun applyMissionMetadataUpdate(missionId: String, obj: JsonObject) {
+        _state.update { st ->
+            st.copy(
+                mission = st.mission?.let { if (it.id == missionId) mergeMissionMetadata(it, obj) else it },
+                recentMissions = st.recentMissions.map { if (it.id == missionId) mergeMissionMetadata(it, obj) else it },
+                childMissions = st.childMissions.map { if (it.id == missionId) mergeMissionMetadata(it, obj) else it },
+            )
+        }
+    }
+
+    private fun mergeMissionMetadata(mission: Mission, obj: JsonObject): Mission =
+        mission.copy(
+            title = stringField(obj, "title", mission.title),
+            shortDescription = stringField(obj, "short_description", mission.shortDescription),
+            metadataUpdatedAt = stringField(obj, "metadata_updated_at", mission.metadataUpdatedAt),
+            updatedAt = stringField(obj, "updated_at", mission.updatedAt) ?: mission.updatedAt,
+            metadataSource = stringField(obj, "metadata_source", mission.metadataSource),
+            metadataModel = stringField(obj, "metadata_model", mission.metadataModel),
+            metadataVersion = stringField(obj, "metadata_version", mission.metadataVersion),
+        )
+
+    private fun stringField(obj: JsonObject, key: String, fallback: String?): String? =
+        if (obj.containsKey(key)) obj[key]?.jsonPrimitive?.contentOrNull else fallback
 
     private fun storedEventToSse(ev: sh.sandboxed.dashboard.data.StoredEvent): SseEvent {
         val data = ev.metadata.toMutableMap()
