@@ -72,6 +72,7 @@ import androidx.compose.ui.unit.sp
 import sh.sandboxed.dashboard.data.AppContainer
 import sh.sandboxed.dashboard.data.Backend
 import sh.sandboxed.dashboard.data.BackendAgent
+import sh.sandboxed.dashboard.data.BuiltinCommandsResponse
 import sh.sandboxed.dashboard.data.ChatMessage
 import sh.sandboxed.dashboard.data.ChatMessageKind
 import sh.sandboxed.dashboard.data.Mission
@@ -80,6 +81,7 @@ import sh.sandboxed.dashboard.data.Provider
 import sh.sandboxed.dashboard.data.QueuedMessage
 import sh.sandboxed.dashboard.data.RunningMissionInfo
 import sh.sandboxed.dashboard.data.SharedFile
+import sh.sandboxed.dashboard.data.SlashCommand
 import sh.sandboxed.dashboard.data.Workspace
 import sh.sandboxed.dashboard.ui.components.ErrorBanner
 import sh.sandboxed.dashboard.ui.components.GlassCard
@@ -101,6 +103,14 @@ fun ControlScreen(
     var showNewMission by remember { mutableStateOf(false) }
     var showMissionSwitcher by remember { mutableStateOf(false) }
     var showWorkers by remember { mutableStateOf(false) }
+    val slashSuggestions = remember(state.draft, state.mission?.backend, state.slashCommands) {
+        visibleSlashSuggestions(
+            draft = state.draft,
+            backend = state.mission?.backend,
+            catalog = state.slashCommands,
+        )
+    }
+    val slashPanelActive = isSlashPanelActive(state.draft)
 
     LaunchedEffect(state.messages.size) {
         if (state.messages.isNotEmpty()) listState.animateScrollToItem(state.messages.lastIndex)
@@ -122,6 +132,8 @@ fun ControlScreen(
                 canResume = state.mission?.let { it.status.canResume || it.resumable } == true,
                 workerCount = state.childMissions.size,
                 runningCount = state.parallel.size,
+                runState = state.runState,
+                progress = state.progress,
                 onResume = { haptics.success(); vm.resume() },
                 onAutomations = { state.mission?.id?.let(onOpenAutomations) },
                 onNewMission = { showNewMission = true },
@@ -142,6 +154,16 @@ fun ControlScreen(
                 verticalArrangement = Arrangement.spacedBy(8.dp),
             ) {
                 items(state.messages, key = { it.id }) { msg -> MessageRow(msg) }
+            }
+            if (slashPanelActive && (slashSuggestions.isNotEmpty() || state.slashCommandsLoading)) {
+                SlashSuggestions(
+                    commands = slashSuggestions,
+                    loading = state.slashCommandsLoading && slashSuggestions.isEmpty(),
+                    onSelect = {
+                        haptics.selection()
+                        vm.applySlashCommand(it)
+                    },
+                )
             }
             Composer(
                 value = state.draft,
@@ -220,6 +242,8 @@ private fun TopBar(
     canResume: Boolean,
     workerCount: Int,
     runningCount: Int,
+    runState: ControlRunState,
+    progress: ExecutionProgress?,
     onResume: () -> Unit,
     onAutomations: () -> Unit,
     onNewMission: () -> Unit,
@@ -231,9 +255,19 @@ private fun TopBar(
         Row(verticalAlignment = Alignment.CenterVertically) {
             Column(Modifier.weight(1f)) {
                 Text(mission?.title ?: "New mission", style = MaterialTheme.typography.titleMedium, color = Palette.TextPrimary, maxLines = 1)
-                Text(if (connected) "Connected" else "Reconnecting…",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = if (connected) Palette.Success else Palette.Warning)
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Text(
+                        if (connected) "Connected" else "Reconnecting…",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = if (connected) Palette.Success else Palette.Warning,
+                    )
+                    Text("•", color = Palette.TextTertiary, style = MaterialTheme.typography.bodySmall)
+                    Text(runState.label, color = runStateColor(runState), style = MaterialTheme.typography.bodySmall)
+                    progress?.takeIf { it.total > 0 }?.let {
+                        Text("•", color = Palette.TextTertiary, style = MaterialTheme.typography.bodySmall)
+                        Text(it.displayText, color = Palette.Success, style = MaterialTheme.typography.bodySmall)
+                    }
+                }
             }
             mission?.status?.let { StatusBadge(it) }
             if (canResume) {
@@ -268,6 +302,12 @@ private fun TopBar(
             }
         }
     }
+}
+
+private fun runStateColor(runState: ControlRunState): Color = when (runState) {
+    ControlRunState.IDLE -> Palette.TextSecondary
+    ControlRunState.RUNNING -> Palette.Success
+    ControlRunState.WAITING_FOR_TOOL -> Palette.Warning
 }
 
 @Composable
@@ -744,6 +784,94 @@ private fun LinearLoading() {
         CircularProgressIndicator(strokeWidth = 2.dp, modifier = Modifier.height(20.dp), color = Palette.Accent)
     }
 }
+
+@Composable
+private fun SlashSuggestions(
+    commands: List<SlashCommand>,
+    loading: Boolean,
+    onSelect: (SlashCommand) -> Unit,
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(Palette.BackgroundSecondary)
+            .padding(horizontal = 12.dp, vertical = 8.dp),
+        verticalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
+        if (loading) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(Palette.Card, RoundedCornerShape(10.dp))
+                    .border(1.dp, Palette.Border, RoundedCornerShape(10.dp))
+                    .padding(horizontal = 12.dp, vertical = 10.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                CircularProgressIndicator(strokeWidth = 2.dp, modifier = Modifier.size(14.dp), color = Palette.Accent)
+                Spacer(Modifier.width(8.dp))
+                Text("Loading commands…", color = Palette.TextSecondary, style = MaterialTheme.typography.bodySmall)
+            }
+        } else {
+            commands.take(8).forEach { command ->
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .background(Palette.Card, RoundedCornerShape(10.dp))
+                        .border(1.dp, Palette.Border, RoundedCornerShape(10.dp))
+                        .clickable { onSelect(command) }
+                        .padding(horizontal = 12.dp, vertical = 10.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text("/${command.name}", color = Palette.AccentLight, style = MaterialTheme.typography.labelLarge, modifier = Modifier.widthIn(min = 92.dp))
+                    Column(Modifier.weight(1f)) {
+                        command.description?.takeIf { it.isNotBlank() }?.let {
+                            Text(it, color = Palette.TextSecondary, style = MaterialTheme.typography.bodySmall, maxLines = 2)
+                        }
+                        val hint = slashCommandHint(command)
+                        if (hint.isNotBlank()) {
+                            Text(hint, color = Palette.TextTertiary, style = MaterialTheme.typography.labelSmall)
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+private fun isSlashPanelActive(draft: String): Boolean {
+    val trimmed = draft.trim()
+    if (!trimmed.startsWith("/")) return false
+    return !trimmed.drop(1).any { it.isWhitespace() }
+}
+
+private fun visibleSlashSuggestions(
+    draft: String,
+    backend: String?,
+    catalog: BuiltinCommandsResponse?,
+): List<SlashCommand> {
+    catalog ?: return emptyList()
+    val trimmed = draft.trim()
+    if (!trimmed.startsWith("/")) return emptyList()
+    val fragment = trimmed.drop(1)
+    if (fragment.any { it.isWhitespace() }) return emptyList()
+    val pool = when (backend) {
+        "codex" -> catalog.codex
+        "claudecode" -> catalog.claudecode
+        "opencode" -> catalog.opencode
+        else -> catalog.opencode + catalog.claudecode + catalog.codex
+    }
+    return pool
+        .filter { command ->
+            fragment.isBlank() ||
+                command.name.startsWith(fragment, ignoreCase = true)
+        }
+        .distinctBy { "${it.path}:${it.name}" }
+}
+
+private fun slashCommandHint(command: SlashCommand): String =
+    command.params.joinToString(" ") { param ->
+        if (param.required) "<${param.name}>" else "[${param.name}]"
+    }
 
 @Composable
 private fun MessageRow(msg: ChatMessage) {
