@@ -1,6 +1,6 @@
 //! Workspace management for OpenCode sessions.
 //!
-//! Open Agent acts as a workspace host for OpenCode. This module prepares
+//! sandboxed.sh acts as a workspace host for OpenCode. This module prepares
 //! per-workspace directories (shared across missions) and writes `opencode.json`
 //! with the currently configured MCP servers.
 //!
@@ -553,7 +553,7 @@ fn unique_key(base: &str, used: &mut std::collections::HashSet<String>) -> Strin
     }
 }
 
-/// Root directory for Open Agent config data (versioned with repo).
+/// Root directory for sandboxed.sh config data (versioned with repo).
 pub fn config_root(working_dir: &Path) -> PathBuf {
     working_dir.join(".sandboxed-sh")
 }

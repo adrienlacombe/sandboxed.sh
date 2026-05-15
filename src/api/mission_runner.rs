@@ -3606,7 +3606,7 @@ fn read_backend_configs() -> Option<Vec<serde_json::Value>> {
     );
 
     // Always check /root/.sandboxed-sh as fallback since the dashboard saves config there
-    // and Open Agent service may run with a different HOME (e.g., /var/lib/opencode)
+    // and the sandboxed.sh service may run with a different HOME (e.g., /var/lib/opencode)
     if home != "/root" {
         candidates.push(
             std::path::PathBuf::from("/root")
@@ -6087,7 +6087,7 @@ fn install_opencode_serve_port_wrapper(
     // Note: We exclude our wrapper directory from PATH when searching for the real binary
     // to avoid finding ourselves in an infinite loop.
     let wrapper_script = r#"#!/bin/sh
-# opencode serve port override wrapper (installed by Open Agent)
+# opencode serve port override wrapper (installed by sandboxed.sh)
 WRAPPER_DIR="$(cd "$(dirname "$0")" && pwd)"
 CLEAN_PATH="$(echo "$PATH" | tr ':' '\n' | grep -v "^$WRAPPER_DIR$" | tr '\n' ':' | sed 's/:$//')"
 REAL_OPENCODE="$(PATH="$CLEAN_PATH" command -v opencode 2>/dev/null || echo /usr/local/bin/opencode)"

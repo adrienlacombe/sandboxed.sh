@@ -10,7 +10,7 @@ import { getVisibleAgents, getOpenAgentConfig, listBackends, listBackendAgents, 
 import type { Workspace } from '@/lib/api';
 import { isBackendAvailable, useBackendConfigs } from '@/lib/use-backend-configs';
 
-const KNOWN_BACKEND_IDS = ['opencode', 'claudecode', 'amp', 'codex', 'gemini', 'grok'] as const;
+const KNOWN_BACKEND_IDS = ['opencode', 'claudecode', 'codex', 'gemini', 'grok'] as const;
 
 // Kept in sync with src/api/control.rs `normalize_model_effort_for_backend`.
 // Codex only accepts the three baseline levels; claudecode also accepts
@@ -159,7 +159,13 @@ export function NewMissionDialog({
     {
     revalidateOnFocus: false,
     dedupingInterval: 30000,
-    fallbackData: [{ id: 'opencode', name: 'OpenCode' }, { id: 'claudecode', name: 'Claude Code' }, { id: 'amp', name: 'Amp' }, { id: 'gemini', name: 'Gemini CLI' }, { id: 'grok', name: 'Grok Build' }],
+    fallbackData: [
+      { id: 'opencode', name: 'OpenCode' },
+      { id: 'claudecode', name: 'Claude Code' },
+      { id: 'codex', name: 'Codex' },
+      { id: 'gemini', name: 'Gemini CLI' },
+      { id: 'grok', name: 'Grok Build' },
+    ],
     }
   );
 
@@ -192,11 +198,6 @@ export function NewMissionDialog({
   const { data: claudecodeAgents, mutate: mutateClaudecodeAgents } = useSWR<BackendAgent[]>(
     open && enabledBackends.some(b => b.id === 'claudecode') ? 'backend-claudecode-agents' : null,
     () => listBackendAgents('claudecode'),
-    { revalidateOnFocus: true, dedupingInterval: 5000 }
-  );
-  const { data: ampAgents, mutate: mutateAmpAgents } = useSWR<BackendAgent[]>(
-    open && enabledBackends.some(b => b.id === 'amp') ? 'backend-amp-agents' : null,
-    () => listBackendAgents('amp'),
     { revalidateOnFocus: true, dedupingInterval: 5000 }
   );
   const { data: codexAgents, mutate: mutateCodexAgents } = useSWR<BackendAgent[]>(
@@ -285,12 +286,6 @@ export function NewMissionDialog({
         // Filter out hidden Claude Code agents by name
         const allClaudeAgents = claudecodeAgents || [];
         agents = allClaudeAgents.filter(a => !claudeCodeHiddenAgents.includes(a.name));
-      } else if (backend.id === 'amp') {
-        // Amp has built-in modes: smart and rush
-        agents = ampAgents || [
-          { id: 'smart', name: 'Smart Mode' },
-          { id: 'rush', name: 'Rush Mode' },
-        ];
       } else if (backend.id === 'codex') {
         // Codex agents
         agents = codexAgents || [
@@ -321,7 +316,7 @@ export function NewMissionDialog({
     }
 
     return result;
-  }, [enabledBackends, opencodeAgents, opencodeProfileAgentNames, claudecodeAgents, ampAgents, codexAgents, geminiAgents, grokAgents, agentsPayload, config, claudeCodeLibConfig]);
+  }, [enabledBackends, opencodeAgents, opencodeProfileAgentNames, claudecodeAgents, codexAgents, geminiAgents, grokAgents, agentsPayload, config, claudeCodeLibConfig]);
 
   // Group agents by backend for display
   const agentsByBackend = useMemo(() => {
@@ -528,7 +523,7 @@ export function NewMissionDialog({
       }
     }
 
-    // Fallback: use first available backend with priority claudecode → opencode → amp
+    // Fallback: use first available backend with priority claudecode → opencode → grok → gemini → codex
     // Try Claude Code first
     const claudeCodeAgent = allAgents.find(a => a.backend === 'claudecode');
     if (claudeCodeAgent) {
@@ -551,12 +546,13 @@ export function NewMissionDialog({
       return;
     }
 
-    // Try Amp third
-    const ampAgent = allAgents.find(a => a.backend === 'amp');
-    if (ampAgent) {
-      setSelectedAgentValue(ampAgent.value);
-      setDefaultSet(true);
-      return;
+    for (const backendId of ['grok', 'gemini', 'codex']) {
+      const agent = allAgents.find(a => a.backend === backendId);
+      if (agent) {
+        setSelectedAgentValue(agent.value);
+        setDefaultSet(true);
+        return;
+      }
     }
 
     // Final fallback: use first available agent (shouldn't reach here)
@@ -567,9 +563,6 @@ export function NewMissionDialog({
   }, [open, defaultSet, allAgents, config, initialValues]);
 
   useEffect(() => {
-    if (selectedBackend === 'amp' && modelOverride) {
-      setModelOverride('');
-    }
     // Clear effort if the current selection isn't valid for the selected
     // backend. Codex only supports low/medium/high — leaving "xhigh"/"max"
     // in state when switching from claudecode would silently render as
@@ -607,7 +600,6 @@ export function NewMissionDialog({
     await Promise.all([
       mutateOpencodeAgents?.(),
       mutateClaudecodeAgents?.(),
-      mutateAmpAgents?.(),
       mutateCodexAgents?.(),
       mutateGeminiAgents?.(),
       mutateGrokAgents?.(),
@@ -631,7 +623,7 @@ export function NewMissionDialog({
           ? trimmedModel.split('/').pop() || ''
           : trimmedModel;
     const modelOverrideValue =
-      selectedBackend === 'amp' || !normalizedModel ? undefined : normalizedModel;
+      !normalizedModel ? undefined : normalizedModel;
     const modelEffortValue =
       modelEffort && isEffortSupportedByBackend(modelEffort, selectedBackend)
         ? modelEffort
@@ -847,14 +839,9 @@ export function NewMissionDialog({
               <select
                 value={modelOverride}
                 onChange={(e) => setModelOverride(e.target.value)}
-                disabled={selectedBackend === 'amp'}
                 className="w-full rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2.5 text-sm text-white focus:border-indigo-500/50 focus:outline-none disabled:opacity-60 [&>option]:bg-slate-800 [&>option]:text-white [&>optgroup]:bg-slate-900 [&>optgroup]:text-white/70"
               >
-                <option value="">
-                  {selectedBackend === 'amp'
-                    ? 'No override (Amp ignores model overrides)'
-                    : 'No override (use default)'}
-                </option>
+                <option value="">No override (use default)</option>
                 {(() => {
                   if (modelOptionsLoading || providersLoading) {
                     return (
@@ -902,9 +889,7 @@ export function NewMissionDialog({
                 })()}
               </select>
               <p className="text-xs text-white/30 mt-1.5">
-                {selectedBackend === 'amp'
-                  ? 'Amp ignores model overrides.'
-                  : selectedBackend === 'opencode'
+                {selectedBackend === 'opencode'
                     ? 'Use provider/model format (e.g., openai/gpt-5-codex).'
                     : 'Use the raw model ID (e.g., gpt-5-codex or claude-opus-4-7).'}
               </p>

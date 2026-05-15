@@ -1688,20 +1688,6 @@ export async function updateClaudeCodeHostConfig(
   return apiPut("/api/claudecode/config", config, "Failed to update Claude Code host config");
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Amp Host Config API
-// ─────────────────────────────────────────────────────────────────────────────
-
-export async function getAmpCodeHostConfig(): Promise<Record<string, unknown>> {
-  return apiGet("/api/amp/config", "Failed to get Amp host config");
-}
-
-export async function updateAmpCodeHostConfig(
-  config: Record<string, unknown>
-): Promise<Record<string, unknown>> {
-  return apiPut("/api/amp/config", config, "Failed to update Amp host config");
-}
-
 // Restart OpenCode service (to apply settings changes)
 export async function restartOpenCodeService(): Promise<{ success: boolean; message: string }> {
   return apiPost("/api/opencode/restart", undefined, "Failed to restart OpenCode service");
@@ -1722,7 +1708,7 @@ export async function saveLibraryOpenCodeSettings(settings: Record<string, unkno
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// OpenAgent Config API
+// sandboxed.sh Config API
 // ─────────────────────────────────────────────────────────────────────────────
 
 export interface OpenAgentConfig {
@@ -1730,22 +1716,22 @@ export interface OpenAgentConfig {
   default_agent: string | null;
 }
 
-// Get OpenAgent config from Library
+// Get sandboxed.sh config from Library
 export async function getOpenAgentConfig(): Promise<OpenAgentConfig> {
   try {
-    return await apiGet("/api/library/sandboxed-sh/config", "Failed to get OpenAgent config");
+    return await apiGet("/api/library/sandboxed-sh/config", "Failed to get sandboxed.sh config");
   } catch {
     // Return default config if endpoint doesn't exist (not yet implemented)
     return { hidden_agents: [], default_agent: null };
   }
 }
 
-// Save OpenAgent config to Library
+// Save sandboxed.sh config to Library
 export async function saveOpenAgentConfig(config: OpenAgentConfig): Promise<void> {
-  return apiPut("/api/library/sandboxed-sh/config", config, "Failed to save OpenAgent config");
+  return apiPut("/api/library/sandboxed-sh/config", config, "Failed to save sandboxed.sh config");
 }
 
-// Get visible agents (filtered by OpenAgent config)
+// Get visible agents (filtered by sandboxed.sh config)
 export async function getVisibleAgents(): Promise<unknown> {
   try {
     return await apiGet("/api/library/sandboxed-sh/agents", "Failed to get visible agents");
@@ -1789,10 +1775,6 @@ export interface ConfigProfileFile {
   content: string;
 }
 
-export interface AmpCodeConfig {
-  default_mode?: string | null;
-}
-
 export interface ConfigProfile {
   name: string;
   is_default: boolean;
@@ -1801,7 +1783,6 @@ export interface ConfigProfile {
   opencode_settings: Record<string, unknown>;
   openagent_config: OpenAgentConfig;
   claudecode_config: ClaudeCodeConfig;
-  ampcode_config: AmpCodeConfig;
 }
 
 // List all config profiles
@@ -1856,12 +1837,12 @@ export async function saveLibraryOpenCodeSettingsForProfile(
   );
 }
 
-// Get OpenAgent config for a specific profile
+// Get sandboxed.sh config for a specific profile
 export async function getOpenAgentConfigForProfile(profile: string): Promise<OpenAgentConfig> {
   try {
     return await apiGet(
       `/api/library/config-profile/${encodeURIComponent(profile)}/sandboxed-sh/config`,
-      "Failed to get OpenAgent config for profile"
+      "Failed to get sandboxed.sh config for profile"
     );
   } catch {
     // Return default config if endpoint doesn't exist (not yet implemented)
@@ -1869,7 +1850,7 @@ export async function getOpenAgentConfigForProfile(profile: string): Promise<Ope
   }
 }
 
-// Save OpenAgent config for a specific profile
+// Save sandboxed.sh config for a specific profile
 export async function saveOpenAgentConfigForProfile(
   profile: string,
   config: OpenAgentConfig
@@ -1877,7 +1858,7 @@ export async function saveOpenAgentConfigForProfile(
   return apiPut(
     `/api/library/config-profile/${encodeURIComponent(profile)}/sandboxed-sh/config`,
     config,
-    "Failed to save OpenAgent config for profile"
+    "Failed to save sandboxed.sh config for profile"
   );
 }
 
@@ -1898,26 +1879,6 @@ export async function saveClaudeCodeConfigForProfile(
     `/api/library/config-profile/${encodeURIComponent(profile)}/claudecode/config`,
     config,
     "Failed to save Claude Code config for profile"
-  );
-}
-
-// Get Amp Code config for a specific profile
-export async function getAmpCodeConfigForProfile(profile: string): Promise<AmpCodeConfig> {
-  return apiGet(
-    `/api/library/config-profile/${encodeURIComponent(profile)}/ampcode/config`,
-    "Failed to get Amp Code config for profile"
-  );
-}
-
-// Save Amp Code config for a specific profile
-export async function saveAmpCodeConfigForProfile(
-  profile: string,
-  config: AmpCodeConfig
-): Promise<void> {
-  return apiPut(
-    `/api/library/config-profile/${encodeURIComponent(profile)}/ampcode/config`,
-    config,
-    "Failed to save Amp Code config for profile"
   );
 }
 
@@ -2029,29 +1990,7 @@ export async function saveHarnessDefaultFile(
   }
 }
 
-// AI Provider types and functions are now exported from ./api/providers
-// Legacy interface removed - types come from providers module
-
-interface _RemovedLegacyAIProvider {
-  _removed: true;
-  has_api_key: boolean;
-}
-
-// Provider types and BackendProviderResponse are now in ./api/providers
-
-// This legacy interface is kept due to redacted content but is not exported
-interface _LegacyBackendProviderResponse {
-  configured: boolean;
-  provider_type: string | null;
-  provider_name: string | null;
-  api_key: string | null;
-  oauth: {
-    access_token: string;
-    refresh_token: string;
-    expires_at: number;
-  } | null;
-  has_credentials: boolean;
-}
+// AI provider types and functions are exported from ./api/providers.
 
 // ============================================================================
 // Secrets API

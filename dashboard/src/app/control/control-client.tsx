@@ -7158,7 +7158,7 @@ export default function ControlClient() {
           return updated;
         });
 
-        // Detect desktop_start_session from ToolCall (Claude Code/Amp don't emit ToolResult for MCP tools)
+        // Detect desktop_start_session from ToolCall (Claude Code does not emit ToolResult for MCP tools)
         const isDesktopStart =
           name === "desktop_start_session" ||
           name === "desktop_desktop_start_session" ||

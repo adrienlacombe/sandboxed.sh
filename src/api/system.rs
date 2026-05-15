@@ -315,7 +315,7 @@ async fn get_components(State(state): State<Arc<AppState>>) -> Json<SystemCompon
     let mut components = Vec::new();
     let repo_path = resolve_sandboxed_repo_path(&state).await;
 
-    // Open Agent (self)
+    // sandboxed.sh (self)
     let current_version = env!("CARGO_PKG_VERSION");
     let update_available = check_sandboxed_update(Some(current_version), Some(&repo_path)).await;
     let status = if update_available.is_some() {
@@ -804,7 +804,7 @@ async fn check_opencode_update(current_version: Option<&str>) -> Option<String> 
     }
 }
 
-/// Check if there's a newer version of Open Agent available.
+/// Check if there's a newer version of sandboxed.sh available.
 /// First checks GitHub releases, then falls back to git tags if no releases exist.
 async fn check_sandboxed_update(
     current_version: Option<&str>,
@@ -1193,13 +1193,13 @@ async fn uninstall_component(
     }
 }
 
-/// Stream the Open Agent update process.
+/// Stream the sandboxed.sh update process.
 /// Builds from source using git tags (no pre-built binaries needed).
 fn stream_sandboxed_update(
     state: Arc<AppState>,
 ) -> impl Stream<Item = Result<Event, std::convert::Infallible>> {
     async_stream::stream! {
-        yield sse("log", "Starting Open Agent update...", Some(0));
+        yield sse("log", "Starting sandboxed.sh update...", Some(0));
 
         let repo_path_str = resolve_sandboxed_repo_path(&state).await;
         let repo_path = std::path::Path::new(&repo_path_str);
@@ -1303,7 +1303,7 @@ fn stream_sandboxed_update(
         }
 
         // Build the project
-        yield sse("log", "Building Open Agent (this may take a few minutes)...", Some(20));
+        yield sse("log", "Building sandboxed.sh (this may take a few minutes)...", Some(20));
 
         match Command::new("bash")
             .args(["-c", "source /root/.cargo/env && cargo build --bin sandboxed-sh --bin workspace-mcp --bin desktop-mcp"])
@@ -1348,7 +1348,7 @@ fn stream_sandboxed_update(
             .output()
             .await;
 
-        let src = format!("{}/target/debug/sandboxed_sh", repo_path.display());
+        let src = format!("{}/target/debug/{}", repo_path.display(), exe_name);
         match Command::new("install")
             .args(["-m", "0755", &src, &install_dest])
             .output()

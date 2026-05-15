@@ -16,8 +16,6 @@ import {
   updateOpenCodeConfig,
   getClaudeCodeHostConfig,
   updateClaudeCodeHostConfig,
-  getAmpCodeHostConfig,
-  updateAmpCodeHostConfig,
   ClaudeCodeConfig,
   DivergedHistoryError,
 } from '@/lib/api';
@@ -148,14 +146,6 @@ const HARNESS_CONFIG = {
       { name: 'settings.json', description: 'Default model, agent, visibility settings', libraryName: 'config.json' },
     ],
   },
-  ampcode: {
-    name: 'Amp',
-    dir: '.ampcode',
-    libraryDir: 'ampcode',
-    files: [
-      { name: 'settings.json', description: 'Default mode (smart/rush)', libraryName: 'config.json' },
-    ],
-  },
   codex: {
     name: 'Codex',
     dir: '.codex',
@@ -182,9 +172,6 @@ const EMPTY_FALLBACKS: Record<string, Record<string, string>> = {
     'oh-my-opencode.json': '{}',
   },
   claudecode: {
-    'settings.json': '{}',
-  },
-  ampcode: {
     'settings.json': '{}',
   },
   codex: {
@@ -226,13 +213,6 @@ const HOST_SYNC_MAP: Partial<Record<HarnessId, Record<string, HostSyncHandler>>>
       save: updateClaudeCodeHostConfig,
     },
   },
-  ampcode: {
-    'settings.json': {
-      label: '~/.config/amp/settings.json',
-      load: getAmpCodeHostConfig,
-      save: updateAmpCodeHostConfig,
-    },
-  },
 };
 
 export default function SettingsPage() {
@@ -261,19 +241,15 @@ export default function SettingsPage() {
   const { data: claudecodeConfig } = useSWR('backend-claudecode-config', () => getBackendConfig('claudecode'), {
     revalidateOnFocus: false,
   });
-  const { data: ampConfig } = useSWR('backend-amp-config', () => getBackendConfig('amp'), {
-    revalidateOnFocus: false,
-  });
   const { data: codexConfig } = useSWR('backend-codex-config', () => getBackendConfig('codex'), {
     revalidateOnFocus: false,
   });
 
   // Filter to only enabled backends
-  const enabledHarnesses: HarnessId[] = ['opencode', 'claudecode', 'codex', 'ampcode', 'openagent'].filter((id) => {
+  const enabledHarnesses: HarnessId[] = ['opencode', 'claudecode', 'codex', 'openagent'].filter((id) => {
     if (id === 'opencode') return opencodeConfig?.enabled !== false;
     if (id === 'claudecode') return claudecodeConfig?.enabled !== false;
     if (id === 'codex') return codexConfig?.enabled !== false;
-    if (id === 'ampcode') return ampConfig?.enabled !== false;
     return true; // openagent is always enabled
   }) as HarnessId[];
 

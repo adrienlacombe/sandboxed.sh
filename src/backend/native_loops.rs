@@ -1,7 +1,7 @@
 //! Native harness loop adapters.
 //!
 //! A "native loop" is a harness-driven continuation (claudecode `/goal`,
-//! codex `/goal`, future opencode variants). Open Agent's automation
+//! codex `/goal`, future opencode variants). sandboxed.sh's automation
 //! infrastructure doesn't decide when these iterate — the harness CLI does —
 //! but we still materialize an `Automation` row and record each iteration as
 //! an `AutomationExecution` so the panel shows them alongside OA-scheduled

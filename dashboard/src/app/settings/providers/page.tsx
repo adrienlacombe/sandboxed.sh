@@ -24,7 +24,6 @@ import {
   Loader,
   Key,
   BarChart3,
-  ChevronDown,
   ChevronUp,
   RefreshCw,
 } from 'lucide-react';
@@ -50,7 +49,6 @@ const providerConfig: Record<string, { color: string; icon: string }> = {
   'together-ai': { color: 'bg-orange-500/10 text-orange-400', icon: '🤝' },
   perplexity: { color: 'bg-cyan-500/10 text-cyan-400', icon: '🔍' },
   cohere: { color: 'bg-rose-500/10 text-rose-400', icon: '💬' },
-  amp: { color: 'bg-violet-500/10 text-violet-400', icon: 'A' },
   custom: { color: 'bg-white/10 text-white/60', icon: '🔧' },
 };
 
@@ -69,7 +67,6 @@ const defaultProviderTypes: AIProviderTypeInfo[] = [
   { id: 'zai', name: 'Z.AI', uses_oauth: false, env_var: 'ZHIPU_API_KEY' },
   { id: 'minimax', name: 'Minimax', uses_oauth: false, env_var: 'MINIMAX_API_KEY' },
   { id: 'github-copilot', name: 'GitHub Copilot', uses_oauth: true, env_var: null },
-  { id: 'amp', name: 'Amp', uses_oauth: false, env_var: 'AMP_API_KEY' },
 ];
 
 /** Format a number with commas */

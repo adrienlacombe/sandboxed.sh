@@ -1,7 +1,7 @@
 'use client';
 
 import { useState, useRef, useEffect } from 'react';
-import { X, ExternalLink, Key, Loader, Cpu, Plus, Trash2 } from 'lucide-react';
+import { X, ExternalLink, Key, Loader, Plus, Trash2 } from 'lucide-react';
 import { toast } from '@/components/toast';
 import { cn } from '@/lib/utils';
 import {
@@ -28,7 +28,6 @@ const providerIcons: Record<string, string> = {
   zai: '⚡',
   xai: '𝕏',
   minimax: 'M',
-  amp: 'A',
   custom: '🔧',
 };
 
@@ -170,8 +169,6 @@ export function AddProviderModal({ open, onClose, onSuccess, providerTypes }: Ad
       setSelectedBackends(['opencode', 'gemini']);
     } else if (providerType === 'xai') {
       setSelectedBackends(['opencode', 'grok']);
-    } else if (providerType === 'amp') {
-      setSelectedBackends(['amp']);
     } else {
       setSelectedBackends(['opencode']);
     }

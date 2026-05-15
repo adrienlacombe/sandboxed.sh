@@ -1,6 +1,6 @@
-//! Configuration management for Open Agent.
+//! Configuration management for sandboxed.sh.
 //!
-//! Open Agent uses per-mission CLI execution for agent backends.
+//! sandboxed.sh uses per-mission CLI execution for agent backends.
 //! Configuration can be set via environment variables:
 //! - `DEFAULT_MODEL` - Optional. Override default model (provider/model format). If unset, uses backend default.
 //! - `WORKING_DIR` - Optional. Default working directory for relative paths. Defaults to `/root` in production, current directory in dev.

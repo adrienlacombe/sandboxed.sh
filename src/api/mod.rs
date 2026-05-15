@@ -1,4 +1,4 @@
-//! HTTP API for the Open Agent.
+//! HTTP API for sandboxed.sh.
 //!
 //! ## Endpoints
 //!

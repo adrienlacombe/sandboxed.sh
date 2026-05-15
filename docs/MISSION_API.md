@@ -19,7 +19,9 @@ POST /api/control/missions
 }
 ```
 
-`backend` can be `"opencode"`, `"claudecode"`, or `"amp"`. Defaults to `"opencode"` if omitted.
+`backend` can be `"opencode"`, `"claudecode"`, `"codex"`, `"gemini"`, or
+`"grok"`. If omitted, the server uses `DEFAULT_BACKEND` or the first detected
+CLI in priority order: Claude Code, OpenCode, Grok, Gemini, then Codex.
 
 **Response**: `Mission` object (see below).
 
@@ -41,7 +43,8 @@ POST /api/control/message
 ```json
 {
   "content": "Your message here",
-  "agent": "optional-agent-override"
+  "agent": "optional-agent-override",
+  "client_message_id": "optional-uuid-for-idempotent-retries"
 }
 ```
 
@@ -54,6 +57,10 @@ POST /api/control/message
 ```
 
 `queued: true` means another message is being processed.
+
+`client_message_id` is optional but recommended for slow or unreliable networks.
+When supplied, the backend uses it as the user-message id and ignores duplicate
+retries with the same id.
 
 ## Cancel Current Execution
 
@@ -87,15 +94,21 @@ Statuses: `pending`, `active`, `completed`, `failed`, `interrupted`.
 ## Get Mission Events (History)
 
 ```
-GET /api/control/missions/:id/events?types=user_message,assistant_message&limit=100&offset=0
+GET /api/control/missions/:id/events?types=user_message,assistant_message&limit=100&latest=true
 ```
 
 **Query params** (all optional):
 - `types`: comma-separated event types to filter
 - `limit`: max events to return
-- `offset`: pagination offset
+- `offset`: legacy pagination offset
+- `latest`: when `true`, return the newest `limit` events
+- `since_seq`: return events after a stored sequence number
+- `before_seq`: return events before a stored sequence number
 
-**Response**: Array of `StoredEvent`:
+The response includes `X-Total-Events` and `X-Max-Sequence` headers when event
+sequence metadata is available.
+
+**Response**: Array of `StoredEvent` ordered by sequence:
 ```json
 [
   {

@@ -703,7 +703,7 @@ pub fn get_xai_api_key_for_grok(working_dir: &Path) -> Option<String> {
 ///
 /// Credential sources checked (in order):
 /// 1. OpenCode auth.json (API key or OAuth)
-/// 2. Open Agent ai_providers.json (API key or OAuth)
+/// 2. sandboxed.sh ai_providers.json (API key or OAuth)
 ///
 /// Returns None if:
 /// - Anthropic provider is not configured for claudecode
@@ -1113,7 +1113,7 @@ fn get_anthropic_auth_from_opencode_auth() -> Option<ClaudeCodeAuth> {
     }
 }
 
-/// Get Anthropic API key or OAuth access token from Open Agent's ai_providers.json.
+/// Get Anthropic API key or OAuth access token from sandboxed.sh's ai_providers.json.
 fn get_anthropic_auth_from_ai_providers(working_dir: &Path) -> Option<ClaudeCodeAuth> {
     get_all_anthropic_auth_from_ai_providers(working_dir)
         .into_iter()
@@ -1533,7 +1533,7 @@ pub fn get_openai_api_key_for_codex_default(working_dir: &Path) -> Option<String
 ///
 /// Credential sources checked (in order):
 /// 1. OpenCode auth.json (API key or OAuth)
-/// 2. Open Agent ai_providers.json (API key or OAuth)
+/// 2. sandboxed.sh ai_providers.json (API key or OAuth)
 ///
 /// Returns None if:
 /// - OpenAI provider is not configured for codex
@@ -2847,11 +2847,11 @@ fn sync_to_opencode_auth(
         keys
     );
 
-    // Also write to Open Agent's canonical credential store
+    // Also write to sandboxed.sh's canonical credential store
     if let Err(e) =
         write_sandboxed_credential(provider_type, refresh_token, access_token, expires_at)
     {
-        tracing::warn!("Failed to write Open Agent credentials: {}", e);
+        tracing::warn!("Failed to write sandboxed.sh credentials: {}", e);
     }
 
     Ok(())
@@ -2914,7 +2914,7 @@ enum OAuthTokenSource {
     ClaudeCliCredentials,
 }
 
-/// Path to Open Agent's canonical credential store.
+/// Path to sandboxed.sh's canonical credential store.
 fn get_sandboxed_credentials_path() -> PathBuf {
     let home = home_dir();
     PathBuf::from(home)
@@ -2922,7 +2922,7 @@ fn get_sandboxed_credentials_path() -> PathBuf {
         .join("credentials.json")
 }
 
-/// Read an OAuth credential from Open Agent's canonical credential store.
+/// Read an OAuth credential from sandboxed.sh's canonical credential store.
 /// The file uses the same format as OpenCode's auth.json:
 /// ```json
 /// {
@@ -2957,7 +2957,7 @@ fn read_sandboxed_credential(provider_type: ProviderType) -> Option<(OAuthTokenE
             provider = ?provider_type,
             path = %path.display(),
             expires_at = expires_at,
-            "Found OAuth token in Open Agent credentials"
+            "Found OAuth token in sandboxed.sh credentials"
         );
 
         return Some((
@@ -2973,7 +2973,7 @@ fn read_sandboxed_credential(provider_type: ProviderType) -> Option<(OAuthTokenE
     None
 }
 
-/// Write an OAuth credential to Open Agent's canonical credential store.
+/// Write an OAuth credential to sandboxed.sh's canonical credential store.
 /// Read-modify-write to preserve entries for other providers.
 fn write_sandboxed_credential(
     provider_type: ProviderType,
@@ -2990,7 +2990,7 @@ fn write_sandboxed_credential(
 
     let mut auth: serde_json::Map<String, serde_json::Value> = if path.exists() {
         let contents = std::fs::read_to_string(&path)
-            .map_err(|e| format!("Failed to read Open Agent credentials: {}", e))?;
+            .map_err(|e| format!("Failed to read sandboxed.sh credentials: {}", e))?;
         serde_json::from_str(&contents).unwrap_or_default()
     } else {
         serde_json::Map::new()
@@ -3009,20 +3009,20 @@ fn write_sandboxed_credential(
     }
 
     let contents = serde_json::to_string_pretty(&auth)
-        .map_err(|e| format!("Failed to serialize Open Agent credentials: {}", e))?;
+        .map_err(|e| format!("Failed to serialize sandboxed.sh credentials: {}", e))?;
     std::fs::write(&path, contents)
-        .map_err(|e| format!("Failed to write Open Agent credentials: {}", e))?;
+        .map_err(|e| format!("Failed to write sandboxed.sh credentials: {}", e))?;
 
     tracing::info!(
         path = %path.display(),
         keys = ?keys,
-        "Synced OAuth credentials to Open Agent credentials.json"
+        "Synced OAuth credentials to sandboxed.sh credentials.json"
     );
 
     Ok(())
 }
 
-/// Remove a provider entry from Open Agent's credential store.
+/// Remove a provider entry from sandboxed.sh's credential store.
 fn remove_sandboxed_credential(provider_type: ProviderType) -> Result<(), String> {
     let path = get_sandboxed_credentials_path();
     if !path.exists() {
@@ -3031,7 +3031,7 @@ fn remove_sandboxed_credential(provider_type: ProviderType) -> Result<(), String
 
     let mut auth: serde_json::Map<String, serde_json::Value> = {
         let contents = std::fs::read_to_string(&path)
-            .map_err(|e| format!("Failed to read Open Agent credentials: {}", e))?;
+            .map_err(|e| format!("Failed to read sandboxed.sh credentials: {}", e))?;
         serde_json::from_str(&contents).unwrap_or_default()
     };
 
@@ -3045,9 +3045,9 @@ fn remove_sandboxed_credential(provider_type: ProviderType) -> Result<(), String
 
     if changed {
         let contents = serde_json::to_string_pretty(&auth)
-            .map_err(|e| format!("Failed to serialize Open Agent credentials: {}", e))?;
+            .map_err(|e| format!("Failed to serialize sandboxed.sh credentials: {}", e))?;
         std::fs::write(&path, contents)
-            .map_err(|e| format!("Failed to write Open Agent credentials: {}", e))?;
+            .map_err(|e| format!("Failed to write sandboxed.sh credentials: {}", e))?;
     }
 
     Ok(())
@@ -3126,7 +3126,7 @@ fn read_anthropic_from_claude_credentials() -> Option<(OAuthTokenEntry, PathBuf)
 pub fn read_oauth_token_entry(provider_type: ProviderType) -> Option<OAuthTokenEntry> {
     let mut candidates: Vec<(OAuthTokenEntry, OAuthTokenSource, Option<PathBuf>)> = Vec::new();
 
-    // Tier 1: Open Agent's canonical credential store
+    // Tier 1: sandboxed.sh's canonical credential store
     let tier1 = read_sandboxed_credential(provider_type);
     if let Some((entry, path)) = tier1.clone() {
         candidates.push((entry, OAuthTokenSource::SandboxedCredentials, Some(path)));
@@ -4149,7 +4149,7 @@ fn remove_opencode_auth_entry(provider_type: ProviderType) -> Result<(), String>
                     .map_err(|e| format!("Failed to remove OpenCode provider auth: {}", e))?;
             }
         }
-        // Also clean Open Agent's credential store
+        // Also clean sandboxed.sh's credential store
         let _ = remove_sandboxed_credential(provider_type);
         return Ok(());
     }
@@ -4190,9 +4190,9 @@ fn remove_opencode_auth_entry(provider_type: ProviderType) -> Result<(), String>
         }
     }
 
-    // Also clean Open Agent's credential store
+    // Also clean sandboxed.sh's credential store
     if let Err(e) = remove_sandboxed_credential(provider_type) {
-        tracing::warn!("Failed to remove Open Agent credential entry: {}", e);
+        tracing::warn!("Failed to remove sandboxed.sh credential entry: {}", e);
     }
 
     Ok(())
@@ -7672,7 +7672,7 @@ pub async fn refresh_oauth_token_internal(
 ///
 /// **Solution #3: Multi-Tier Token Sync**
 /// After a successful token refresh, we must update:
-/// 1. Tier 1: Open Agent's canonical credential store (~/.sandboxed-sh/credentials.json)
+/// 1. Tier 1: sandboxed.sh's canonical credential store (~/.sandboxed-sh/credentials.json)
 /// 2. Tier 2: OpenCode auth.json paths
 /// 3. Tier 3: Claude CLI credentials (~/.claude/.credentials.json) - Anthropic only
 ///
@@ -7683,7 +7683,7 @@ pub fn sync_oauth_to_all_tiers(
     access_token: &str,
     expires_at: i64,
 ) -> Result<(), String> {
-    // Tier 1: Open Agent's canonical credential store
+    // Tier 1: sandboxed.sh's canonical credential store
     if let Err(e) =
         write_sandboxed_credential(provider_type, refresh_token, access_token, expires_at)
     {
