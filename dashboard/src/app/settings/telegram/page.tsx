@@ -53,6 +53,7 @@ const BACKEND_LABELS: Record<string, string> = {
   codex: 'Codex',
   gemini: 'Gemini',
   amp: 'Amp',
+  grok: 'Grok Build',
 };
 
 export default function TelegramSettingsPage() {
@@ -115,7 +116,8 @@ export default function TelegramSettingsPage() {
     const allowlist =
       backend === 'claudecode' ? new Set(['anthropic']) :
       backend === 'codex' ? new Set(['openai']) :
-      backend === 'gemini' ? new Set(['google']) : null;
+      backend === 'gemini' ? new Set(['google']) :
+      backend === 'grok' ? new Set(['xai']) : null;
 
     const backendOpts = backendModelOptions?.backends?.[backend];
     if (backendOpts && backendOpts.length > 0) {
@@ -867,7 +869,7 @@ export default function TelegramSettingsPage() {
                           {BACKEND_LABELS[b.id] || b.name || b.id}
                         </option>
                       ))
-                    : ['claudecode', 'opencode', 'codex', 'gemini', 'amp'].map((id) => (
+                    : ['claudecode', 'opencode', 'codex', 'gemini', 'amp', 'grok'].map((id) => (
                         <option key={id} value={id}>
                           {BACKEND_LABELS[id] || id}
                         </option>
@@ -1049,7 +1051,7 @@ export default function TelegramSettingsPage() {
                           {BACKEND_LABELS[b.id] || b.name || b.id}
                         </option>
                       ))
-                    : ['claudecode', 'opencode', 'codex', 'gemini', 'amp'].map((id) => (
+                    : ['claudecode', 'opencode', 'codex', 'gemini', 'amp', 'grok'].map((id) => (
                         <option key={id} value={id}>
                           {BACKEND_LABELS[id] || id}
                         </option>

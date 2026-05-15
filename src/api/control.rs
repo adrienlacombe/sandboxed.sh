@@ -2323,6 +2323,12 @@ async fn close_mission_desktop_sessions(
 #[derive(Debug, Clone, Deserialize)]
 pub struct ControlMessageRequest {
     pub content: String,
+    /// Client-generated idempotency key for the send action. When present,
+    /// the backend uses it as the message id and ignores duplicate commands
+    /// with the same id, so a slow/lost POST response can be retried without
+    /// creating two user messages.
+    #[serde(default)]
+    pub client_message_id: Option<Uuid>,
     /// Optional agent override for this specific message (e.g., from @agent mention)
     #[serde(default)]
     pub agent: Option<String>,
@@ -3377,7 +3383,7 @@ pub async fn post_message(
         return Err((StatusCode::BAD_REQUEST, "content is required".to_string()));
     }
 
-    let id = Uuid::new_v4();
+    let id = req.client_message_id.unwrap_or_else(Uuid::new_v4);
     let agent = req.agent;
     let target_mission_id = req.mission_id;
     let control = control_for_user(&state, &user).await;
@@ -4110,7 +4116,10 @@ pub async fn create_mission(
     // Skip validation for Claude Code, Amp, Codex, and Gemini - they have their own built-in agents
     if let Some(ref agent_name) = agent {
         let backend_id = backend.as_deref();
-        let skip_validation = matches!(backend_id, Some("claudecode" | "amp" | "codex" | "gemini"));
+        let skip_validation = matches!(
+            backend_id,
+            Some("claudecode" | "amp" | "codex" | "gemini" | "grok")
+        );
         if !skip_validation {
             super::library::validate_agent_exists(
                 &state,
@@ -4253,7 +4262,7 @@ pub async fn update_mission_settings(
     if let Some(ref agent_name) = effective_agent {
         let skip_validation = matches!(
             effective_backend.as_str(),
-            "claudecode" | "amp" | "codex" | "gemini"
+            "claudecode" | "amp" | "codex" | "gemini" | "grok"
         );
         if !skip_validation {
             super::library::validate_agent_exists(
@@ -6242,6 +6251,10 @@ fn queue_has_pending_target_mission(
         .any(|(_id, _msg, _agent, target_mid)| *target_mid == Some(mission_id))
 }
 
+fn accept_user_message_id(accepted: &mut HashSet<Uuid>, id: Uuid) -> bool {
+    accepted.insert(id)
+}
+
 fn mission_status_for_terminal_reason(
     reason: TerminalReason,
     complete_turn_without_follow_up: bool,
@@ -6851,6 +6864,12 @@ async fn control_actor_loop(
     let mut main_runner_last_activity: std::time::Instant = std::time::Instant::now();
     // Track current activity label for the main runner
     let mut main_runner_activity: Option<String> = None;
+    // Idempotency guard for user sends. The dashboard may retry a POST if a
+    // weak connection drops after the command reached this actor but before
+    // the HTTP response got back. Since the client can now provide the UUID,
+    // ignore repeated commands with the same id instead of queueing/running
+    // the same user message twice.
+    let mut accepted_user_message_ids: HashSet<Uuid> = HashSet::new();
     // Track subtasks for the main runner
     let mut main_runner_subtasks: Vec<super::mission_runner::SubtaskInfo> = Vec::new();
     // Track number of in-flight tool calls on the main runner so the stall
@@ -7050,6 +7069,12 @@ async fn control_actor_loop(
                 let Some(cmd) = cmd else { break };
                 match cmd {
                     ControlCommand::UserMessage { id, content, agent: msg_agent, target_mission_id, respond } => {
+                        if !accept_user_message_id(&mut accepted_user_message_ids, id) {
+                            let status_snapshot = status.read().await;
+                            let _ = respond.send(status_snapshot.state != ControlRunState::Idle);
+                            continue;
+                        }
+
                         // Smart routing: decide where to send this message based on target_mission_id
                         // and what's currently running.
 
@@ -10146,6 +10171,29 @@ async fn run_single_control_turn(
                 session_id.as_deref(),
                 is_continuation,
                 api_key.as_deref(),
+            ))
+            .await
+        }
+        Some("grok") => {
+            let mid = match require_mission_id(mission_id, "Grok Build", &events_tx) {
+                Ok(id) => id,
+                Err(r) => return r,
+            };
+            let is_continuation =
+                force_session_resume || history.iter().any(|(role, _)| role == "assistant");
+            Box::pin(super::mission_runner::run_grok_turn(
+                exec_workspace,
+                &ctx.working_dir,
+                &user_message,
+                requested_model
+                    .as_deref()
+                    .or(config.default_model.as_deref()),
+                mid,
+                events_tx.clone(),
+                cancel,
+                &config.working_dir,
+                session_id.as_deref(),
+                is_continuation,
             ))
             .await
         }
@@ -16105,6 +16153,15 @@ Investigate <service/> failures.
 
         assert!(queue_has_pending_target_mission(&queue, mission_id));
         assert!(!queue_has_pending_target_mission(&queue, Uuid::new_v4()));
+    }
+
+    #[test]
+    fn test_accept_user_message_id_rejects_duplicate_retry_id() {
+        let message_id = Uuid::new_v4();
+        let mut accepted = HashSet::new();
+
+        assert!(accept_user_message_id(&mut accepted, message_id));
+        assert!(!accept_user_message_id(&mut accepted, message_id));
     }
 
     #[test]

@@ -319,7 +319,7 @@ impl OrchestratorMcp {
                     "properties": {
                         "backend": {
                             "type": "string",
-                            "enum": ["claudecode", "codex", "gemini", "opencode", "amp"],
+                            "enum": ["claudecode", "codex", "gemini", "opencode", "amp", "grok"],
                             "description": "Optional single backend to inspect. If omitted, returns all common backends."
                         }
                     }
@@ -327,7 +327,7 @@ impl OrchestratorMcp {
             },
             ToolDefinition {
                 name: "create_worker_mission".to_string(),
-                description: "Create a new worker mission (child of the current boss mission). The worker will start executing immediately and runs in the same workspace as the boss by default, so it sees the boss's container, mounts, and installed tooling. IMPORTANT: You must set the 'backend' field to match the harness you want (claudecode, codex, gemini, opencode). If omitted, defaults to the workspace default (usually claudecode).".to_string(),
+                description: "Create a new worker mission (child of the current boss mission). The worker will start executing immediately and runs in the same workspace as the boss by default, so it sees the boss's container, mounts, and installed tooling. IMPORTANT: You must set the 'backend' field to match the harness you want (claudecode, codex, gemini, grok, opencode). If omitted, defaults to the workspace default (usually claudecode).".to_string(),
                 input_schema: json!({
                     "type": "object",
                     "required": ["title", "prompt"],
@@ -338,12 +338,12 @@ impl OrchestratorMcp {
                         },
                         "backend": {
                             "type": "string",
-                            "enum": ["claudecode", "codex", "gemini", "opencode", "amp"],
-                            "description": "Backend/harness to use. MUST match the model: claudecode for Claude models, codex for OpenAI/GPT models, gemini for Gemini models, opencode for any model via provider routing, amp for Amp."
+                            "enum": ["claudecode", "codex", "gemini", "opencode", "amp", "grok"],
+                            "description": "Backend/harness to use. MUST match the model: claudecode for Claude models, codex for OpenAI/GPT models, gemini for Gemini models, grok for Grok models, opencode for any model via provider routing, amp for Amp."
                         },
                         "model_override": {
                             "type": "string",
-                            "description": "Model to use. Must match the backend: Claude models (e.g. 'claude-opus-4-7') for claudecode, GPT models (e.g. 'gpt-5.5') for codex, Gemini models for gemini, 'provider/model' format for opencode."
+                            "description": "Model to use. Must match the backend: Claude models (e.g. 'claude-opus-4-7') for claudecode, GPT models (e.g. 'gpt-5.5') for codex, Gemini models for gemini, Grok models for grok, 'provider/model' format for opencode."
                         },
                         "model_effort": {
                             "type": "string",
@@ -388,7 +388,7 @@ impl OrchestratorMcp {
                                 "required": ["title", "prompt"],
                                 "properties": {
                                     "title": { "type": "string" },
-                                    "backend": { "type": "string", "enum": ["claudecode", "codex", "gemini", "opencode", "amp"] },
+                                    "backend": { "type": "string", "enum": ["claudecode", "codex", "gemini", "opencode", "amp", "grok"] },
                                     "model_override": { "type": "string" },
                                     "model_effort": { "type": "string", "enum": ["low", "medium", "high", "xhigh", "max"] },
                                     "agent": { "type": "string" },
@@ -869,6 +869,7 @@ impl OrchestratorMcp {
                     "codex".to_string(),
                     "gemini".to_string(),
                     "opencode".to_string(),
+                    "grok".to_string(),
                 ]
             });
 
@@ -938,6 +939,14 @@ impl OrchestratorMcp {
                     "backend": "amp",
                     "ready": true,
                     "reason": "Amp auth is handled by AMP_API_KEY or provider store, not this tool.",
+                }),
+                "grok" => json!({
+                    "backend": "grok",
+                    "ready": true,
+                    "provider": "xAI",
+                    "provider_targeted": provider_targets_backend(&workspace_root, ProviderType::Xai, "grok"),
+                    "reason": "Grok Build can use a targeted xAI provider API key or the CLI's own X login cache.",
+                    "default_backends": default_backends_for_provider(ProviderType::Xai),
                 }),
                 other => json!({
                     "backend": other,

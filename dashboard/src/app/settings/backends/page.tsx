@@ -18,10 +18,10 @@ import { getRuntimeApiBase, writeSavedSettings } from '@/lib/settings';
 import { ServerConnectionCard } from '@/components/server-connection-card';
 import { useBackendConfigs } from '@/lib/use-backend-configs';
 
-const SETTINGS_BACKEND_IDS = ['opencode', 'claudecode', 'amp'] as const;
+const SETTINGS_BACKEND_IDS = ['opencode', 'claudecode', 'amp', 'grok'] as const;
 
 export default function BackendsPage() {
-  const [activeBackendTab, setActiveBackendTab] = useState<'opencode' | 'claudecode' | 'amp'>('opencode');
+  const [activeBackendTab, setActiveBackendTab] = useState<'opencode' | 'claudecode' | 'amp' | 'grok'>('opencode');
   const [savingBackend, setSavingBackend] = useState(false);
   const [savingMissionLimit, setSavingMissionLimit] = useState(false);
   const [savingTaskLimit, setSavingTaskLimit] = useState(false);
@@ -85,6 +85,10 @@ export default function BackendsPage() {
     enabled: true,
     api_key: '',
   });
+  const [grokForm, setGrokForm] = useState({
+    cli_path: '',
+    enabled: true,
+  });
 
   // SWR: fetch backends
   const { data: backends = [] } = useSWR('backends', listBackends, {
@@ -92,6 +96,8 @@ export default function BackendsPage() {
     fallbackData: [
       { id: 'opencode', name: 'OpenCode' },
       { id: 'claudecode', name: 'Claude Code' },
+      { id: 'amp', name: 'Amp' },
+      { id: 'grok', name: 'Grok Build' },
     ],
   });
 
@@ -104,6 +110,7 @@ export default function BackendsPage() {
   const opencodeBackendConfig = backendConfigs.opencode;
   const claudecodeBackendConfig = backendConfigs.claudecode;
   const ampBackendConfig = backendConfigs.amp;
+  const grokBackendConfig = backendConfigs.grok;
 
   // Fetch Claude Code provider status (Anthropic provider configured for claudecode)
   const { data: claudecodeProvider } = useSWR<BackendProviderResponse>(
@@ -145,6 +152,15 @@ export default function BackendsPage() {
       api_key: typeof settings.api_key === 'string' ? settings.api_key : '',
     });
   }, [ampBackendConfig]);
+
+  useEffect(() => {
+    if (!grokBackendConfig?.settings) return;
+    const settings = grokBackendConfig.settings as Record<string, unknown>;
+    setGrokForm({
+      cli_path: typeof settings.cli_path === 'string' ? settings.cli_path : '',
+      enabled: grokBackendConfig.enabled,
+    });
+  }, [grokBackendConfig]);
 
   useEffect(() => {
     const limit = serverSettings?.max_parallel_missions;
@@ -277,6 +293,27 @@ export default function BackendsPage() {
     }
   };
 
+  const handleSaveGrokBackend = async () => {
+    setSavingBackend(true);
+    try {
+      const result = await updateBackendConfig(
+        'grok',
+        { cli_path: grokForm.cli_path || null },
+        { enabled: grokForm.enabled }
+      );
+      toast.success(result.message || 'Grok Build settings updated');
+      refreshBackendConfigs();
+    } catch (err) {
+      toast.error(
+        `Failed to update Grok Build settings: ${
+          err instanceof Error ? err.message : 'Unknown error'
+        }`
+      );
+    } finally {
+      setSavingBackend(false);
+    }
+  };
+
   return (
     <div className="flex-1 flex flex-col items-center p-6 overflow-auto">
       <div className="w-full max-w-xl space-y-6">
@@ -397,7 +434,7 @@ export default function BackendsPage() {
                 key={backend.id}
                 onClick={() =>
                   setActiveBackendTab(
-                    backend.id as 'opencode' | 'claudecode' | 'amp'
+                    backend.id as 'opencode' | 'claudecode' | 'amp' | 'grok'
                   )
                 }
                 className={cn(
@@ -639,6 +676,61 @@ export default function BackendsPage() {
                     <Save className="h-3.5 w-3.5" />
                   )}
                   Save Amp
+                </button>
+              </div>
+            </div>
+          ) : activeBackendTab === 'grok' ? (
+            <div className="space-y-3">
+              <label className="flex items-center gap-2 text-xs text-white/60 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={grokForm.enabled}
+                  onChange={(e) =>
+                    setGrokForm((prev) => ({ ...prev, enabled: e.target.checked }))
+                  }
+                  className="rounded border-white/20 cursor-pointer"
+                />
+                Enabled
+              </label>
+              <div className="flex items-center justify-between py-2 px-3 rounded-lg border border-white/[0.06] bg-white/[0.02]">
+                <div className="flex items-center gap-2">
+                  <span className="text-base">𝕏</span>
+                  <span className="text-sm text-white/70">xAI provider or X login</span>
+                </div>
+                <a
+                  href="/settings/providers"
+                  className="text-xs text-indigo-400 hover:text-indigo-300 transition-colors"
+                >
+                  Configure provider →
+                </a>
+              </div>
+              <div>
+                <label className="block text-xs text-white/60 mb-1.5">CLI Path</label>
+                <input
+                  type="text"
+                  value={grokForm.cli_path || ''}
+                  onChange={(e) =>
+                    setGrokForm((prev) => ({ ...prev, cli_path: e.target.value }))
+                  }
+                  placeholder="grok (uses PATH) or /path/to/grok"
+                  className="w-full rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2 text-sm text-white focus:outline-none focus:border-indigo-500/50"
+                />
+                <p className="mt-1.5 text-xs text-white/30">
+                  Grok opens a browser for X authentication on first launch. In headless environments, configure an xAI provider for Grok Build.
+                </p>
+              </div>
+              <div className="flex items-center gap-2 pt-1">
+                <button
+                  onClick={handleSaveGrokBackend}
+                  disabled={savingBackend}
+                  className="flex items-center gap-2 rounded-lg bg-indigo-500 px-3 py-1.5 text-xs text-white hover:bg-indigo-600 transition-colors disabled:opacity-50"
+                >
+                  {savingBackend ? (
+                    <Loader className="h-3.5 w-3.5 animate-spin" />
+                  ) : (
+                    <Save className="h-3.5 w-3.5" />
+                  )}
+                  Save Grok Build
                 </button>
               </div>
             </div>

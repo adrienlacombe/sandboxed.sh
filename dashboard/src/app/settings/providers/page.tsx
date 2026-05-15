@@ -644,6 +644,8 @@ export default function ProvidersPage() {
                                     ? 'Codex'
                                     : backend === 'gemini'
                                     ? 'Gemini'
+                                    : backend === 'grok'
+                                    ? 'Grok'
                                     : backend}
                                 </span>
                               ))}

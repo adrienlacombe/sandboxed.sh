@@ -3328,6 +3328,21 @@ async fn run_mission_turn(
 
             result
         }
+        "grok" => {
+            run_grok_turn(
+                &workspace,
+                &mission_work_dir,
+                &user_message,
+                config.default_model.as_deref(),
+                mission_id,
+                events_tx.clone(),
+                cancel,
+                &config.working_dir,
+                session_id.as_deref(),
+                is_continuation,
+            )
+            .await
+        }
         "codex" => {
             let requested_model = config.default_model.as_deref();
             // Goal-mode missions (`/goal <objective>`) need to reach the
@@ -10079,6 +10094,29 @@ pub async fn check_backend_prerequisites(
             let cli = cli_path.unwrap_or("gemini");
             check_gemini_prerequisites(&workspace_exec, cwd, cli).await
         }
+        "grok" => {
+            let cli = cli_path.unwrap_or("grok");
+            let available = command_available(&workspace_exec, cwd, cli).await;
+            BackendPreflightResult {
+                backend_id: "grok".to_string(),
+                available,
+                cli_available: available,
+                auto_install_possible: false,
+                missing_dependencies: if available {
+                    Vec::new()
+                } else {
+                    vec!["grok CLI".to_string()]
+                },
+                message: if available {
+                    Some("Grok Build CLI is available".to_string())
+                } else {
+                    Some(
+                        "Grok Build CLI not found. Install it with: curl -fsSL https://x.ai/cli/install.sh | bash"
+                            .to_string(),
+                    )
+                },
+            }
+        }
         _ => BackendPreflightResult {
             backend_id: backend_id.to_string(),
             available: false,
@@ -10086,7 +10124,7 @@ pub async fn check_backend_prerequisites(
             auto_install_possible: false,
             missing_dependencies: vec![format!("unknown backend: {}", backend_id)],
             message: Some(format!(
-                "Unknown backend '{}'. Supported backends: claudecode, opencode, codex, amp, gemini",
+                "Unknown backend '{}'. Supported backends: claudecode, opencode, codex, amp, gemini, grok",
                 backend_id
             )),
         },
@@ -13408,6 +13446,309 @@ pub async fn run_amp_turn(
         result = result.with_usage(usage);
     }
     result.with_cost_source(cost_source)
+}
+
+fn grok_event_text(value: &serde_json::Value) -> Option<String> {
+    if let Some(text) = value
+        .get("delta")
+        .and_then(|delta| delta.get("text").or_else(|| delta.get("content")))
+        .and_then(|v| v.as_str())
+    {
+        return Some(text.to_string());
+    }
+
+    if let Some(content) = value.get("content") {
+        if let Some(text) = content.as_str() {
+            return Some(text.to_string());
+        }
+        if let Some(text) = content.get("text").and_then(|v| v.as_str()) {
+            return Some(text.to_string());
+        }
+    }
+
+    if let Some(text) = value
+        .get("message")
+        .and_then(|message| message.get("content"))
+        .and_then(|content| {
+            content.as_str().map(str::to_string).or_else(|| {
+                content.as_array().map(|blocks| {
+                    blocks
+                        .iter()
+                        .filter_map(|block| block.get("text").and_then(|v| v.as_str()))
+                        .collect::<Vec<_>>()
+                        .join("")
+                })
+            })
+        })
+    {
+        if !text.is_empty() {
+            return Some(text);
+        }
+    }
+
+    for key in ["text", "answer", "result", "output"] {
+        if let Some(text) = value.get(key).and_then(|v| v.as_str()) {
+            return Some(text.to_string());
+        }
+    }
+
+    None
+}
+
+fn grok_event_session_id(value: &serde_json::Value) -> Option<String> {
+    value
+        .get("session_id")
+        .or_else(|| value.get("sessionId"))
+        .or_else(|| value.get("session").and_then(|session| session.get("id")))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| s.to_string())
+}
+
+fn grok_event_model(value: &serde_json::Value) -> Option<String> {
+    value
+        .get("model")
+        .or_else(|| {
+            value
+                .get("message")
+                .and_then(|message| message.get("model"))
+        })
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| s.to_string())
+}
+
+fn grok_event_is_error(value: &serde_json::Value) -> bool {
+    value
+        .get("type")
+        .and_then(|v| v.as_str())
+        .is_some_and(|t| t.eq_ignore_ascii_case("error"))
+        || value.get("error").is_some()
+}
+
+/// Execute a turn using the Grok Build CLI backend.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_grok_turn(
+    workspace: &Workspace,
+    work_dir: &std::path::Path,
+    message: &str,
+    model: Option<&str>,
+    mission_id: Uuid,
+    events_tx: broadcast::Sender<AgentEvent>,
+    cancel: CancellationToken,
+    app_working_dir: &std::path::Path,
+    session_id: Option<&str>,
+    is_continuation: bool,
+) -> AgentResult {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+
+    let workspace_exec = WorkspaceExec::new(workspace.clone());
+    let cli_path =
+        get_backend_string_setting("grok", "cli_path").unwrap_or_else(|| "grok".to_string());
+    if !command_available(&workspace_exec, work_dir, &cli_path).await {
+        let err_msg =
+            "Grok Build CLI not found. Install it with: curl -fsSL https://x.ai/cli/install.sh | bash";
+        return AgentResult::failure(err_msg.to_string(), 0)
+            .with_terminal_reason(TerminalReason::LlmError);
+    }
+
+    let mut args = Vec::new();
+    if is_continuation {
+        if let Some(sid) = session_id {
+            args.push("--resume".to_string());
+            args.push(sid.to_string());
+        } else {
+            args.push("--continue".to_string());
+        }
+    } else if let Some(sid) = session_id {
+        args.push("--session-id".to_string());
+        args.push(sid.to_string());
+    }
+    args.push("-p".to_string());
+    args.push(message.to_string());
+    args.push("--output-format".to_string());
+    args.push("streaming-json".to_string());
+    args.push("--always-approve".to_string());
+    args.push("--cwd".to_string());
+    args.push(work_dir.display().to_string());
+    if let Some(model) = model.filter(|m| !m.trim().is_empty()) {
+        args.push("--model".to_string());
+        args.push(model.to_string());
+    }
+
+    let mut env = HashMap::new();
+    if let Some(key) = crate::api::ai_providers::get_xai_api_key_for_grok(app_working_dir) {
+        env.insert("GROK_CODE_XAI_API_KEY".to_string(), key);
+    } else if let Ok(key) = std::env::var("GROK_CODE_XAI_API_KEY") {
+        if !key.trim().is_empty() {
+            env.insert("GROK_CODE_XAI_API_KEY".to_string(), key);
+        }
+    } else if let Ok(key) = std::env::var("XAI_API_KEY") {
+        if !key.trim().is_empty() {
+            env.insert("GROK_CODE_XAI_API_KEY".to_string(), key);
+        }
+    }
+
+    let mut child = match workspace_exec
+        .spawn_streaming(work_dir, &cli_path, &args, env)
+        .await
+    {
+        Ok(child) => child,
+        Err(e) => {
+            return AgentResult::failure(format!("Failed to start Grok Build CLI: {}", e), 0)
+                .with_terminal_reason(TerminalReason::LlmError);
+        }
+    };
+    drop(child.stdin.take());
+
+    let stdout = match child.stdout.take() {
+        Some(stdout) => stdout,
+        None => {
+            return AgentResult::failure("Failed to capture Grok stdout".to_string(), 0)
+                .with_terminal_reason(TerminalReason::LlmError);
+        }
+    };
+    let stderr = child.stderr.take();
+    let stderr_capture = std::sync::Arc::new(tokio::sync::Mutex::new(String::new()));
+    let stderr_capture_clone = stderr_capture.clone();
+    let stderr_handle = stderr.map(|stderr| {
+        tokio::spawn(async move {
+            let reader = BufReader::new(stderr);
+            let mut lines = reader.lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                let mut captured = stderr_capture_clone.lock().await;
+                if !captured.is_empty() {
+                    captured.push('\n');
+                }
+                captured.push_str(trimmed);
+            }
+        })
+    });
+
+    let mut final_result = String::new();
+    let mut had_error = false;
+    let mut model_used = model.map(str::to_string);
+    let mut last_streamed_len = 0usize;
+    let reader = BufReader::new(stdout);
+    let mut lines = reader.lines();
+
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => {
+                let _ = child.kill().await;
+                if let Some(handle) = stderr_handle {
+                    handle.abort();
+                }
+                return AgentResult::failure("Cancelled".to_string(), 0)
+                    .with_terminal_reason(TerminalReason::Cancelled);
+            }
+            line_result = lines.next_line() => {
+                match line_result {
+                    Ok(Some(line)) => {
+                        if line.trim().is_empty() {
+                            continue;
+                        }
+                        let value: serde_json::Value = match serde_json::from_str(&line) {
+                            Ok(value) => value,
+                            Err(_) => {
+                                if final_result.is_empty() {
+                                    final_result.push_str(&line);
+                                } else {
+                                    final_result.push('\n');
+                                    final_result.push_str(&line);
+                                }
+                                continue;
+                            }
+                        };
+                        if let Some(sid) = grok_event_session_id(&value) {
+                            let _ = events_tx.send(AgentEvent::SessionIdUpdate {
+                                session_id: sid,
+                                mission_id,
+                            });
+                        }
+                        if model_used.is_none() {
+                            model_used = grok_event_model(&value);
+                        }
+                        if grok_event_is_error(&value) {
+                            had_error = true;
+                            if let Some(text) = grok_event_text(&value) {
+                                final_result = text;
+                            } else {
+                                final_result = value.to_string();
+                            }
+                            continue;
+                        }
+                        if let Some(text) = grok_event_text(&value) {
+                            if !text.is_empty() {
+                                if value
+                                    .get("delta")
+                                    .is_some()
+                                    || value.get("type").and_then(|v| v.as_str()).is_some_and(|t| {
+                                        t.contains("delta") || t.contains("chunk")
+                                    })
+                                {
+                                    final_result.push_str(&text);
+                                } else {
+                                    final_result = text;
+                                }
+                                if final_result.len() > last_streamed_len {
+                                    last_streamed_len = final_result.len();
+                                    let _ = events_tx.send(AgentEvent::TextDelta {
+                                        content: final_result.clone(),
+                                        mission_id: Some(mission_id),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(e) => {
+                        had_error = true;
+                        final_result = format!("Error reading Grok stdout: {}", e);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    let exit_status = child.wait().await;
+    if let Some(handle) = stderr_handle {
+        let _ = handle.await;
+    }
+
+    if final_result.trim().is_empty() {
+        let stderr_content = stderr_capture.lock().await;
+        if !stderr_content.trim().is_empty() {
+            final_result = format!(
+                "Grok Build error: {}",
+                stderr_content
+                    .lines()
+                    .take(5)
+                    .collect::<Vec<_>>()
+                    .join(" | ")
+            );
+            had_error = true;
+        } else {
+            final_result = "Grok Build produced no output. Run `grok login` or configure an xAI provider for Grok Build.".to_string();
+            had_error = true;
+        }
+    }
+
+    let success = exit_status.map(|status| status.success()).unwrap_or(false) && !had_error;
+    let mut result = if success {
+        AgentResult::success(final_result, 0).with_terminal_reason(TerminalReason::TurnComplete)
+    } else {
+        AgentResult::failure(final_result, 0).with_terminal_reason(TerminalReason::LlmError)
+    };
+    if let Some(model) = model_used {
+        result = result.with_model(model);
+    }
+    result
 }
 
 /// Compact info about a running mission (for API responses).

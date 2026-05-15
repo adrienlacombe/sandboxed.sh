@@ -2459,9 +2459,9 @@ pub async fn write_backend_config(
             )
             .await
         }
-        "gemini" => {
-            // Gemini CLI doesn't need its own config format; use OpenCode config
-            // for workspace setup (skills, commands, etc.)
+        "gemini" | "grok" => {
+            // These CLIs don't need a Sandboxed.sh-specific config format; use
+            // OpenCode config for workspace setup (skills, commands, etc.).
             write_opencode_config(
                 workspace_dir,
                 mcp_configs,
@@ -3503,7 +3503,10 @@ pub async fn prepare_mission_workspace_with_skills_backend(
         }
 
         // Collect skills (for backends that use skill contents directly)
-        if matches!(backend_id, "claudecode" | "amp" | "codex" | "gemini") {
+        if matches!(
+            backend_id,
+            "claudecode" | "amp" | "codex" | "gemini" | "grok"
+        ) {
             let skill_names = match resolve_workspace_skill_names(workspace, lib).await {
                 Ok(names) => {
                     tracing::debug!(

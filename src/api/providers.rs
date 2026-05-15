@@ -572,6 +572,11 @@ fn default_providers_config() -> ProvidersConfig {
                 description: "Grok models via xAI API key".to_string(),
                 models: vec![
                     ProviderModel {
+                        id: "grok-code-fast-1".to_string(),
+                        name: "Grok Code Fast 1".to_string(),
+                        description: Some("Coding-specialized Grok model".to_string()),
+                    },
+                    ProviderModel {
                         id: "grok-4-fast".to_string(),
                         name: "Grok 4 Fast".to_string(),
                         description: Some("Most capable Grok model".to_string()),
@@ -1244,6 +1249,7 @@ pub async fn list_backend_model_options(
         &|id: &str| id.contains("codex") || id == "gpt-5.5" || id == "gpt-5.4";
     push_options("codex", Some(&["openai"]), false, Some(codex_filter));
     push_options("gemini", Some(&["google"]), false, None);
+    push_options("grok", Some(&["xai"]), false, None);
     push_options("opencode", None, true, None);
     backends.entry("amp".to_string()).or_default();
 
@@ -1468,6 +1474,35 @@ pub async fn validate_model_override(
                         model_override
                     ))
                 }
+            }
+        }
+        "grok" => {
+            let xai = providers.iter().find(|p| p.id == "xai");
+            if let Some(provider) = xai {
+                if provider.models.iter().any(|m| m.id == model_override)
+                    || model_override.starts_with("grok-")
+                {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "Model '{}' not found in xAI catalog. Available models: {}. For custom Grok models, use format 'grok-*'",
+                        model_override,
+                        provider
+                            .models
+                            .iter()
+                            .map(|m| &m.id)
+                            .cloned()
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ))
+                }
+            } else if model_override.starts_with("grok-") {
+                Ok(())
+            } else {
+                Err(format!(
+                    "xAI provider not configured. Expected a Grok model ID (e.g., 'grok-code-fast-1'), got '{}'",
+                    model_override
+                ))
             }
         }
         _ => {

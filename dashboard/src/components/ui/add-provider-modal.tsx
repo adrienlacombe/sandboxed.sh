@@ -26,6 +26,7 @@ const providerIcons: Record<string, string> = {
   'together-ai': '🤝',
   perplexity: '🔍',
   zai: '⚡',
+  xai: '𝕏',
   minimax: 'M',
   amp: 'A',
   custom: '🔧',
@@ -167,6 +168,8 @@ export function AddProviderModal({ open, onClose, onSuccess, providerTypes }: Ad
       setSelectedBackends(['opencode', 'codex']);
     } else if (providerType === 'google') {
       setSelectedBackends(['opencode', 'gemini']);
+    } else if (providerType === 'xai') {
+      setSelectedBackends(['opencode', 'grok']);
     } else if (providerType === 'amp') {
       setSelectedBackends(['amp']);
     } else {
@@ -176,7 +179,7 @@ export function AddProviderModal({ open, onClose, onSuccess, providerTypes }: Ad
     // If provider has OAuth options, show method selection
     if (typeInfo?.uses_oauth && methods.length > 0) {
       setStep('select-method');
-    } else if (providerType === 'anthropic' || providerType === 'openai' || providerType === 'google') {
+    } else if (providerType === 'anthropic' || providerType === 'openai' || providerType === 'google' || providerType === 'xai') {
       // Providers with backend targeting go to backend selection even without OAuth
       setStep('select-backends');
     } else {
@@ -630,6 +633,35 @@ export function AddProviderModal({ open, onClose, onSuccess, providerTypes }: Ad
                       <div className="flex-1">
                         <div className="text-sm text-white">Gemini CLI</div>
                         <div className="text-xs text-white/40">Use for Gemini CLI-based missions</div>
+                      </div>
+                    </label>
+                  </>
+                )}
+
+                {selectedProvider === 'xai' && (
+                  <>
+                    <label className="flex items-center gap-3 p-3 rounded-xl border border-white/[0.06] hover:bg-white/[0.02] transition-colors cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={selectedBackends.includes('opencode')}
+                        onChange={() => toggleBackend('opencode')}
+                        className="rounded border-white/20 bg-white/[0.02] text-indigo-500 focus:ring-indigo-500/30 cursor-pointer"
+                      />
+                      <div className="flex-1">
+                        <div className="text-sm text-white">OpenCode</div>
+                        <div className="text-xs text-white/40">Use xAI models through OpenCode</div>
+                      </div>
+                    </label>
+                    <label className="flex items-center gap-3 p-3 rounded-xl border border-white/[0.06] hover:bg-white/[0.02] transition-colors cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={selectedBackends.includes('grok')}
+                        onChange={() => toggleBackend('grok')}
+                        className="rounded border-white/20 bg-white/[0.02] text-indigo-500 focus:ring-indigo-500/30 cursor-pointer"
+                      />
+                      <div className="flex-1">
+                        <div className="text-sm text-white">Grok Build</div>
+                        <div className="text-xs text-white/40">Use for Grok Build CLI missions</div>
                       </div>
                     </label>
                   </>

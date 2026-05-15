@@ -391,14 +391,22 @@ export type ControlAgentEvent =
 
 export async function postControlMessage(
   content: string,
-  options?: { agent?: string; mission_id?: string }
+  options?: { agent?: string; mission_id?: string; client_message_id?: string }
 ): Promise<{ id: string; queued: boolean }> {
-  const body: { content: string; agent?: string; mission_id?: string } = { content };
+  const body: {
+    content: string;
+    agent?: string;
+    mission_id?: string;
+    client_message_id?: string;
+  } = { content };
   if (options?.agent) {
     body.agent = options.agent;
   }
   if (options?.mission_id) {
     body.mission_id = options.mission_id;
+  }
+  if (options?.client_message_id) {
+    body.client_message_id = options.client_message_id;
   }
   const res = await apiFetch("/api/control/message", {
     method: "POST",

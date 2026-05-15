@@ -793,8 +793,28 @@ export default function SettingsPage() {
 
   if (loading && !fileContent) {
     return (
-      <div className="flex items-center justify-center min-h-[calc(100vh-4rem)]">
-        <Loader className="h-8 w-8 animate-spin text-white/40" />
+      <div className="h-screen flex flex-col p-6 gap-4 overflow-hidden">
+        <div className="h-16 rounded-xl bg-white/[0.02] border border-white/[0.06]" />
+        <div className="flex items-center justify-between mb-2">
+          <div className="flex items-center gap-2">
+            {Array.from({ length: 3 }).map((_, index) => (
+              <div key={index} className="h-10 w-24 rounded-lg bg-white/[0.04] border border-white/[0.06]" />
+            ))}
+          </div>
+          <div className="h-10 w-40 rounded-lg bg-white/[0.04] border border-white/[0.06]" />
+        </div>
+        <div className="flex gap-4 flex-1 min-h-0">
+          <div className="w-64 flex-shrink-0 rounded-xl bg-white/[0.02] border border-white/[0.06] p-4 space-y-3">
+            <div className="h-4 w-28 rounded bg-white/[0.06]" />
+            {Array.from({ length: 7 }).map((_, index) => (
+              <div key={index} className="h-12 rounded-lg bg-white/[0.04]" />
+            ))}
+          </div>
+          <div className="flex-1 rounded-xl bg-white/[0.02] border border-white/[0.06] p-5 space-y-4">
+            <div className="h-6 w-48 rounded bg-white/[0.06]" />
+            <div className="h-full min-h-0 rounded-lg bg-black/20 border border-white/[0.04]" />
+          </div>
+        </div>
       </div>
     );
   }

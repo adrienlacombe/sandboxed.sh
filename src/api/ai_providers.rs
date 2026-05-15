@@ -651,6 +651,7 @@ pub fn default_backends_for_provider(provider_type: ProviderType) -> Vec<String>
         ProviderType::Anthropic => vec!["opencode".to_string(), "claudecode".to_string()],
         ProviderType::OpenAI => vec!["opencode".to_string(), "codex".to_string()],
         ProviderType::Google => vec!["opencode".to_string(), "gemini".to_string()],
+        ProviderType::Xai => vec!["opencode".to_string(), "grok".to_string()],
         ProviderType::Amp => vec!["amp".to_string()],
         _ => vec!["opencode".to_string()],
     }
@@ -668,6 +669,32 @@ pub fn provider_targets_backend(
         .unwrap_or_else(|| default_backends_for_provider(provider_type));
 
     configured.iter().any(|candidate| candidate == backend)
+}
+
+/// Return the preferred xAI API key for Grok Build.
+///
+/// Grok's headless docs use `GROK_CODE_XAI_API_KEY`; xAI provider entries in
+/// Sandboxed.sh are stored as regular xAI API keys and can be targeted at the
+/// `grok` backend through `use_for_backends`.
+pub fn get_xai_api_key_for_grok(working_dir: &Path) -> Option<String> {
+    if !provider_targets_backend(working_dir, ProviderType::Xai, "grok") {
+        return None;
+    }
+
+    let path = working_dir.join(AI_PROVIDERS_PATH);
+    let contents = std::fs::read_to_string(path).ok()?;
+    let mut providers: Vec<crate::ai_providers::AIProvider> =
+        serde_json::from_str(&contents).ok()?;
+    providers.sort_by_key(|provider| provider.priority);
+    providers.into_iter().find_map(|provider| {
+        if provider.provider_type != ProviderType::Xai || !provider.enabled {
+            return None;
+        }
+        provider
+            .api_key
+            .filter(|key| !key.trim().is_empty())
+            .map(|key| key.trim().to_string())
+    })
 }
 
 /// Get the Anthropic API key or OAuth access token for the Claude Code backend.

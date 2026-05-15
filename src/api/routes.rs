@@ -58,7 +58,6 @@ fn cli_available(name: &str) -> bool {
 use super::providers::ModelCatalog;
 
 use super::ai_providers as ai_providers_api;
-use super::ampcode as ampcode_api;
 use super::auth::{self, AuthUser};
 use super::backends as backends_api;
 use super::claudecode as claudecode_api;
@@ -262,9 +261,9 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
             config.opencode_permissive,
         )),
         Box::new(crate::backend::claudecode::ClaudeCodeBackend::new()),
-        Box::new(crate::backend::amp::AmpBackend::new()),
         Box::new(crate::backend::codex::CodexBackend::new()),
         Box::new(crate::backend::gemini::GeminiBackend::new()),
+        Box::new(crate::backend::grok::GrokBackend::new()),
     ];
     struct BackendProbe {
         id: String,
@@ -340,7 +339,8 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
     // a fixed preference order. The preference list lives here (operational
     // policy) but the "is it available" answer comes from the probe map so
     // we don't restate CLI names.
-    const DEFAULT_BACKEND_PRIORITY: &[&str] = &["claudecode", "opencode", "amp", "gemini", "codex"];
+    const DEFAULT_BACKEND_PRIORITY: &[&str] =
+        &["claudecode", "opencode", "grok", "gemini", "codex"];
     let default_backend = config.default_backend.clone().unwrap_or_else(|| {
         let detected = |id: &str| {
             probes
@@ -374,9 +374,9 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         opencode_permissive,
     ));
     backend_registry.register(crate::backend::claudecode::registry_entry());
-    backend_registry.register(crate::backend::amp::registry_entry());
     backend_registry.register(crate::backend::codex::registry_entry());
     backend_registry.register(crate::backend::gemini::registry_entry());
+    backend_registry.register(crate::backend::grok::registry_entry());
     let backend_registry = Arc::new(RwLock::new(backend_registry));
     tracing::info!("Backend registry initialized with {} backends", 5);
 
@@ -918,11 +918,6 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         .route(
             "/api/claudecode/config",
             axum::routing::put(claudecode_api::update_claudecode_config),
-        )
-        .route("/api/amp/config", get(ampcode_api::get_amp_config))
-        .route(
-            "/api/amp/config",
-            axum::routing::put(ampcode_api::update_amp_config),
         )
         .route(
             "/api/opencode/restart",

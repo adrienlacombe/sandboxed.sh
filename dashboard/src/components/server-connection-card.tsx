@@ -32,6 +32,7 @@ const componentNames: Record<string, string> = {
   claude_code: 'Claude Code',
   codex: 'Codex',
   amp: 'Amp',
+  grok: 'Grok Build',
   oh_my_opencode: 'oh-my-opencode',
 };
 
