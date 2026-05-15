@@ -3253,81 +3253,6 @@ async fn run_mission_turn(
             )
             .await
         }
-        "amp" => {
-            let api_key = get_amp_api_key_from_config();
-            let mut result = run_amp_turn(
-                &workspace,
-                &mission_work_dir,
-                &user_message,
-                effective_agent.as_deref(), // Used as mode (smart/rush)
-                mission_id,
-                events_tx.clone(),
-                cancel.clone(),
-                &config.working_dir,
-                session_id.as_deref(),
-                is_continuation,
-                api_key.as_deref(),
-            )
-            .await;
-
-            // Account rotation: if rate-limited, try alternate Amp API keys.
-            if result.terminal_reason == Some(TerminalReason::RateLimited) {
-                let alt_keys = super::ai_providers::get_all_amp_api_keys(&config.working_dir);
-                if alt_keys.len() > 1 {
-                    tracing::info!(
-                        mission_id = %mission_id,
-                        total_keys = alt_keys.len(),
-                        "Amp rate limited; trying alternate API keys"
-                    );
-                    // Skip the key we already tried (explicit config key or env var fallback)
-                    let already_tried = api_key.map(|s| s.to_string()).or_else(|| {
-                        std::env::var("AMP_API_KEY")
-                            .ok()
-                            .filter(|s| !s.trim().is_empty())
-                    });
-                    for (idx, alt_key) in alt_keys.into_iter().enumerate() {
-                        if cancel.is_cancelled() {
-                            break;
-                        }
-                        if Some(&alt_key) == already_tried.as_ref() {
-                            continue;
-                        }
-                        tracing::info!(
-                            mission_id = %mission_id,
-                            attempt = idx + 2,
-                            "Rotating to alternate Amp API key"
-                        );
-                        result = run_amp_turn(
-                            &workspace,
-                            &mission_work_dir,
-                            &user_message,
-                            effective_agent.as_deref(),
-                            mission_id,
-                            events_tx.clone(),
-                            cancel.clone(),
-                            &config.working_dir,
-                            session_id.as_deref(),
-                            is_continuation,
-                            Some(&alt_key),
-                        )
-                        .await;
-                        match result.terminal_reason {
-                            Some(TerminalReason::RateLimited) => {
-                                tracing::info!(
-                                    mission_id = %mission_id,
-                                    attempt = idx + 2,
-                                    "Amp rate limited; rotating to next key"
-                                );
-                                continue;
-                            }
-                            _ => break,
-                        }
-                    }
-                }
-            }
-
-            result
-        }
         "grok" => {
             run_grok_turn(
                 &workspace,
@@ -3748,33 +3673,6 @@ fn get_backend_bool_setting(backend_id: &str, key: &str) -> Option<bool> {
         }
     }
     None
-}
-
-/// Read API key from Amp backend config file if available.
-pub fn get_amp_api_key_from_config() -> Option<String> {
-    let key = get_backend_string_setting("amp", "api_key")?;
-    if key.starts_with("[REDACTED") || key == "********" {
-        return None;
-    }
-    Some(key)
-}
-
-/// Read amp.url from Amp CLI settings file (~/.config/amp/settings.json)
-fn get_amp_url_from_settings() -> Option<String> {
-    let home = std::env::var("HOME").ok()?;
-    let settings_path = std::path::PathBuf::from(&home)
-        .join(".config")
-        .join("amp")
-        .join("settings.json");
-
-    let contents = std::fs::read_to_string(&settings_path).ok()?;
-    let settings: serde_json::Value = serde_json::from_str(&contents).ok()?;
-
-    settings
-        .get("amp.url")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
 }
 
 /// Execute a turn using Claude Code CLI backend.
@@ -10055,6 +9953,77 @@ async fn ensure_opencode_cli_available(
     Ok(())
 }
 
+async fn ensure_grok_cli_available(
+    workspace_exec: &WorkspaceExec,
+    cwd: &std::path::Path,
+    cli_path: &str,
+) -> Result<String, String> {
+    let program = cli_path.split(' ').next().unwrap_or(cli_path);
+    if command_available(workspace_exec, cwd, program).await {
+        return Ok(cli_path.to_string());
+    }
+
+    let auto_install = env_var_bool("SANDBOXED_SH_AUTO_INSTALL_GROK", true);
+    if !auto_install {
+        return Err(format!(
+            "Grok Build CLI '{}' not found in workspace. Install it with: curl -fsSL https://x.ai/cli/install.sh | bash",
+            cli_path
+        ));
+    }
+
+    if !command_available(workspace_exec, cwd, "curl").await {
+        return Err(format!(
+            "Grok Build CLI '{}' not found and curl is not available in the workspace. Install curl or install Grok manually.",
+            cli_path
+        ));
+    }
+
+    tracing::info!("Auto-installing Grok Build CLI");
+    let output = workspace_exec
+        .output(
+            cwd,
+            "/bin/sh",
+            &[
+                "-lc".to_string(),
+                "curl -fsSL https://x.ai/cli/install.sh | GROK_BIN_DIR=/usr/local/bin bash 2>&1"
+                    .to_string(),
+            ],
+            HashMap::new(),
+        )
+        .await
+        .map_err(|e| format!("Failed to run Grok Build installer: {}", e))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let mut message = String::new();
+        if !stderr.trim().is_empty() {
+            message.push_str(stderr.trim());
+        }
+        if !stdout.trim().is_empty() {
+            if !message.is_empty() {
+                message.push_str(" | ");
+            }
+            message.push_str(stdout.trim());
+        }
+        if message.is_empty() {
+            message = "Grok Build install failed with no output".to_string();
+        }
+        return Err(format!("Grok Build install failed: {}", message));
+    }
+
+    if command_available(workspace_exec, cwd, cli_path).await {
+        Ok(cli_path.to_string())
+    } else if command_available(workspace_exec, cwd, "/usr/local/bin/grok").await {
+        Ok("/usr/local/bin/grok".to_string())
+    } else {
+        Err(
+            "Grok Build install completed but 'grok' is still not available in workspace PATH."
+                .to_string(),
+        )
+    }
+}
+
 /// Result of a backend preflight check
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct BackendPreflightResult {
@@ -10085,10 +10054,6 @@ pub async fn check_backend_prerequisites(
         "codex" => {
             let cli = cli_path.unwrap_or("codex");
             check_codex_prerequisites(&workspace_exec, cwd, cli).await
-        }
-        "amp" => {
-            let cli = cli_path.unwrap_or("amp");
-            check_amp_prerequisites(&workspace_exec, cwd, cli).await
         }
         "gemini" => {
             let cli = cli_path.unwrap_or("gemini");
@@ -10124,7 +10089,7 @@ pub async fn check_backend_prerequisites(
             auto_install_possible: false,
             missing_dependencies: vec![format!("unknown backend: {}", backend_id)],
             message: Some(format!(
-                "Unknown backend '{}'. Supported backends: claudecode, opencode, codex, amp, gemini, grok",
+                "Unknown backend '{}'. Supported backends: claudecode, opencode, codex, gemini, grok",
                 backend_id
             )),
         },
@@ -10266,52 +10231,6 @@ async fn check_codex_prerequisites(
             Some("Codex CLI not found and neither npm nor bun is available. Install Node.js/npm or Bun in the workspace template.".to_string())
         } else {
             Some("Codex CLI not found but can be auto-installed via npm/bun.".to_string())
-        },
-    }
-}
-
-async fn check_amp_prerequisites(
-    workspace_exec: &WorkspaceExec,
-    cwd: &std::path::Path,
-    cli_path: &str,
-) -> BackendPreflightResult {
-    let program = cli_path.split_whitespace().next().unwrap_or(cli_path);
-
-    let cli_available = command_available(workspace_exec, cwd, program).await
-        || command_available(workspace_exec, cwd, "/root/.bun/bin/amp").await
-        || command_available(workspace_exec, cwd, "/root/.cache/.bun/bin/amp").await;
-
-    if cli_available {
-        return BackendPreflightResult {
-            backend_id: "amp".to_string(),
-            available: true,
-            cli_available: true,
-            auto_install_possible: false,
-            missing_dependencies: vec![],
-            message: None,
-        };
-    }
-
-    let has_npm = command_available(workspace_exec, cwd, "npm").await;
-    let has_bun = command_available(workspace_exec, cwd, "bun").await
-        || command_available(workspace_exec, cwd, "/root/.bun/bin/bun").await;
-
-    let auto_install_possible = has_npm || has_bun;
-
-    BackendPreflightResult {
-        backend_id: "amp".to_string(),
-        available: auto_install_possible,
-        cli_available: false,
-        auto_install_possible,
-        missing_dependencies: if !auto_install_possible {
-            vec!["npm or bun".to_string()]
-        } else {
-            vec![]
-        },
-        message: if !auto_install_possible {
-            Some("Amp CLI not found and neither npm nor bun is available. Install Node.js/npm or Bun in the workspace template.".to_string())
-        } else {
-            Some("Amp CLI not found but can be auto-installed via npm/bun.".to_string())
         },
     }
 }
@@ -12713,741 +12632,6 @@ pub async fn run_opencode_turn(
     result
 }
 
-/// Execute a turn using Amp CLI backend.
-///
-/// For Host workspaces: spawns the CLI directly on the host.
-/// For Container workspaces: spawns the CLI inside the container using systemd-nspawn.
-#[allow(clippy::too_many_arguments)]
-pub async fn run_amp_turn(
-    workspace: &Workspace,
-    work_dir: &std::path::Path,
-    message: &str,
-    mode: Option<&str>,
-    mission_id: Uuid,
-    events_tx: broadcast::Sender<AgentEvent>,
-    cancel: CancellationToken,
-    _app_working_dir: &std::path::Path,
-    session_id: Option<&str>,
-    is_continuation: bool,
-    api_key: Option<&str>,
-) -> AgentResult {
-    use crate::backend::amp::client::{AmpEvent, ContentBlock, StreamEvent};
-    use std::collections::HashMap;
-    use tokio::io::{AsyncBufReadExt, BufReader};
-
-    let workspace_exec = WorkspaceExec::new(workspace.clone());
-
-    // Check if amp CLI is available
-    if !command_available(&workspace_exec, work_dir, "amp").await {
-        let auto_install = env_var_bool("SANDBOXED_SH_AUTO_INSTALL_AMP", true);
-        if auto_install {
-            // Try to install via bun first (preferred for container templates), then npm
-            let has_bun = command_available(&workspace_exec, work_dir, "bun").await;
-            let has_npm = command_available(&workspace_exec, work_dir, "npm").await;
-
-            if has_bun {
-                tracing::info!(mission_id = %mission_id, "Auto-installing Amp CLI via bun");
-                let install_result = workspace_exec
-                    .output(
-                        work_dir,
-                        "/bin/sh",
-                        &[
-                            "-lc".to_string(),
-                            "bun install -g @sourcegraph/amp 2>&1".to_string(),
-                        ],
-                        HashMap::new(),
-                    )
-                    .await;
-                match &install_result {
-                    Ok(output) => {
-                        let stdout = String::from_utf8_lossy(&output.stdout);
-                        let stderr = String::from_utf8_lossy(&output.stderr);
-                        if output.status.success() {
-                            tracing::info!(mission_id = %mission_id, stdout = %stdout, "Amp CLI installed via bun");
-                        } else {
-                            tracing::warn!(mission_id = %mission_id, stdout = %stdout, stderr = %stderr, exit_code = ?output.status.code(), "bun install for Amp CLI failed");
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!(mission_id = %mission_id, error = %e, "Failed to run bun install for Amp CLI");
-                    }
-                }
-            } else if has_npm {
-                tracing::info!(mission_id = %mission_id, "Auto-installing Amp CLI via npm");
-                let install_result = workspace_exec
-                    .output(
-                        work_dir,
-                        "/bin/sh",
-                        &[
-                            "-lc".to_string(),
-                            "npm install -g @sourcegraph/amp".to_string(),
-                        ],
-                        HashMap::new(),
-                    )
-                    .await;
-                if let Err(e) = &install_result {
-                    tracing::warn!(mission_id = %mission_id, error = %e, "Failed to auto-install Amp CLI via npm");
-                }
-            } else {
-                tracing::warn!(mission_id = %mission_id, "Neither bun nor npm available for Amp CLI auto-install");
-            }
-        }
-    }
-
-    // Check if node is available (amp CLI is a Node.js script)
-    let has_node = command_available(&workspace_exec, work_dir, "node").await;
-    let has_bun = command_available(&workspace_exec, work_dir, "bun").await
-        || command_available(&workspace_exec, work_dir, "/root/.bun/bin/bun").await;
-
-    // Find the amp binary - check standard PATH first, then bun's global bin paths
-    // The amp CLI is a Node.js script, so if node is not available but bun is,
-    // we need to run it via "bun run amp" or "bun /path/to/main.js"
-    let (amp_binary, amp_args_prefix): (String, Vec<String>) = if has_node
-        && command_available(&workspace_exec, work_dir, "amp").await
-    {
-        // Node available and amp in PATH - run directly
-        ("amp".to_string(), vec![])
-    } else if has_bun {
-        // No node, but bun is available - use "bun run amp" or run the JS directly
-        // First check for bun's global install paths
-        let bun_path = if command_available(&workspace_exec, work_dir, "bun").await {
-            "bun".to_string()
-        } else {
-            "/root/.bun/bin/bun".to_string()
-        };
-
-        // Check for amp's main.js in bun's global install location
-        let amp_main_js_paths = [
-            "/root/.bun/install/global/node_modules/@sourcegraph/amp/dist/main.js",
-            "/root/.cache/.bun/install/global/node_modules/@sourcegraph/amp/dist/main.js",
-        ];
-
-        let mut found_js = None;
-        for path in &amp_main_js_paths {
-            let check_result = workspace_exec
-                .output(
-                    work_dir,
-                    "/bin/sh",
-                    &["-c".to_string(), format!("test -f {} && echo exists", path)],
-                    HashMap::new(),
-                )
-                .await;
-            if let Ok(output) = check_result {
-                if String::from_utf8_lossy(&output.stdout).contains("exists") {
-                    found_js = Some(path.to_string());
-                    break;
-                }
-            }
-        }
-
-        if let Some(js_path) = found_js {
-            tracing::info!(
-                mission_id = %mission_id,
-                js_path = %js_path,
-                "Running Amp CLI via bun (node not available)"
-            );
-            (bun_path, vec![js_path])
-        } else {
-            // Try "bun run amp" as fallback
-            tracing::info!(
-                mission_id = %mission_id,
-                "Trying 'bun run amp' (amp main.js not found in expected locations)"
-            );
-            (bun_path, vec!["run".to_string(), "amp".to_string()])
-        }
-    } else if command_available(&workspace_exec, work_dir, "/root/.bun/bin/amp").await {
-        // Amp exists but may fail without node - try anyway
-        ("/root/.bun/bin/amp".to_string(), vec![])
-    } else if command_available(&workspace_exec, work_dir, "/root/.cache/.bun/bin/amp").await {
-        ("/root/.cache/.bun/bin/amp".to_string(), vec![])
-    } else {
-        let err_msg = "Amp CLI not found. Install it with: bun install -g @sourcegraph/amp (or npm install -g @sourcegraph/amp)";
-        tracing::error!(mission_id = %mission_id, "{}", err_msg);
-        return AgentResult::failure(err_msg.to_string(), 0)
-            .with_terminal_reason(TerminalReason::LlmError);
-    };
-
-    tracing::info!(
-        mission_id = %mission_id,
-        work_dir = %work_dir.display(),
-        workspace_type = ?workspace.workspace_type,
-        mode = ?mode,
-        is_continuation = is_continuation,
-        amp_binary = %amp_binary,
-        "Starting Amp execution via WorkspaceExec"
-    );
-
-    // Build CLI arguments
-    // Amp CLI format: amp [subcommand] --execute "message" [flags]
-    // For continuation: amp threads continue <session_id> --execute "message" [flags]
-    // When running via bun, amp_args_prefix contains ["/path/to/main.js"] or ["run", "amp"]
-    let mut args = amp_args_prefix;
-
-    // For continuation, use threads continue subcommand
-    if is_continuation {
-        if let Some(sid) = session_id {
-            args.push("threads".to_string());
-            args.push("continue".to_string());
-            args.push(sid.to_string());
-        }
-    }
-
-    // --execute with message as its argument (must come before other flags)
-    args.push("--execute".to_string());
-    args.push(message.to_string());
-
-    // Remaining flags
-    args.push("--stream-json".to_string());
-    args.push("--dangerously-allow-all".to_string());
-
-    // Mode (smart/rush)
-    if let Some(m) = mode {
-        args.push("--mode".to_string());
-        args.push(m.to_string());
-    }
-
-    // Build environment
-    let mut env = HashMap::new();
-
-    // Use API key from config, or fall back to environment variable
-    if let Some(key) = api_key {
-        env.insert("AMP_API_KEY".to_string(), key.to_string());
-    } else if let Ok(key) = std::env::var("AMP_API_KEY") {
-        env.insert("AMP_API_KEY".to_string(), key);
-    }
-
-    // Pass through AMP_URL for CLIProxyAPI integration
-    // This allows routing Amp requests through a local proxy (e.g., CLIProxyAPI)
-    // AMP_URL sets the Amp service URL (default: https://ampcode.com/)
-    if let Ok(amp_url) = std::env::var("AMP_URL") {
-        env.insert("AMP_URL".to_string(), amp_url);
-    }
-
-    // Also support legacy AMP_PROVIDER_URL as an alias
-    if !env.contains_key("AMP_URL") {
-        if let Ok(provider_url) = std::env::var("AMP_PROVIDER_URL") {
-            env.insert("AMP_URL".to_string(), provider_url);
-        }
-    }
-
-    // Fall back to reading amp.url from Amp CLI settings file if no env var set
-    if !env.contains_key("AMP_URL") {
-        if let Some(amp_url) = get_amp_url_from_settings() {
-            tracing::debug!(mission_id = %mission_id, amp_url = %amp_url, "Using amp.url from Amp CLI settings");
-            env.insert("AMP_URL".to_string(), amp_url);
-        }
-    }
-
-    // Log the environment for debugging
-    tracing::debug!(
-        mission_id = %mission_id,
-        env_vars = ?env.keys().collect::<Vec<_>>(),
-        amp_url = ?env.get("AMP_URL"),
-        amp_api_key_present = env.contains_key("AMP_API_KEY"),
-        "Spawning Amp CLI with environment"
-    );
-
-    // Use WorkspaceExec to spawn the CLI
-    let mut child = match workspace_exec
-        .spawn_streaming(work_dir, &amp_binary, &args, env)
-        .await
-    {
-        Ok(child) => child,
-        Err(e) => {
-            let err_msg = format!("Failed to start Amp CLI: {}", e);
-            tracing::error!("{}", err_msg);
-            return AgentResult::failure(err_msg, 0).with_terminal_reason(TerminalReason::LlmError);
-        }
-    };
-
-    // Close stdin immediately - Amp uses --execute with args, not stdin
-    // Leaving the pipe open can cause issues with Node.js process lifecycle
-    drop(child.stdin.take());
-
-    // Get stdout for reading events
-    let stdout = match child.stdout.take() {
-        Some(stdout) => stdout,
-        None => {
-            let err_msg = "Failed to capture Amp stdout";
-            tracing::error!("{}", err_msg);
-            return AgentResult::failure(err_msg.to_string(), 0)
-                .with_terminal_reason(TerminalReason::LlmError);
-        }
-    };
-
-    // Capture stderr for debugging
-    let stderr = child.stderr.take();
-    let stderr_capture = std::sync::Arc::new(tokio::sync::Mutex::new(String::new()));
-    let stderr_capture_clone = stderr_capture.clone();
-    let mission_id_for_stderr = mission_id;
-    let stderr_handle = stderr.map(|stderr| {
-        tokio::spawn(async move {
-            let stderr_reader = BufReader::new(stderr);
-            let mut stderr_lines = stderr_reader.lines();
-            while let Ok(Some(line)) = stderr_lines.next_line().await {
-                let trimmed = line.trim();
-                if !trimmed.is_empty() {
-                    tracing::debug!(mission_id = %mission_id_for_stderr, stderr = %trimmed, "Amp CLI stderr");
-                    let mut captured = stderr_capture_clone.lock().await;
-                    if !captured.is_empty() {
-                        captured.push('\n');
-                    }
-                    captured.push_str(trimmed);
-                }
-            }
-        })
-    });
-
-    // Track tool calls for result mapping
-    let mut pending_tools: HashMap<String, String> = HashMap::new();
-    let mut final_result = String::new();
-    let mut had_error = false;
-    let mut model_used: Option<String> = None;
-
-    // Track token usage for cost calculation
-    let mut total_input_tokens: u64 = 0;
-    let mut total_output_tokens: u64 = 0;
-    let mut total_cache_creation_tokens: u64 = 0;
-    let mut total_cache_read_tokens: u64 = 0;
-
-    // Track content blocks for streaming
-    let mut block_types: HashMap<u32, String> = HashMap::new();
-    let mut thinking_buffer: HashMap<u32, String> = HashMap::new();
-    let mut text_buffer: HashMap<u32, String> = HashMap::new();
-    let mut active_thinking_index: Option<u32> = None;
-    let mut finalized_thinking_indices: std::collections::HashSet<u32> =
-        std::collections::HashSet::new();
-    let mut last_text_len: usize = 0;
-    let mut thinking_streamed = false; // Track if thinking was already streamed
-
-    let reader = BufReader::new(stdout);
-    let mut lines = reader.lines();
-
-    // Process events until completion or cancellation
-    loop {
-        tokio::select! {
-            _ = cancel.cancelled() => {
-                tracing::info!(mission_id = %mission_id, "Amp execution cancelled, killing process");
-                let _ = child.kill().await;
-                if let Some(handle) = stderr_handle {
-                    handle.abort();
-                }
-                return AgentResult::failure("Cancelled".to_string(), 0)
-                    .with_terminal_reason(TerminalReason::Cancelled);
-            }
-            line_result = lines.next_line() => {
-                match line_result {
-                    Ok(Some(line)) => {
-                        if line.is_empty() {
-                            continue;
-                        }
-
-                        let amp_event: AmpEvent = match serde_json::from_str(&line) {
-                            Ok(event) => event,
-                            Err(e) => {
-                                tracing::warn!(
-                                    mission_id = %mission_id,
-                                    error = %e,
-                                    line = %if line.len() > 200 { let end = safe_truncate_index(&line, 200); format!("{}...", &line[..end]) } else { line.clone() },
-                                    "Failed to parse Amp event"
-                                );
-                                continue;
-                            }
-                        };
-
-                        match amp_event {
-                            AmpEvent::System(sys) => {
-                                tracing::debug!(
-                                    mission_id = %mission_id,
-                                    session_id = %sys.session_id,
-                                    model = ?sys.model,
-                                    "Amp session init"
-                                );
-                                if sys.model.is_some() {
-                                    model_used = sys.model;
-                                }
-                                // Amp generates its own session/thread ID; emit an update so the
-                                // mission's session_id gets updated for continuation.
-                                let _ = events_tx.send(AgentEvent::SessionIdUpdate {
-                                    session_id: sys.session_id.clone(),
-                                    mission_id,
-                                });
-                            }
-                            AmpEvent::StreamEvent(wrapper) => {
-                                match wrapper.event {
-                                    StreamEvent::ContentBlockDelta { index, delta } => {
-                                        let block_type = block_types
-                                            .get(&index)
-                                            .map(|value| value.as_str());
-                                        let is_thinking_block =
-                                            matches!(block_type, Some("thinking"));
-                                        if delta.delta_type == "thinking_delta"
-                                            || (is_thinking_block
-                                                && delta.delta_type == "text_delta")
-                                        {
-                                            let thinking_text = delta.thinking.or(delta.text.clone());
-                                            if let Some(thinking_text) = thinking_text {
-                                                if !thinking_text.is_empty() {
-                                                    // If a new thinking block started, finalize the previous one
-                                                    if let Some(prev_idx) = active_thinking_index {
-                                                        if prev_idx != index {
-                                                            let _ = events_tx.send(AgentEvent::Thinking {
-                                                                content: String::new(),
-                                                                done: true,
-                                                                mission_id: Some(mission_id),
-                                                            });
-                                                            finalized_thinking_indices.insert(prev_idx);
-                                                        }
-                                                    }
-                                                    active_thinking_index = Some(index);
-
-                                                    let buffer = thinking_buffer.entry(index).or_default();
-                                                    buffer.push_str(&thinking_text);
-                                                    thinking_streamed = true;
-
-                                                    let _ = events_tx.send(AgentEvent::Thinking {
-                                                        content: buffer.clone(),
-                                                        done: false,
-                                                        mission_id: Some(mission_id),
-                                                    });
-                                                }
-                                            }
-                                        } else if delta.delta_type == "text_delta" {
-                                            if let Some(text) = delta.text {
-                                                if !text.is_empty() {
-                                                    let buffer = text_buffer.entry(index).or_default();
-                                                    buffer.push_str(&text);
-
-                                                    // Stream text deltas similar to thinking
-                                                    let total_len = text_buffer.values().map(|s| s.len()).sum::<usize>();
-                                                    if total_len > last_text_len {
-                                                        let accumulated: String = text_buffer.values().cloned().collect::<Vec<_>>().join("");
-                                                        last_text_len = total_len;
-
-                                                        let _ = events_tx.send(AgentEvent::TextDelta {
-                                                            content: accumulated,
-                                                            mission_id: Some(mission_id),
-                                                        });
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                    StreamEvent::ContentBlockStart { index, content_block }
-                                        if content_block.block_type == "tool_use" =>
-                                    {
-                                        block_types.insert(index, content_block.block_type.clone());
-
-                                        if let (Some(id), Some(name)) =
-                                            (content_block.id, content_block.name)
-                                        {
-                                            pending_tools.insert(id, name);
-                                        }
-                                    }
-                                    StreamEvent::ContentBlockStart { index, content_block } => {
-                                        block_types.insert(index, content_block.block_type);
-                                    }
-                                    _ => {}
-                                }
-                            }
-                            AmpEvent::Assistant(evt) => {
-                                // Track model from assistant message
-                                if evt.message.model.is_some() {
-                                    model_used = evt.message.model.clone();
-                                }
-
-                                // Accumulate token usage for cost calculation
-                                if let Some(usage) = &evt.message.usage {
-                                    total_input_tokens += usage.input_tokens.unwrap_or(0);
-                                    total_output_tokens += usage.output_tokens.unwrap_or(0);
-                                    total_cache_creation_tokens += usage.cache_creation_input_tokens.unwrap_or(0);
-                                    total_cache_read_tokens += usage.cache_read_input_tokens.unwrap_or(0);
-                                }
-
-                                for (content_idx, block) in evt.message.content.into_iter().enumerate() {
-                                    let content_idx = content_idx as u32;
-                                    match block {
-                                        ContentBlock::Text { text } if !text.is_empty() => {
-                                            if !thinking_streamed {
-                                                if let Some((thought, cleaned)) =
-                                                    extract_thought_line(&text)
-                                                {
-                                                    let _ = events_tx.send(AgentEvent::Thinking {
-                                                        content: thought,
-                                                        done: true,
-                                                        mission_id: Some(mission_id),
-                                                    });
-                                                    thinking_streamed = true;
-                                                    final_result = cleaned;
-                                                } else {
-                                                    final_result = text;
-                                                }
-                                            } else {
-                                                final_result = text;
-                                            }
-                                        }
-                                        ContentBlock::ToolUse { id, name, input } => {
-                                            pending_tools.insert(id.clone(), name.clone());
-                                            let _ = events_tx.send(AgentEvent::ToolCall {
-                                                tool_call_id: id.clone(),
-                                                name: name.clone(),
-                                                args: input,
-                                                mission_id: Some(mission_id),
-                                            });
-                                        }
-                                        ContentBlock::Thinking { thinking } => {
-                                            // Skip blocks already finalized during streaming
-                                            if finalized_thinking_indices.contains(&content_idx) {
-                                                continue;
-                                            }
-                                            if !thinking.is_empty() && !thinking_streamed {
-                                                let _ = events_tx.send(AgentEvent::Thinking {
-                                                    content: thinking,
-                                                    done: true,
-                                                    mission_id: Some(mission_id),
-                                                });
-                                            } else if thinking_streamed {
-                                                // Send done=true signal without content to indicate thinking is complete
-                                                let _ = events_tx.send(AgentEvent::Thinking {
-                                                    content: String::new(),
-                                                    done: true,
-                                                    mission_id: Some(mission_id),
-                                                });
-                                            }
-                                        }
-                                        _ => {}
-                                    }
-                                }
-                                // Reset per-turn accumulation state so the next turn
-                                // starts fresh (block indices restart from 0 each turn)
-                                thinking_buffer.clear();
-                                text_buffer.clear();
-                                active_thinking_index = None;
-                                finalized_thinking_indices.clear();
-                                last_text_len = 0;
-                                block_types.clear();
-                                thinking_streamed = false;
-                            }
-                            AmpEvent::User(evt) => {
-                                for block in evt.message.content {
-                                    if let ContentBlock::ToolResult { tool_use_id, content, is_error } = block {
-                                        // Get tool name and remove from pending (tool is now complete)
-                                        let name = pending_tools
-                                            .remove(&tool_use_id)
-                                            .unwrap_or_else(|| "unknown".to_string());
-
-                                        let content_str = content.to_string_lossy();
-
-                                        let result_value = if let Some(ref extra) = evt.tool_use_result {
-                                            serde_json::json!({
-                                                "content": content_str,
-                                                "stdout": extra.stdout(),
-                                                "stderr": extra.stderr(),
-                                                "is_error": is_error,
-                                                "interrupted": extra.interrupted(),
-                                            })
-                                        } else {
-                                            serde_json::json!(content_str)
-                                        };
-
-                                        let _ = events_tx.send(AgentEvent::ToolResult {
-                                            tool_call_id: tool_use_id,
-                                            name,
-                                            result: result_value,
-                                            mission_id: Some(mission_id),
-                                        });
-                                    }
-                                }
-                            }
-                            AmpEvent::Result(res) => {
-                                if res.is_error || res.subtype == "error" {
-                                    had_error = true;
-                                    let err_msg = res.error_message();
-                                    tracing::warn!(
-                                        mission_id = %mission_id,
-                                        subtype = %res.subtype,
-                                        result = ?res.result,
-                                        error = ?res.error,
-                                        message = ?res.message,
-                                        raw_line = %if line.len() > 500 { let end = safe_truncate_index(&line, 500); format!("{}...", &line[..end]) } else { line.clone() },
-                                        "Amp error result event"
-                                    );
-                                    // Don't send an Error event here - let the failure propagate
-                                    // through the AgentResult. control.rs will emit an AssistantMessage
-                                    // with success=false which the UI displays as a failure message.
-                                    // Sending Error here would cause duplicate messages.
-                                    final_result = err_msg;
-                                } else {
-                                    apply_terminal_result_text(&mut final_result, res.result);
-                                }
-
-                                tracing::debug!(
-                                    mission_id = %mission_id,
-                                    subtype = %res.subtype,
-                                    duration_ms = ?res.duration_ms,
-                                    num_turns = ?res.num_turns,
-                                    "Amp result received"
-                                );
-
-                                // Result event means we're done
-                                break;
-                            }
-                            AmpEvent::Unknown => {
-                                // Forward-compatibility: silently ignore unknown events.
-                            }
-                        }
-                    }
-                    Ok(None) => {
-                        // EOF
-                        break;
-                    }
-                    Err(e) => {
-                        tracing::error!(mission_id = %mission_id, error = %e, "Error reading Amp stdout");
-                        break;
-                    }
-                }
-            }
-        }
-    }
-
-    // Wait for process to finish
-    let exit_status = child.wait().await;
-
-    // Wait for stderr capture to complete (don't abort - we need the content)
-    if let Some(handle) = stderr_handle {
-        let _ = handle.await;
-    }
-
-    // Compute cost from accumulated token usage
-    let usage = crate::cost::TokenUsage {
-        input_tokens: total_input_tokens,
-        output_tokens: total_output_tokens,
-        cache_creation_input_tokens: if total_cache_creation_tokens > 0 {
-            Some(total_cache_creation_tokens)
-        } else {
-            None
-        },
-        cache_read_input_tokens: if total_cache_read_tokens > 0 {
-            Some(total_cache_read_tokens)
-        } else {
-            None
-        },
-    };
-    let (cost_cents, cost_source) =
-        resolve_cost_cents_and_source(None, model_used.as_deref(), &usage);
-
-    tracing::debug!(
-        mission_id = %mission_id,
-        model = ?model_used,
-        input_tokens = total_input_tokens,
-        output_tokens = total_output_tokens,
-        cache_creation_tokens = total_cache_creation_tokens,
-        cache_read_tokens = total_cache_read_tokens,
-        cost_cents = cost_cents,
-        "Amp cost computed from token usage"
-    );
-
-    // If no final result from Assistant or Result events, use accumulated text buffer
-    if final_result.trim().is_empty() && !text_buffer.is_empty() {
-        let mut sorted_entries: Vec<_> = text_buffer.iter().collect();
-        sorted_entries.sort_by_key(|(idx, _)| *idx);
-        final_result = sorted_entries
-            .into_iter()
-            .map(|(_, text)| text.clone())
-            .collect::<Vec<_>>()
-            .join("");
-        tracing::debug!(
-            mission_id = %mission_id,
-            "Using accumulated text buffer as final result ({} chars)",
-            final_result.len()
-        );
-    }
-
-    // If result is still empty/generic, include stderr for a useful error message
-    if (final_result.trim().is_empty() || final_result == "Unknown error") && !had_error {
-        had_error = true;
-        let stderr_content = stderr_capture.lock().await;
-        if !stderr_content.is_empty() {
-            tracing::warn!(
-                mission_id = %mission_id,
-                stderr = %stderr_content,
-                exit_status = ?exit_status,
-                "Amp CLI produced no useful output but had stderr"
-            );
-            final_result = format!(
-                "Amp error: {}",
-                stderr_content
-                    .lines()
-                    .take(5)
-                    .collect::<Vec<_>>()
-                    .join(" | ")
-            );
-        } else {
-            tracing::warn!(
-                mission_id = %mission_id,
-                exit_status = ?exit_status,
-                "Amp CLI produced no output and no stderr"
-            );
-            final_result =
-                "Amp CLI produced no output. Check CLI installation or API key.".to_string();
-        }
-    } else if had_error && (final_result.trim().is_empty() || final_result == "Unknown error") {
-        // Error was flagged by Result event but message is empty/generic - enrich with stderr
-        let stderr_content = stderr_capture.lock().await;
-        if !stderr_content.is_empty() {
-            tracing::warn!(
-                mission_id = %mission_id,
-                stderr = %stderr_content,
-                "Amp error with no result text, using stderr"
-            );
-            final_result = format!(
-                "Amp error: {}",
-                stderr_content
-                    .lines()
-                    .take(5)
-                    .collect::<Vec<_>>()
-                    .join(" | ")
-            );
-        } else {
-            final_result = "Amp CLI returned an error with no details. Check API key and network connectivity.".to_string();
-        }
-    }
-
-    // Check exit status
-    let success = match exit_status {
-        Ok(status) => status.success() && !had_error,
-        Err(e) => {
-            tracing::error!(mission_id = %mission_id, error = %e, "Failed to wait for Amp process");
-            false
-        }
-    };
-
-    // Note: Do NOT emit AssistantMessage here - control.rs emits it based on AgentResult.
-    // Emitting here would cause duplicate messages in the UI.
-
-    let mut result = if success {
-        AgentResult::success(final_result, cost_cents)
-            .with_terminal_reason(TerminalReason::TurnComplete)
-    } else {
-        // Detect rate limit / overloaded errors for account rotation.
-        let reason = if is_rate_limited_error(&final_result) {
-            TerminalReason::RateLimited
-        } else {
-            TerminalReason::LlmError
-        };
-        AgentResult::failure(final_result, cost_cents).with_terminal_reason(reason)
-    };
-
-    if let Some(model) = model_used {
-        result = result.with_model(model);
-    }
-
-    if usage.has_usage() {
-        result = result.with_usage(usage);
-    }
-    result.with_cost_source(cost_source)
-}
-
 fn grok_event_text(value: &serde_json::Value) -> Option<String> {
     if let Some(text) = value
         .get("delta")
@@ -13545,12 +12729,12 @@ pub async fn run_grok_turn(
     let workspace_exec = WorkspaceExec::new(workspace.clone());
     let cli_path =
         get_backend_string_setting("grok", "cli_path").unwrap_or_else(|| "grok".to_string());
-    if !command_available(&workspace_exec, work_dir, &cli_path).await {
-        let err_msg =
-            "Grok Build CLI not found. Install it with: curl -fsSL https://x.ai/cli/install.sh | bash";
-        return AgentResult::failure(err_msg.to_string(), 0)
-            .with_terminal_reason(TerminalReason::LlmError);
-    }
+    let cli_path = match ensure_grok_cli_available(&workspace_exec, work_dir, &cli_path).await {
+        Ok(cli_path) => cli_path,
+        Err(err_msg) => {
+            return AgentResult::failure(err_msg, 0).with_terminal_reason(TerminalReason::LlmError);
+        }
+    };
 
     let mut args = Vec::new();
     if is_continuation {

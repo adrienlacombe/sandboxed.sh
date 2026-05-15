@@ -572,28 +572,13 @@ fn default_providers_config() -> ProvidersConfig {
                 description: "Grok models via xAI API key".to_string(),
                 models: vec![
                     ProviderModel {
-                        id: "grok-code-fast-1".to_string(),
-                        name: "Grok Code Fast 1".to_string(),
-                        description: Some("Coding-specialized Grok model".to_string()),
+                        id: "grok-4.3".to_string(),
+                        name: "Grok 4.3".to_string(),
+                        description: Some("Current flagship Grok model".to_string()),
                     },
                     ProviderModel {
-                        id: "grok-4-fast".to_string(),
-                        name: "Grok 4 Fast".to_string(),
-                        description: Some("Most capable Grok model".to_string()),
-                    },
-                    ProviderModel {
-                        id: "grok-3".to_string(),
-                        name: "Grok 3".to_string(),
-                        description: Some("Balanced capability and speed".to_string()),
-                    },
-                    ProviderModel {
-                        id: "grok-3-fast".to_string(),
-                        name: "Grok 3 Fast".to_string(),
-                        description: Some("Fast Grok model".to_string()),
-                    },
-                    ProviderModel {
-                        id: "grok-3-mini".to_string(),
-                        name: "Grok 3 Mini".to_string(),
+                        id: "grok-4.3-latest".to_string(),
+                        name: "Grok 4.3 Latest".to_string(),
                         description: Some("Fast and economical".to_string()),
                     },
                 ],
@@ -1251,7 +1236,6 @@ pub async fn list_backend_model_options(
     push_options("gemini", Some(&["google"]), false, None);
     push_options("grok", Some(&["xai"]), false, None);
     push_options("opencode", None, true, None);
-    backends.entry("amp".to_string()).or_default();
 
     let codex_candidates: Vec<String> = backends
         .get("codex")
@@ -1307,11 +1291,6 @@ pub async fn validate_model_override(
     backend: &str,
     model_override: &str,
 ) -> Result<(), String> {
-    // Amp ignores model overrides, so no validation needed
-    if backend == "amp" {
-        return Ok(());
-    }
-
     let working_dir = state.config.working_dir.to_string_lossy().to_string();
     let mut config = load_providers_config(&working_dir);
 
@@ -1500,7 +1479,7 @@ pub async fn validate_model_override(
                 Ok(())
             } else {
                 Err(format!(
-                    "xAI provider not configured. Expected a Grok model ID (e.g., 'grok-code-fast-1'), got '{}'",
+                    "xAI provider not configured. Expected a Grok model ID (e.g., 'grok-4.3'), got '{}'",
                     model_override
                 ))
             }

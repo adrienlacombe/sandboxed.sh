@@ -16,7 +16,6 @@
 //! - `POST /api/tools/{name}/toggle` - Enable/disable a tool
 
 pub mod ai_providers;
-pub mod ampcode;
 mod auth;
 pub mod automation_variables;
 pub mod backends;

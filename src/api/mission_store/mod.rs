@@ -897,7 +897,7 @@ pub trait MissionStore: Send + Sync {
         metadata_version: Option<Option<&str>>,
     ) -> Result<(), String>;
 
-    /// Update mission session ID (for backends like Amp that generate their own IDs).
+    /// Update mission session ID (for backends that generate their own IDs).
     async fn update_mission_session_id(&self, id: Uuid, session_id: &str) -> Result<(), String>;
 
     /// Update cached goal-mode metadata for missions started with `/goal`.

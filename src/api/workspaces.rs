@@ -1770,7 +1770,6 @@ async fn check_backend_preflight(
 
     let cli_path = if backend_id == "claudecode"
         || backend_id == "codex"
-        || backend_id == "amp"
         || backend_id == "gemini"
     {
         state

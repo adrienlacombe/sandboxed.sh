@@ -104,7 +104,7 @@ struct CreateWorkerParams {
     title: String,
     #[serde(default)]
     agent: Option<String>,
-    /// Backend to use: "claudecode", "codex", "gemini", "opencode", "amp"
+    /// Backend to use: "claudecode", "codex", "gemini", "opencode"
     #[serde(default)]
     backend: Option<String>,
     #[serde(default)]
@@ -319,7 +319,7 @@ impl OrchestratorMcp {
                     "properties": {
                         "backend": {
                             "type": "string",
-                            "enum": ["claudecode", "codex", "gemini", "opencode", "amp", "grok"],
+                            "enum": ["claudecode", "codex", "gemini", "opencode", "grok"],
                             "description": "Optional single backend to inspect. If omitted, returns all common backends."
                         }
                     }
@@ -338,8 +338,8 @@ impl OrchestratorMcp {
                         },
                         "backend": {
                             "type": "string",
-                            "enum": ["claudecode", "codex", "gemini", "opencode", "amp", "grok"],
-                            "description": "Backend/harness to use. MUST match the model: claudecode for Claude models, codex for OpenAI/GPT models, gemini for Gemini models, grok for Grok models, opencode for any model via provider routing, amp for Amp."
+                            "enum": ["claudecode", "codex", "gemini", "opencode", "grok"],
+                            "description": "Backend/harness to use. MUST match the model: claudecode for Claude models, codex for OpenAI/GPT models, gemini for Gemini models, grok for Grok models, opencode for any model via provider routing."
                         },
                         "model_override": {
                             "type": "string",
@@ -388,7 +388,7 @@ impl OrchestratorMcp {
                                 "required": ["title", "prompt"],
                                 "properties": {
                                     "title": { "type": "string" },
-                                    "backend": { "type": "string", "enum": ["claudecode", "codex", "gemini", "opencode", "amp", "grok"] },
+                                    "backend": { "type": "string", "enum": ["claudecode", "codex", "gemini", "opencode", "grok"] },
                                     "model_override": { "type": "string" },
                                     "model_effort": { "type": "string", "enum": ["low", "medium", "high", "xhigh", "max"] },
                                     "agent": { "type": "string" },
@@ -934,11 +934,6 @@ impl OrchestratorMcp {
                     "backend": "opencode",
                     "ready": true,
                     "reason": "OpenCode routes through configured providers; inspect provider selection separately.",
-                }),
-                "amp" => json!({
-                    "backend": "amp",
-                    "ready": true,
-                    "reason": "Amp auth is handled by AMP_API_KEY or provider store, not this tool.",
                 }),
                 "grok" => json!({
                     "backend": "grok",

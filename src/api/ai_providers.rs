@@ -338,8 +338,8 @@ pub fn read_standard_accounts(working_dir: &Path) -> Vec<crate::provider_health:
             let Some(provider_type) = ProviderType::from_id(key.as_str()) else {
                 continue;
             };
-            // Skip custom/amp providers — they live in AIProviderStore / backend config
-            if provider_type == ProviderType::Custom || provider_type == ProviderType::Amp {
+            // Skip custom providers — they live in AIProviderStore
+            if provider_type == ProviderType::Custom {
                 continue;
             }
             // Extract actual API key from the auth entry.
@@ -652,7 +652,6 @@ pub fn default_backends_for_provider(provider_type: ProviderType) -> Vec<String>
         ProviderType::OpenAI => vec!["opencode".to_string(), "codex".to_string()],
         ProviderType::Google => vec!["opencode".to_string(), "gemini".to_string()],
         ProviderType::Xai => vec!["opencode".to_string(), "grok".to_string()],
-        ProviderType::Amp => vec!["amp".to_string()],
         _ => vec!["opencode".to_string()],
     }
 }
@@ -1310,79 +1309,6 @@ fn get_all_openai_keys_from_ai_providers(working_dir: &Path) -> Vec<String> {
     for (idx, provider) in providers.iter().enumerate() {
         let provider_type = provider.get("provider_type").and_then(|v| v.as_str());
         if provider_type != Some("openai") {
-            continue;
-        }
-        let enabled = provider
-            .get("enabled")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(true);
-        if !enabled {
-            continue;
-        }
-        let priority = provider
-            .get("priority")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0) as u32;
-
-        if let Some(api_key) = provider.get("api_key").and_then(|v| v.as_str()) {
-            if !api_key.trim().is_empty() {
-                entries.push((priority, idx, api_key.to_string()));
-            }
-        }
-    }
-
-    entries.sort_by_key(|(p, i, _)| (*p, *i));
-    entries.into_iter().map(|(_, _, key)| key).collect()
-}
-
-/// Get all available Amp API keys for account rotation, in priority order.
-///
-/// Collects keys from all sources:
-/// 1. Backend config (backend_config.json amp.settings.api_key)
-/// 2. AMP_API_KEY environment variable
-/// 3. ai_providers.json (Amp provider entries, sorted by priority)
-///
-/// Used for account rotation: when one account hits a rate limit, the mission
-/// runner can try the next key in the list.
-pub fn get_all_amp_api_keys(working_dir: &Path) -> Vec<String> {
-    let mut all_keys = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-
-    let mut push_unique = |key: String| {
-        if seen.insert(key.clone()) {
-            all_keys.push(key);
-        }
-    };
-
-    // 1. Backend config (highest priority — user-configured in UI)
-    if let Some(key) = super::mission_runner::get_amp_api_key_from_config() {
-        push_unique(key);
-    }
-
-    // 2. AMP_API_KEY env var
-    if let Ok(value) = std::env::var("AMP_API_KEY") {
-        if !value.trim().is_empty() {
-            push_unique(value);
-        }
-    }
-
-    // 3. ai_providers.json (Amp provider entries, sorted by priority)
-    for key in get_all_amp_keys_from_ai_providers(working_dir) {
-        push_unique(key);
-    }
-
-    all_keys
-}
-
-/// Get all Amp API keys from ai_providers.json, sorted by priority.
-fn get_all_amp_keys_from_ai_providers(working_dir: &Path) -> Vec<String> {
-    let providers = load_ai_providers(working_dir);
-
-    let mut entries: Vec<(u32, usize, String)> = Vec::new();
-
-    for (idx, provider) in providers.iter().enumerate() {
-        let provider_type = provider.get("provider_type").and_then(|v| v.as_str());
-        if provider_type != Some("amp") {
             continue;
         }
         let enabled = provider
@@ -2656,8 +2582,8 @@ async fn migrate_opencode_providers_to_store(
         let Some(provider_type) = ProviderType::from_id(key) else {
             continue;
         };
-        // Skip Custom/Amp (already in store) and skip if already in store
-        if provider_type == ProviderType::Custom || provider_type == ProviderType::Amp {
+        // Skip Custom (already in store) and skip if already in store
+        if provider_type == ProviderType::Custom {
             continue;
         }
         let existing = store.get_all_by_type(provider_type).await;
@@ -4365,7 +4291,7 @@ fn write_opencode_provider_auth_file(
 
 fn opencode_auth_keys(provider_type: ProviderType) -> Vec<&'static str> {
     match provider_type {
-        ProviderType::Custom | ProviderType::Amp => Vec::new(),
+        ProviderType::Custom => Vec::new(),
         ProviderType::OpenAI => vec!["openai", "codex"],
         _ => vec![provider_type.id()],
     }
@@ -5152,12 +5078,6 @@ async fn list_provider_types() -> Json<Vec<ProviderTypeInfo>> {
             name: "GitHub Copilot".to_string(),
             uses_oauth: true,
             env_var: None,
-        },
-        ProviderTypeInfo {
-            id: "amp".to_string(),
-            name: "Amp".to_string(),
-            uses_oauth: false,
-            env_var: Some("AMP_API_KEY".to_string()),
         },
     ];
     Json(types)
@@ -6295,7 +6215,7 @@ async fn create_provider(
     );
 
     // For standard providers, sync to opencode.json + auth.json for runtime compatibility
-    if provider_type != ProviderType::Custom && provider_type != ProviderType::Amp {
+    if provider_type != ProviderType::Custom {
         sync_store_to_opencode(
             &state.ai_providers,
             &state.config.working_dir,
@@ -6418,7 +6338,7 @@ async fn update_provider(
 
     // Sync to opencode.json for standard providers
     let pt = result.provider_type;
-    if pt != ProviderType::Custom && pt != ProviderType::Amp {
+    if pt != ProviderType::Custom {
         sync_store_to_opencode(&state.ai_providers, &state.config.working_dir, pt).await;
     }
 
@@ -6440,7 +6360,7 @@ async fn update_provider(
 /// DELETE /api/ai/providers/:id - Delete a provider.
 ///
 /// The `:id` param can be either a provider type ID (e.g. "anthropic") for
-/// standard providers, or a UUID for store-based providers (Amp, Custom).
+/// standard providers, or a UUID for store-based custom providers.
 async fn delete_provider(
     State(state): State<Arc<super::routes::AppState>>,
     AxumPath(id): AxumPath<String>,
@@ -6464,7 +6384,7 @@ async fn delete_provider(
     }
 
     // Re-sync opencode.json for this provider type (will remove if no more of this type)
-    if provider_type != ProviderType::Custom && provider_type != ProviderType::Amp {
+    if provider_type != ProviderType::Custom {
         sync_store_to_opencode(
             &state.ai_providers,
             &state.config.working_dir,

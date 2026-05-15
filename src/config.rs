@@ -1,6 +1,6 @@
 //! Configuration management for Open Agent.
 //!
-//! Open Agent uses per-mission CLI execution for both OpenCode and Claude Code.
+//! Open Agent uses per-mission CLI execution for agent backends.
 //! Configuration can be set via environment variables:
 //! - `DEFAULT_MODEL` - Optional. Override default model (provider/model format). If unset, uses backend default.
 //! - `WORKING_DIR` - Optional. Default working directory for relative paths. Defaults to `/root` in production, current directory in dev.
@@ -17,8 +17,8 @@
 //! - `LIBRARY_REMOTE` - Optional. Initial library remote URL (can be changed via Settings in the dashboard).
 //!   This environment variable is used as the initial default when no settings file exists.
 //!   If not set, defaults to: https://github.com/Th0rgal/sandboxed-library-template.git
-//! - `DEFAULT_BACKEND` - Optional. Default backend to use (claudecode, opencode, or amp).
-//!   If not set, defaults to the first available backend with priority: claudecode → opencode → amp.
+//! - `DEFAULT_BACKEND` - Optional. Default backend to use.
+//!   If not set, defaults to the first available backend with priority: claudecode → opencode → grok → gemini → codex.
 //!
 //! Note: The agent has **full system access**. It can read/write any file, execute any command,
 //! and search anywhere on the machine. The `WORKING_DIR` is just the default for relative paths.
@@ -482,10 +482,10 @@ impl Config {
         // Default backend configuration
         let default_backend = std::env::var("DEFAULT_BACKEND").ok().and_then(|v| {
             let backend = v.trim().to_lowercase();
-            if backend.is_empty() || !["claudecode", "opencode", "amp"].contains(&backend.as_str())
+            if backend.is_empty() || !["claudecode", "opencode", "grok", "gemini", "codex"].contains(&backend.as_str())
             {
                 tracing::warn!(
-                    "Invalid DEFAULT_BACKEND '{}'. Expected one of: claudecode, opencode, amp",
+                    "Invalid DEFAULT_BACKEND '{}'. Expected one of: claudecode, opencode, grok, gemini, codex",
                     v
                 );
                 None

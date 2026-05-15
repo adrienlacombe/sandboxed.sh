@@ -23,10 +23,10 @@ use tokio::sync::RwLock;
 
 use crate::library::{
     rename::{ItemType, RenameResult},
-    AmpCodeConfig, ClaudeCodeConfig, Command, CommandParam, CommandSummary, ConfigProfile,
-    ConfigProfileSummary, GitAuthor, InitScript, InitScriptSummary, LibraryAgent,
-    LibraryAgentSummary, LibraryStatus, LibraryStore, McpServer, MigrationReport, SandboxedConfig,
-    Skill, SkillSummary, WorkspaceTemplate, WorkspaceTemplateSummary,
+    ClaudeCodeConfig, Command, CommandParam, CommandSummary, ConfigProfile, ConfigProfileSummary,
+    GitAuthor, InitScript, InitScriptSummary, LibraryAgent, LibraryAgentSummary, LibraryStatus,
+    LibraryStore, McpServer, MigrationReport, SandboxedConfig, Skill, SkillSummary,
+    WorkspaceTemplate, WorkspaceTemplateSummary,
 };
 use crate::nspawn::NspawnDistro;
 use crate::util::{internal_error, not_found_or_internal, sanitize_skill_list};
@@ -263,14 +263,6 @@ pub fn routes() -> Router<Arc<super::routes::AppState>> {
         .route(
             "/config-profile/:name/claudecode/config",
             put(save_claudecode_config_for_profile),
-        )
-        .route(
-            "/config-profile/:name/ampcode/config",
-            get(get_ampcode_config_for_profile),
-        )
-        .route(
-            "/config-profile/:name/ampcode/config",
-            put(save_ampcode_config_for_profile),
         )
         // File-based config profile editing
         .route(
@@ -2069,40 +2061,6 @@ async fn save_claudecode_config_for_profile(
             (
                 StatusCode::OK,
                 "Claude Code config saved successfully".to_string(),
-            )
-        })
-        .map_err(internal_error)
-}
-
-/// GET /api/library/config-profile/:name/ampcode/config - Get Amp Code config for a profile.
-async fn get_ampcode_config_for_profile(
-    State(state): State<Arc<super::routes::AppState>>,
-    Path(name): Path<String>,
-    headers: HeaderMap,
-) -> Result<Json<AmpCodeConfig>, (StatusCode, String)> {
-    let library = ensure_library(&state, &headers).await?;
-    library
-        .get_ampcode_config_for_profile(&name)
-        .await
-        .map(Json)
-        .map_err(internal_error)
-}
-
-/// PUT /api/library/config-profile/:name/ampcode/config - Save Amp Code config for a profile.
-async fn save_ampcode_config_for_profile(
-    State(state): State<Arc<super::routes::AppState>>,
-    Path(name): Path<String>,
-    headers: HeaderMap,
-    Json(config): Json<AmpCodeConfig>,
-) -> Result<(StatusCode, String), (StatusCode, String)> {
-    let library = ensure_library(&state, &headers).await?;
-    library
-        .save_ampcode_config_for_profile(&name, &config)
-        .await
-        .map(|_| {
-            (
-                StatusCode::OK,
-                "Amp Code config saved successfully".to_string(),
             )
         })
         .map_err(internal_error)

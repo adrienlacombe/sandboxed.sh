@@ -1,4 +1,3 @@
-pub mod amp;
 pub mod claudecode;
 pub mod codex;
 pub mod events;

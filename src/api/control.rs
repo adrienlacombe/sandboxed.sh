@@ -2749,7 +2749,7 @@ pub enum AgentEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         mission_id: Option<Uuid>,
     },
-    /// Session ID update (for backends like Amp that generate their own session IDs)
+    /// Session ID update (for backends that generate their own session IDs)
     SessionIdUpdate {
         /// The new session ID to use for continuation
         session_id: String,
@@ -4113,13 +4113,11 @@ pub async fn create_mission(
     };
 
     // Validate agent exists before creating mission (fail fast with clear error)
-    // Skip validation for Claude Code, Amp, Codex, and Gemini - they have their own built-in agents
+    // Skip validation for Claude Code, Codex, Gemini, and Grok - they have their own built-in agents
     if let Some(ref agent_name) = agent {
         let backend_id = backend.as_deref();
-        let skip_validation = matches!(
-            backend_id,
-            Some("claudecode" | "amp" | "codex" | "gemini" | "grok")
-        );
+        let skip_validation =
+            matches!(backend_id, Some("claudecode" | "codex" | "gemini" | "grok"));
         if !skip_validation {
             super::library::validate_agent_exists(
                 &state,
@@ -4233,9 +4231,6 @@ pub async fn update_mission_settings(
     if backend_changed && model_effort.is_none() {
         model_effort = Some(None);
     }
-    if effective_backend == "amp" {
-        model_override = Some(None);
-    }
     if !matches!(effective_backend.as_str(), "codex" | "claudecode") {
         model_effort = Some(None);
     }
@@ -4262,7 +4257,7 @@ pub async fn update_mission_settings(
     if let Some(ref agent_name) = effective_agent {
         let skip_validation = matches!(
             effective_backend.as_str(),
-            "claudecode" | "amp" | "codex" | "gemini" | "grok"
+            "claudecode" | "codex" | "gemini" | "grok"
         );
         if !skip_validation {
             super::library::validate_agent_exists(
@@ -9354,7 +9349,7 @@ async fn control_actor_loop(
                                 }
 
                                 // Desktop session detection from ToolCall.
-                                // Claude Code and Amp don't emit ToolResult for MCP tools,
+                                // Claude Code does not emit ToolResult for MCP tools,
                                 // so we detect the session start from the ToolCall and
                                 // spawn a background task to attribute Xvfb processes.
                                 let is_desktop_start = matches!(
@@ -9600,7 +9595,7 @@ async fn control_actor_loop(
                         }
                     }
 
-                    // Handle session ID updates (for backends like Amp that generate their own IDs)
+                    // Handle session ID updates for backends that generate their own IDs.
                     if let AgentEvent::SessionIdUpdate { mission_id, session_id } = &event {
                         if let Err(err) = mission_store
                             .update_mission_session_id(*mission_id, session_id)
@@ -10150,29 +10145,6 @@ async fn run_single_control_turn(
             }
 
             result
-        }
-        Some("amp") => {
-            let mid = match require_mission_id(mission_id, "Amp", &events_tx) {
-                Ok(id) => id,
-                Err(r) => return r,
-            };
-            let is_continuation =
-                force_session_resume || history.iter().any(|(role, _)| role == "assistant");
-            let api_key = super::mission_runner::get_amp_api_key_from_config();
-            Box::pin(super::mission_runner::run_amp_turn(
-                exec_workspace,
-                &ctx.working_dir,
-                &user_message,
-                config.opencode_agent.as_deref(), // mode (smart/rush)
-                mid,
-                events_tx.clone(),
-                cancel,
-                &config.working_dir,
-                session_id.as_deref(),
-                is_continuation,
-                api_key.as_deref(),
-            ))
-            .await
         }
         Some("grok") => {
             let mid = match require_mission_id(mission_id, "Grok Build", &events_tx) {
