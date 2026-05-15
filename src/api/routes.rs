@@ -22,7 +22,7 @@ use tokio::sync::RwLock;
 use axum::middleware;
 use axum::{
     extract::{DefaultBodyLimit, Extension, Path, Query, State},
-    http::StatusCode,
+    http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{
         sse::{Event, Sse},
         Json,
@@ -1145,7 +1145,7 @@ fn shutdown_cmdline() -> Option<String> {
 }
 
 /// Health check endpoint.
-async fn health(State(state): State<Arc<AppState>>) -> Json<HealthResponse> {
+async fn health(State(state): State<Arc<AppState>>) -> (HeaderMap, Json<HealthResponse>) {
     let auth_mode = match state.config.auth.auth_mode(state.config.dev_mode) {
         AuthMode::Disabled => "disabled",
         AuthMode::SingleTenant => "single_tenant",
@@ -1153,15 +1153,29 @@ async fn health(State(state): State<Arc<AppState>>) -> Json<HealthResponse> {
     };
     // Read library_remote from settings store (persisted to disk)
     let library_remote = state.settings.get_library_remote().await;
-    Json(HealthResponse {
-        status: "ok".to_string(),
-        version: env!("CARGO_PKG_VERSION").to_string(),
-        dev_mode: state.config.dev_mode,
-        auth_required: state.config.auth.auth_required(state.config.dev_mode),
-        auth_mode: auth_mode.to_string(),
-        max_iterations: state.config.max_iterations,
-        library_remote,
-    })
+    // The dashboard probes `/api/health` from `AuthGate` and from a couple
+    // of other entry-point effects on every full page load, so the same
+    // request goes out 2–3 times in quick succession. A tiny browser-side
+    // freshness window lets the duplicates resolve from the HTTP cache
+    // without a round-trip. The body is keyed on server config rather
+    // than per-request state, so a few seconds of staleness is harmless.
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, max-age=5"),
+    );
+    (
+        headers,
+        Json(HealthResponse {
+            status: "ok".to_string(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            dev_mode: state.config.dev_mode,
+            auth_required: state.config.auth.auth_required(state.config.dev_mode),
+            auth_mode: auth_mode.to_string(),
+            max_iterations: state.config.max_iterations,
+            library_remote,
+        }),
+    )
 }
 
 /// Optional query parameters for the stats endpoint.

@@ -23,6 +23,11 @@ import { getMissionDotColor, isFinishedStatus } from "@/lib/mission-status";
 import { getRuntimeApiBase } from "@/lib/settings";
 import { authHeader } from "@/lib/auth";
 import {
+  readCachedEvents,
+  writeCachedEvents,
+  deleteCachedEvents,
+} from "@/lib/event-cache";
+import {
   cancelControl,
   postControlMessage,
   postControlToolResult,
@@ -162,6 +167,31 @@ function formatDiagAge(ts?: number) {
   const hrs = Math.floor(mins / 60);
   const remMins = mins % 60;
   return `${hrs}h ${remMins}m ago`;
+}
+
+function isRetriableSendError(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  const message = error.message.toLowerCase();
+  return (
+    message.includes("failed to fetch") ||
+    message.includes("networkerror") ||
+    message.includes("load failed") ||
+    message.includes("network request failed") ||
+    message.includes("offline")
+  );
+}
+
+async function postControlMessageWithRetry(
+  content: string,
+  options: { agent?: string; mission_id?: string; client_message_id: string }
+): Promise<{ id: string; queued: boolean }> {
+  try {
+    return await postControlMessage(content, options);
+  } catch (error) {
+    if (!isRetriableSendError(error)) throw error;
+    await new Promise((resolve) => setTimeout(resolve, 800));
+    return postControlMessage(content, options);
+  }
 }
 
 type StreamLogLevel = "debug" | "info" | "warn" | "error";
@@ -954,6 +984,36 @@ function Shimmer({ className }: { className?: string }) {
       <div className="h-4 bg-white/[0.06] rounded w-3/4 mb-2" />
       <div className="h-4 bg-white/[0.06] rounded w-1/2 mb-2" />
       <div className="h-4 bg-white/[0.06] rounded w-5/6" />
+    </div>
+  );
+}
+
+function ChatLoadingSkeleton() {
+  return (
+    <div className="mx-auto max-w-3xl space-y-6 animate-pulse">
+      {[0, 1, 2].map((idx) => (
+        <div
+          key={idx}
+          className={cn(
+            "flex gap-3",
+            idx % 2 === 0 ? "justify-start" : "justify-end"
+          )}
+        >
+          {idx % 2 === 0 && (
+            <div className="h-8 w-8 shrink-0 rounded-full bg-white/[0.06]" />
+          )}
+          <div
+            className={cn(
+              "rounded-2xl border border-white/[0.06] bg-white/[0.03] px-4 py-3",
+              idx % 2 === 0 ? "w-[70%] rounded-tl-md" : "w-[58%] rounded-tr-md"
+            )}
+          >
+            <div className="h-3 rounded bg-white/[0.08]" />
+            <div className="mt-2 h-3 w-4/5 rounded bg-white/[0.06]" />
+            {idx === 0 && <div className="mt-2 h-3 w-2/3 rounded bg-white/[0.06]" />}
+          </div>
+        </div>
+      ))}
     </div>
   );
 }
@@ -3366,6 +3426,12 @@ export default function ControlClient() {
   const missionHistoricEventsRef = useRef<Map<string, StoredEvent[]>>(new Map());
   const historicItemsCountRef = useRef<Map<string, number>>(new Map());
   const missionTotalHistoryRef = useRef<Map<string, number>>(new Map());
+  // In-flight guard for backwards-paginate. The manual "Load older
+  // messages" click and the post-initial background fill both advance
+  // the `missionMinSeqRef` cursor; if they fire concurrently they'd
+  // race on the same `before_seq` value and prepend duplicate events.
+  // The set holds the mission ids currently mid-fetch.
+  const paginatingOlderRef = useRef<Set<string>>(new Set());
   // Captured scroll geometry from the moment of `setItems` during a
   // paginate-back. Consumed by a `useLayoutEffect` watching `items` so the
   // restoration runs synchronously after commit but BEFORE the browser
@@ -3629,10 +3695,26 @@ export default function ControlClient() {
    */
   const missionMaxSeqRef = useRef<Map<string, number>>(new Map());
 
-  // Page size for both the initial history load and each backwards-
-  // paginate-older fetch. Tuned for memory headroom on long missions —
-  // see the `chatScrollContainerRef` comment block above.
+  // Page size for the initial history fetch. Kept deliberately small so the
+  // newest messages render fast on a fresh mission load — a long-running
+  // mission with hundreds of events used to ship 1.5 MB / 20+ s of payload
+  // before the UI could paint a single message. We then `streamOlderHistory`
+  // in the background to fill in older events without blocking first paint.
+  const INITIAL_HISTORY_PAGE_SIZE = 200;
+  // Page size for each backwards-paginate-older fetch (both the explicit
+  // "Load older messages" button and the post-initial background fill).
+  // Tuned for memory headroom on long missions — see the
+  // `chatScrollContainerRef` comment block above.
   const HISTORY_PAGE_SIZE = 5000;
+  // Cap how far the background fill walks back from the head on first load.
+  // Past this depth the user has to click "Load older messages" — keeps
+  // memory + render cost predictable on huge missions while still feeling
+  // "complete" for typical ones.
+  const BACKGROUND_FILL_TARGET = 2000;
+  // Per-page size used by the background fill. Smaller than the explicit
+  // "Load older" button so each chunk costs less and we can interleave with
+  // live SSE events without long main-thread stalls.
+  const BACKGROUND_FILL_PAGE_SIZE = 500;
 
   const loadHistoryEvents = useCallback(
     async (id: string, opts?: { sinceSeq?: number }) => {
@@ -3670,25 +3752,96 @@ export default function ControlClient() {
         return events;
       }
 
-      // Initial load — request the most recent HISTORY_PAGE_SIZE events.
-      // `latest=true` lets the server compute the tail offset in one
-      // shot, so clients no longer need the binary-search probe loop
-      // to handle 25k+ event missions.
-      const { events, meta } = await getMissionEventsWithMeta(id, {
-        types: HISTORY_EVENT_TYPES,
-        latest: true,
-        limit: HISTORY_PAGE_SIZE,
-      });
+      // Initial load. Two-phase strategy:
+      //
+      // 1. If a recent IDB cache exists for this mission, hydrate from it
+      //    and issue a small `since_seq` delta fetch — most reopens find
+      //    zero or a handful of new events, turning a 1.5 MB / 20 s
+      //    `latest=true` round-trip into a sub-second catch-up.
+      //
+      // 2. Cache miss (or stale / regressed server state) falls through to
+      //    the original `latest=true` fetch with a small page size. The
+      //    background `streamOlderHistory` then fills in older context
+      //    after first paint either way.
+      let sorted: StoredEvent[] | null = null;
+      let metaMaxSeq: number | undefined;
+      let metaTotal: number | undefined;
+
+      const cached = await readCachedEvents(id).catch(() => null);
+      if (cached && cached.events.length > 0) {
+        try {
+          const delta = await getMissionEventsWithMeta(id, {
+            types: HISTORY_EVENT_TYPES,
+            sinceSeq: cached.maxSequence,
+            limit: HISTORY_PAGE_SIZE,
+          });
+          // If the server doesn't expose `X-Max-Sequence` it's an older
+          // build that ignored `since_seq` and returned offset=0 rows.
+          // Don't trust it — fall through to a fresh `latest` fetch.
+          //
+          // If the server's max sequence is *behind* what we cached, the
+          // mission was reset or replaced server-side and our cache is
+          // bogus — drop it and reload fresh.
+          if (
+            delta.meta.maxSequence === undefined ||
+            delta.meta.maxSequence < cached.maxSequence
+          ) {
+            void deleteCachedEvents(id).catch(() => undefined);
+          } else {
+            // Merge cached tail + delta. Both are sorted by sequence;
+            // dedup defensively in case the server re-sent an overlap row.
+            const seen = new Set<number>();
+            const merged: StoredEvent[] = [];
+            for (const ev of cached.events) {
+              if (!seen.has(ev.sequence)) {
+                seen.add(ev.sequence);
+                merged.push(ev);
+              }
+            }
+            for (const ev of delta.events) {
+              if (!seen.has(ev.sequence)) {
+                seen.add(ev.sequence);
+                merged.push(ev);
+              }
+            }
+            merged.sort((a, b) => a.sequence - b.sequence);
+            sorted = merged;
+            metaMaxSeq = delta.meta.maxSequence;
+            metaTotal = delta.meta.totalEvents;
+          }
+        } catch {
+          // Network or auth failure on the delta — fall through to the
+          // fresh `latest` fetch path. The cache row stays so a future
+          // reopen can try again.
+        }
+      }
+
+      if (!sorted) {
+        // Cache miss (or delta path bailed). Request the most recent
+        // INITIAL_HISTORY_PAGE_SIZE events; `latest=true` lets the server
+        // compute the tail offset in one shot. The page size is
+        // intentionally small so first paint isn't gated on the full
+        // mission history; `streamOlderHistory` runs after to fill in the
+        // rest in the background.
+        const { events, meta } = await getMissionEventsWithMeta(id, {
+          types: HISTORY_EVENT_TYPES,
+          latest: true,
+          limit: INITIAL_HISTORY_PAGE_SIZE,
+        });
+        // Defensive: sort by sequence ASC in case upstream contract changes.
+        sorted = events.slice().sort((a, b) => a.sequence - b.sequence);
+        metaMaxSeq = meta.maxSequence;
+        metaTotal = meta.totalEvents;
+      }
+
       // Only seed `missionMaxSeqRef` when the server has confirmed it
       // supports the resume protocol via `X-Max-Sequence`. Seeding from
       // `event.sequence` alone would enable the delta path against old
       // backends that ignore `since_seq`, causing them to return
       // offset=0 rows that'd get appended as bogus "new" events.
-      if (meta.maxSequence !== undefined && meta.maxSequence > 0) {
-        missionMaxSeqRef.current.set(id, meta.maxSequence);
+      if (metaMaxSeq !== undefined && metaMaxSeq > 0) {
+        missionMaxSeqRef.current.set(id, metaMaxSeq);
       }
-      // Defensive: sort by sequence ASC in case upstream contract changes.
-      const sorted = events.slice().sort((a, b) => a.sequence - b.sequence);
       // Seed pagination caches: snapshot of historic events, lowest seq
       // (cursor for next backwards page), and total filtered count from
       // the server (so we know when the user has reached the start).
@@ -3698,15 +3851,56 @@ export default function ControlClient() {
       } else {
         missionMinSeqRef.current.delete(id);
       }
-      if (meta.totalEvents !== undefined) {
-        missionTotalHistoryRef.current.set(id, meta.totalEvents);
+      if (metaTotal !== undefined) {
+        missionTotalHistoryRef.current.set(id, metaTotal);
       } else {
         missionTotalHistoryRef.current.delete(id);
       }
+
+      // Persist the freshly-loaded tail to the IDB cache so the next
+      // reopen hits the fast path. Best-effort — write failures are
+      // silently ignored. We only write when the server confirmed the
+      // delta protocol via `X-Max-Sequence`; otherwise we'd risk
+      // poisoning the cache with offset=0 rows from a legacy backend.
+      if (
+        metaMaxSeq !== undefined &&
+        metaMaxSeq > 0 &&
+        metaTotal !== undefined &&
+        sorted.length > 0
+      ) {
+        void writeCachedEvents(id, sorted, metaMaxSeq, metaTotal).catch(
+          () => undefined
+        );
+      }
+
+      // Kick off the background fill so the rest of the history streams in
+      // after first paint. Scheduled via setTimeout(0) so the caller's
+      // setItems/render commits first — running the next fetch synchronously
+      // here would just stall the same task we tried to free up. The ref
+      // indirection breaks TDZ against `streamOlderHistory`, which is
+      // declared after the older-paginator below.
+      const hasMoreLocal =
+        metaTotal !== undefined
+          ? sorted.length < metaTotal
+          : sorted.length >= INITIAL_HISTORY_PAGE_SIZE;
+      if (hasMoreLocal) {
+        const fillFn = streamOlderHistoryRef.current;
+        if (fillFn) {
+          setTimeout(() => {
+            void fillFn(id);
+          }, 0);
+        }
+      }
       return sorted;
     },
-    [HISTORY_EVENT_TYPES]
+    [HISTORY_EVENT_TYPES, INITIAL_HISTORY_PAGE_SIZE]
   );
+
+  // Bridge between `loadHistoryEvents` (declared above) and
+  // `streamOlderHistory` (declared below). `loadHistoryEvents` schedules
+  // the background fill at the tail end of its initial-load branch, but
+  // can't reference `streamOlderHistory` by name without a TDZ violation.
+  const streamOlderHistoryRef = useRef<((id: string) => Promise<void>) | null>(null);
 
   /**
    * Recompute "is there more older history to load" for a mission, by
@@ -4796,12 +4990,19 @@ export default function ControlClient() {
    * reference it without hitting `const` TDZ at component init.
    */
   const loadOlderHistoryEvents = useCallback(
-    async (id: string) => {
+    async (id: string, opts?: { silent?: boolean; limit?: number }) => {
       const beforeSeq = missionMinSeqRef.current.get(id);
       if (beforeSeq === undefined || beforeSeq <= 1) {
         setOlderLoadState({ missionId: id, hasMore: false, loading: false });
         return;
       }
+      // Race guard. If another path (manual click vs background fill)
+      // is already paginating older for this mission, drop this call
+      // rather than fetch the same page and prepend duplicate events.
+      if (paginatingOlderRef.current.has(id)) {
+        return;
+      }
+      paginatingOlderRef.current.add(id);
       // The button click that fired this is for the currently-viewing
       // mission, so writing `missionId: id` here is correct. If the user
       // switches missions during the in-flight fetch, the UI's
@@ -4809,16 +5010,24 @@ export default function ControlClient() {
       // (it filters on `missionId === viewingMissionId`), so a fetch
       // that never gets to clear `loading: false` can't pin the new
       // mission's button to a stuck "Loading…" state.
-      setOlderLoadState((prev) => ({
-        missionId: id,
-        hasMore: prev.missionId === id ? prev.hasMore : false,
-        loading: true,
-      }));
+      //
+      // `silent: true` (used by the background fill after initial load)
+      // skips toggling `olderLoadState.loading` so the "Load older
+      // messages…" button doesn't flicker into a loading state while the
+      // user is just reading the latest messages.
+      if (!opts?.silent) {
+        setOlderLoadState((prev) => ({
+          missionId: id,
+          hasMore: prev.missionId === id ? prev.hasMore : false,
+          loading: true,
+        }));
+      }
       try {
+        try {
         const { events: olderEvents } = await getMissionEventsWithMeta(id, {
           types: HISTORY_EVENT_TYPES,
           beforeSeq,
-          limit: HISTORY_PAGE_SIZE,
+          limit: opts?.limit ?? HISTORY_PAGE_SIZE,
         });
         if (olderEvents.length === 0) {
           // Same per-mission gate as below — see comment on
@@ -4899,9 +5108,18 @@ export default function ControlClient() {
           // historic items so the visible window now also covers the
           // older page. We don't shrink it past `prev` — other code
           // may have already grown it for unrelated reasons.
-          const addedHistoricItems = newHistoricItems.length - oldHistoricCount;
-          if (addedHistoricItems > 0) {
-            setVisibleItemsLimit((prev) => prev + addedHistoricItems);
+          //
+          // In `silent` mode (post-initial background fill) we deliberately
+          // skip this — the user is reading the latest messages and the
+          // older content stays in the accumulated cache. When they scroll
+          // up the existing "load more visible items" handler grows the
+          // window, surfacing the already-fetched events without a network
+          // round-trip.
+          if (!opts?.silent) {
+            const addedHistoricItems = newHistoricItems.length - oldHistoricCount;
+            if (addedHistoricItems > 0) {
+              setVisibleItemsLimit((prev) => prev + addedHistoricItems);
+            }
           }
 
           setOlderLoadState({
@@ -4912,7 +5130,14 @@ export default function ControlClient() {
         }
       } catch (err) {
         console.error("Failed to load older events:", err);
-        toast.error("Failed to load older messages");
+        // Background fill is invisible work — a fetch failure mid-stream
+        // shouldn't pop a toast. The user-driven "Load older messages"
+        // button does want one. `streamOlderHistory` rethrows nothing,
+        // it just stops walking on error, which is the right behavior
+        // (the user can still hit the manual button later).
+        if (!opts?.silent) {
+          toast.error("Failed to load older messages");
+        }
         // Only clear the loading flag if the active mission is still the
         // one we were paginating — otherwise we'd wipe state set for a
         // newer, unrelated mission. (The missionId-tagged read selector
@@ -4921,11 +5146,19 @@ export default function ControlClient() {
         const stillActive =
           currentMissionRef.current?.id === id ||
           viewingMissionRef.current?.id === id;
-        if (stillActive) {
+        if (stillActive && !opts?.silent) {
           setOlderLoadState((prev) =>
             prev.missionId === id ? { ...prev, loading: false } : prev
           );
         }
+        if (opts?.silent) {
+          // Propagate so `streamOlderHistory` can stop the fill loop on
+          // failure instead of wedging in a tight retry.
+          throw err;
+        }
+      }
+      } finally {
+        paginatingOlderRef.current.delete(id);
       }
     },
     // Note: `viewingMission` is intentionally NOT in deps — the body now
@@ -4934,6 +5167,72 @@ export default function ControlClient() {
     // closure that bugbot flagged.
     [HISTORY_EVENT_TYPES, eventsToItems, computeHasMoreOlder]
   );
+
+  // Background fill: after the initial fetch shows the newest events,
+  // walk older pages until we've reached `BACKGROUND_FILL_TARGET` total
+  // history events or there are no more. Runs `silent` so the
+  // "Load older messages" button doesn't flash a loading state; bails
+  // if the user switches missions, if a fetch fails, or if the mission
+  // turns out to have fewer events than the target (server total reached).
+  const streamOlderHistory = useCallback(
+    async (id: string) => {
+      // Yield once so the initial-render setItems can commit and paint
+      // before we start eating network/main-thread time on background
+      // fills. Without this the first chunk can land before the user
+      // sees the latest message at all.
+      await new Promise((resolve) => setTimeout(resolve, 50));
+
+      const stillActive = (): boolean =>
+        currentMissionRef.current?.id === id ||
+        viewingMissionRef.current?.id === id;
+
+      // Up to a few page-loads, with a small inter-page yield so live
+      // SSE events can interleave on the main thread without jank.
+      // Hard ceiling (16) is a backstop; the loop normally exits via
+      // the `hasMore`/target check first.
+      for (let i = 0; i < 16; i++) {
+        if (!stillActive()) return;
+        const accumulated =
+          missionHistoricEventsRef.current.get(id)?.length ?? 0;
+        const total = missionTotalHistoryRef.current.get(id);
+        if (total !== undefined && accumulated >= total) return;
+        if (accumulated >= BACKGROUND_FILL_TARGET) return;
+        const minSeq = missionMinSeqRef.current.get(id);
+        if (minSeq === undefined || minSeq <= 1) return;
+
+        try {
+          await loadOlderHistoryEvents(id, {
+            silent: true,
+            limit: BACKGROUND_FILL_PAGE_SIZE,
+          });
+        } catch {
+          // Stop on error — the user's manual "Load older messages"
+          // path remains available for retry.
+          return;
+        }
+
+        // If accumulated didn't grow, the server returned an empty
+        // page and there's nothing left to fetch. Avoid the
+        // pathological tight loop.
+        const after = missionHistoricEventsRef.current.get(id)?.length ?? 0;
+        if (after <= accumulated) return;
+
+        // Small pause between pages so the main thread can run other
+        // work (live event handlers, scroll, input).
+        await new Promise((resolve) => setTimeout(resolve, 150));
+      }
+    },
+    [loadOlderHistoryEvents, BACKGROUND_FILL_PAGE_SIZE, BACKGROUND_FILL_TARGET]
+  );
+
+  // Wire the ref consumed by `loadHistoryEvents` (which is declared
+  // above `streamOlderHistory`, so it can't reference it directly).
+  useEffect(() => {
+    streamOlderHistoryRef.current = streamOlderHistory;
+    return () => {
+      streamOlderHistoryRef.current = null;
+    };
+  }, [streamOlderHistory]);
 
   // Load mission from URL param on mount (and retry on auth success)
   const [authRetryTrigger, setAuthRetryTrigger] = useState(0);
@@ -5505,6 +5804,7 @@ export default function ControlClient() {
       setViewingMissionId(missionId);
       fetchingMissionIdRef.current = missionId;
       handleViewMissionLoadingRef.current = missionId;
+      setMissionLoading(true);
 
       // Update URL immediately so it's shareable/bookmarkable
       router.replace(`/control?mission=${missionId}`, { scroll: false });
@@ -5600,6 +5900,14 @@ export default function ControlClient() {
           setVisibleItemsLimit(INITIAL_VISIBLE_ITEMS);
           setHasDesktopSession(false);
           router.replace(`/control`, { scroll: false });
+        }
+      } finally {
+        if (fetchingMissionIdRef.current === missionId) {
+          setMissionLoading(false);
+          fetchingMissionIdRef.current = null;
+        }
+        if (handleViewMissionLoadingRef.current === missionId) {
+          handleViewMissionLoadingRef.current = null;
         }
       }
     },
@@ -7496,7 +7804,7 @@ export default function ControlClient() {
 
     // Generate temp ID and add message optimistically BEFORE the API call
     // This ensures messages appear in send order, not response order
-    const tempId = `temp-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const tempId = crypto.randomUUID();
     const timestamp = Date.now();
 
     // Message is queued only if agent is currently busy AND there are existing user messages
@@ -7516,7 +7824,9 @@ export default function ControlClient() {
     ]);
 
     try {
-      const { id, queued } = await postControlMessage(content);
+      const { id, queued } = await postControlMessageWithRetry(content, {
+        client_message_id: tempId,
+      });
 
       // Replace temp ID with server-assigned ID and update queued status
       // This allows SSE handler to correctly deduplicate
@@ -7524,7 +7834,7 @@ export default function ControlClient() {
       setItems((prev) => {
         // Check if SSE already added this message (race condition where SSE arrives before API response)
         // If so, just remove the temp message to avoid duplicates
-        const sseAlreadyAdded = prev.some((item) => item.id === id);
+        const sseAlreadyAdded = prev.some((item) => item.id === id && item.id !== tempId);
         if (sseAlreadyAdded) {
           return prev.filter((item) => item.id !== tempId);
         }
@@ -7558,16 +7868,44 @@ export default function ControlClient() {
     submittingRef.current = true;
 
     const targetMissionId = viewingMissionIdRef.current;
+    const tempId = crypto.randomUUID();
+    const timestamp = Date.now();
+    const hasExistingUserMessages = items.some((item) => item.kind === "user");
+    const willBeQueued = isBusy && hasExistingUserMessages;
+
+    const restoreFailedOptimisticSend = () => {
+      setItems((prev) => prev.filter((item) => item.id !== tempId));
+      enhancedInputRef.current?.restoreDraft(trimmedContent, agent ?? null);
+      setInput(trimmedContent);
+      setDraftInput(trimmedContent);
+    };
+
+    // Acknowledge the user's send immediately, before any mission sync or
+    // network round-trip. If sync/post fails below, the optimistic row is
+    // removed and the draft is restored.
+    setItems((prev) => [
+      ...prev,
+      {
+        kind: "user" as const,
+        id: tempId,
+        content: trimmedContent,
+        timestamp,
+        queued: willBeQueued,
+      },
+    ]);
+    enhancedInputRef.current?.clear();
+    setInput("");
+    setDraftInput("");
 
     // Sync mission state before sending (backend needs current_mission set correctly).
-    // Mission-sync error paths below return early BEFORE we call
-    // `enhancedInputRef.current?.clear()`, so the user's typed draft
-    // stays intact and doesn't need to be explicitly restored.
+    // This now happens after the optimistic row so slow mission sync does not
+    // make the Send button feel ignored.
     if (targetMissionId) {
       try {
         let mission = await loadMission(targetMissionId);
 
         if (!mission) {
+          restoreFailedOptimisticSend();
           toast.error("Mission not found");
           submittingRef.current = false;
           return;
@@ -7591,44 +7929,24 @@ export default function ControlClient() {
       } catch (err) {
         const errMsg = err instanceof Error ? err.message : String(err);
         console.error("Failed to sync mission before sending:", err);
+        restoreFailedOptimisticSend();
         toast.error(`Failed to sync mission: ${errMsg}. Check API connection in Settings.`);
         submittingRef.current = false;
         return;
       }
     }
 
-    const tempId = `temp-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-    const timestamp = Date.now();
-    const hasExistingUserMessages = items.some((item) => item.kind === "user");
-    const willBeQueued = isBusy && hasExistingUserMessages;
-
-    // Use trimmed content for optimistic message (not prefixed with agent)
-    // so it matches exactly what the backend stores and SSE echoes back,
-    // preventing duplicate messages when SSE arrives before the API response
-    setItems((prev) => [
-      ...prev,
-      {
-        kind: "user" as const,
-        id: tempId,
-        content: trimmedContent,
-        timestamp,
-        queued: willBeQueued,
-      },
-    ]);
-    enhancedInputRef.current?.clear();
-    setInput("");
-    setDraftInput("");
-
     try {
       // Send message with mission_id - backend handles routing (main vs parallel)
-      const { id, queued } = await postControlMessage(trimmedContent, {
+      const { id, queued } = await postControlMessageWithRetry(trimmedContent, {
         agent: agent || undefined,
         mission_id: targetMissionId || undefined,
+        client_message_id: tempId,
       });
       setItems((prev) => {
         // Check if SSE already added this message (race condition where SSE arrives before API response)
         // If so, just remove the temp message to avoid duplicates
-        const sseAlreadyAdded = prev.some((item) => item.id === id);
+        const sseAlreadyAdded = prev.some((item) => item.id === id && item.id !== tempId);
         if (sseAlreadyAdded) {
           return prev.filter((item) => item.id !== tempId);
         }
@@ -7642,16 +7960,13 @@ export default function ControlClient() {
       });
     } catch (err) {
       console.error(err);
-      setItems((prev) => prev.filter((item) => item.id !== tempId));
       // Restore via the imperative handle so a locked-agent badge is
       // reinstated instead of surfacing as a raw "@agent " prefix.
       // Use `trimmedContent` — it's what the optimistic item and the
       // failed API call carried, so the restored draft matches what
       // the user actually sent. Leading/trailing whitespace in
       // `content` is intentionally dropped here.
-      enhancedInputRef.current?.restoreDraft(trimmedContent, agent ?? null);
-      setInput(trimmedContent);
-      setDraftInput(trimmedContent);
+      restoreFailedOptimisticSend();
       toast.error("Failed to send message");
     } finally {
       submittingRef.current = false;
@@ -7956,6 +8271,10 @@ export default function ControlClient() {
   };
 
   const activeMission = viewingMission ?? currentMission;
+  const isMissionSwitching =
+    missionLoading &&
+    !!viewingMissionId &&
+    activeMission?.id !== viewingMissionId;
   const workspaceNameById = useMemo(() => {
     return Object.fromEntries(workspaces.map((ws) => [ws.id, ws.name]));
   }, [workspaces]);
@@ -8713,7 +9032,9 @@ export default function ControlClient() {
               </button>
             </div>
           )}
-          {items.length === 0 ? (
+          {isMissionSwitching ? (
+            <ChatLoadingSkeleton />
+          ) : items.length === 0 ? (
             <div className="flex h-full items-center justify-center">
               <div className="text-center">
                 <div className="mx-auto mb-4 flex h-16 w-16 items-center justify-center rounded-2xl bg-indigo-500/10">
@@ -9257,7 +9578,7 @@ export default function ControlClient() {
             )}
 
             {/* Worker Panel — real child missions (parent_mission_id) */}
-            {showWorkerPanel && childMissions.length > 0 && (
+            {showWorkerPanel && isBossMission && (
               <WorkerPanel
                 childMissions={childMissions}
                 runningMissions={runningMissions}

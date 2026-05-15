@@ -12,7 +12,7 @@
 
 use axum::{
     extract::{Multipart, Path, Query, State},
-    http::{HeaderMap, StatusCode},
+    http::{header, HeaderMap, HeaderValue, StatusCode},
     routing::{delete, get, post, put},
     Json, Router,
 };
@@ -971,7 +971,25 @@ struct BuiltinCommandsResponse {
 ///
 /// Returns the native slash commands available for OpenCode and Claude Code.
 /// These are runtime-specific commands that don't come from the Library.
-async fn get_builtin_commands() -> Json<BuiltinCommandsResponse> {
+///
+/// The response body is compiled into the binary and never changes for the
+/// lifetime of the process, so it's safe to cache aggressively in the
+/// browser. The dashboard re-fetches this on every full page load — a few
+/// minutes of HTTP-cache freshness skips the round-trip entirely on
+/// subsequent reloads. `stale-while-revalidate` keeps the next reload
+/// instant after the freshness window expires while a background revalidate
+/// picks up any change that could happen across a deploy.
+async fn get_builtin_commands() -> (HeaderMap, Json<BuiltinCommandsResponse>) {
+    let mut response_headers = HeaderMap::new();
+    response_headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("public, max-age=300, stale-while-revalidate=3600"),
+    );
+    let body = build_builtin_commands();
+    (response_headers, Json(body))
+}
+
+fn build_builtin_commands() -> BuiltinCommandsResponse {
     // OpenCode builtin commands (oh-my-opencode)
     let opencode_commands = vec![
         CommandSummary {
@@ -1116,11 +1134,11 @@ async fn get_builtin_commands() -> Json<BuiltinCommandsResponse> {
         }],
     }];
 
-    Json(BuiltinCommandsResponse {
+    BuiltinCommandsResponse {
         opencode: opencode_commands,
         claudecode: claudecode_commands,
         codex: codex_commands,
-    })
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
