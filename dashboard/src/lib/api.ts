@@ -1711,13 +1711,13 @@ export async function saveLibraryOpenCodeSettings(settings: Record<string, unkno
 // sandboxed.sh Config API
 // ─────────────────────────────────────────────────────────────────────────────
 
-export interface OpenAgentConfig {
+export interface SandboxedConfig {
   hidden_agents: string[];
   default_agent: string | null;
 }
 
 // Get sandboxed.sh config from Library
-export async function getOpenAgentConfig(): Promise<OpenAgentConfig> {
+export async function getSandboxedConfig(): Promise<SandboxedConfig> {
   try {
     return await apiGet("/api/library/sandboxed-sh/config", "Failed to get sandboxed.sh config");
   } catch {
@@ -1727,7 +1727,7 @@ export async function getOpenAgentConfig(): Promise<OpenAgentConfig> {
 }
 
 // Save sandboxed.sh config to Library
-export async function saveOpenAgentConfig(config: OpenAgentConfig): Promise<void> {
+export async function saveSandboxedConfig(config: SandboxedConfig): Promise<void> {
   return apiPut("/api/library/sandboxed-sh/config", config, "Failed to save sandboxed.sh config");
 }
 
@@ -1781,7 +1781,7 @@ export interface ConfigProfile {
   path: string;
   files: ConfigProfileFile[];
   opencode_settings: Record<string, unknown>;
-  openagent_config: OpenAgentConfig;
+  sandboxed_config: SandboxedConfig;
   claudecode_config: ClaudeCodeConfig;
 }
 
@@ -1838,7 +1838,7 @@ export async function saveLibraryOpenCodeSettingsForProfile(
 }
 
 // Get sandboxed.sh config for a specific profile
-export async function getOpenAgentConfigForProfile(profile: string): Promise<OpenAgentConfig> {
+export async function getSandboxedConfigForProfile(profile: string): Promise<SandboxedConfig> {
   try {
     return await apiGet(
       `/api/library/config-profile/${encodeURIComponent(profile)}/sandboxed-sh/config`,
@@ -1851,9 +1851,9 @@ export async function getOpenAgentConfigForProfile(profile: string): Promise<Ope
 }
 
 // Save sandboxed.sh config for a specific profile
-export async function saveOpenAgentConfigForProfile(
+export async function saveSandboxedConfigForProfile(
   profile: string,
-  config: OpenAgentConfig
+  config: SandboxedConfig
 ): Promise<void> {
   return apiPut(
     `/api/library/config-profile/${encodeURIComponent(profile)}/sandboxed-sh/config`,

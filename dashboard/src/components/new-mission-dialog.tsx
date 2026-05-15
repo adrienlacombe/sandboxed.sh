@@ -6,7 +6,7 @@ import { createPortal } from 'react-dom';
 import { useRouter } from 'next/navigation';
 import { Plus, X, ExternalLink, RefreshCw, SlidersHorizontal } from 'lucide-react';
 import useSWR from 'swr';
-import { getVisibleAgents, getOpenAgentConfig, listBackends, listBackendAgents, getClaudeCodeConfig, getLibraryOpenCodeSettingsForProfile, listBackendModelOptions, listProviders, type Backend, type BackendAgent, type BackendModelOption, type ModelEffort, type Provider } from '@/lib/api';
+import { getVisibleAgents, getSandboxedConfig, listBackends, listBackendAgents, getClaudeCodeConfig, getLibraryOpenCodeSettingsForProfile, listBackendModelOptions, listProviders, type Backend, type BackendAgent, type BackendModelOption, type ModelEffort, type Provider } from '@/lib/api';
 import type { Workspace } from '@/lib/api';
 import { isBackendAvailable, useBackendConfigs } from '@/lib/use-backend-configs';
 
@@ -221,7 +221,7 @@ export function NewMissionDialog({
     revalidateOnFocus: true,
     dedupingInterval: 5000,
   });
-  const { data: config, mutate: mutateConfig } = useSWR(open ? 'openagent-config' : null, getOpenAgentConfig, {
+  const { data: config, mutate: mutateConfig } = useSWR(open ? 'sandboxed-config' : null, getSandboxedConfig, {
     revalidateOnFocus: true,
     dedupingInterval: 5000,
   });
