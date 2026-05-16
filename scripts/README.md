@@ -36,6 +36,11 @@ Installs desktop automation dependencies on the host (used by the desktop MCP).
 ### generate_ios_icons.js
 Generates iOS app icons for the SwiftUI dashboard.
 
+### setup_android_release_secrets.sh
+Generates an Android release signing keystore, stores a local backup under
+`android_dashboard/keys/`, and uploads the matching GitHub Actions secrets with
+`gh secret set`.
+
 ### validate_skill_isolation.sh
 Validates strong workspace skill isolation on the server (checks OpenCode env, global skill dirs, and latest mission skills).
 

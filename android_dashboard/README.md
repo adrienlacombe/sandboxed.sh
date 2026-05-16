@@ -2,6 +2,12 @@
 
 Native Android client for Sandboxed.sh, with feature parity against the iOS dashboard. SwiftUI ↔ Jetpack Compose port; talks to the same `/api/...` backend.
 
+## Install
+
+The Android app is published on Zapstore:
+
+https://zapstore.dev/apps/sh.sandboxed.dashboard
+
 ## What's in v0.2.0
 
 ### Bottom-tab screens
