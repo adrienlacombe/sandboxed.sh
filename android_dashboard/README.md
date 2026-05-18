@@ -262,6 +262,56 @@ For a debug APK that just installs:
 
 The release `signingConfig` only kicks in if `RELEASE_KEYSTORE` is set; without it, `assembleRelease` produces an unsigned APK.
 
+## Release to Zapstore
+
+Zapstore metadata lives in `zapstore.yaml`. The published app page is:
+
+https://zapstore.dev/apps/sh.sandboxed.dashboard
+
+### Prerequisites
+
+- `~/go/bin/zsp` is installed.
+- The release APK exists at `app/build/outputs/apk/release/app-release.apk`.
+- The zsp bunker pairing from Oubli is present locally. The paired bunker pubkey is:
+  `7ebbce1843a17cd778a5e169e3d2f679f5ac7b5125d1c43d265e190f7b27538c`
+
+zsp stores the local client key for that bunker under the user config directory
+(`~/Library/Application Support/zsp/bunker-keys/` on macOS). Do not commit bunker
+URLs that include a `secret=` parameter or any Nostr private key.
+
+### Publish
+
+Build the signed release APK first:
+
+```bash
+cd android_dashboard
+source keys/release-secrets.env
+./gradlew :app:assembleRelease
+```
+
+Validate that zsp can read the APK and config:
+
+```bash
+~/go/bin/zsp publish --check zapstore.yaml
+```
+
+Publish with the same bunker signer used by Oubli:
+
+```bash
+SIGN_WITH="bunker://7ebbce1843a17cd778a5e169e3d2f679f5ac7b5125d1c43d265e190f7b27538c?relay=wss://relay.nsec.app" \
+  ~/go/bin/zsp publish -y --skip-preview --skip-certificate-linking zapstore.yaml
+```
+
+Approve the signing requests in the remote signer if prompted. A successful run
+ends with:
+
+```text
+Published sh.sandboxed.dashboard <version> to wss://relay.zapstore.dev
+```
+
+If you need to republish the same version after changing metadata or assets, add
+`--overwrite-release`.
+
 ### Lint
 
 ```bash
