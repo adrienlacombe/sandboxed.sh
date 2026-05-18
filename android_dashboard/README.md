@@ -281,7 +281,8 @@ URLs that include a `secret=` parameter or any Nostr private key.
 
 ### Publish
 
-Build the signed release APK first:
+Build the signed release APK first, or download the APK from the GitHub release
+you want to publish.
 
 ```bash
 cd android_dashboard
@@ -289,17 +290,35 @@ source keys/release-secrets.env
 ./gradlew :app:assembleRelease
 ```
 
+To publish an APK that was already built by GitHub Actions:
+
+```bash
+TAG=v0.12.3
+rm -rf "/tmp/sandboxed-zapstore-${TAG}"
+mkdir -p "/tmp/sandboxed-zapstore-${TAG}"
+gh release download "${TAG}" \
+  --repo adrienlacombe/sandboxed.sh \
+  --pattern "sandboxed-dashboard-${TAG}.apk" \
+  --dir "/tmp/sandboxed-zapstore-${TAG}"
+
+mkdir -p app/build/outputs/apk/release
+cp "/tmp/sandboxed-zapstore-${TAG}/sandboxed-dashboard-${TAG}.apk" \
+  app/build/outputs/apk/release/app-release.apk
+shasum -a 256 app/build/outputs/apk/release/app-release.apk
+```
+
 Validate that zsp can read the APK and config:
 
 ```bash
-~/go/bin/zsp publish --check zapstore.yaml
+GITHUB_TOKEN="$(gh auth token)" ~/go/bin/zsp publish --check zapstore.yaml
 ```
 
 Publish with the same bunker signer used by Oubli:
 
 ```bash
 SIGN_WITH="bunker://7ebbce1843a17cd778a5e169e3d2f679f5ac7b5125d1c43d265e190f7b27538c?relay=wss://relay.nsec.app" \
-  ~/go/bin/zsp publish -y --skip-preview --skip-certificate-linking zapstore.yaml
+GITHUB_TOKEN="$(gh auth token)" \
+  ~/go/bin/zsp publish -q --skip-preview --skip-certificate-linking zapstore.yaml
 ```
 
 Approve the signing requests in the remote signer if prompted. A successful run
@@ -311,6 +330,9 @@ Published sh.sandboxed.dashboard <version> to wss://relay.zapstore.dev
 
 If you need to republish the same version after changing metadata or assets, add
 `--overwrite-release`.
+
+Record the published APK SHA-256 in release notes or deployment notes after
+publishing.
 
 ### Lint
 
