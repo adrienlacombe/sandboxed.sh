@@ -1,6 +1,7 @@
 release_source: ./app/build/outputs/apk/release/app-release.apk
 repository: https://github.com/adrienlacombe/sandboxed.sh
 website: https://sandboxed.sh
+icon: ./metadata/icon.png
 
 name: Sandboxed
 summary: Mobile mission control for self-hosted AI coding agents
