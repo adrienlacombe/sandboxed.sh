@@ -88,7 +88,9 @@ private fun MainScaffold(container: AppContainer, host: FragmentActivity?) {
                             navController.navigate(tab.route) {
                                 popUpTo(navController.graph.findStartDestination().id) { saveState = true }
                                 launchSingleTop = true
-                                restoreState = true
+                                // More is a menu, not a persistent content tab. Restoring its
+                                // previous state can reopen the last menu destination directly.
+                                restoreState = tab.route != "more"
                             }
                         },
                         icon = { Icon(tab.icon, contentDescription = tab.label) },
