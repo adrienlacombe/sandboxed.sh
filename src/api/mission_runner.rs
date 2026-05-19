@@ -4888,6 +4888,10 @@ pub fn run_claudecode_turn<'a>(
         let mut process_exited_without_result = false;
         let mut idle_timeout_triggered = false;
         let mut transport_failure_stage: Option<ClaudeTransportFailureStage> = None;
+        // Cancellation breaks out of the loop instead of returning immediately,
+        // so the post-loop fallback (final_result ← text_buffer ← thinking_buffer)
+        // can surface whatever the agent already produced. See run_codex_turn.
+        let mut cancelled = false;
 
         // Track content block types and accumulated content for Claude Code streaming
         // This is needed because Claude sends incremental deltas that need to be accumulated
@@ -4995,8 +4999,8 @@ pub fn run_claudecode_turn<'a>(
                     // Kill the process to stop consuming API resources
                     pty.kill();
                     reader_handle.abort();
-                    return AgentResult::failure("Cancelled".to_string(), 0)
-                        .with_terminal_reason(TerminalReason::Cancelled);
+                    cancelled = true;
+                    break;
                 }
                 _ = tokio::time::sleep_until(startup_deadline), if !saw_non_init_event => {
                     tracing::warn!(
@@ -5701,7 +5705,12 @@ pub fn run_claudecode_turn<'a>(
             );
         }
 
-        if !had_error && !saw_terminal_result_event {
+        // Cancellation suppresses the "no terminal result" / "no output"
+        // failure-message construction below: those messages describe a
+        // broken Claude Code transport, but a user/system cancel is not a
+        // transport failure. We want the accumulated text/thinking buffers
+        // (or, as a last resort, the synthetic cancel string) to surface.
+        if !cancelled && !had_error && !saw_terminal_result_event {
             had_error = true;
             let exit_summary = describe_pty_exit_status(&exit_status);
             if !saw_non_init_event {
@@ -5757,7 +5766,7 @@ pub fn run_claudecode_turn<'a>(
             }
         }
 
-        if final_result.trim().is_empty() && !had_error {
+        if !cancelled && final_result.trim().is_empty() && !had_error {
             had_error = true;
             if !non_json_output.is_empty() {
                 tracing::warn!(
@@ -5813,7 +5822,26 @@ pub fn run_claudecode_turn<'a>(
             final_result = format!("Claude Code error: {}", non_json_output.join(" | "));
         }
 
-        let mut result = if had_error {
+        let mut result = if cancelled {
+            // The cancel arm fell through here instead of returning a synthetic
+            // "Cancelled" failure, so final_result still holds whatever the
+            // text/thinking-buffer fallbacks managed to recover. Surface that
+            // partial work but mark the mission Interrupted/ServerShutdown
+            // so the dashboard renders the resume affordance.
+            //
+            // Snapshot the cancel marker once — calling
+            // `cancel_or_shutdown_failure()` twice could pair "Mission
+            // cancelled" text with ServerShutdown (or vice versa) if a
+            // shutdown signal arrives between reads.
+            let cancel_marker = cancel_or_shutdown_failure();
+            if final_result.trim().is_empty() {
+                final_result = cancel_marker.output.clone();
+            }
+            let cancel_reason = cancel_marker
+                .terminal_reason
+                .unwrap_or(TerminalReason::Cancelled);
+            AgentResult::failure(final_result, cost_cents).with_terminal_reason(cancel_reason)
+        } else if had_error {
             // Detect rate limit / overloaded errors for account rotation.
             //
             // We check for specific Anthropic error types and HTTP status codes.
@@ -13562,13 +13590,20 @@ pub async fn run_codex_turn(
     let mut total_input_tokens: u64 = 0;
     let mut total_output_tokens: u64 = 0;
     let mut tool_events_seen: usize = 0;
+    // Set when the cancellation token fires mid-turn. Instead of returning a
+    // synthetic "Mission cancelled" failure and discarding everything the
+    // model already produced (the common shape for /goal missions, where the
+    // closing audit lives in `thinking_accumulated`), we break out of the
+    // loop and let the post-loop finalization recover whatever it can.
+    let mut cancelled = false;
 
     loop {
         tokio::select! {
             _ = cancel.cancelled() => {
                 tracing::info!("Codex turn cancelled for mission {}", mission_id);
                 // Note: Codex process will be cleaned up automatically when the event stream task ends
-                return cancel_or_shutdown_failure();
+                cancelled = true;
+                break;
             }
             Some(event) = event_rx.recv() => {
                 match event {
@@ -13763,6 +13798,18 @@ pub async fn run_codex_turn(
         }
     }
 
+    // Capture a copy of the accumulated reasoning before the flush below
+    // moves it into the broadcast event. /goal missions frequently end with
+    // the model emitting a self-audit as reasoning and then calling
+    // `update_goal { status: "complete" }` without a closing chat message;
+    // in that case `assistant_message` is empty (or stale from an earlier
+    // iteration) and the only place the audit lives is `thinking_accumulated`.
+    let thinking_for_fallback = if thinking_accumulated.trim().is_empty() {
+        None
+    } else {
+        Some(thinking_accumulated.clone())
+    };
+
     // Flush any remaining accumulated thinking with full content so
     // the event logger persists it for replay/history.
     if thinking_emitted && !thinking_done_emitted {
@@ -13773,8 +13820,10 @@ pub async fn run_codex_turn(
         });
     }
 
-    let no_output = assistant_message.trim().is_empty() && last_summary.is_none();
-    if no_output && error_message.is_none() {
+    let no_output = assistant_message.trim().is_empty()
+        && last_summary.is_none()
+        && thinking_for_fallback.is_none();
+    if no_output && error_message.is_none() && !cancelled {
         success = false;
         error_message = Some(
             "Codex produced no output. This usually means the Codex CLI failed before emitting JSON (often authentication). Check that the host has a valid `~/.codex/auth.json` and that the backend can access it."
@@ -13782,12 +13831,31 @@ pub async fn run_codex_turn(
         );
     }
 
+    // Snapshot the cancel marker (output + terminal_reason) once. The marker
+    // reads `is_shutdown_initiated()` internally, and a shutdown signal
+    // arriving between two reads could pair "Mission cancelled" text with a
+    // ServerShutdown reason (or vice versa) — TOCTOU race flagged by bugbot.
+    let cancel_marker = if cancelled {
+        Some(cancel_or_shutdown_failure())
+    } else {
+        None
+    };
+
     let mut final_message = if let Some(err) = error_message {
         err
     } else if !assistant_message.is_empty() {
         assistant_message
     } else if let Some(summary) = last_summary {
         summary
+    } else if let Some(thinking_text) = thinking_for_fallback {
+        // Surface the model's reasoning as the assistant message so the
+        // dashboard's final-message slot matches what's already visible in
+        // the thinking panel.
+        thinking_text
+    } else if let Some(marker) = cancel_marker.as_ref() {
+        // Mid-turn cancellation with nothing accumulated — preserve the
+        // historical "Mission cancelled" / shutdown text for the UI.
+        marker.output.clone()
     } else {
         "No response from Codex".to_string()
     };
@@ -13840,7 +13908,16 @@ Update it to the latest version (`npm install -g @openai/codex@latest`) and retr
     let model_for_cost = resolved_model.as_deref();
     let (cost_cents, cost_source) = resolve_cost_cents_and_source(None, model_for_cost, &usage);
 
-    let mut result = if success {
+    let mut result = if let Some(marker) = cancel_marker {
+        // Cancellation outranks success/error classification: keep the partial
+        // assistant_message / thinking content as the visible final message
+        // but mark the mission Interrupted (or ServerShutdown) so the
+        // dashboard renders the resume affordance and not a fake completion.
+        // Reusing the marker from the final-message picker keeps the
+        // text/reason pair consistent if shutdown fires mid-finalize.
+        let cancel_reason = marker.terminal_reason.unwrap_or(TerminalReason::Cancelled);
+        AgentResult::failure(final_message, cost_cents).with_terminal_reason(cancel_reason)
+    } else if success {
         AgentResult::success(final_message, cost_cents)
             .with_terminal_reason(TerminalReason::TurnComplete)
     } else {
@@ -14091,6 +14168,10 @@ pub async fn run_gemini_turn(
     let mut thinking_accumulated = String::new();
     let mut total_input_tokens: u64 = 0;
     let mut total_output_tokens: u64 = 0;
+    // See run_codex_turn: on cancellation we break instead of returning so
+    // the post-loop fallback can surface accumulated text / reasoning as the
+    // final assistant message.
+    let mut cancelled = false;
 
     loop {
         tokio::select! {
@@ -14100,7 +14181,8 @@ pub async fn run_gemini_turn(
                 backend.kill().await;
                 // Abort the event-conversion task
                 handle.abort();
-                return cancel_or_shutdown_failure();
+                cancelled = true;
+                break;
             }
             Some(event) = event_rx.recv() => {
                 match event {
@@ -14207,6 +14289,14 @@ pub async fn run_gemini_turn(
         }
     }
 
+    // See run_codex_turn: capture thinking before the flush below moves it,
+    // so the final-message picker can surface it when no text was produced.
+    let thinking_for_fallback = if thinking_accumulated.trim().is_empty() {
+        None
+    } else {
+        Some(thinking_accumulated.clone())
+    };
+
     // Flush any remaining accumulated thinking with full content
     if thinking_emitted && !thinking_done_emitted {
         let _ = events_tx.send(AgentEvent::Thinking {
@@ -14216,8 +14306,8 @@ pub async fn run_gemini_turn(
         });
     }
 
-    let no_output = assistant_message.trim().is_empty();
-    if no_output && error_message.is_none() {
+    let no_output = assistant_message.trim().is_empty() && thinking_for_fallback.is_none();
+    if no_output && error_message.is_none() && !cancelled {
         success = false;
         error_message = Some(
             "Gemini CLI produced no output. Check that the Gemini CLI is installed and configured with valid credentials (GEMINI_API_KEY or Google OAuth)."
@@ -14225,10 +14315,22 @@ pub async fn run_gemini_turn(
         );
     }
 
+    // See run_codex_turn: snapshot the cancel marker once to keep the
+    // output/terminal_reason pair consistent if shutdown fires mid-finalize.
+    let cancel_marker = if cancelled {
+        Some(cancel_or_shutdown_failure())
+    } else {
+        None
+    };
+
     let final_message = if let Some(err) = error_message {
         err
     } else if !assistant_message.is_empty() {
         assistant_message
+    } else if let Some(thinking_text) = thinking_for_fallback {
+        thinking_text
+    } else if let Some(marker) = cancel_marker.as_ref() {
+        marker.output.clone()
     } else {
         "No response from Gemini CLI".to_string()
     };
@@ -14243,7 +14345,10 @@ pub async fn run_gemini_turn(
     let model_for_cost = resolved_model.as_deref();
     let (cost_cents, cost_source) = resolve_cost_cents_and_source(None, model_for_cost, &usage);
 
-    let mut result = if success {
+    let mut result = if let Some(marker) = cancel_marker {
+        let cancel_reason = marker.terminal_reason.unwrap_or(TerminalReason::Cancelled);
+        AgentResult::failure(final_message, cost_cents).with_terminal_reason(cancel_reason)
+    } else if success {
         AgentResult::success(final_message, cost_cents)
             .with_terminal_reason(TerminalReason::TurnComplete)
     } else {
