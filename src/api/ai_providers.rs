@@ -255,6 +255,7 @@ const GOOGLE_REDIRECT_URI: &str = "http://localhost:8085/oauth2callback";
 const GOOGLE_SCOPES: &str =
     "https://www.googleapis.com/auth/cloud-platform https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/userinfo.profile";
 const GROK_OAUTH_CLIENT_KEY: &str = "https://auth.x.ai::b1a00492-073a-47ea-816f-4c329264a828";
+const GROK_OAUTH_CLIENT_ID: &str = "b1a00492-073a-47ea-816f-4c329264a828";
 
 fn google_client_id() -> &'static str {
     GOOGLE_CLIENT_ID
@@ -266,6 +267,15 @@ fn google_client_secret() -> &'static str {
 
 fn grok_auth_path() -> PathBuf {
     PathBuf::from(home_dir()).join(".grok").join("auth.json")
+}
+
+fn grok_auth_paths() -> Vec<PathBuf> {
+    let mut paths = vec![grok_auth_path()];
+    let service_path = PathBuf::from("/var/lib/opencode/.grok/auth.json");
+    if !paths.iter().any(|path| path == &service_path) {
+        paths.push(service_path);
+    }
+    paths
 }
 
 fn read_grok_auth_entry() -> Option<serde_json::Value> {
@@ -285,10 +295,21 @@ fn grok_auth_email(entry: &serde_json::Value) -> Option<String> {
 fn grok_auth_expires_at_millis(entry: &serde_json::Value) -> i64 {
     entry
         .get("expires_at")
-        .and_then(|v| v.as_str())
-        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-        .map(|dt| dt.timestamp_millis())
+        .and_then(parse_grok_expires_at_value)
         .unwrap_or_else(|| chrono::Utc::now().timestamp_millis() + 6 * 60 * 60 * 1000)
+}
+
+fn parse_grok_expires_at_value(value: &serde_json::Value) -> Option<i64> {
+    if let Some(expires_at) = value.as_i64() {
+        return Some(expires_at);
+    }
+    let text = value.as_str()?.trim();
+    if let Ok(expires_at) = text.parse::<i64>() {
+        return Some(expires_at);
+    }
+    chrono::DateTime::parse_from_rfc3339(text)
+        .ok()
+        .map(|dt| dt.timestamp_millis())
 }
 
 fn parse_grok_device_auth_line(line: &str) -> (Option<String>, Option<String>) {
@@ -322,7 +343,9 @@ fn parse_grok_device_auth_line(line: &str) -> (Option<String>, Option<String>) {
 
 #[cfg(test)]
 mod grok_oauth_tests {
-    use super::{get_xai_api_key_for_grok, parse_grok_device_auth_line};
+    use super::{
+        get_xai_api_key_for_grok, grok_auth_expires_at_millis, parse_grok_device_auth_line,
+    };
     use crate::ai_providers::{AIProvider, OAuthCredentials, ProviderType};
 
     #[test]
@@ -343,6 +366,24 @@ mod grok_oauth_tests {
         let (_, code) = parse_grok_device_auth_line("  YKRD-M9AF");
 
         assert_eq!(code.as_deref(), Some("YKRD-M9AF"));
+    }
+
+    #[test]
+    fn parses_grok_rfc3339_expiry() {
+        let entry = serde_json::json!({
+            "expires_at": "2026-05-19T06:30:31.759077679Z"
+        });
+
+        assert_eq!(grok_auth_expires_at_millis(&entry), 1779172231759);
+    }
+
+    #[test]
+    fn parses_grok_numeric_expiry() {
+        let entry = serde_json::json!({
+            "expires_at": 1779172231759_i64
+        });
+
+        assert_eq!(grok_auth_expires_at_millis(&entry), 1779172231759);
     }
 
     #[test]
@@ -3168,6 +3209,12 @@ fn sync_to_opencode_auth(
         }
     }
 
+    if matches!(provider_type, ProviderType::Xai) {
+        if let Err(e) = write_grok_oauth_auth_file(refresh_token, access_token, expires_at) {
+            tracing::error!("Failed to write Grok OAuth auth file: {}", e);
+        }
+    }
+
     tracing::info!(
         "Synced OAuth credentials to OpenCode auth.json for provider keys: {:?}",
         keys
@@ -3178,6 +3225,87 @@ fn sync_to_opencode_auth(
         write_sandboxed_credential(provider_type, refresh_token, access_token, expires_at)
     {
         tracing::warn!("Failed to write sandboxed.sh credentials: {}", e);
+    }
+
+    Ok(())
+}
+
+fn write_grok_oauth_auth_file(
+    refresh_token: &str,
+    access_token: &str,
+    expires_at: i64,
+) -> Result<(), String> {
+    let expires_at = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(expires_at)
+        .map(|dt| dt.to_rfc3339())
+        .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
+
+    let mut last_error = None;
+    for auth_path in grok_auth_paths() {
+        let mut auth = if auth_path.exists() {
+            match std::fs::read_to_string(&auth_path)
+                .ok()
+                .and_then(|contents| serde_json::from_str::<serde_json::Value>(&contents).ok())
+                .and_then(|value| value.as_object().cloned())
+            {
+                Some(auth) => auth,
+                None => serde_json::Map::new(),
+            }
+        } else {
+            serde_json::Map::new()
+        };
+
+        let mut entry = auth
+            .get(GROK_OAUTH_CLIENT_KEY)
+            .and_then(|value| value.as_object().cloned())
+            .unwrap_or_default();
+        entry.insert(
+            "auth_mode".to_string(),
+            serde_json::Value::String("oauth".to_string()),
+        );
+        entry.insert(
+            "oidc_client_id".to_string(),
+            serde_json::Value::String(GROK_OAUTH_CLIENT_ID.to_string()),
+        );
+        entry.insert(
+            "oidc_issuer".to_string(),
+            serde_json::Value::String("https://auth.x.ai".to_string()),
+        );
+        entry.insert(
+            "key".to_string(),
+            serde_json::Value::String(access_token.to_string()),
+        );
+        entry.insert(
+            "refresh_token".to_string(),
+            serde_json::Value::String(refresh_token.to_string()),
+        );
+        entry.insert(
+            "expires_at".to_string(),
+            serde_json::Value::String(expires_at.clone()),
+        );
+        auth.insert(
+            GROK_OAUTH_CLIENT_KEY.to_string(),
+            serde_json::Value::Object(entry),
+        );
+
+        let write_result = (|| -> Result<(), String> {
+            if let Some(parent) = auth_path.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| format!("Failed to create Grok auth directory: {}", e))?;
+            }
+            let contents = serde_json::to_string_pretty(&serde_json::Value::Object(auth))
+                .map_err(|e| format!("Failed to serialize Grok auth: {}", e))?;
+            std::fs::write(&auth_path, contents)
+                .map_err(|e| format!("Failed to write Grok auth: {}", e))?;
+            Ok(())
+        })();
+
+        if let Err(e) = write_result {
+            last_error = Some(format!("{}: {}", auth_path.display(), e));
+        }
+    }
+
+    if let Some(error) = last_error {
+        return Err(error);
     }
 
     Ok(())
@@ -8177,6 +8305,56 @@ pub async fn refresh_oauth_token_internal(
             let expires_at = chrono::Utc::now().timestamp_millis() + (expires_in * 1000);
 
             Ok((new_access_token.to_string(), new_refresh_token, expires_at))
+        }
+        ProviderType::Xai => {
+            let token_response = client
+                .post("https://auth.x.ai/oauth2/token")
+                .header("Content-Type", "application/x-www-form-urlencoded")
+                .form(&[
+                    ("grant_type", "refresh_token"),
+                    ("refresh_token", refresh_token),
+                    ("client_id", GROK_OAUTH_CLIENT_ID),
+                ])
+                .send()
+                .await
+                .map_err(|e| {
+                    OAuthRefreshError::Other(format!("Failed to refresh xAI token: {}", e))
+                })?;
+
+            if !token_response.status().is_success() {
+                let status = token_response.status();
+                let error_text = token_response.text().await.unwrap_or_default();
+                if error_text.contains("invalid_grant") || error_text.contains("Invalid grant") {
+                    return Err(OAuthRefreshError::InvalidGrant(format!(
+                        "xAI refresh token expired or revoked ({}): {}",
+                        status, error_text
+                    )));
+                }
+
+                return Err(OAuthRefreshError::Other(format!(
+                    "xAI token refresh failed ({}): {}",
+                    status, error_text
+                )));
+            }
+
+            let token_data: serde_json::Value = token_response.json().await.map_err(|e| {
+                OAuthRefreshError::Other(format!("Failed to parse xAI token response: {}", e))
+            })?;
+
+            let new_access_token = token_data["access_token"].as_str().ok_or_else(|| {
+                OAuthRefreshError::Other("No access token in xAI refresh response".to_string())
+            })?;
+            let new_refresh_token = token_data["refresh_token"]
+                .as_str()
+                .unwrap_or(refresh_token);
+            let expires_in = token_data["expires_in"].as_i64().unwrap_or(3600);
+            let expires_at = chrono::Utc::now().timestamp_millis() + (expires_in * 1000);
+
+            Ok((
+                new_access_token.to_string(),
+                new_refresh_token.to_string(),
+                expires_at,
+            ))
         }
         _ => Err(OAuthRefreshError::Other(format!(
             "OAuth refresh not supported for provider type: {:?}",

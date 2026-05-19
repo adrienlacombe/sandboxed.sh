@@ -10080,6 +10080,12 @@ async fn sync_grok_oauth_auth_file(
     }
 
     let source_expires_at = grok_auth_file_expires_at(&auth_json);
+    if crate::api::ai_providers::oauth_token_expired(source_expires_at) {
+        return Err(
+            "Host Grok auth file is expired; reconnect xAI or refresh OAuth before syncing"
+                .to_string(),
+        );
+    }
     let existing_output = workspace_exec
         .output(
             cwd,
@@ -10150,11 +10156,18 @@ fn grok_auth_file_expires_at(contents: &str) -> i64 {
         .ok()
         .and_then(|auth| auth.get(GROK_OAUTH_CLIENT_KEY).cloned())
         .and_then(|entry| {
-            entry
-                .get("expires_at")
-                .and_then(|v| v.as_str())
-                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-                .map(|dt| dt.timestamp_millis())
+            entry.get("expires_at").and_then(|value| {
+                if let Some(expires_at) = value.as_i64() {
+                    return Some(expires_at);
+                }
+                let text = value.as_str()?.trim();
+                if let Ok(expires_at) = text.parse::<i64>() {
+                    return Some(expires_at);
+                }
+                chrono::DateTime::parse_from_rfc3339(text)
+                    .ok()
+                    .map(|dt| dt.timestamp_millis())
+            })
         })
         .unwrap_or(0)
 }
@@ -13005,6 +13018,47 @@ pub async fn run_grok_turn(
     if let Some(model) = model.filter(|m| !m.trim().is_empty()) {
         args.push("--model".to_string());
         args.push(model.to_string());
+    }
+
+    if let Some(entry) =
+        crate::api::ai_providers::read_oauth_token_entry(crate::ai_providers::ProviderType::Xai)
+    {
+        if crate::api::ai_providers::oauth_token_expired(entry.expires_at) {
+            match crate::api::ai_providers::refresh_oauth_token_with_lock(
+                crate::ai_providers::ProviderType::Xai,
+                entry.expires_at,
+            )
+            .await
+            {
+                Ok((_access, _refresh, expires_at)) => {
+                    tracing::info!(
+                        mission_id = %mission_id,
+                        expires_at,
+                        "Refreshed xAI OAuth token before starting Grok Build"
+                    );
+                }
+                Err(crate::api::ai_providers::OAuthRefreshError::InvalidGrant(err)) => {
+                    return AgentResult::failure(
+                        format!(
+                            "Grok Build xAI OAuth refresh token is expired or revoked. Reconnect the xAI provider, then retry the mission. {}",
+                            err
+                        ),
+                        0,
+                    )
+                    .with_terminal_reason(TerminalReason::LlmError);
+                }
+                Err(err) => {
+                    return AgentResult::failure(
+                        format!(
+                            "Failed to refresh xAI OAuth before starting Grok Build: {}",
+                            err
+                        ),
+                        0,
+                    )
+                    .with_terminal_reason(TerminalReason::LlmError);
+                }
+            }
+        }
     }
 
     if let Err(err) = sync_grok_oauth_auth_file(&workspace_exec, work_dir).await {
