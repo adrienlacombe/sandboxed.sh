@@ -315,6 +315,40 @@ fn canonicalize_or_original(path: &Path) -> PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
+/// Search one level deep inside the mission workspace for a file whose tail
+/// matches `resolved`. Used when the agent worked inside a cloned-repo
+/// subdirectory and the dashboard's path resolution doesn't account for it.
+/// Returns the unique match, or `None` if zero or multiple subdirs match
+/// (ambiguous matches stay an error so the caller's existing 4xx handling
+/// surfaces the issue).
+async fn find_in_mission_subdirs(
+    workspace_root: &Path,
+    mission_id: uuid::Uuid,
+    resolved: &Path,
+) -> Option<PathBuf> {
+    let mission_dir = crate::workspace::mission_workspace_dir_for_root(workspace_root, mission_id);
+    let tail = resolved.strip_prefix(&mission_dir).ok()?;
+    if tail.as_os_str().is_empty() {
+        return None;
+    }
+    let mut entries = tokio::fs::read_dir(&mission_dir).await.ok()?;
+    let mut matches = Vec::new();
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let entry_path = entry.path();
+        if !entry.file_type().await.map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let candidate = entry_path.join(tail);
+        if candidate.exists() {
+            matches.push(candidate);
+            if matches.len() > 1 {
+                return None;
+            }
+        }
+    }
+    matches.pop()
+}
+
 fn path_allowed_roots(state: &AppState) -> Vec<PathBuf> {
     let mut roots = vec![state.config.working_dir.clone(), api_context_root(state)];
 
@@ -578,7 +612,7 @@ pub async fn resolve_path_for_workspace(
     let input = Path::new(path);
 
     // Resolve the final path based on input type
-    let resolved = if input.is_absolute() {
+    let mut resolved = if input.is_absolute() {
         if workspace.workspace_type == WorkspaceType::Container {
             if input.starts_with(&workspace_root) {
                 input.to_path_buf()
@@ -614,6 +648,20 @@ pub async fn resolve_path_for_workspace(
         // Default: resolve relative to workspace path
         workspace_root.join(path)
     };
+
+    // Read fallback: when the agent `cd`'d into a cloned-repo subdirectory of
+    // its mission workspace (e.g. `keel/`), rich `<image>`/`<file>` tags emit
+    // paths the dashboard resolves against the mission workspace root — one
+    // level shallower than the actual file. If the originally resolved path
+    // doesn't exist but a single direct subdirectory of the mission workspace
+    // contains the same tail, transparently use that match.
+    if let Some(mid) = mission_id {
+        if !resolved.exists() {
+            if let Some(rerooted) = find_in_mission_subdirs(&workspace_root, mid, &resolved).await {
+                resolved = rerooted;
+            }
+        }
+    }
 
     // Canonicalize to resolve ".." and symlinks, then validate within workspace
     // For non-existent paths, we validate the parent directory exists and is within workspace

@@ -2206,6 +2206,11 @@ pub struct MissionRunner {
     /// Optional working directory override (e.g. git worktree path for orchestrated workers)
     pub working_directory: Option<String>,
 
+    /// API user that owns this mission. Forwarded into the orchestrator MCP
+    /// so worker missions land in this user's per-user mission store instead
+    /// of the MCP's own `orchestrator-mcp` store.
+    pub user_id: Option<String>,
+
     /// Number of tool calls currently in flight (tool_use seen, no tool_result
     /// yet). Used by the stall classifier to avoid Severe-stalling a worker
     /// that is honestly inside a long Bash subprocess (e.g. `lake build`).
@@ -2249,6 +2254,7 @@ impl MissionRunner {
             current_activity: None,
             subtasks: Vec::new(),
             working_directory: None,
+            user_id: None,
             active_tool_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
@@ -2397,6 +2403,7 @@ impl MissionRunner {
         let session_id = self.session_id.clone();
         let config_profile = self.config_profile.clone();
         let working_directory = self.working_directory.clone();
+        let user_id = self.user_id.clone();
         let user_message = msg.content.clone();
         let msg_id = msg.id;
         tracing::info!(
@@ -2448,6 +2455,7 @@ impl MissionRunner {
                 session_id,
                 config_profile,
                 working_directory,
+                user_id,
             )
             .await;
             (msg_id, user_message, result)
@@ -2771,6 +2779,7 @@ async fn run_mission_turn(
     session_id: Option<String>,
     mission_config_profile: Option<String>,
     mission_working_directory: Option<String>,
+    boss_user_id: Option<String>,
 ) -> AgentResult {
     let mut config = config;
     let effective_agent = agent_override.clone();
@@ -2912,6 +2921,7 @@ async fn run_mission_turn(
             &backend_id,
             None, // custom_providers: TODO integrate with provider store
             effective_config_profile.as_deref(),
+            boss_user_id.as_deref(),
         )
         .await
     };

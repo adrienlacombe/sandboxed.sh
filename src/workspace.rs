@@ -3160,7 +3160,7 @@ pub async fn prepare_mission_workspace_with_skills(
     mission_id: Uuid,
 ) -> anyhow::Result<PathBuf> {
     prepare_mission_workspace_with_skills_backend(
-        workspace, mcp, library, mission_id, "opencode", None, None,
+        workspace, mcp, library, mission_id, "opencode", None, None, None,
     )
     .await
 }
@@ -3205,6 +3205,12 @@ fn read_custom_providers_from_file(workspace_root: &Path) -> Vec<AIProvider> {
 }
 
 /// Prepare a workspace directory for a mission with skill and tool syncing for a specific backend.
+///
+/// `boss_user_id` is the API user that owns this (boss) mission. When set, it
+/// is injected into the orchestrator MCP environment as `BOSS_USER_ID` so the
+/// MCP mints a service JWT scoped to that user — putting any worker missions
+/// it creates into the same per-user mission store as the boss instead of the
+/// MCP's own implicit `orchestrator-mcp` store.
 pub async fn prepare_mission_workspace_with_skills_backend(
     workspace: &Workspace,
     mcp: &McpRegistry,
@@ -3213,6 +3219,7 @@ pub async fn prepare_mission_workspace_with_skills_backend(
     backend_id: &str,
     custom_providers: Option<&[AIProvider]>,
     config_profile: Option<&str>,
+    boss_user_id: Option<&str>,
 ) -> anyhow::Result<PathBuf> {
     // Mission workspace directory lives under the selected workspace root.
     // This keeps filesystem and config effects scoped to the mission.
@@ -3393,6 +3400,17 @@ pub async fn prepare_mission_workspace_with_skills_backend(
                 if cfg.name == "orchestrator" || cfg.name == "automation-manager" {
                     if let Ok(secret) = std::env::var("JWT_SECRET") {
                         env.entry("JWT_SECRET".to_string()).or_insert(secret);
+                    }
+                }
+                // Tell the orchestrator MCP which user owns the boss
+                // mission so it mints its service JWT as that user. Without
+                // this, worker missions end up in `missions-orchestrator-mcp.db`
+                // and never appear in the boss's `/api/control/missions` list,
+                // breaking the dashboard's worker chips and the WorkerPanel.
+                if cfg.name == "orchestrator" {
+                    if let Some(user_id) = boss_user_id {
+                        env.entry("BOSS_USER_ID".to_string())
+                            .or_insert_with(|| user_id.to_string());
                     }
                 }
             }

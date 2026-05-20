@@ -3347,6 +3347,7 @@ impl ControlHub {
             mission_store,
             self.secrets.clone(),
             self.telegram_bridge.clone(),
+            user.id.clone(),
         );
         sessions.insert(user.id.clone(), state.clone());
 
@@ -5922,6 +5923,7 @@ fn spawn_control_session(
     mission_store: Arc<dyn MissionStore>,
     secrets: Option<Arc<SecretsStore>>,
     telegram_bridge: Option<super::telegram::SharedTelegramBridge>,
+    user_id: String,
 ) -> ControlState {
     let (cmd_tx, cmd_rx) = mpsc::channel::<ControlCommand>(256);
     // 8 192 slots ≈ ~8 s of headroom even for chatty missions (text_delta
@@ -6016,6 +6018,7 @@ fn spawn_control_session(
         progress,
         mission_store,
         secrets,
+        user_id,
     ));
 
     // Recover missions stopped by the previous backend process. Graceful
@@ -8048,6 +8051,7 @@ async fn control_actor_loop(
     progress: Arc<RwLock<ExecutionProgress>>,
     mission_store: Arc<dyn MissionStore>,
     secrets: Option<Arc<SecretsStore>>,
+    session_user_id: String,
 ) {
     // Queue stores (id, content, agent, target_mission_id) for the current/primary mission
     // The target_mission_id tracks which mission each queued message is intended for
@@ -8445,6 +8449,7 @@ async fn control_actor_loop(
                                                 mission.model_effort.clone(),
                                             );
                                             runner.working_directory = mission.working_directory.clone();
+                                            runner.user_id = Some(session_user_id.clone());
                                             // Load existing history
                                             for entry in &mission.history {
                                                 runner.history.push((entry.role.clone(), entry.content.clone()));
@@ -8774,6 +8779,7 @@ async fn control_actor_loop(
                                 main_runner_last_activity = std::time::Instant::now();
                                 main_runner_activity = None;
                                 main_runner_subtasks.clear();
+                                let user_id_for_turn = session_user_id.clone();
                                 running = Some(tokio::spawn(async move {
                                     let result = run_single_control_turn(
                                         cfg,
@@ -8799,6 +8805,7 @@ async fn control_actor_loop(
                                         session_id,
                                         false, // force_session_resume: regular message, not a resume
                                         mission_config_profile,
+                                        Some(user_id_for_turn),
                                     )
                                     .await;
                                     (mid, msg, result)
@@ -9059,6 +9066,7 @@ async fn control_actor_loop(
                                 mission.model_effort.clone(),
                             );
                             runner.working_directory = mission.working_directory.clone();
+                            runner.user_id = Some(session_user_id.clone());
 
                             // Load existing history into runner to preserve conversation context
                             for entry in &mission.history {
@@ -9387,6 +9395,7 @@ async fn control_actor_loop(
                                         mission.model_effort.clone(),
                                     );
                                     runner.working_directory = mission.working_directory.clone();
+                                    runner.user_id = Some(session_user_id.clone());
                                     for entry in &mission.history {
                                         runner
                                             .history
@@ -9533,6 +9542,7 @@ async fn control_actor_loop(
                                         main_runner_last_activity = std::time::Instant::now();
                                         main_runner_activity = None;
                                         main_runner_subtasks.clear();
+                                        let user_id_for_turn = session_user_id.clone();
                                         running = Some(tokio::spawn(async move {
                                             let result = run_single_control_turn(
                                                 cfg,
@@ -9558,6 +9568,7 @@ async fn control_actor_loop(
                                                 session_id,
                                                 true, // force_session_resume: this is a resume operation
                                                 mission_config_profile,
+                                                Some(user_id_for_turn),
                                             )
                                             .await;
                                             (mid, msg, result)
@@ -10216,6 +10227,7 @@ async fn control_actor_loop(
                     main_runner_last_activity = std::time::Instant::now();
                     main_runner_activity = None;
                     main_runner_subtasks.clear();
+                    let user_id_for_turn = session_user_id.clone();
                     running = Some(tokio::spawn(async move {
                         let result = run_single_control_turn(
                             cfg,
@@ -10241,6 +10253,7 @@ async fn control_actor_loop(
                             session_id,
                             false, // force_session_resume: continuation turn, not a resume
                             mission_config_profile,
+                            Some(user_id_for_turn),
                         )
                         .await;
                         (mid, msg, result)
@@ -10980,6 +10993,7 @@ async fn run_single_control_turn(
     session_id: Option<String>,
     force_session_resume: bool,
     mission_config_profile: Option<String>,
+    boss_user_id: Option<String>,
 ) -> crate::agents::AgentResult {
     let is_claudecode = backend_id.as_deref() == Some("claudecode");
     let is_codex = backend_id.as_deref() == Some("codex");
@@ -11039,6 +11053,7 @@ async fn run_single_control_turn(
             backend_id.as_deref().unwrap_or("opencode"),
             None, // custom_providers: TODO integrate with provider store
             effective_config_profile.as_deref(),
+            boss_user_id.as_deref(),
         ))
         .await
         {

@@ -230,12 +230,25 @@ struct JwtClaims {
 }
 
 /// Mint a short-lived service JWT using the shared secret.
+///
+/// When `BOSS_USER_ID` is set (forwarded by workspace prep), the token is
+/// minted as that user so worker missions created via this MCP land in the
+/// boss's per-user mission store. Without it, the SingleTenant auth path
+/// would create a synthetic `orchestrator-mcp` user and shard workers into
+/// `missions-orchestrator-mcp.db`, where the dashboard can't see them.
 fn mint_service_jwt(secret: &str) -> Option<String> {
     let now = Utc::now();
     let exp = now + chrono::Duration::hours(24);
+    let (sub, usr) = match std::env::var("BOSS_USER_ID") {
+        Ok(id) if !id.trim().is_empty() => (id.clone(), id),
+        _ => (
+            "orchestrator-mcp".to_string(),
+            "orchestrator-mcp".to_string(),
+        ),
+    };
     let claims = JwtClaims {
-        sub: "orchestrator-mcp".to_string(),
-        usr: "orchestrator-mcp".to_string(),
+        sub,
+        usr,
         iat: now.timestamp(),
         exp: exp.timestamp(),
     };
