@@ -6,8 +6,9 @@
 //!
 //! This is used for per-workspace Claude Code and OpenCode execution.
 
-use std::collections::HashMap;
+use std::collections::{hash_map::DefaultHasher, HashMap};
 use std::fs;
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
@@ -506,12 +507,29 @@ impl WorkspaceExec {
     }
 
     fn machine_name(&self) -> Option<String> {
-        self.workspace
+        let base = self
+            .workspace
             .path
             .file_name()
             .and_then(|n| n.to_str())
-            .map(|s| s.to_string())
-            .filter(|s| !s.trim().is_empty())
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())?;
+        let sanitized: String = base
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '-'
+                }
+            })
+            .collect();
+
+        let mut hasher = DefaultHasher::new();
+        self.workspace.path.hash(&mut hasher);
+        let suffix = format!("{:08x}", hasher.finish() as u32);
+
+        Some(format!("sandboxed-{}-{}", sanitized, suffix))
     }
 
     async fn running_container_leader(&self) -> Option<String> {

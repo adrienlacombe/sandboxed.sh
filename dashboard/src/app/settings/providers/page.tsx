@@ -342,7 +342,7 @@ export default function ProvidersPage() {
   // Pull the entire bulk cache so the rate-limit panel is instant the moment
   // the user expands a provider. Refreshes itself on a slow tick — the server
   // already refreshes in the background, so we just need to read the snapshot.
-  const { data: bulkUsage } = useSWR(
+  const { data: bulkUsage, mutate: mutateBulkUsage } = useSWR(
     'ai-providers-usage-bulk',
     getAllProviderUsage,
     { revalidateOnFocus: false, refreshInterval: 60_000 }
@@ -363,14 +363,11 @@ export default function ProvidersPage() {
 
   useEffect(() => {
     if (!cachedEntries) return;
-    // Only seed local state for providers we haven't fetched directly yet.
-    // A direct `fetchUsage(id, true)` after re-auth (or the refresh button)
-    // must not be clobbered by a stale entry from the next bulk poll.
     setUsageData((prev) => {
       let changed = false;
       const next = { ...prev };
       for (const [id, usage] of Object.entries(cachedEntries)) {
-        if (next[id] === undefined) {
+        if (next[id] !== usage) {
           next[id] = usage;
           changed = true;
         }
@@ -386,6 +383,17 @@ export default function ProvidersPage() {
         ? await refreshProviderUsage(providerId)
         : await getProviderUsage(providerId);
       setUsageData((prev) => ({ ...prev, [providerId]: data }));
+      if (force) {
+        // Keep the bulk snapshot in sync so the periodic poll doesn't roll
+        // this row back to the prior error within the next 60s.
+        mutateBulkUsage(
+          (current) =>
+            current
+              ? { ...current, entries: { ...current.entries, [providerId]: data } }
+              : current,
+          { revalidate: false }
+        );
+      }
     } catch {
       setUsageData((prev) => ({
         ...prev,
@@ -398,7 +406,7 @@ export default function ProvidersPage() {
     } finally {
       setUsageLoading((prev) => ({ ...prev, [providerId]: false }));
     }
-  }, []);
+  }, [mutateBulkUsage]);
 
   const toggleUsage = useCallback(
     (providerId: string) => {
@@ -424,13 +432,36 @@ export default function ProvidersPage() {
     try {
       const result = await authenticateAIProvider(provider.id);
       if (result.success) {
-        toast.success(result.message);
         mutateProviders();
         // Auth succeeding does not mean the provider is healthy — a 429 or
         // network error from the live usage check will still leave the row
         // red. Force a fresh usage probe so the status indicator reflects
-        // reality instead of the stale cached error.
-        await fetchUsage(provider.id, true);
+        // reality instead of the stale cached error, then surface the real
+        // outcome rather than a misleading "authenticated" message.
+        const fresh = await refreshProviderUsage(provider.id);
+        setUsageData((prev) => ({ ...prev, [provider.id]: fresh }));
+        // Patch the bulk snapshot too so the next periodic poll doesn't
+        // revert this row to the old cached error before its 60s tick.
+        mutateBulkUsage(
+          (current) =>
+            current
+              ? { ...current, entries: { ...current.entries, [provider.id]: fresh } }
+              : current,
+          { revalidate: false }
+        );
+        const stillBroken =
+          !!fresh?.error ||
+          (typeof fresh?.status === 'string' &&
+            !['connected', 'ok'].includes(fresh.status));
+        if (stillBroken) {
+          toast.error(
+            `Re-authenticated, but provider check still fails: ${String(
+              fresh?.error || fresh?.status || 'unknown error'
+            )}`
+          );
+        } else {
+          toast.success(result.message);
+        }
       } else {
         if (result.auth_url) {
           window.open(result.auth_url, '_blank');
