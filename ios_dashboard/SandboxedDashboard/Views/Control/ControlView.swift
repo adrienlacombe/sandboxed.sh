@@ -22,6 +22,51 @@ private struct BufferedStreamEvent: @unchecked Sendable {
     let data: [String: AnyCodable]
 }
 
+private struct ControlDiagnosticsOverlay: View {
+    let missionId: String?
+    let transport: String
+    let streamScope: String
+    let maxSequence: Int64?
+    let cacheHit: Bool?
+    let mergeCount: Int
+    let renderCount: Int
+    let droppedEvents: Int
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text("control diagnostics")
+                .font(.caption2.weight(.semibold))
+                .foregroundStyle(Theme.textMuted)
+            diagnosticRow("mission", missionId.map { String($0.prefix(8)) } ?? "none")
+            diagnosticRow("transport", "\(transport.lowercased()) · \(streamScope)")
+            diagnosticRow("max seq", maxSequence.map(String.init) ?? "?")
+            diagnosticRow("cache", cacheHit.map { $0 ? "hit" : "miss" } ?? "?")
+            diagnosticRow("merge", "\(mergeCount) ev")
+            diagnosticRow("render", "\(renderCount) rows")
+            diagnosticRow("drops", "\(droppedEvents)", warning: droppedEvents > 0)
+        }
+        .font(.caption2.monospacedDigit())
+        .padding(8)
+        .background(.black.opacity(0.78), in: RoundedRectangle(cornerRadius: 8))
+        .overlay(
+            RoundedRectangle(cornerRadius: 8)
+                .stroke(Theme.border.opacity(0.7), lineWidth: 0.5)
+        )
+        .foregroundStyle(Theme.textSecondary)
+    }
+
+    private func diagnosticRow(_ label: String, _ value: String, warning: Bool = false) -> some View {
+        HStack(spacing: 8) {
+            Text(label)
+                .foregroundStyle(Theme.textMuted)
+            Spacer(minLength: 12)
+            Text(value)
+                .foregroundStyle(warning ? Theme.warning : Theme.textPrimary)
+        }
+        .frame(width: 150, alignment: .leading)
+    }
+}
+
 struct ControlView: View {
     private static let draftTextKey = "control_draft_text"
     private static let lastMissionIdKey = "control_last_mission_id"
@@ -69,6 +114,10 @@ struct ControlView: View {
     @State private var hasMoreHistory = false
     @State private var isLoadingEarlier = false
     @State private var loadedEventCount = 0  // How many events we've loaded so far
+    @State private var controlCacheHit: Bool?
+    @State private var controlMergeCount = 0
+    @State private var controlDroppedEvents = 0
+    @AppStorage("control_debug_perf") private var showControlDiagnostics = false
 
     /// Per-mission high-water mark for `sequence`. When non-nil, reload paths
     /// pass it as `since_seq` to `/events` so the server returns only the tail
@@ -171,6 +220,23 @@ struct ControlView: View {
                 inputView
             }
             .animation(.easeInOut(duration: 0.2), value: connectionState.isConnected)
+
+            if showControlDiagnostics {
+                ControlDiagnosticsOverlay(
+                    missionId: viewingMissionId,
+                    transport: "SSE",
+                    streamScope: viewingMissionId == nil ? "global" : "mission",
+                    maxSequence: viewingMissionId.flatMap { missionMaxSeq[$0] },
+                    cacheHit: controlCacheHit,
+                    mergeCount: controlMergeCount,
+                    renderCount: groupedItems.count,
+                    droppedEvents: controlDroppedEvents
+                )
+                .padding(.top, 8)
+                .padding(.trailing, 8)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
+                .allowsHitTesting(false)
+            }
         }
         .navigationTitle(viewingMission?.displayTitle ?? "Control")
         .navigationBarTitleDisplayMode(.inline)
@@ -358,6 +424,10 @@ struct ControlView: View {
                         showSettings = true
                     } label: {
                         Label("Settings", systemImage: "gearshape")
+                    }
+
+                    Toggle(isOn: $showControlDiagnostics) {
+                        Label("Control Diagnostics", systemImage: "gauge.with.dots.needle.bottom.50percent")
                     }
 
                     if let mission = viewingMission {
@@ -1550,6 +1620,7 @@ struct ControlView: View {
             : nil
         hasMoreHistory = false
         loadedEventCount = 0
+        controlMergeCount = mission.history.count
         messages = mission.history.enumerated().map { index, entry in
             ChatMessage(
                 id: "\(mission.id)-\(index)",
@@ -1588,6 +1659,7 @@ struct ControlView: View {
 
         // Track total event count for pagination
         loadedEventCount = orderedEvents.count
+        controlMergeCount = orderedEvents.count
 
         // Clear and replay all events to rebuild message history
         messages.removeAll()
@@ -1685,6 +1757,7 @@ struct ControlView: View {
         }
 
         loadedEventCount += orderedEvents.count
+        controlMergeCount = orderedEvents.count
         recomputeGroupedItems()
     }
 
@@ -1716,8 +1789,12 @@ struct ControlView: View {
             currentMission = cachedData.mission
             applyViewingMissionWithEvents(cachedData.mission, events: cachedData.events)
             hasCache = true
+            controlCacheHit = true
         } else {
             hasCache = false
+            if updateViewing {
+                controlCacheHit = false
+            }
         }
 
         // Only show loading state if we don't have cached data to display
@@ -1735,6 +1812,7 @@ struct ControlView: View {
                     do {
                         let snapshot = try await api.getMissionSnapshot(id: mission.id)
                         let events = snapshot.events
+                        controlCacheHit = hasCache
 
                         if events.isEmpty {
                             // Clear stale cache when events are empty
@@ -1788,8 +1866,10 @@ struct ControlView: View {
             // Use cached events for consistent display (avoids flash when fresh data arrives)
             applyViewingMissionWithEvents(cachedData.mission, events: cachedData.events)
             hasCache = true
+            controlCacheHit = true
         } else {
             hasCache = false
+            controlCacheHit = false
         }
 
         // Only show loading state if we don't have cached data to display
@@ -1811,6 +1891,7 @@ struct ControlView: View {
             }
 
             let events = snapshot.events
+            controlCacheHit = hasCache
             if events.isEmpty {
                 // Clear stale cache when events are empty to prevent visual flashing
                 removeMissionFromCache(mission.id)
@@ -2663,8 +2744,10 @@ struct ControlView: View {
         if let cached = loadCachedMissionData(id) {
             applyViewingMissionWithEvents(cached.mission, events: cached.events)
             hasCache = true
+            controlCacheHit = true
         } else {
             hasCache = false
+            controlCacheHit = false
             isLoading = true
         }
 
@@ -2702,6 +2785,7 @@ struct ControlView: View {
             }
 
             if !snapshot.events.isEmpty {
+                controlCacheHit = hasCache
                 hasMoreHistory = snapshot.totalEvents > snapshot.events.count
                 applyViewingMissionWithEvents(mission, events: snapshot.events)
                 if snapshot.latestSequence > 0 { missionMaxSeq[id] = snapshot.latestSequence }
@@ -2851,6 +2935,16 @@ struct ControlView: View {
     }
     
     private func handleStreamEvent(type: String, data: [String: Any], isHistoricalReplay: Bool = false) {
+        if type == "stream_lagged" {
+            if let dropped = data["dropped"] as? Int {
+                controlDroppedEvents += dropped
+            }
+            if let viewingId = viewingMissionId {
+                Task { await resumeMissionAfterReconnect(id: viewingId) }
+            }
+            return
+        }
+
         // Filter events by mission_id - only show events for the mission we're viewing
         // This prevents cross-mission contamination when parallel missions are running
         let eventMissionId = data["mission_id"] as? String
