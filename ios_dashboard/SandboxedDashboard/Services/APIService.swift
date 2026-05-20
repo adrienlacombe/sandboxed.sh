@@ -226,13 +226,14 @@ final class APIService {
         return response.ok
     }
 
-    func getMissionEvents(id: String, types: [String]? = nil, limit: Int? = nil, offset: Int? = nil, latest: Bool = false) async throws -> [StoredEvent] {
+    func getMissionEvents(id: String, types: [String]? = nil, limit: Int? = nil, offset: Int? = nil, latest: Bool = false, beforeSeq: Int64? = nil) async throws -> [StoredEvent] {
         try await getMissionEventsWithMeta(
             id: id,
             types: types,
             limit: limit,
             offset: offset,
-            latest: latest
+            latest: latest,
+            beforeSeq: beforeSeq
         ).events
     }
 
@@ -243,14 +244,16 @@ final class APIService {
     /// as "delta resume not supported" and not seed any high-water mark.
     ///
     /// `sinceSeq` requests only events with `sequence > sinceSeq` (delta path used
-    /// on SSE reconnect / scene-phase active). `latest` requests the tail page.
+    /// on SSE reconnect / scene-phase active). `beforeSeq` requests events with
+    /// `sequence < beforeSeq` (backwards pagination). `latest` requests the tail page.
     func getMissionEventsWithMeta(
         id: String,
         types: [String]? = nil,
         limit: Int? = nil,
         offset: Int? = nil,
         latest: Bool = false,
-        sinceSeq: Int64? = nil
+        sinceSeq: Int64? = nil,
+        beforeSeq: Int64? = nil
     ) async throws -> MissionEventsResult {
         var queryItems: [URLQueryItem] = []
         if let types = types {
@@ -267,6 +270,9 @@ final class APIService {
         }
         if let sinceSeq = sinceSeq {
             queryItems.append(URLQueryItem(name: "since_seq", value: String(sinceSeq)))
+        }
+        if let beforeSeq = beforeSeq {
+            queryItems.append(URLQueryItem(name: "before_seq", value: String(beforeSeq)))
         }
 
         var urlString = "/api/control/missions/\(id)/events"

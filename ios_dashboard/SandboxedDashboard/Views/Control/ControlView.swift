@@ -132,6 +132,8 @@ struct ControlView: View {
     /// from the `X-Max-Sequence` response header — backends that don't set the
     /// header leave this `nil` and callers fall back to full reload.
     @State private var missionMaxSeq: [String: Int64] = [:]
+    @State private var missionMinSeq: [String: Int64] = [:]
+    @State private var missionEventCache: [String: [StoredEvent]] = [:]
 
     // Cached grouped items (recomputed only when messages change)
     @State private var groupedItems: [GroupedChatItem] = []
@@ -1668,6 +1670,40 @@ struct ControlView: View {
         clearLoadingHistoryAfterRender()
     }
 
+    private func rememberMissionEvents(_ events: [StoredEvent], for missionId: String) -> [StoredEvent] {
+        let orderedEvents = events.sorted { lhs, rhs in
+            if lhs.sequence != rhs.sequence {
+                return lhs.sequence < rhs.sequence
+            }
+            if lhs.timestamp != rhs.timestamp {
+                return lhs.timestamp < rhs.timestamp
+            }
+            return lhs.id < rhs.id
+        }
+
+        missionEventCache[missionId] = orderedEvents
+        if let minSequence = orderedEvents.first?.sequence {
+            missionMinSeq[missionId] = minSequence
+        } else {
+            missionMinSeq.removeValue(forKey: missionId)
+        }
+        if let maxSequence = orderedEvents.last?.sequence {
+            missionMaxSeq[missionId] = max(missionMaxSeq[missionId] ?? 0, maxSequence)
+        }
+        return orderedEvents
+    }
+
+    private func mergeMissionEvents(_ incoming: [StoredEvent], for missionId: String) -> [StoredEvent] {
+        var bySequence: [Int64: StoredEvent] = [:]
+        for event in missionEventCache[missionId] ?? [] {
+            bySequence[event.sequence] = event
+        }
+        for event in incoming {
+            bySequence[event.sequence] = event
+        }
+        return rememberMissionEvents(Array(bySequence.values), for: missionId)
+    }
+
     private func applyViewingMissionWithEvents(_ mission: Mission, events: [StoredEvent], scrollToBottom: Bool = true) {
         isLoadingHistory = true  // Suppress animated auto-scroll during history load
 
@@ -1678,15 +1714,7 @@ struct ControlView: View {
             : nil
 
         // Ensure deterministic replay order in case the backend returns unsorted results
-        let orderedEvents = events.sorted { lhs, rhs in
-            if lhs.sequence != rhs.sequence {
-                return lhs.sequence < rhs.sequence
-            }
-            if lhs.timestamp != rhs.timestamp {
-                return lhs.timestamp < rhs.timestamp
-            }
-            return lhs.id < rhs.id
-        }
+        let orderedEvents = rememberMissionEvents(events, for: mission.id)
 
         // Track total event count for pagination
         loadedEventCount = orderedEvents.count
@@ -1971,18 +1999,20 @@ struct ControlView: View {
         defer { isLoadingEarlier = false }
 
         do {
-            let allEvents = try await api.getMissionEvents(
+            let olderEvents = try await api.getMissionEvents(
                 id: missionId,
                 types: historyEventTypes,
-                limit: Self.loadEarlierPageLimit
+                limit: Self.loadEarlierPageLimit,
+                beforeSeq: missionMinSeq[missionId]
             )
             guard viewingMissionId == missionId else { return }
 
-            if !allEvents.isEmpty, let mission = viewingMission {
+            if !olderEvents.isEmpty, let mission = viewingMission {
                 // Only mark history exhausted if we got fewer rows than the
                 // page cap. If the server returned a full page, more may
                 // remain — keep the button visible.
-                hasMoreHistory = allEvents.count >= Self.loadEarlierPageLimit
+                hasMoreHistory = olderEvents.count >= Self.loadEarlierPageLimit
+                let allEvents = mergeMissionEvents(olderEvents, for: missionId)
                 applyViewingMissionWithEvents(mission, events: allEvents, scrollToBottom: false)
                 cacheMissionWithEvents(mission, events: allEvents)
             }
@@ -2020,6 +2050,7 @@ struct ControlView: View {
             )
             guard viewingMissionId == id else { return .viewChanged }
             let maxSeq = result.maxSequence ?? knownSeq
+            _ = mergeMissionEvents(result.events, for: id)
             applyDeltaEvents(result.events)
             // If the page was capped by the limit, advance the cursor to the
             // largest sequence we actually saw so the next call resumes from
