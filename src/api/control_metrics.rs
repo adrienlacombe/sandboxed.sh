@@ -2,9 +2,9 @@
 //!
 //! Tracks counters used to validate the perf overhaul:
 //! - SSE chunk size p50 / p99 (sample-based)
-//! - `/api/control/events` request rate
+//! - `/api/control/events` request rate, latency, payload bytes, and summarization
 //! - `/api/control/running` request rate
-//! - Average broadcast events per active mission
+//! - Average broadcast events per active mission and broadcast lag
 //!
 //! Everything lives behind a single `Arc<ControlMetrics>` so the handler at
 //! `GET /api/control/metrics` can return a JSON snapshot. Counters are
@@ -37,9 +37,15 @@ pub struct ControlMetrics {
     sse_chunk_sizes: Mutex<RingSamples>,
 
     events_endpoint_hits: Mutex<Vec<Instant>>,
+    events_latency_ms: Mutex<RingSamples>,
+    events_payload_bytes_total: AtomicU64,
+    events_original_total: AtomicU64,
+    events_summarized_total: AtomicU64,
     running_endpoint_hits: Mutex<Vec<Instant>>,
 
     broadcast_events_total: AtomicU64,
+    broadcast_lagged_total: AtomicU64,
+    broadcast_dropped_total: AtomicU64,
     broadcast_events_by_mission: Mutex<HashMap<uuid::Uuid, u64>>,
 
     /// P5-#25 health budget reports — bounded ring of recent client
@@ -117,8 +123,14 @@ impl ControlMetrics {
             sse_bytes_total: AtomicU64::new(0),
             sse_chunk_sizes: Mutex::new(RingSamples::new()),
             events_endpoint_hits: Mutex::new(Vec::with_capacity(128)),
+            events_latency_ms: Mutex::new(RingSamples::new()),
+            events_payload_bytes_total: AtomicU64::new(0),
+            events_original_total: AtomicU64::new(0),
+            events_summarized_total: AtomicU64::new(0),
             running_endpoint_hits: Mutex::new(Vec::with_capacity(128)),
             broadcast_events_total: AtomicU64::new(0),
+            broadcast_lagged_total: AtomicU64::new(0),
+            broadcast_dropped_total: AtomicU64::new(0),
             broadcast_events_by_mission: Mutex::new(HashMap::new()),
             health_reports: Mutex::new(Vec::with_capacity(256)),
         }
@@ -153,6 +165,26 @@ impl ControlMetrics {
         }
     }
 
+    /// Record `/events` response characteristics after the handler has
+    /// materialized the read-side payload.
+    pub fn record_events_response(
+        &self,
+        latency: Duration,
+        payload_bytes: usize,
+        original_count: usize,
+        summarized_count: usize,
+    ) {
+        if let Ok(mut samples) = self.events_latency_ms.lock() {
+            samples.push(latency.as_millis().min(u128::from(u64::MAX)) as u64);
+        }
+        self.events_payload_bytes_total
+            .fetch_add(payload_bytes as u64, Ordering::Relaxed);
+        self.events_original_total
+            .fetch_add(original_count as u64, Ordering::Relaxed);
+        self.events_summarized_total
+            .fetch_add(summarized_count as u64, Ordering::Relaxed);
+    }
+
     /// Record a single `/api/control/running` request hit.
     pub fn record_running_request(&self) {
         if let Ok(mut hits) = self.running_endpoint_hits.lock() {
@@ -172,6 +204,13 @@ impl ControlMetrics {
         }
     }
 
+    /// Record broadcast receiver lag surfaced to clients as `stream_lagged`.
+    pub fn record_broadcast_lag(&self, dropped: u64) {
+        self.broadcast_lagged_total.fetch_add(1, Ordering::Relaxed);
+        self.broadcast_dropped_total
+            .fetch_add(dropped, Ordering::Relaxed);
+    }
+
     fn trim_window(&self, hits: &mut Vec<Instant>) {
         let cutoff = Instant::now()
             .checked_sub(RATE_WINDOW)
@@ -182,6 +221,11 @@ impl ControlMetrics {
     pub fn snapshot(&self) -> MetricsSnapshot {
         let (sse_p50, sse_p99, sample_count) = self
             .sse_chunk_sizes
+            .lock()
+            .map(|s| s.percentiles())
+            .unwrap_or((None, None, 0));
+        let (events_latency_p50, events_latency_p99, events_latency_sample_count) = self
+            .events_latency_ms
             .lock()
             .map(|s| s.percentiles())
             .unwrap_or((None, None, 0));
@@ -247,10 +291,18 @@ impl ControlMetrics {
             },
             endpoints: EndpointStats {
                 events_req_per_minute: events_hits as u64,
+                events_latency_p50_ms: events_latency_p50,
+                events_latency_p99_ms: events_latency_p99,
+                events_latency_sample_count,
+                events_payload_bytes_total: self.events_payload_bytes_total.load(Ordering::Relaxed),
+                events_original_total: self.events_original_total.load(Ordering::Relaxed),
+                events_summarized_total: self.events_summarized_total.load(Ordering::Relaxed),
                 running_req_per_minute: running_hits as u64,
             },
             broadcast: BroadcastStats {
                 events_total: self.broadcast_events_total.load(Ordering::Relaxed),
+                lagged_total: self.broadcast_lagged_total.load(Ordering::Relaxed),
+                dropped_total: self.broadcast_dropped_total.load(Ordering::Relaxed),
                 mission_count_observed: mission_count,
                 events_avg_per_mission,
                 top_missions,
@@ -282,12 +334,20 @@ pub struct SseStats {
 pub struct EndpointStats {
     /// Hits in the last 60 seconds.
     pub events_req_per_minute: u64,
+    pub events_latency_p50_ms: Option<u64>,
+    pub events_latency_p99_ms: Option<u64>,
+    pub events_latency_sample_count: usize,
+    pub events_payload_bytes_total: u64,
+    pub events_original_total: u64,
+    pub events_summarized_total: u64,
     pub running_req_per_minute: u64,
 }
 
 #[derive(Debug, Serialize)]
 pub struct BroadcastStats {
     pub events_total: u64,
+    pub lagged_total: u64,
+    pub dropped_total: u64,
     pub mission_count_observed: usize,
     pub events_avg_per_mission: f64,
     pub top_missions: Vec<TopMission>,
@@ -325,12 +385,29 @@ mod tests {
         m.record_broadcast(Some(a));
         m.record_broadcast(Some(b));
         m.record_broadcast(None); // status event, doesn't count toward per-mission
+        m.record_broadcast_lag(7);
         let snap = m.snapshot();
         assert_eq!(snap.broadcast.events_total, 4);
+        assert_eq!(snap.broadcast.lagged_total, 1);
+        assert_eq!(snap.broadcast.dropped_total, 7);
         assert_eq!(snap.broadcast.mission_count_observed, 2);
         assert!((snap.broadcast.events_avg_per_mission - 1.5).abs() < 1e-9);
         assert_eq!(snap.broadcast.top_missions[0].mission_id, a);
         assert_eq!(snap.broadcast.top_missions[0].count, 2);
+    }
+
+    #[test]
+    fn events_response_metrics_track_latency_payload_and_summary() {
+        let m = ControlMetrics::new();
+        m.record_events_response(Duration::from_millis(12), 4096, 100, 10);
+
+        let snap = m.snapshot();
+        assert_eq!(snap.endpoints.events_latency_p50_ms, Some(12));
+        assert_eq!(snap.endpoints.events_latency_p99_ms, Some(12));
+        assert_eq!(snap.endpoints.events_latency_sample_count, 1);
+        assert_eq!(snap.endpoints.events_payload_bytes_total, 4096);
+        assert_eq!(snap.endpoints.events_original_total, 100);
+        assert_eq!(snap.endpoints.events_summarized_total, 10);
     }
 
     #[test]

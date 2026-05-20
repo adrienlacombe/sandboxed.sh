@@ -12,6 +12,7 @@ use std::convert::Infallible;
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
 use axum::{
     body::Bytes,
@@ -4711,6 +4712,7 @@ pub async fn get_mission_events(
     axum::extract::Query(query): axum::extract::Query<GetEventsQuery>,
 ) -> Result<Response, (StatusCode, String)> {
     state.control_metrics.record_events_request();
+    let metrics_start = Instant::now();
     let control = control_for_user(&state, &user).await;
 
     // Check mission exists
@@ -4780,6 +4782,16 @@ pub async fn get_mission_events(
         .max_event_sequence(mission_id)
         .await
         .ok();
+
+    let payload_bytes = serde_json::to_vec(&summary.events)
+        .map(|bytes| bytes.len())
+        .unwrap_or(0);
+    state.control_metrics.record_events_response(
+        metrics_start.elapsed(),
+        payload_bytes,
+        summary.original_count,
+        summary.summarized_count,
+    );
 
     let mut response = Json(summary.events).into_response();
     let headers = response.headers_mut();
@@ -5795,6 +5807,7 @@ pub async fn stream(
                             }
                         }
                         Err(broadcast::error::RecvError::Lagged(dropped)) => {
+                            metrics.record_broadcast_lag(dropped);
                             tracing::warn!(stream_id = %stream_id, dropped, "Per-mission SSE lagged");
                             match Event::default()
                                 .event("stream_lagged")
@@ -5880,6 +5893,7 @@ pub async fn stream(
                             }
                         }
                         Err(broadcast::error::RecvError::Lagged(dropped)) => {
+                            metrics.record_broadcast_lag(dropped);
                             // This receiver's cursor slipped behind the
                             // broadcast buffer's tail by `dropped` events.
                             // The stream itself is still alive — `recv()`
