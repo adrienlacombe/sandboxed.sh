@@ -9636,7 +9636,19 @@ async fn ensure_codex_cli_available(
                 native_binary = ?native.as_ref().map(|p| p.display().to_string()),
                 "Codex CLI host resolution for container"
             );
-            let to_copy = native.unwrap_or(resolved);
+            let resolved_is_node_wrapper = is_codex_node_wrapper(&resolved);
+            let Some(to_copy) =
+                native.or_else(|| (!resolved_is_node_wrapper).then_some(resolved.clone()))
+            else {
+                tracing::warn!(
+                    host_path = %resolved.display(),
+                    "Skipping Codex Node wrapper copy because no native binary was found"
+                );
+                return Err(format!(
+                    "Codex CLI '{}' resolves to a host Node.js wrapper, but its native Codex binary was not found. Reinstall @openai/codex on the backend host or set CODEX_CLI_PATH to the native binary.",
+                    cli_path
+                ));
+            };
             if let Ok(dest_in_container) =
                 copy_host_executable_into_container(&workspace_exec.workspace, &to_copy)
             {
@@ -9951,12 +9963,43 @@ fn resolve_host_executable(program: &str) -> Option<std::path::PathBuf> {
         return None;
     }
 
-    let path_var = std::env::var("PATH").ok()?;
-    for dir in path_var.split(':') {
-        if dir.is_empty() {
+    let mut dirs: Vec<std::path::PathBuf> = std::env::var("PATH")
+        .ok()
+        .into_iter()
+        .flat_map(|path_var| {
+            path_var
+                .split(':')
+                .filter(|dir| !dir.is_empty())
+                .map(std::path::PathBuf::from)
+                .collect::<Vec<_>>()
+        })
+        .collect();
+
+    // systemd services often run with a narrow PATH. These are where npm/bun
+    // global installs land on the backend hosts.
+    if let Ok(home) = std::env::var("HOME") {
+        let home = std::path::PathBuf::from(home);
+        dirs.push(home.join(".bun/bin"));
+        dirs.push(home.join(".cache/.bun/bin"));
+        dirs.push(home.join(".npm-global/bin"));
+    }
+    dirs.extend(
+        [
+            "/root/.bun/bin",
+            "/root/.cache/.bun/bin",
+            "/usr/local/bin",
+            "/usr/bin",
+            "/bin",
+        ]
+        .into_iter()
+        .map(std::path::PathBuf::from),
+    );
+
+    for dir in dirs {
+        if dir.as_os_str().is_empty() {
             continue;
         }
-        let candidate = std::path::Path::new(dir).join(program);
+        let candidate = dir.join(program);
         if candidate.is_file() {
             return Some(candidate);
         }

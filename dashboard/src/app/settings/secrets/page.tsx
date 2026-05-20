@@ -365,15 +365,15 @@ export default function SecretsPage() {
   const hasSecrets = (secretsStatus?.registries ?? []).some(r => r.secret_count > 0);
 
   return (
-    <div className="flex-1 p-6 overflow-auto">
-      <div className="max-w-4xl mx-auto space-y-8">
+    <div className="flex-1 flex flex-col items-center p-6 overflow-auto">
+      <div className="w-full max-w-4xl space-y-6">
       {/* Header */}
-      <div>
-        <h1 className="text-2xl font-semibold text-white mb-2">Security</h1>
-        <p className="text-white/50">
+      <header>
+        <h1 className="text-xl font-semibold text-white">Security</h1>
+        <p className="mt-1 text-sm text-white/50">
           Authentication, encryption, and secrets management.
         </p>
-      </div>
+      </header>
 
       {loading ? (
         <div className="space-y-4">
@@ -706,22 +706,22 @@ export default function SecretsPage() {
             </p>
           </div>
         ) : (
-          <div className="flex">
-            {/* Registries sidebar */}
-            <div className="w-48 border-r border-white/[0.06] p-2">
+          <div className="flex flex-col sm:flex-row">
+            {/* Registries — sidebar on sm+, horizontal scroller on mobile */}
+            <div className="border-b sm:border-b-0 sm:border-r border-white/[0.06] p-2 sm:w-48 sm:flex-shrink-0 flex sm:flex-col gap-1 overflow-x-auto sm:overflow-x-visible">
               {secretsStatus.registries.map((registry) => (
                 <button
                   key={registry.name}
                   onClick={() => setSelectedRegistry(registry.name)}
                   className={cn(
-                    'w-full text-left p-2 rounded-lg transition-colors mb-1 text-sm',
+                    'text-left p-2 rounded-lg transition-colors text-sm flex-shrink-0 sm:flex-shrink sm:w-full',
                     selectedRegistry === registry.name
                       ? 'bg-white/[0.08] text-white'
                       : 'text-white/60 hover:bg-white/[0.04] hover:text-white'
                   )}
                 >
                   <div className="flex items-center gap-2">
-                    <Key className="h-3.5 w-3.5" />
+                    <Key className="h-3.5 w-3.5 flex-shrink-0" />
                     <span className="truncate">{registry.name}</span>
                   </div>
                   <p className="text-xs text-white/40 mt-0.5 ml-5">
@@ -732,7 +732,7 @@ export default function SecretsPage() {
             </div>
 
             {/* Secrets list */}
-            <div className="flex-1">
+            <div className="flex-1 min-w-0">
               <div className="divide-y divide-white/[0.06]">
                 {loadingSecrets ? (
                   <div className="p-8 flex items-center justify-center">

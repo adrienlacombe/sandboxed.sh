@@ -15,7 +15,7 @@ use crate::api::control::{AgentEvent, AgentTreeNode, DesktopSessionInfo, TextOp}
 use async_trait::async_trait;
 use chrono::Utc;
 use rusqlite::{params, Connection, OptionalExtension};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -101,6 +101,28 @@ const TELEGRAM_MEMORY_SEARCH_STOPWORDS: &[&str] = &[
     "with",
     "you",
 ];
+
+fn usage_cost_with_read_side_estimate(
+    model: &str,
+    stored_cost_cents: u64,
+    input_tokens: u64,
+    output_tokens: u64,
+    cache_creation_tokens: u64,
+    cache_read_tokens: u64,
+) -> u64 {
+    if stored_cost_cents > 0 {
+        return stored_cost_cents;
+    }
+    crate::cost::cost_cents_from_usage(
+        model,
+        &crate::cost::TokenUsage {
+            input_tokens,
+            output_tokens,
+            cache_creation_input_tokens: Some(cache_creation_tokens),
+            cache_read_input_tokens: Some(cache_read_tokens),
+        },
+    )
+}
 
 #[derive(serde::Serialize)]
 struct AssistantCostMetadata {
@@ -4131,14 +4153,27 @@ impl MissionStore for SqliteMissionStore {
                 let cache_creation_tokens: i64 = row.get(4)?;
                 let cache_read_tokens: i64 = row.get(5)?;
                 let cost_cents: i64 = row.get(6)?;
+                let input_tokens = input_tokens.max(0) as u64;
+                let output_tokens = output_tokens.max(0) as u64;
+                let cache_creation_tokens = cache_creation_tokens.max(0) as u64;
+                let cache_read_tokens = cache_read_tokens.max(0) as u64;
+                let stored_cost_cents = cost_cents.max(0) as u64;
+                let cost_cents = usage_cost_with_read_side_estimate(
+                    &model,
+                    stored_cost_cents,
+                    input_tokens,
+                    output_tokens,
+                    cache_creation_tokens,
+                    cache_read_tokens,
+                );
                 Ok(ModelUsageStats {
                     model,
                     requests: requests.max(0) as u64,
-                    input_tokens: input_tokens.max(0) as u64,
-                    output_tokens: output_tokens.max(0) as u64,
-                    cache_creation_tokens: cache_creation_tokens.max(0) as u64,
-                    cache_read_tokens: cache_read_tokens.max(0) as u64,
-                    cost_cents: cost_cents.max(0) as u64,
+                    input_tokens,
+                    output_tokens,
+                    cache_creation_tokens,
+                    cache_read_tokens,
+                    cost_cents,
                 })
             })
             .map_err(|e| e.to_string())?;
@@ -4170,9 +4205,15 @@ impl MissionStore for SqliteMissionStore {
         let base_query = r#"
             SELECT
                 substr(timestamp, 1, 10) AS day,
+                COALESCE(
+                    json_extract(metadata, '$.model_normalized'),
+                    json_extract(metadata, '$.model'),
+                    ''
+                ) AS model,
                 COUNT(*) AS requests,
                 COALESCE(SUM(CAST(json_extract(metadata, '$.usage.input_tokens') AS INTEGER)), 0) AS input_tokens,
                 COALESCE(SUM(CAST(json_extract(metadata, '$.usage.output_tokens') AS INTEGER)), 0) AS output_tokens,
+                COALESCE(SUM(CAST(json_extract(metadata, '$.usage.cache_creation_input_tokens') AS INTEGER)), 0) AS cache_creation_tokens,
                 COALESCE(SUM(CAST(json_extract(metadata, '$.usage.cache_read_input_tokens') AS INTEGER)), 0) AS cache_read_tokens,
                 COALESCE(SUM(
                     CASE WHEN CAST(
@@ -4195,8 +4236,10 @@ impl MissionStore for SqliteMissionStore {
         "#;
 
         let sql = match since {
-            Some(_) => format!("{base_query} AND timestamp >= ?1 GROUP BY day ORDER BY day ASC"),
-            None => format!("{base_query} GROUP BY day ORDER BY day ASC"),
+            Some(_) => {
+                format!("{base_query} AND timestamp >= ?1 GROUP BY day, model ORDER BY day ASC")
+            }
+            None => format!("{base_query} GROUP BY day, model ORDER BY day ASC"),
         };
 
         let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
@@ -4208,31 +4251,58 @@ impl MissionStore for SqliteMissionStore {
         let rows = stmt
             .query_map(params.as_slice(), |row| {
                 let day: String = row.get(0)?;
-                let requests: i64 = row.get(1)?;
-                let input_tokens: i64 = row.get(2)?;
-                let output_tokens: i64 = row.get(3)?;
-                let cache_read_tokens: i64 = row.get(4)?;
-                let cost_cents: i64 = row.get(5)?;
-                Ok(DailyUsageStats {
+                let model: String = row.get(1)?;
+                let requests: i64 = row.get(2)?;
+                let input_tokens: i64 = row.get(3)?;
+                let output_tokens: i64 = row.get(4)?;
+                let cache_creation_tokens: i64 = row.get(5)?;
+                let cache_read_tokens: i64 = row.get(6)?;
+                let cost_cents: i64 = row.get(7)?;
+                let input_tokens = input_tokens.max(0) as u64;
+                let output_tokens = output_tokens.max(0) as u64;
+                let cache_creation_tokens = cache_creation_tokens.max(0) as u64;
+                let cache_read_tokens = cache_read_tokens.max(0) as u64;
+                let cost_cents = usage_cost_with_read_side_estimate(
+                    &model,
+                    cost_cents.max(0) as u64,
+                    input_tokens,
+                    output_tokens,
+                    cache_creation_tokens,
+                    cache_read_tokens,
+                );
+                Ok((
                     day,
-                    requests: requests.max(0) as u64,
-                    input_tokens: input_tokens.max(0) as u64,
-                    output_tokens: output_tokens.max(0) as u64,
-                    cache_read_tokens: cache_read_tokens.max(0) as u64,
-                    cost_cents: cost_cents.max(0) as u64,
-                })
+                    requests.max(0) as u64,
+                    input_tokens,
+                    output_tokens,
+                    cache_read_tokens,
+                    cost_cents,
+                ))
             })
             .map_err(|e| e.to_string())?;
 
-        let mut out: Vec<DailyUsageStats> = Vec::new();
+        let mut by_day: BTreeMap<String, DailyUsageStats> = BTreeMap::new();
         for r in rows {
-            let row = r.map_err(|e| e.to_string())?;
-            if row.day.is_empty() {
+            let (day, requests, input_tokens, output_tokens, cache_read_tokens, cost_cents) =
+                r.map_err(|e| e.to_string())?;
+            if day.is_empty() {
                 continue;
             }
-            out.push(row);
+            let entry = by_day.entry(day.clone()).or_insert(DailyUsageStats {
+                day,
+                requests: 0,
+                input_tokens: 0,
+                output_tokens: 0,
+                cache_read_tokens: 0,
+                cost_cents: 0,
+            });
+            entry.requests = entry.requests.saturating_add(requests);
+            entry.input_tokens = entry.input_tokens.saturating_add(input_tokens);
+            entry.output_tokens = entry.output_tokens.saturating_add(output_tokens);
+            entry.cache_read_tokens = entry.cache_read_tokens.saturating_add(cache_read_tokens);
+            entry.cost_cents = entry.cost_cents.saturating_add(cost_cents);
         }
-        Ok(out)
+        Ok(by_day.into_values().collect())
     }
 
     async fn get_usage_by_hour(
@@ -4246,9 +4316,15 @@ impl MissionStore for SqliteMissionStore {
         let base_query = r#"
             SELECT
                 substr(timestamp, 1, 13) AS hour,
+                COALESCE(
+                    json_extract(metadata, '$.model_normalized'),
+                    json_extract(metadata, '$.model'),
+                    ''
+                ) AS model,
                 COUNT(*) AS requests,
                 COALESCE(SUM(CAST(json_extract(metadata, '$.usage.input_tokens') AS INTEGER)), 0) AS input_tokens,
                 COALESCE(SUM(CAST(json_extract(metadata, '$.usage.output_tokens') AS INTEGER)), 0) AS output_tokens,
+                COALESCE(SUM(CAST(json_extract(metadata, '$.usage.cache_creation_input_tokens') AS INTEGER)), 0) AS cache_creation_tokens,
                 COALESCE(SUM(CAST(json_extract(metadata, '$.usage.cache_read_input_tokens') AS INTEGER)), 0) AS cache_read_tokens,
                 COALESCE(SUM(
                     CASE WHEN CAST(
@@ -4270,8 +4346,10 @@ impl MissionStore for SqliteMissionStore {
             WHERE event_type = 'assistant_message'
         "#;
         let sql = match since {
-            Some(_) => format!("{base_query} AND timestamp >= ?1 GROUP BY hour ORDER BY hour ASC"),
-            None => format!("{base_query} GROUP BY hour ORDER BY hour ASC"),
+            Some(_) => {
+                format!("{base_query} AND timestamp >= ?1 GROUP BY hour, model ORDER BY hour ASC")
+            }
+            None => format!("{base_query} GROUP BY hour, model ORDER BY hour ASC"),
         };
         let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
         let since_owned = since.map(|s| s.to_string());
@@ -4282,30 +4360,57 @@ impl MissionStore for SqliteMissionStore {
         let rows = stmt
             .query_map(params.as_slice(), |row| {
                 let hour: String = row.get(0)?;
-                let requests: i64 = row.get(1)?;
-                let input_tokens: i64 = row.get(2)?;
-                let output_tokens: i64 = row.get(3)?;
-                let cache_read_tokens: i64 = row.get(4)?;
-                let cost_cents: i64 = row.get(5)?;
-                Ok(HourlyUsageStats {
+                let model: String = row.get(1)?;
+                let requests: i64 = row.get(2)?;
+                let input_tokens: i64 = row.get(3)?;
+                let output_tokens: i64 = row.get(4)?;
+                let cache_creation_tokens: i64 = row.get(5)?;
+                let cache_read_tokens: i64 = row.get(6)?;
+                let cost_cents: i64 = row.get(7)?;
+                let input_tokens = input_tokens.max(0) as u64;
+                let output_tokens = output_tokens.max(0) as u64;
+                let cache_creation_tokens = cache_creation_tokens.max(0) as u64;
+                let cache_read_tokens = cache_read_tokens.max(0) as u64;
+                let cost_cents = usage_cost_with_read_side_estimate(
+                    &model,
+                    cost_cents.max(0) as u64,
+                    input_tokens,
+                    output_tokens,
+                    cache_creation_tokens,
+                    cache_read_tokens,
+                );
+                Ok((
                     hour,
-                    requests: requests.max(0) as u64,
-                    input_tokens: input_tokens.max(0) as u64,
-                    output_tokens: output_tokens.max(0) as u64,
-                    cache_read_tokens: cache_read_tokens.max(0) as u64,
-                    cost_cents: cost_cents.max(0) as u64,
-                })
+                    requests.max(0) as u64,
+                    input_tokens,
+                    output_tokens,
+                    cache_read_tokens,
+                    cost_cents,
+                ))
             })
             .map_err(|e| e.to_string())?;
-        let mut out: Vec<HourlyUsageStats> = Vec::new();
+        let mut by_hour: BTreeMap<String, HourlyUsageStats> = BTreeMap::new();
         for r in rows {
-            let row = r.map_err(|e| e.to_string())?;
-            if row.hour.is_empty() {
+            let (hour, requests, input_tokens, output_tokens, cache_read_tokens, cost_cents) =
+                r.map_err(|e| e.to_string())?;
+            if hour.is_empty() {
                 continue;
             }
-            out.push(row);
+            let entry = by_hour.entry(hour.clone()).or_insert(HourlyUsageStats {
+                hour,
+                requests: 0,
+                input_tokens: 0,
+                output_tokens: 0,
+                cache_read_tokens: 0,
+                cost_cents: 0,
+            });
+            entry.requests = entry.requests.saturating_add(requests);
+            entry.input_tokens = entry.input_tokens.saturating_add(input_tokens);
+            entry.output_tokens = entry.output_tokens.saturating_add(output_tokens);
+            entry.cache_read_tokens = entry.cache_read_tokens.saturating_add(cache_read_tokens);
+            entry.cost_cents = entry.cost_cents.saturating_add(cost_cents);
         }
-        Ok(out)
+        Ok(by_hour.into_values().collect())
     }
 
     async fn create_automation(&self, automation: Automation) -> Result<Automation, String> {

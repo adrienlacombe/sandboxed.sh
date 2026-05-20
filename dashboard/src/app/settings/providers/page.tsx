@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useCallback, useMemo } from 'react';
+import { useState, useCallback, useEffect, useMemo } from 'react';
 import useSWR from 'swr';
 import { toast } from '@/components/toast';
 import {
@@ -361,6 +361,24 @@ export default function ProvidersPage() {
     return next;
   }, [cachedEntries]);
 
+  useEffect(() => {
+    if (!cachedEntries) return;
+    // Only seed local state for providers we haven't fetched directly yet.
+    // A direct `fetchUsage(id, true)` after re-auth (or the refresh button)
+    // must not be clobbered by a stale entry from the next bulk poll.
+    setUsageData((prev) => {
+      let changed = false;
+      const next = { ...prev };
+      for (const [id, usage] of Object.entries(cachedEntries)) {
+        if (next[id] === undefined) {
+          next[id] = usage;
+          changed = true;
+        }
+      }
+      return changed ? next : prev;
+    });
+  }, [cachedEntries]);
+
   const fetchUsage = useCallback(async (providerId: string, force = false) => {
     setUsageLoading((prev) => ({ ...prev, [providerId]: true }));
     try {
@@ -389,15 +407,16 @@ export default function ProvidersPage() {
       } else {
         setExpandedProvider(providerId);
         // Seed from the bulk cache immediately for an instant render…
-        if (!usageData[providerId] && cachedSeen[providerId]) {
+        if (cachedSeen[providerId]) {
           setUsageData((prev) => ({ ...prev, [providerId]: cachedSeen[providerId] }));
+          return;
         }
         // …then fetch via the cached endpoint (cheap, server returns cached
         // copy if fresh).
         fetchUsage(providerId);
       }
     },
-    [expandedProvider, fetchUsage, usageData, cachedSeen]
+    [expandedProvider, fetchUsage, cachedSeen]
   );
 
   const handleAuthenticate = async (provider: AIProvider) => {
@@ -407,6 +426,11 @@ export default function ProvidersPage() {
       if (result.success) {
         toast.success(result.message);
         mutateProviders();
+        // Auth succeeding does not mean the provider is healthy — a 429 or
+        // network error from the live usage check will still leave the row
+        // red. Force a fresh usage probe so the status indicator reflects
+        // reality instead of the stale cached error.
+        await fetchUsage(provider.id, true);
       } else {
         if (result.auth_url) {
           window.open(result.auth_url, '_blank');
@@ -500,34 +524,32 @@ export default function ProvidersPage() {
         providerTypes={providerTypes}
       />
 
-      <div className="w-full max-w-4xl">
-        <div className="mb-6">
+      <div className="w-full max-w-4xl space-y-6">
+        <header>
           <h1 className="text-xl font-semibold text-white">AI Providers</h1>
           <p className="mt-1 text-sm text-white/50">
             Manage API keys and authentication
           </p>
-        </div>
+        </header>
 
-        <div className="mb-6">
-          <UsageOverview window={usageWindow} onWindowChange={setUsageWindow} />
-        </div>
+        <UsageOverview window={usageWindow} onWindowChange={setUsageWindow} />
 
-        <div className="rounded-xl bg-white/[0.02] border border-white/[0.04] p-5 max-w-xl mx-auto">
-          <div className="flex items-center justify-between mb-4">
-            <div className="flex items-center gap-3">
-              <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-violet-500/10">
+        <section className="rounded-xl bg-white/[0.02] border border-white/[0.04] p-5">
+          <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
+            <div className="flex items-center gap-3 min-w-0">
+              <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-violet-500/10 flex-shrink-0">
                 <Cpu className="h-5 w-5 text-violet-400" />
               </div>
-              <div>
+              <div className="min-w-0">
                 <h2 className="text-sm font-medium text-white">Configured Providers</h2>
-                <p className="text-xs text-white/40">
-                  Configure inference providers for OpenCode, Claude Code, Gemini, and Codex
+                <p className="text-xs text-white/40 truncate">
+                  Inference providers for OpenCode, Claude Code, Gemini, and Codex
                 </p>
               </div>
             </div>
             <button
               onClick={() => setShowAddModal(true)}
-              className="flex items-center gap-1.5 rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-1.5 text-xs text-white/70 hover:bg-white/[0.04] transition-colors cursor-pointer"
+              className="flex items-center gap-1.5 rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-1.5 text-xs text-white/70 hover:bg-white/[0.04] transition-colors cursor-pointer flex-shrink-0"
             >
               <Plus className="h-3 w-3" />
               Add Provider
@@ -547,18 +569,36 @@ export default function ProvidersPage() {
                   </div>
                 </div>
                 <p className="text-sm text-white/50 mb-1">No providers configured</p>
-                <p className="text-xs text-white/30">
+                <p className="text-xs text-white/30 mb-4">
                   Add an AI provider to enable inference capabilities
                 </p>
+                <button
+                  onClick={() => setShowAddModal(true)}
+                  className="inline-flex items-center gap-1.5 rounded-lg bg-indigo-500 px-3 py-1.5 text-xs text-white hover:bg-indigo-600 transition-colors cursor-pointer"
+                >
+                  <Plus className="h-3 w-3" />
+                  Add Provider
+                </button>
               </div>
             ) : (
               providers.map((provider) => {
                 const config = getProviderConfig(provider.provider_type);
-                const statusColor = provider.status.type === 'connected'
+                const cachedUsage = usageData[provider.id] ?? cachedSeen[provider.id];
+                const usageIndicatesDisconnected =
+                  !!cachedUsage?.error ||
+                  (typeof cachedUsage?.status === 'string' &&
+                    !['connected', 'ok'].includes(cachedUsage.status));
+                const effectiveStatus = usageIndicatesDisconnected
+                  ? 'error'
+                  : provider.status.type;
+                const statusColor = effectiveStatus === 'connected'
                   ? 'bg-emerald-400'
-                  : provider.status.type === 'needs_auth'
+                  : effectiveStatus === 'needs_auth'
                   ? 'bg-amber-400'
                   : 'bg-red-400';
+                const statusTitle = usageIndicatesDisconnected
+                  ? String(cachedUsage?.error || cachedUsage?.status || 'Provider usage check failed')
+                  : provider.status.message || provider.status.type;
                 const isExpanded = expandedProvider === provider.id;
 
                 return (
@@ -691,15 +731,23 @@ export default function ProvidersPage() {
                             {provider.is_default && (
                               <Star className="h-3 w-3 text-indigo-400 fill-indigo-400" />
                             )}
-                            <span className={cn('h-1.5 w-1.5 rounded-full', statusColor)} />
+                            <span
+                              className={cn('h-1.5 w-1.5 rounded-full', statusColor)}
+                              title={statusTitle}
+                            />
                           </div>
 
-                          <div className="flex items-center gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity">
-                            {provider.status.type === 'connected' && (
+                          <div className="flex items-center gap-0.5 opacity-60 group-hover:opacity-100 transition-opacity">
+                            {(provider.status.type === 'connected' || cachedUsage) && (
                               <button
                                 onClick={() => toggleUsage(provider.id)}
-                                className="p-1.5 rounded-md text-white/30 hover:text-white/60 hover:bg-white/[0.04] transition-colors cursor-pointer"
-                                title="View usage"
+                                className={cn(
+                                  'p-1.5 rounded-md hover:bg-white/[0.04] transition-colors cursor-pointer',
+                                  usageIndicatesDisconnected
+                                    ? 'text-red-400/70 hover:text-red-300'
+                                    : 'text-white/30 hover:text-white/60'
+                                )}
+                                title={usageIndicatesDisconnected ? statusTitle : 'View usage'}
                               >
                                 {isExpanded ? (
                                   <ChevronUp className="h-3.5 w-3.5" />
@@ -708,12 +756,27 @@ export default function ProvidersPage() {
                                 )}
                               </button>
                             )}
-                            {provider.status.type === 'needs_auth' && (
+                            {(effectiveStatus === 'needs_auth' || effectiveStatus === 'error') && (
                               <button
                                 onClick={() => handleAuthenticate(provider)}
                                 disabled={authenticatingProviderId === provider.id}
-                                className="p-1.5 rounded-md text-amber-400 hover:bg-white/[0.04] transition-colors cursor-pointer disabled:opacity-50"
-                                title="Connect"
+                                className={cn(
+                                  'p-1.5 rounded-md hover:bg-white/[0.04] transition-colors cursor-pointer disabled:opacity-50',
+                                  effectiveStatus === 'needs_auth'
+                                    ? 'text-amber-400'
+                                    : 'text-red-400 hover:text-red-300'
+                                )}
+                                title={
+                                  effectiveStatus === 'needs_auth'
+                                    ? 'Connect'
+                                    : `Reconnect (${
+                                        provider.has_oauth
+                                          ? 'OAuth'
+                                          : provider.has_api_key
+                                          ? 'API key'
+                                          : 'auth'
+                                      })`
+                                }
                               >
                                 {authenticatingProviderId === provider.id ? (
                                   <Loader className="h-3.5 w-3.5 animate-spin" />
@@ -763,7 +826,7 @@ export default function ProvidersPage() {
                               </button>
                             </div>
                             <UsageDetails
-                              usage={usageData[provider.id] ?? null}
+                              usage={usageData[provider.id] ?? cachedSeen[provider.id] ?? null}
                               loading={usageLoading[provider.id] ?? false}
                             />
                           </div>
@@ -775,7 +838,7 @@ export default function ProvidersPage() {
               })
             )}
           </div>
-        </div>
+        </section>
       </div>
     </div>
   );

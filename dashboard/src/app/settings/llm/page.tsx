@@ -134,14 +134,14 @@ export default function LLMSettingsPage() {
 
   return (
     <div className="flex-1 flex flex-col items-center p-6 overflow-auto">
-      <div className="w-full max-w-xl">
-        <div className="mb-8">
+      <div className="w-full max-w-xl space-y-6">
+        <header>
           <h1 className="text-xl font-semibold text-white">LLM</h1>
           <p className="mt-1 text-sm text-white/50">
             Configure a fast LLM provider for dashboard features like
             auto-generated mission titles
           </p>
-        </div>
+        </header>
 
         <div className="space-y-5">
           {/* Enable toggle */}

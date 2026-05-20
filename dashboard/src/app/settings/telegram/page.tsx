@@ -348,10 +348,19 @@ export default function TelegramSettingsPage() {
     setCreateConfigProfile('');
   };
 
-  const getMissionTitle = (missionId: string) => {
-    const m = missions.find((m: Mission) => m.id === missionId);
-    return m?.title || missionId.slice(0, 8) + '...';
-  };
+  // Index missions by ID once per render so per-chat lookups stay O(1).
+  const missionsById = useMemo(() => {
+    const map = new Map<string, Mission>();
+    for (const m of missions) map.set(m.id, m);
+    return map;
+  }, [missions]);
+  const getMissionTitle = useCallback(
+    (missionId: string) => {
+      const m = missionsById.get(missionId);
+      return m?.title || missionId.slice(0, 8) + '...';
+    },
+    [missionsById]
+  );
 
   // ESC to close dialogs
   useEffect(() => {
@@ -366,24 +375,24 @@ export default function TelegramSettingsPage() {
   }, [showCreateDialog, editingBot]);
 
   return (
-    <div className="flex-1 p-6 overflow-auto">
-      <div className="max-w-4xl mx-auto space-y-8">
+    <div className="flex-1 flex flex-col items-center p-6 overflow-auto">
+      <div className="w-full max-w-4xl space-y-6">
         {/* Header */}
-        <div className="flex items-center justify-between">
-          <div>
-            <h1 className="text-2xl font-semibold text-white mb-2">Telegram Bots</h1>
-            <p className="text-white/50">
+        <header className="flex flex-wrap items-center justify-between gap-3">
+          <div className="min-w-0">
+            <h1 className="text-xl font-semibold text-white">Telegram Bots</h1>
+            <p className="mt-1 text-sm text-white/50">
               Configure Telegram bots that auto-create missions for each conversation.
             </p>
           </div>
           <button
             onClick={() => setShowCreateDialog(true)}
-            className="flex items-center gap-2 px-4 py-2 text-sm font-medium text-white bg-indigo-500 hover:bg-indigo-600 rounded-lg transition-colors"
+            className="flex items-center gap-2 px-3 py-1.5 text-xs font-medium text-white bg-indigo-500 hover:bg-indigo-600 rounded-lg transition-colors flex-shrink-0"
           >
-            <Plus className="h-4 w-4" />
+            <Plus className="h-3.5 w-3.5" />
             Add Bot
           </button>
-        </div>
+        </header>
 
         {/* Bot list */}
         {bots.length === 0 ? (
@@ -427,7 +436,7 @@ export default function TelegramSettingsPage() {
 
                   {/* Info */}
                   <div className="flex-1 min-w-0">
-                    <div className="flex items-center gap-2">
+                    <div className="flex flex-wrap items-center gap-2">
                       <span className="text-sm font-medium text-white">
                         @{bot.bot_username || 'unknown'}
                       </span>
@@ -450,7 +459,7 @@ export default function TelegramSettingsPage() {
                         </span>
                       )}
                     </div>
-                    <div className="flex items-center gap-3 mt-0.5">
+                    <div className="flex flex-wrap items-center gap-x-3 gap-y-1 mt-0.5">
                       <p className="text-xs text-white/40">
                         {BACKEND_LABELS[bot.default_backend || 'claudecode'] || bot.default_backend || 'Claude Code'}
                       </p>
@@ -527,10 +536,10 @@ export default function TelegramSettingsPage() {
                 {expandedBots.has(bot.id) && (
                   <div className="px-4 pb-4 space-y-3 border-t border-white/[0.04]">
                     {/* Bot details */}
-                    <div className="grid grid-cols-2 gap-4 pt-3">
-                      <div>
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 pt-3">
+                      <div className="min-w-0">
                         <p className="text-[10px] text-white/30 mb-1">Bot ID</p>
-                        <p className="text-xs text-white/60 font-mono">{bot.id}</p>
+                        <p className="text-xs text-white/60 font-mono truncate" title={bot.id}>{bot.id}</p>
                       </div>
                       <div>
                         <p className="text-[10px] text-white/30 mb-1">Backend</p>

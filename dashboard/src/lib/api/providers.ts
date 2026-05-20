@@ -153,7 +153,12 @@ export interface BackendModelOptionsResponse {
 // ---------------------------------------------------------------------------
 
 export async function listAIProviders(): Promise<AIProvider[]> {
-  return apiGet("/api/ai/providers", "Failed to list AI providers");
+  const data = await apiGet<AIProvider[] | { providers?: AIProvider[] }>(
+    "/api/ai/providers",
+    "Failed to list AI providers"
+  );
+  if (Array.isArray(data)) return data;
+  return Array.isArray(data.providers) ? data.providers : [];
 }
 
 export async function listAIProviderTypes(): Promise<AIProviderTypeInfo[]> {

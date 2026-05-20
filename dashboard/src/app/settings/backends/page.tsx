@@ -12,7 +12,7 @@ import {
   updateSettings,
   BackendProviderResponse,
 } from '@/lib/api';
-import { Server, Save, Loader, Check } from 'lucide-react';
+import { Server, Save, Loader, Check, Gauge } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { getRuntimeApiBase, writeSavedSettings } from '@/lib/settings';
 import { ServerConnectionCard } from '@/components/server-connection-card';
@@ -269,60 +269,57 @@ export default function BackendsPage() {
 
   return (
     <div className="flex-1 flex flex-col items-center p-6 overflow-auto">
-      <div className="w-full max-w-6xl space-y-6">
+      <div className="w-full max-w-4xl space-y-6">
         {/* Header */}
-        <div className="mb-8">
+        <header>
           <h1 className="text-xl font-semibold text-white">Backends</h1>
           <p className="mt-1 text-sm text-white/50">
-            Configure AI coding agent harnesses
+            Configure harnesses, installs, and runtime limits
           </p>
-        </div>
+        </header>
 
-        <div className="grid gap-6 xl:grid-cols-[minmax(0,1.35fr)_minmax(360px,0.85fr)]">
-          <div className="space-y-4">
-            {/* Server Connection */}
-            <ServerConnectionCard
-              apiUrl={apiUrl}
-              setApiUrl={setApiUrl}
-              urlError={urlError}
-              validateUrl={validateUrl}
-              health={health ?? null}
-              healthLoading={healthLoading}
-              testingConnection={testingConnection}
-              testApiConnection={testApiConnection}
-            />
+        {/* Server Connection */}
+        <ServerConnectionCard
+          apiUrl={apiUrl}
+          setApiUrl={setApiUrl}
+          urlError={urlError}
+          validateUrl={validateUrl}
+          health={health ?? null}
+          healthLoading={healthLoading}
+          testingConnection={testingConnection}
+          testApiConnection={testApiConnection}
+        />
 
-            {/* Save URL button */}
-            {hasUnsavedUrlChanges && (
-              <div className="flex items-center justify-end gap-3">
-                <span className="text-xs text-amber-400">Unsaved changes</span>
-                <button
-                  onClick={handleSaveUrl}
-                  disabled={!!urlError}
-                  className="flex items-center gap-2 rounded-lg bg-indigo-500 px-3 py-1.5 text-xs font-medium text-white hover:bg-indigo-600 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-                >
-                  <Save className="h-3.5 w-3.5" />
-                  Save URL
-                </button>
-              </div>
-            )}
+        {/* Save URL button */}
+        {hasUnsavedUrlChanges && (
+          <div className="flex items-center justify-end gap-3 -mt-3">
+            <span className="text-xs text-amber-400">Unsaved changes</span>
+            <button
+              onClick={handleSaveUrl}
+              disabled={!!urlError}
+              className="flex items-center gap-2 rounded-lg bg-indigo-500 px-3 py-1.5 text-xs font-medium text-white hover:bg-indigo-600 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              <Save className="h-3.5 w-3.5" />
+              Save URL
+            </button>
           </div>
+        )}
 
-          {/* Backends */}
-          <div className="rounded-xl bg-white/[0.02] border border-white/[0.04] p-5">
+        {/* Concurrency Limits */}
+        <section className="rounded-xl bg-white/[0.02] border border-white/[0.04] p-5">
           <div className="flex items-center gap-3 mb-4">
-            <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-emerald-500/10">
-              <Server className="h-5 w-5 text-emerald-400" />
+            <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-amber-500/10 flex-shrink-0">
+              <Gauge className="h-5 w-5 text-amber-400" />
             </div>
-            <div>
-              <h2 className="text-sm font-medium text-white">Backend Settings</h2>
-              <p className="text-xs text-white/40">
-                Configure execution backends and authentication
+            <div className="min-w-0">
+              <h2 className="text-sm font-medium text-white">Concurrency Limits</h2>
+              <p className="text-xs text-white/40 truncate">
+                Global execution caps applied across all missions and tasks
               </p>
             </div>
           </div>
 
-          <div className="mb-4 grid gap-3 sm:grid-cols-2">
+          <div className="grid gap-3 sm:grid-cols-2">
             <div className="rounded-lg border border-white/[0.06] bg-white/[0.02] p-3">
               <label className="block text-xs text-white/60 mb-1.5">
                 Max Parallel Missions
@@ -339,7 +336,7 @@ export default function BackendsPage() {
                 <button
                   onClick={handleSaveMissionLimit}
                   disabled={savingMissionLimit}
-                  className="flex h-9 w-9 items-center justify-center rounded-lg bg-indigo-500 text-white hover:bg-indigo-600 transition-colors disabled:opacity-50"
+                  className="flex h-9 w-9 flex-shrink-0 items-center justify-center rounded-lg bg-indigo-500 text-white hover:bg-indigo-600 transition-colors disabled:opacity-50"
                   title="Save mission limit"
                 >
                   {savingMissionLimit ? (
@@ -370,7 +367,7 @@ export default function BackendsPage() {
                 <button
                   onClick={handleSaveTaskLimit}
                   disabled={savingTaskLimit}
-                  className="flex h-9 w-9 items-center justify-center rounded-lg bg-indigo-500 text-white hover:bg-indigo-600 transition-colors disabled:opacity-50"
+                  className="flex h-9 w-9 flex-shrink-0 items-center justify-center rounded-lg bg-indigo-500 text-white hover:bg-indigo-600 transition-colors disabled:opacity-50"
                   title="Save task limit"
                 >
                   {savingTaskLimit ? (
@@ -385,8 +382,23 @@ export default function BackendsPage() {
               </p>
             </div>
           </div>
+        </section>
 
-          <div className="flex items-center gap-2 mb-4">
+        {/* Backends */}
+        <section className="rounded-xl bg-white/[0.02] border border-white/[0.04] p-5">
+          <div className="flex items-center gap-3 mb-4">
+            <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-emerald-500/10 flex-shrink-0">
+              <Server className="h-5 w-5 text-emerald-400" />
+            </div>
+            <div className="min-w-0">
+              <h2 className="text-sm font-medium text-white">Harness Settings</h2>
+              <p className="text-xs text-white/40 truncate">
+                Per-harness defaults and authentication
+              </p>
+            </div>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2 mb-4">
             {backends.map((backend) => (
               <button
                 key={backend.id}
@@ -597,8 +609,7 @@ export default function BackendsPage() {
               </div>
             </div>
           ) : null}
-          </div>
-        </div>
+        </section>
       </div>
     </div>
   );

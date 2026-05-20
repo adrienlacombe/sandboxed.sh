@@ -781,6 +781,9 @@ export function UsageOverview({ window, onWindowChange }: UsageOverviewProps) {
   );
 
   const totals = data?.totals;
+  const byModel = data?.by_model ?? [];
+  const byDay = data?.by_day ?? [];
+  const byHour = data?.by_hour ?? [];
   const cacheHitRate = useMemo(() => {
     if (!totals) return 0;
     const denom = totals.input_tokens + totals.cache_read_tokens + totals.cache_creation_tokens;
@@ -788,7 +791,7 @@ export function UsageOverview({ window, onWindowChange }: UsageOverviewProps) {
     return (totals.cache_read_tokens / denom) * 100;
   }, [totals]);
 
-  const hasData = !!data && (data.by_model.length > 0 || (totals?.requests ?? 0) > 0);
+  const hasData = !!data && (byModel.length > 0 || (totals?.requests ?? 0) > 0);
 
   return (
     <div className="space-y-3" data-testid="usage-overview">
@@ -877,18 +880,18 @@ export function UsageOverview({ window, onWindowChange }: UsageOverviewProps) {
           <div className="grid gap-3 md:grid-cols-3 md:items-stretch">
             <div className="md:col-span-2">
               <CostAreaChart
-                byDay={data.by_day}
-                byHour={data.by_hour ?? []}
+                byDay={byDay}
+                byHour={byHour}
                 windowKey={window}
               />
             </div>
             <div className="md:col-span-1">
-              <ProviderDistribution models={data.by_model} />
+              <ProviderDistribution models={byModel} />
             </div>
           </div>
 
           {/* Model table */}
-          <ModelTable models={data.by_model} totalRequests={totals!.requests} />
+          <ModelTable models={byModel} totalRequests={totals!.requests} />
         </>
       )}
     </div>

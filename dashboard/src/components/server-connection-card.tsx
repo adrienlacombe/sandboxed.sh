@@ -95,7 +95,7 @@ export function ServerConnectionCard({
   testingConnection,
   testApiConnection,
 }: ServerConnectionCardProps) {
-  const [componentsExpanded, setComponentsExpanded] = useState(true);
+  const [componentsExpanded, setComponentsExpanded] = useState(false);
   const [activeOps, setActiveOps] = useState<ActiveOps>({});
   const [updateLogsByOp, setUpdateLogsByOp] = useState<Record<OpKey, UpdateLog[]>>({});
   const [expandedRows, setExpandedRows] = useState<Record<string, boolean>>({});
@@ -294,13 +294,9 @@ export function ServerConnectionCard({
     return key ? updateLogsByOp[key] ?? [] : [];
   };
 
-  // Default rows to expanded when the component has any drift, so the user
-  // immediately sees the problem the page is meant to expose.
-  const rowExpanded = (component: ComponentInfo, report?: ComponentWorkspaceReport) => {
+  const rowExpanded = (component: ComponentInfo) => {
     if (component.name in expandedRows) return expandedRows[component.name];
-    if (!report) return false;
-    const hasDrift = installedWorkspaces(report).some((w) => !w.in_sync);
-    return hasDrift;
+    return false;
   };
 
   const toggleRow = (name: string, current: boolean) =>
@@ -314,8 +310,8 @@ export function ServerConnectionCard({
           <Server className="h-5 w-5 text-indigo-400" />
         </div>
         <div>
-          <h2 className="text-sm font-medium text-white">Server Connection</h2>
-          <p className="text-xs text-white/40">Backend endpoint & system components</p>
+          <h2 className="text-sm font-medium text-white">Backend Operations</h2>
+          <p className="text-xs text-white/40">Endpoint, installed harnesses, and workspace sync</p>
         </div>
       </div>
 
@@ -374,7 +370,7 @@ export function ServerConnectionCard({
       <div>
         <div className="flex items-center justify-between mb-3">
           <div className="flex items-center gap-2">
-            <span className="text-xs font-medium text-white/60">System Components</span>
+            <span className="text-xs font-medium text-white/60">Harness Components</span>
             <span className="text-xs text-white/30">
               {components.length > 0
                 ? (() => {
@@ -417,7 +413,7 @@ export function ServerConnectionCard({
                 const summary = componentSyncSummary(component, report);
                     const visibleWorkspaces = installedWorkspaces(report);
                     const outOfSync = syncableWorkspaces(report);
-                    const isExpanded = rowExpanded(component, report);
+                    const isExpanded = rowExpanded(component);
                     const hostOpInFlight = isOpInProgress(component.name);
                     const componentLogs = logsForComponent(component.name);
                     const displayVersion =

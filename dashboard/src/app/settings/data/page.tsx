@@ -191,22 +191,23 @@ export default function DataSettingsPage() {
 
   return (
     <div className="flex-1 flex flex-col items-center p-6 overflow-auto">
-      <div className="w-full max-w-xl">
-        <div className="mb-8">
+      <div className="w-full max-w-4xl space-y-6">
+        <header>
           <h1 className="text-xl font-semibold text-white">Data</h1>
           <p className="mt-1 text-sm text-white/50">
             Library settings and backup management
           </p>
-        </div>
+        </header>
 
         <div className="space-y-5">
+          <div className="grid gap-5 md:grid-cols-2">
           {/* Library Settings */}
-          <div className="rounded-xl bg-white/[0.02] border border-white/[0.04] p-5">
+          <div className="rounded-xl bg-white/[0.02] border border-white/[0.04] p-5 flex flex-col">
             <div className="flex items-center gap-3 mb-4">
-              <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-indigo-500/10">
+              <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-indigo-500/10 flex-shrink-0">
                 <GitBranch className="h-5 w-5 text-indigo-400" />
               </div>
-              <div>
+              <div className="min-w-0">
                 <h2 className="text-sm font-medium text-white">Library</h2>
                 <p className="text-xs text-white/40">
                   Git-based configuration library for skills, tools, and agents
@@ -281,12 +282,12 @@ export default function DataSettingsPage() {
           </div>
 
           {/* sandboxed.sh Source */}
-          <div className="rounded-xl bg-white/[0.02] border border-white/[0.04] p-5">
+          <div className="rounded-xl bg-white/[0.02] border border-white/[0.04] p-5 flex flex-col">
             <div className="flex items-center gap-3 mb-4">
-              <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-emerald-500/10">
+              <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-emerald-500/10 flex-shrink-0">
                 <Archive className="h-5 w-5 text-emerald-400" />
               </div>
-              <div>
+              <div className="min-w-0">
                 <h2 className="text-sm font-medium text-white">sandboxed.sh Source</h2>
                 <p className="text-xs text-white/40">
                   Path to the sandboxed.sh git checkout used for updates
@@ -354,10 +355,11 @@ export default function DataSettingsPage() {
                   {serverSettings?.sandboxed_repo_path || 'Using default path'}
                 </div>
               )}
-              <p className="mt-2 text-xs text-white/40">
+              <p className="mt-1.5 text-xs text-white/30">
                 Leave blank to use the server default or <span className="font-mono">SANDBOXED_SH_REPO_PATH</span>.
               </p>
             </div>
+          </div>
           </div>
 
           {/* RTK Settings */}
@@ -374,8 +376,8 @@ export default function DataSettingsPage() {
               </div>
             </div>
 
-            <div className="flex items-center justify-between">
-              <div>
+            <div className="flex items-start justify-between gap-4">
+              <div className="min-w-0">
                 <p className="text-sm text-white/70">
                   {serverSettings?.rtk_enabled
                     ? 'RTK compression is enabled for terminal commands'
@@ -386,29 +388,31 @@ export default function DataSettingsPage() {
                   before returning to the LLM, reducing token consumption.
                 </p>
               </div>
-              <button
-                type="button"
-                aria-label="Toggle RTK compression"
-                aria-pressed={Boolean(serverSettings?.rtk_enabled)}
-                onClick={() => handleToggleRtk(!Boolean(serverSettings?.rtk_enabled))}
-                disabled={togglingRtk || settingsLoading}
-                className={cn(
-                  'relative inline-flex h-6 w-11 items-center rounded-full transition-colors',
-                  serverSettings?.rtk_enabled
-                    ? 'bg-violet-500'
-                    : 'bg-white/10'
-                )}
-              >
-                <span
-                  className={cn(
-                    'inline-block h-4 w-4 rounded-full bg-white transition-transform',
-                    serverSettings?.rtk_enabled ? 'translate-x-6' : 'translate-x-1'
-                  )}
-                />
+              <div className="flex items-center gap-2 flex-shrink-0">
                 {togglingRtk && (
-                  <Loader className="absolute left-1/2 top-1/2 h-3 w-3 -translate-x-1/2 -translate-y-1/2 animate-spin text-white" />
+                  <Loader className="h-3.5 w-3.5 animate-spin text-white/40" />
                 )}
-              </button>
+                <button
+                  type="button"
+                  aria-label="Toggle RTK compression"
+                  aria-pressed={Boolean(serverSettings?.rtk_enabled)}
+                  onClick={() => handleToggleRtk(!Boolean(serverSettings?.rtk_enabled))}
+                  disabled={togglingRtk || settingsLoading}
+                  className={cn(
+                    'relative inline-flex h-6 w-11 items-center rounded-full transition-colors disabled:opacity-60 disabled:cursor-not-allowed',
+                    serverSettings?.rtk_enabled
+                      ? 'bg-violet-500'
+                      : 'bg-white/10'
+                  )}
+                >
+                  <span
+                    className={cn(
+                      'inline-block h-4 w-4 rounded-full bg-white transition-transform',
+                      serverSettings?.rtk_enabled ? 'translate-x-6' : 'translate-x-1'
+                    )}
+                  />
+                </button>
+              </div>
             </div>
           </div>
 
@@ -433,7 +437,7 @@ export default function DataSettingsPage() {
                 library encryption key.
               </p>
 
-              <div className="flex items-center gap-3">
+              <div className="flex flex-wrap items-center gap-3">
                 <button
                   onClick={handleDownloadBackup}
                   disabled={downloadingBackup}
