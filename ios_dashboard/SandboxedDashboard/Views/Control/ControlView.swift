@@ -8,6 +8,12 @@
 import SwiftUI
 import os
 
+private enum ScrollAnchorState {
+    case pinned
+    case detached
+    case programmatic
+}
+
 /// Snapshot of the active codex goal-mode loop, surfaced as a pill above
 /// the composer. Status mirrors codex's `thread/goal/updated` payload:
 /// `active`, `paused`, `budgetLimited`, `complete`, or `cleared`.
@@ -92,6 +98,7 @@ struct ControlView: View {
     @State private var scrollToBottomTick = 0
     @State private var progress: ExecutionProgress?
     @State private var isAtBottom = true
+    @State private var scrollAnchorState: ScrollAnchorState = .pinned
 
     /// Goal-mode pill state. Tracks the latest `iteration`, `status`, and
     /// `objective` for codex `/goal` continuation missions. `nil` when no
@@ -844,8 +851,11 @@ struct ControlView: View {
             .defaultScrollAnchor(.bottom)
             .coordinateSpace(name: "scroll")
             .onPreferenceChange(ScrollOffsetPreferenceKey.self) { maxY in
-                // Check if we're at the bottom (within 200 points for less flicker)
-                isAtBottom = maxY < UIScreen.main.bounds.height + 200
+                let pinned = maxY < UIScreen.main.bounds.height + 200
+                if scrollAnchorState != .programmatic {
+                    scrollAnchorState = pinned ? .pinned : .detached
+                }
+                isAtBottom = scrollAnchorState == .pinned
             }
             .onTapGesture {
                 // Dismiss keyboard when tapping on messages area
@@ -855,9 +865,9 @@ struct ControlView: View {
                 if let pendingFocusedMessageId {
                     scheduleMessageFocusRetry(proxy: proxy, targetId: pendingFocusedMessageId)
                 }
-                // Only auto-scroll on message count change if we're at bottom AND not loading historical messages
+                // Only auto-scroll while explicitly pinned and not loading historical messages.
                 // This prevents the jarring animated scroll when loading cached/historical conversations
-                if isAtBottom && !isLoadingHistory {
+                if scrollAnchorState == .pinned && !isLoadingHistory {
                     scrollToBottom(proxy: proxy)
                 }
             }
@@ -882,12 +892,9 @@ struct ControlView: View {
             }
             .overlay(alignment: .bottom) {
                 // Scroll to bottom button
-                if !isAtBottom && !messages.isEmpty {
+                if scrollAnchorState == .detached && !messages.isEmpty {
                     Button {
-                        withAnimation(.spring(duration: 0.3)) {
-                            proxy.scrollTo(bottomAnchorId, anchor: .bottom)
-                        }
-                        isAtBottom = true
+                        scrollToBottom(proxy: proxy)
                     } label: {
                         Image(systemName: "arrow.down")
                             .font(.system(size: 14, weight: .semibold))
@@ -1003,6 +1010,7 @@ struct ControlView: View {
     }
     
     private func scrollToBottom(proxy: ScrollViewProxy, immediate: Bool = false) {
+        scrollAnchorState = .programmatic
         if immediate {
             // Immediate scroll without animation for loading historical conversations
             proxy.scrollTo(bottomAnchorId, anchor: .bottom)
@@ -1011,6 +1019,11 @@ struct ControlView: View {
             withAnimation {
                 proxy.scrollTo(bottomAnchorId, anchor: .bottom)
             }
+        }
+        Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(immediate ? 16 : 300))
+            scrollAnchorState = .pinned
+            isAtBottom = true
         }
     }
     

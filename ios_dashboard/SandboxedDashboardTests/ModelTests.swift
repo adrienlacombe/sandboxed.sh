@@ -134,6 +134,11 @@ final class ModelTests: XCTestCase {
         XCTAssertTrue(source.contains("thought-latest"))
         XCTAssertTrue(source.contains("thoughts-bottom"))
         XCTAssertTrue(source.contains(".defaultScrollAnchor(.bottom)"))
+        XCTAssertTrue(source.contains("ScrollAnchorState"))
+        XCTAssertTrue(source.contains("case pinned"))
+        XCTAssertTrue(source.contains("case detached"))
+        XCTAssertTrue(source.contains("case programmatic"))
+        XCTAssertTrue(source.contains("scrollAnchorState == .pinned"))
     }
 
     func testControlViewKeepsReconnectAndStreamingGates() throws {
