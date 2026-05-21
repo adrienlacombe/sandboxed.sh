@@ -5672,7 +5672,7 @@ impl MissionStore for SqliteMissionStore {
             let conn = conn.blocking_lock();
             conn.execute(
                 "UPDATE telegram_alerts
-                 SET status = 'failed', last_error = ?2
+                 SET status = 'pending', last_error = ?2
                  WHERE id = ?1",
                 params![id.to_string(), error],
             )
@@ -8278,7 +8278,20 @@ mod tests {
             .expect("pending alerts");
         assert_eq!(pending.len(), 1);
         store
-            .mark_telegram_alert_sent(pending[0].id, Some(99), "2026-05-20T10:01:00Z")
+            .mark_telegram_alert_failed(pending[0].id, "temporary Telegram outage")
+            .await
+            .expect("record failed attempt");
+        let retryable = store
+            .list_pending_telegram_alerts(1_139_694_048, 10)
+            .await
+            .expect("retryable alerts");
+        assert_eq!(retryable.len(), 1);
+        assert_eq!(
+            retryable[0].last_error.as_deref(),
+            Some("temporary Telegram outage")
+        );
+        store
+            .mark_telegram_alert_sent(retryable[0].id, Some(99), "2026-05-20T10:01:00Z")
             .await
             .expect("mark sent");
         assert!(store

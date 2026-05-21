@@ -1584,7 +1584,7 @@ pub trait MissionStore: Send + Sync {
         Err("Not supported".to_string())
     }
 
-    /// Mark an alert as failed.
+    /// Record a delivery failure without removing the alert from the retry queue.
     async fn mark_telegram_alert_failed(&self, id: Uuid, error: &str) -> Result<(), String> {
         let _ = (id, error);
         Err("Not supported".to_string())

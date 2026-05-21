@@ -688,8 +688,21 @@ fn paloma_alert_importance_for_mission(
     }
 }
 
-fn paloma_alert_event_kind(mission: &Mission, base_kind: &str) -> String {
-    let updated = mission.updated_at.as_str();
+fn paloma_alert_event_kind(mission: &Mission, base_kind: &str, events: &[StoredEvent]) -> String {
+    let status = mission.status.to_string();
+    let updated = events
+        .iter()
+        .rev()
+        .find(|event| {
+            event.event_type == "mission_status_changed"
+                && event
+                    .metadata
+                    .get("status")
+                    .and_then(|value| value.as_str())
+                    == Some(status.as_str())
+        })
+        .map(|event| event.timestamp.as_str())
+        .unwrap_or(mission.updated_at.as_str());
     format!("{base_kind}:{}", updated.replace([':', '.', '+'], "-"))
 }
 
@@ -853,7 +866,7 @@ async fn plan_and_deliver_paloma_alerts(ctx: &ChannelContext, http: &Client) {
                 id: Uuid::new_v4(),
                 telegram_user_id: owner_id,
                 mission_id: Some(mission.id),
-                event_kind: paloma_alert_event_kind(&mission, base_kind),
+                event_kind: paloma_alert_event_kind(&mission, base_kind, &events),
                 importance: paloma_alert_importance_for_mission(&mission, interest).to_string(),
                 title,
                 body,
@@ -5219,9 +5232,23 @@ mod tests {
     #[test]
     fn paloma_alert_event_kind_is_state_specific_and_subscription_can_raise_importance() {
         let mission = test_mission("Checkout fix", MissionStatus::Completed);
+        let events = vec![StoredEvent {
+            id: 1,
+            mission_id: mission.id,
+            sequence: 1,
+            event_type: "mission_status_changed".to_string(),
+            timestamp: "2026-05-20T00:00:00Z".to_string(),
+            event_id: None,
+            tool_call_id: None,
+            tool_name: None,
+            content: String::new(),
+            metadata: serde_json::json!({ "status": "completed" }),
+        }];
 
-        assert!(paloma_alert_event_kind(&mission, "mission_completed")
-            .starts_with("mission_completed:2026-05-20T00-00-00Z"));
+        assert!(
+            paloma_alert_event_kind(&mission, "mission_completed", &events)
+                .starts_with("mission_completed:2026-05-20T00-00-00Z")
+        );
         assert_eq!(
             paloma_alert_importance_for_mission(&mission, TelegramMissionInterestLevel::Normal),
             "low"
@@ -5229,6 +5256,43 @@ mod tests {
         assert_eq!(
             paloma_alert_importance_for_mission(&mission, TelegramMissionInterestLevel::High),
             "high"
+        );
+    }
+
+    #[test]
+    fn paloma_alert_event_kind_ignores_non_status_mission_updates() {
+        let mut mission = test_mission("Checkout fix", MissionStatus::AwaitingUser);
+        mission.updated_at = "2026-05-20T00:20:00Z".to_string();
+        let events = vec![
+            StoredEvent {
+                id: 1,
+                mission_id: mission.id,
+                sequence: 1,
+                event_type: "mission_status_changed".to_string(),
+                timestamp: "2026-05-20T00:05:00Z".to_string(),
+                event_id: None,
+                tool_call_id: None,
+                tool_name: None,
+                content: String::new(),
+                metadata: serde_json::json!({ "status": "awaiting_user" }),
+            },
+            StoredEvent {
+                id: 2,
+                mission_id: mission.id,
+                sequence: 2,
+                event_type: "assistant_message".to_string(),
+                timestamp: "2026-05-20T00:15:00Z".to_string(),
+                event_id: None,
+                tool_call_id: None,
+                tool_name: None,
+                content: "Still waiting for approval.".to_string(),
+                metadata: serde_json::json!({}),
+            },
+        ];
+
+        assert_eq!(
+            paloma_alert_event_kind(&mission, "mission_awaiting_user", &events),
+            "mission_awaiting_user:2026-05-20T00-05-00Z"
         );
     }
 
