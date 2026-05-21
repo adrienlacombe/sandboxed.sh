@@ -770,7 +770,11 @@ struct ControlView: View {
             // the most recent message naturally with no animation, no race.
             if messages.isEmpty {
                 if isLoading {
-                    LoadingView(message: "Loading conversation...")
+                    // Skeleton bubbles instead of a bare spinner: gives the
+                    // user something shaped like the result while the
+                    // snapshot round-trip is in flight, so the cold-open
+                    // path doesn't feel like a hang.
+                    ShimmerConversation()
                 } else if viewingMissionIsRunning {
                     agentWorkingIndicator
                 } else {
@@ -780,6 +784,18 @@ struct ControlView: View {
                 conversationScrollView
             }
         }
+    }
+
+    /// Workspace + mission ids that inline rich-tag images need to fetch
+    /// from `/api/fs/download`. Threaded down via SwiftUI environment so
+    /// every MarkdownView in the scroll picks it up without an extra
+    /// parameter at the call site.
+    private var inlineImageContext: MissionFileContext {
+        let mission = viewingMission ?? currentMission
+        return MissionFileContext(
+            workspaceId: mission?.workspaceId,
+            missionId: mission?.id
+        )
     }
 
     private var conversationScrollView: some View {
@@ -914,9 +930,10 @@ struct ControlView: View {
                     .transition(.scale.combined(with: .opacity))
                 }
             }
+            .environment(\.missionFileContext, inlineImageContext)
         }
     }
-    
+
     private var hasActiveStreamingItem: Bool {
         // Thinking messages don't render in the main content pane any more
         // (they live exclusively in the thoughts sheet), so a live thinking
@@ -3806,13 +3823,11 @@ private struct SharedFileCardView: View {
 
     private var imageCard: some View {
         VStack(alignment: .leading, spacing: 0) {
-            // Image preview with authentication support
+            // Image preview with authentication support. The shimmer
+            // skeleton matches the inline rich-image placeholder so the
+            // chat feels consistent while either type loads.
             Group {
-                if isLoadingImage {
-                    ProgressView()
-                        .frame(maxWidth: .infinity, minHeight: 120)
-                        .background(Theme.backgroundSecondary)
-                } else if let data = imageData, let uiImage = UIImage(data: data) {
+                if let data = imageData, let uiImage = UIImage(data: data) {
                     Image(uiImage: uiImage)
                         .resizable()
                         .aspectRatio(contentMode: .fit)
@@ -3824,9 +3839,7 @@ private struct SharedFileCardView: View {
                         .frame(maxWidth: .infinity, minHeight: 80)
                         .background(Theme.backgroundSecondary)
                 } else {
-                    ProgressView()
-                        .frame(maxWidth: .infinity, minHeight: 120)
-                        .background(Theme.backgroundSecondary)
+                    ShimmerSkeleton(cornerRadius: 12, height: 200)
                 }
             }
             .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
@@ -5000,20 +5013,112 @@ private struct MissionSwitcherSheet: View {
         return localMatches
     }
 
-    private var activeOrPendingMissions: [Mission] {
-        filteredRecent.filter { $0.status == .active || $0.status == .pending }
+    /// A running row carries layout hints so we can render boss + nested
+    /// workers without losing the underlying `RunningMissionInfo`.
+    private struct RunningRow: Identifiable {
+        let info: RunningMissionInfo
+        let isBoss: Bool
+        /// Non-nil when this row should render indented under a boss. The id
+        /// references the boss mission for visual continuity only.
+        let nestedUnder: String?
+
+        var id: String { info.missionId }
     }
 
-    private var completedMissions: [Mission] {
-        filteredRecent.filter { $0.status == .completed }
+    /// boss missionId -> [worker missionId]. Built from the full mission set
+    /// (not just the search-filtered one) so we still know about workers when
+    /// the boss matched the query but a worker didn't.
+    private var bossWorkerIds: [String: [String]] {
+        var map: [String: [String]] = [:]
+        for mission in recentMissions {
+            if let parent = mission.parentMissionId, !parent.isEmpty {
+                map[parent, default: []].append(mission.id)
+            }
+        }
+        return map
     }
 
-    private var failedMissions: [Mission] {
-        filteredRecent.filter { $0.status == .failed || $0.status == .notFeasible }
+    /// Running missions ordered to nest workers under their boss (matching the
+    /// Next.js cmd+K palette): bosses first with their workers indented, then
+    /// standalone running missions, then any orphan workers whose boss isn't
+    /// currently running.
+    private var orderedRunning: [RunningRow] {
+        let filtered = filteredRunning
+        let workerIdsByBoss = bossWorkerIds
+        let filteredById: [String: RunningMissionInfo] = Dictionary(
+            uniqueKeysWithValues: filtered.map { ($0.missionId, $0) }
+        )
+
+        var rows: [RunningRow] = []
+        var seen = Set<String>()
+
+        // Phase 1: bosses (with their running workers nested directly under).
+        for info in filtered where workerIdsByBoss[info.missionId] != nil {
+            guard seen.insert(info.missionId).inserted else { continue }
+            rows.append(RunningRow(info: info, isBoss: true, nestedUnder: nil))
+            for workerId in workerIdsByBoss[info.missionId] ?? [] {
+                guard !seen.contains(workerId),
+                      let workerInfo = filteredById[workerId]
+                else { continue }
+                seen.insert(workerId)
+                rows.append(RunningRow(info: workerInfo, isBoss: false, nestedUnder: info.missionId))
+            }
+        }
+
+        // Phase 2: standalone running (no workers, not a worker itself).
+        for info in filtered {
+            guard !seen.contains(info.missionId) else { continue }
+            let mission = missionById[info.missionId]
+            if mission?.parentMissionId == nil {
+                seen.insert(info.missionId)
+                rows.append(RunningRow(info: info, isBoss: false, nestedUnder: nil))
+            }
+        }
+
+        // Phase 3: orphan workers — running, but their boss isn't. Render them
+        // indented so the worker identity is still obvious.
+        for info in filtered {
+            guard !seen.contains(info.missionId) else { continue }
+            seen.insert(info.missionId)
+            let parentId = missionById[info.missionId]?.parentMissionId
+            rows.append(RunningRow(info: info, isBoss: false, nestedUnder: parentId))
+        }
+
+        return rows
     }
 
-    private var interruptedMissions: [Mission] {
-        filteredRecent.filter { $0.status == .interrupted || $0.status == .blocked || $0.status == .unknown }
+    /// Mission ids included in the Just Completed micro-section, so Recent
+    /// can exclude them and we don't show the same row twice.
+    private var justCompletedIds: Set<String> {
+        Set(justCompletedMissions.map { $0.id })
+    }
+
+    /// Terminal missions that landed in the last 24h. Capped to keep the
+    /// section glanceable. Hidden while searching — the ranked list takes
+    /// over and grouping just gets in the way.
+    private var justCompletedMissions: [Mission] {
+        guard normalizedSearchQuery.isEmpty else { return [] }
+        let cutoff = Date().addingTimeInterval(-24 * 60 * 60)
+        return recentMissions
+            .filter { mission in
+                guard !runningMissionIds.contains(mission.id) else { return false }
+                switch mission.status {
+                case .completed, .failed, .notFeasible, .interrupted, .blocked:
+                    return true
+                default:
+                    return false
+                }
+            }
+            .filter { ($0.updatedDate ?? .distantPast) >= cutoff }
+            .prefix(5)
+            .map { $0 }
+    }
+
+    /// Recent missions excluding any row already shown in Just Completed,
+    /// so the same mission never appears twice.
+    private var recentMissionsForList: [Mission] {
+        let justCompleted = justCompletedIds
+        return filteredRecent.filter { !justCompleted.contains($0.id) }
     }
 
     @ViewBuilder
@@ -5031,6 +5136,7 @@ private struct MissionSwitcherSheet: View {
                         isRunning: false,
                         runningState: nil,
                         isViewing: viewingMissionId == mission.id,
+                        isWorker: mission.parentMissionId != nil,
                         quickActions: missionQuickActions(for: mission),
                         onSelect: { onSelectMission(mission.id) },
                         onQuickAction: { action in
@@ -5056,10 +5162,11 @@ private struct MissionSwitcherSheet: View {
                     }
                 }
 
-                // Running missions
-                if !filteredRunning.isEmpty {
+                // Running missions — boss + nested workers, then standalone.
+                if !orderedRunning.isEmpty {
                     Section("Running") {
-                        ForEach(filteredRunning, id: \.missionId) { info in
+                        ForEach(orderedRunning) { row in
+                            let info = row.info
                             let mission = missionById[info.missionId]
                             MissionRow(
                                 missionId: info.missionId,
@@ -5071,6 +5178,7 @@ private struct MissionSwitcherSheet: View {
                                 isRunning: true,
                                 runningState: info.state,
                                 isViewing: viewingMissionId == info.missionId,
+                                isWorker: row.nestedUnder != nil,
                                 quickActions: [.followUp],
                                 onSelect: { onSelectMission(info.missionId) },
                                 onQuickAction: { action in
@@ -5086,10 +5194,8 @@ private struct MissionSwitcherSheet: View {
                     }
                 }
 
-                missionSection("Active & Pending", missions: activeOrPendingMissions)
-                missionSection("Completed", missions: completedMissions)
-                missionSection("Failed", missions: failedMissions)
-                missionSection("Interrupted", missions: interruptedMissions)
+                missionSection("Just Completed", missions: justCompletedMissions)
+                missionSection("Recent", missions: recentMissionsForList)
 
                 if isBackendSearchLoading && !normalizedSearchQuery.isEmpty {
                     Section {
@@ -5524,6 +5630,9 @@ private struct MissionRow: View {
     let isRunning: Bool
     let runningState: String?
     let isViewing: Bool
+    /// When true the row renders indented with a small "W" badge so workers
+    /// read as visually subordinate to their boss row.
+    var isWorker: Bool = false
     let quickActions: [MissionQuickAction]
     let onSelect: () -> Void
     let onQuickAction: ((MissionQuickAction) -> Void)?
@@ -5624,6 +5733,22 @@ private struct MissionRow: View {
             HapticService.selectionChanged()
         } label: {
             HStack(spacing: 12) {
+                if isWorker {
+                    // Indent rail + "W" chip mirrors the cmd+K palette so
+                    // workers read as nested under their boss row above.
+                    HStack(spacing: 6) {
+                        Rectangle()
+                            .fill(Theme.info.opacity(0.5))
+                            .frame(width: 2, height: 24)
+                        Text("W")
+                            .font(.caption2.weight(.bold))
+                            .foregroundStyle(Theme.info)
+                            .frame(width: 14, height: 14)
+                            .background(Theme.info.opacity(0.15))
+                            .clipShape(RoundedRectangle(cornerRadius: 3))
+                    }
+                }
+
                 Image(systemName: statusIcon)
                     .font(.system(size: 18))
                     .foregroundStyle(statusColor)

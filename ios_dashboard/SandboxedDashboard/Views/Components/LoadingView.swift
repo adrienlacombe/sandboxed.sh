@@ -182,6 +182,62 @@ struct ShimmerFileRow: View {
     }
 }
 
+/// Single shimmering chat bubble — caller picks side and width so we can
+/// fake a believable conversation rhythm without forcing exact dimensions.
+struct ShimmerChatBubble: View {
+    enum Side { case left, right }
+
+    let side: Side
+    var width: CGFloat = 220
+    var lines: Int = 2
+
+    var body: some View {
+        HStack(spacing: 0) {
+            if side == .right { Spacer(minLength: 40) }
+
+            VStack(alignment: .leading, spacing: 6) {
+                ForEach(0..<max(1, lines), id: \.self) { line in
+                    ShimmerRow(
+                        height: 12,
+                        width: line == lines - 1 ? width * 0.6 : width * 0.95
+                    )
+                }
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 10)
+            .background(
+                side == .right
+                    ? Theme.accent.opacity(0.22)
+                    : Theme.backgroundSecondary
+            )
+            .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+            .frame(maxWidth: width)
+
+            if side == .left { Spacer(minLength: 40) }
+        }
+    }
+}
+
+/// Stand-in for the conversation list while the snapshot is in flight.
+/// Renders a small repeatable rhythm of bubbles so the user never sees an
+/// empty black canvas — matches the cmd+K shimmer affordance on web.
+struct ShimmerConversation: View {
+    var body: some View {
+        VStack(alignment: .leading, spacing: 20) {
+            ShimmerChatBubble(side: .left, width: 240, lines: 2)
+            ShimmerChatBubble(side: .right, width: 180, lines: 1)
+            ShimmerChatBubble(side: .left, width: 260, lines: 3)
+            ShimmerChatBubble(side: .right, width: 140, lines: 1)
+            ShimmerChatBubble(side: .left, width: 220, lines: 2)
+        }
+        .padding(.horizontal, 16)
+        .padding(.top, 24)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Loading conversation")
+    }
+}
+
 struct EmptyStateView: View {
     let icon: String
     let title: String

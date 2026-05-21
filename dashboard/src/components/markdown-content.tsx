@@ -174,6 +174,26 @@ function resolvePath(path: string, basePath?: string): string {
   return path;
 }
 
+/**
+ * Turn a failed `/api/fs/*` response into a short user-facing message.
+ * The backend currently returns 404 for both "workspace not found" and
+ * "file not found"; we read the body so the UI can distinguish them.
+ */
+async function describeFsError(res: Response): Promise<string> {
+  let body = "";
+  try {
+    body = (await res.text()).trim();
+  } catch {
+    // ignore — fall back to status-only message
+  }
+  const lower = body.toLowerCase();
+  if (lower.includes("workspace") && lower.includes("not found")) {
+    return "Workspace no longer exists";
+  }
+  if (res.status === 404) return "File not found";
+  return `Failed to load (${res.status})`;
+}
+
 function formatFileSize(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
@@ -276,7 +296,8 @@ function FilePreviewModalContent({
       try {
         const res = await fetch(downloadUrl, { headers: { ...authHeader() } });
         if (!res.ok) {
-          if (!cancelled) setError(`Failed to load (${res.status})`);
+          const msg = await describeFsError(res);
+          if (!cancelled) setError(msg);
           if (!cancelled) setLoading(false);
           return;
         }
@@ -326,7 +347,7 @@ function FilePreviewModalContent({
           headers: { ...authHeader() },
         });
         if (!res.ok) {
-          if (!cancelled) setTextError(`Failed to load (${res.status})`);
+          if (!cancelled) setTextError(await describeFsError(res));
           return;
         }
         const blob = await res.blob();
@@ -652,11 +673,13 @@ function InlineImagePreview({
   missionId?: string;
 }) {
   const isAbsolute = path.startsWith("/") || /^[a-zA-Z]:/.test(path);
-  // A relative path can't be resolved until `basePath` is known. Returning a
-  // stable sentinel (null) keeps us in the loading state instead of firing
-  // a 404 fetch against `./artifacts/...` and then leaving a stale error
-  // pill when basePath later arrives and the effect re-runs.
+  // A relative path needs `basePath` to resolve. If the parent passed a
+  // `workspaceId` but no `basePath`, the workspace lookup itself failed
+  // (workspace was deleted/renamed) — the basePath will never arrive, so
+  // show a clear error instead of spinning forever. If neither is set, it's
+  // pre-mount: keep the loading sentinel and let the effect re-run.
   const resolvedPath = isAbsolute || basePath ? resolvePath(path, basePath) : null;
+  const unresolvable = !isAbsolute && !basePath && !!workspaceId;
   const [imageUrl, setImageUrl] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -667,7 +690,13 @@ function InlineImagePreview({
     setImageUrl(null);
     setError(null);
     setLoading(true);
-    if (!resolvedPath) return;
+    if (!resolvedPath) {
+      if (unresolvable) {
+        setError("Workspace unavailable");
+        setLoading(false);
+      }
+      return;
+    }
 
     let cancelled = false;
     let acquired = false;
@@ -693,7 +722,8 @@ function InlineImagePreview({
           headers: { ...authHeader() },
         });
         if (!res.ok) {
-          if (!cancelled) setError(`File not found (${res.status})`);
+          const msg = await describeFsError(res);
+          if (!cancelled) setError(msg);
           if (!cancelled) setLoading(false);
           return;
         }
@@ -717,7 +747,7 @@ function InlineImagePreview({
       cancelled = true;
       if (acquired) releaseImageUrl(resolvedPath);
     };
-  }, [resolvedPath, workspaceId, missionId]);
+  }, [resolvedPath, unresolvable, workspaceId, missionId]);
 
   // Shared placeholder box: same shape for loading and error so the layout
   // doesn't jump and the error state reads as part of the same chrome as
@@ -774,13 +804,32 @@ function InlineFileCard({
   workspaceId?: string;
   missionId?: string;
 }) {
-  const resolvedPath = resolvePath(path, basePath);
+  const isAbsolute = path.startsWith("/") || /^[a-zA-Z]:/.test(path);
+  const canResolve = isAbsolute || !!basePath;
+  // Same logic as InlineImagePreview: a relative path with no basePath but a
+  // workspaceId means the workspace lookup failed — surface that as its own
+  // error instead of "File not found".
+  const unresolvable = !canResolve && !!workspaceId;
+  const resolvedPath = canResolve ? resolvePath(path, basePath) : path;
   const FileIcon = getFileIcon(path);
   const ext = path.split(".").pop()?.toUpperCase() || "";
-  const [metadata, setMetadata] = useState<{ size?: number; exists: boolean } | null>(null);
+  const [metadata, setMetadata] = useState<{
+    size?: number;
+    exists: boolean;
+    errorMessage?: string;
+  } | null>(null);
   const [downloading, setDownloading] = useState(false);
 
   useEffect(() => {
+    if (unresolvable) {
+      setMetadata({ exists: false, errorMessage: "Workspace unavailable" });
+      return;
+    }
+    if (!canResolve) {
+      // Pre-mount: basePath may still arrive. Keep skeleton.
+      setMetadata(null);
+      return;
+    }
     let cancelled = false;
     const fetchMeta = async () => {
       const API_BASE = getRuntimeApiBase();
@@ -795,7 +844,8 @@ function InlineFileCard({
           const data = await res.json();
           if (!cancelled) setMetadata({ exists: data.exists, size: data.size });
         } else {
-          if (!cancelled) setMetadata({ exists: false });
+          const msg = await describeFsError(res);
+          if (!cancelled) setMetadata({ exists: false, errorMessage: msg });
         }
       } catch {
         if (!cancelled) setMetadata({ exists: false });
@@ -803,7 +853,7 @@ function InlineFileCard({
     };
     fetchMeta();
     return () => { cancelled = true; };
-  }, [resolvedPath, workspaceId, missionId]);
+  }, [resolvedPath, workspaceId, missionId, canResolve, unresolvable]);
 
   const handleDownload = async (e: React.MouseEvent) => {
     e.stopPropagation();
@@ -832,10 +882,13 @@ function InlineFileCard({
   };
 
   if (metadata && !metadata.exists) {
+    const label = metadata.errorMessage
+      ? `${metadata.errorMessage}: ${displayName}`
+      : `File not found: ${displayName}`;
     return (
       <span className="inline-flex items-center gap-1.5 px-2 py-1 rounded-md bg-red-500/10 text-red-400 text-xs">
         <File className="h-3.5 w-3.5" />
-        File not found: {displayName}
+        {label}
       </span>
     );
   }

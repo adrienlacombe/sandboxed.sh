@@ -39,9 +39,10 @@ impl TokenUsage {
 /// Normalize model names to canonical form for pricing lookup.
 fn normalize_model(model: &str) -> &str {
     let trimmed = model.trim();
+    let normalized_for_match = trimmed.to_ascii_lowercase().replace(['_', ' '], "-");
 
     // Handle common aliases and versioned names
-    match trimmed {
+    match normalized_for_match.as_str() {
         // Claude models - normalize to base names
         s if s.contains("claude-3-5-sonnet") || s.contains("claude-3.5-sonnet") => {
             "claude-3-5-sonnet"
@@ -90,6 +91,7 @@ fn normalize_model(model: &str) -> &str {
         s if s.contains("grok-4") => "grok-4",
         s if s.contains("grok-3-mini") => "grok-3-mini",
         s if s.contains("grok-3") => "grok-3",
+        s if s.contains("grok-inference") => "grok-4-fast",
 
         // Z.AI / GLM models
         s if s.contains("glm-5.1") || s.contains("glm-5-1") => "glm-5.1",
@@ -536,12 +538,14 @@ mod tests {
         );
         assert_eq!(normalize_model("gpt-4o-2024-08-06"), "gpt-4o");
         assert_eq!(normalize_model("gpt-5.3-codex"), "gpt-5.3");
+        assert_eq!(normalize_model("OpenAI/GPT-5"), "gpt-5");
         assert_eq!(normalize_model("gpt-5-mini"), "gpt-5-mini");
         assert_eq!(normalize_model("gemini-2.5-pro-preview"), "gemini-2.5-pro");
         assert_eq!(normalize_model("gemini-3.1-pro-preview"), "gemini-3.1-pro");
         assert_eq!(normalize_model("gemini-3-1-pro-preview"), "gemini-3.1-pro");
         assert_eq!(normalize_model("gemini-3-pro-preview"), "gemini-3-pro");
         assert_eq!(normalize_model("grok-4-fast-reasoning"), "grok-4-fast");
+        assert_eq!(normalize_model("xAI/Grok Inference"), "grok-4-fast");
         assert_eq!(normalize_model("zai/glm-5"), "glm-5");
         assert_eq!(normalize_model("zai/glm-5.1"), "glm-5.1");
         assert_eq!(normalize_model("minimax-m2"), "minimax-m2");
@@ -556,12 +560,14 @@ mod tests {
         assert!(pricing_for_model("claude-haiku-4-5").is_some());
         assert!(pricing_for_model("gpt-4o").is_some());
         assert!(pricing_for_model("gpt-5.3-codex").is_some());
+        assert!(pricing_for_model("OpenAI/GPT-5").is_some());
         assert!(pricing_for_model("gpt-5-mini").is_some());
         assert!(pricing_for_model("gemini-2.5-pro").is_some());
         assert!(pricing_for_model("gemini-3.1-pro-preview").is_some());
         assert!(pricing_for_model("gemini-3-pro-preview").is_some());
         assert!(pricing_for_model("gemini-3-flash-preview").is_some());
         assert!(pricing_for_model("grok-4-fast").is_some());
+        assert!(pricing_for_model("xAI/Grok Inference").is_some());
         assert!(pricing_for_model("glm-5").is_some());
         assert!(pricing_for_model("glm-5.1").is_some());
         assert!(pricing_for_model("minimax-m2").is_some());

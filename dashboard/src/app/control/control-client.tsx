@@ -3878,6 +3878,12 @@ export default function ControlClient() {
   );
   const [showMissionSwitcher, setShowMissionSwitcher] = useState(false);
   const [showWorkerPanel, setShowWorkerPanel] = useState(false);
+  // Per-mission record of which missions the user has explicitly dismissed
+  // the worker panel for. Used so the auto-open effect doesn't keep reopening
+  // the panel after the user closes it while a streaming boss keeps spawning
+  // sub-agents.
+  const workerPanelDismissedRef = useRef<Set<string>>(new Set());
+  const workerPanelAutoOpenedForRef = useRef<string | null>(null);
   const [highlightedItemId, setHighlightedItemId] = useState<string | null>(
     null,
   );
@@ -5027,36 +5033,43 @@ export default function ControlClient() {
 
   const missionForDownloads = viewingMission ?? currentMission;
 
-  // Derive working directory from mission's desktop sessions for file path resolution
+  // Derive working directory for file-path resolution in rich `<image>`/
+  // `<file>` tags. Priority:
+  //   1. `mission.working_directory` — what the agent actually `cd`'d into
+  //      (e.g. `/workspaces/mission-XXX/keel`). Without this, relative paths
+  //      like `./docs/foo.png` resolve to the mission root and miss files
+  //      that live in a cloned-repo subdir.
+  //   2. Latest desktop session's `screenshots_dir` parent.
+  //   3. `{workspace.path}/workspaces/mission-{shortId}` — but only when the
+  //      mission's `workspace_id` still resolves. The previous host-workspace
+  //      fallback produced a misleading basePath (e.g. `/root/workspaces/…`)
+  //      that 404'd every request without explaining why. Returning
+  //      `undefined` instead lets `InlineImagePreview`/`InlineFileCard`
+  //      surface a clear "workspace unavailable" pill.
   const missionWorkingDirectory = useMemo(() => {
     const mission = missionForDownloads;
     if (!mission) return undefined;
 
+    if (mission.working_directory?.trim()) {
+      return mission.working_directory.replace(/\/+$/, "");
+    }
+
     if (mission.desktop_sessions?.length) {
-      // Try to find screenshots_dir from any session (prefer active/latest)
       for (let i = mission.desktop_sessions.length - 1; i >= 0; i--) {
         const session = mission.desktop_sessions[i];
         if (session?.screenshots_dir) {
-          // screenshots_dir is like /path/to/workspace/screenshots/
-          // We want the parent: /path/to/workspace/
-          const dir = session.screenshots_dir.replace(/\/?$/, ""); // remove trailing slash
+          const dir = session.screenshots_dir.replace(/\/?$/, "");
           const parent = dir.substring(0, dir.lastIndexOf("/"));
           if (parent) return parent;
         }
       }
     }
 
-    const workspace =
-      workspaces.find((ws) => ws.id === mission.workspace_id) ??
-      workspaces.find((ws) => ws.workspace_type === "host");
-
+    if (!mission.workspace_id) return undefined;
+    const workspace = workspaces.find((ws) => ws.id === mission.workspace_id);
     if (!workspace?.path) return undefined;
+
     const cleanRoot = workspace.path.replace(/\/+$/, "");
-    // Per-mission workspace dir matches backend convention:
-    // `{workspace.path}/workspaces/mission-{mission_id_prefix}`.
-    //
-    // This lets rich `<image>`/`<file>` tags using relative paths (e.g. `./chart.svg`)
-    // resolve correctly even when no desktop session was started.
     const shortId = mission.id?.slice(0, 8);
     if (shortId) {
       return `${cleanRoot}/workspaces/mission-${shortId}`;
@@ -8958,6 +8971,23 @@ export default function ControlClient() {
       (m) => m.parent_mission_id === currentMission.id,
     );
   }, [currentMission, recentMissions]);
+
+  // When the viewed mission is itself a worker, surface its parent (boss) and
+  // sibling workers in the strip so the user can navigate back without going
+  // hunting in the workbench dropdown.
+  const viewingParentMission = useMemo<Mission | null>(() => {
+    const parentId = viewingMission?.parent_mission_id;
+    if (!parentId) return null;
+    return recentMissions.find((m) => m.id === parentId) ?? null;
+  }, [viewingMission?.parent_mission_id, recentMissions]);
+  const siblingMissions = useMemo(() => {
+    const parentId = viewingMission?.parent_mission_id;
+    if (!parentId) return [];
+    return recentMissions.filter((m) => m.parent_mission_id === parentId);
+  }, [viewingMission?.parent_mission_id, recentMissions]);
+  // For the strip: on a worker view, use siblings; on the boss view, use
+  // children. A single source so the strip stays self-contained.
+  const stripMissions = viewingParentMission ? siblingMissions : childMissions;
   const activeMissionRole = activeMission
     ? inferMissionRole(activeMission)
     : null;
@@ -8995,13 +9025,29 @@ export default function ControlClient() {
     activeMissionRole === "boss" ||
     hasInMissionSubagents;
 
-  // Auto-show the workers/sub-agents panel when the active mission
-  // first acquires workers or sub-agents.
+  // Auto-show the workers/sub-agents panel ONCE per mission, the first time
+  // the active mission acquires workers or sub-agents. Tracked with a ref so
+  // a streaming mission spawning a new worker doesn't keep reopening the
+  // panel after the user has closed it.
   useEffect(() => {
-    if (childMissions.length > 0 || hasInMissionSubagents) {
-      setShowWorkerPanel(true);
-    }
+    const missionId = activeMission?.id;
+    if (!missionId) return;
+    if (childMissions.length === 0 && !hasInMissionSubagents) return;
+    if (workerPanelDismissedRef.current.has(missionId)) return;
+    if (workerPanelAutoOpenedForRef.current === missionId) return;
+    workerPanelAutoOpenedForRef.current = missionId;
+    setShowWorkerPanel(true);
   }, [activeMission?.id, childMissions.length, hasInMissionSubagents]);
+
+  // Stable callback: closing the panel marks the current mission as dismissed
+  // so the auto-open effect above doesn't immediately reopen it.
+  const handleCloseWorkerPanel = useCallback(() => {
+    const missionId = activeMission?.id;
+    if (missionId) {
+      workerPanelDismissedRef.current.add(missionId);
+    }
+    setShowWorkerPanel(false);
+  }, [activeMission?.id]);
 
   // Determine if we should show the resume UI for interrupted/blocked/failed missions
   // Don't show resume UI if:
@@ -9798,20 +9844,30 @@ export default function ControlClient() {
 
         {/* Main content area - Chat and Desktop stream side by side */}
         <div className="flex-1 min-h-0 flex gap-4">
-          {/* Chat container */}
+          {/* Chat container. We intentionally do NOT animate flex-grow when
+          side panels (Workers / Workbench / Thinking) open: animating layout
+          properties like `flex-grow` re-flows the entire (potentially huge)
+          virtualized chat list every frame for the duration of the transition,
+          which is the source of the "freeze" users see when clicking the
+          Workers toggle. Keep the panels' own fade-in animation; let the chat
+          snap to its new width in a single layout pass. */}
           <div
             className={cn(
-              "flex-1 min-h-0 flex flex-col rounded-2xl glass-panel border border-white/[0.06] overflow-hidden relative transition-all duration-300",
+              "flex-1 min-h-0 flex flex-col rounded-2xl glass-panel border border-white/[0.06] overflow-hidden relative",
               showDesktopStream && "flex-[2]",
             )}
           >
             {/* Active workers strip — sticky above the scrolling messages so the
             boss can see and hop into delegated workers without opening a side
-            panel. Self-hides when there are no child missions. */}
+            panel. On a worker view it shows a "Back to Boss" pill plus sibling
+            workers so the user can navigate up or sideways without digging
+            through the workbench dropdown. Self-hides when there's nothing to
+            show. */}
             <WorkersStrip
-              childMissions={childMissions}
+              childMissions={stripMissions}
               runningMissions={runningMissions}
               viewingMissionId={viewingMissionId}
+              parentMission={viewingParentMission}
               onSelectWorker={handleViewMission}
             />
             {/* Messages */}
@@ -10348,7 +10404,11 @@ export default function ControlClient() {
             (showWorkerPanel && isBossMission)) && (
             <div
               className={cn(
-                "min-h-0 flex flex-col gap-4 transition-all duration-300 animate-fade-in shrink-0",
+                // animate-fade-in is opacity-only and cheap; we drop the
+                // `transition-all duration-300` that was animating width on
+                // mount (the width change is what caused the chat-side reflow
+                // freeze when toggling the Workers panel).
+                "min-h-0 flex flex-col gap-4 animate-fade-in shrink-0",
                 showDesktopStream ? "flex-1 max-w-md" : "w-80",
               )}
             >
@@ -10398,13 +10458,17 @@ export default function ControlClient() {
                   bossMissionId={activeMission?.id ?? ""}
                   viewingMissionId={viewingMissionId}
                   onSelectWorker={(missionId) => handleViewMission(missionId)}
-                  onClose={() => setShowWorkerPanel(false)}
+                  onClose={handleCloseWorkerPanel}
                   className={cn(
+                    // Equal vertical split with siblings instead of fixed
+                    // max-height caps. `min-h-0` is required for the inner
+                    // `overflow-y-auto` to clip rather than push the flex
+                    // child to its content height.
                     showWorkbenchPanel ||
                       showThinkingPanel ||
                       showDesktopStream ||
                       hasInMissionSubagents
-                      ? "flex-shrink-0 max-h-[50%]"
+                      ? "flex-1 min-h-0"
                       : "flex-1",
                   )}
                 />
@@ -10415,13 +10479,13 @@ export default function ControlClient() {
                 <SubagentsPanel
                   subagents={inMissionSubagents}
                   onFocusItem={focusChatItem}
-                  onClose={() => setShowWorkerPanel(false)}
+                  onClose={handleCloseWorkerPanel}
                   className={cn(
                     showWorkbenchPanel ||
                       showThinkingPanel ||
                       showDesktopStream ||
                       childMissions.length > 0
-                      ? "flex-shrink-0 max-h-[50%]"
+                      ? "flex-1 min-h-0"
                       : "flex-1",
                   )}
                 />
@@ -10436,7 +10500,7 @@ export default function ControlClient() {
                     showWorkbenchPanel ||
                     showDesktopStream ||
                     (showWorkerPanel && isBossMission)
-                      ? "flex-shrink-0 max-h-[40%]"
+                      ? "flex-1 min-h-0"
                       : "flex-1"
                   }
                   basePath={missionWorkingDirectory}

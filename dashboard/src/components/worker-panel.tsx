@@ -1,6 +1,6 @@
 'use client';
 
-import { useMemo, useState } from 'react';
+import { memo, useMemo, useState, useCallback } from 'react';
 import {
   X,
   Loader2,
@@ -149,7 +149,7 @@ function ProgressBar({
   );
 }
 
-function WorkerCard({
+const WorkerCard = memo(function WorkerCard({
   mission,
   runningInfo,
   isViewing,
@@ -158,7 +158,7 @@ function WorkerCard({
   mission: Mission;
   runningInfo?: RunningMissionInfo;
   isViewing: boolean;
-  onSelect: () => void;
+  onSelect: (missionId: string) => void;
 }) {
   const status = getWorkerStatusInfo(mission, runningInfo);
   const title = mission.title?.trim() || getMissionShortName(mission.id);
@@ -174,7 +174,7 @@ function WorkerCard({
 
   return (
     <button
-      onClick={onSelect}
+      onClick={() => onSelect(mission.id)}
       className={cn(
         'w-full text-left rounded-lg border p-3 transition-all duration-200 group',
         isViewing
@@ -232,7 +232,7 @@ function WorkerCard({
       )}
     </button>
   );
-}
+});
 
 export function WorkerPanel({
   childMissions,
@@ -243,6 +243,12 @@ export function WorkerPanel({
   className,
 }: WorkerPanelProps) {
   const [peekMissionId, setPeekMissionId] = useState<string | null>(null);
+  // Stable so memoized WorkerCards don't re-render on every parent update
+  // (runningMissions ticks every second while a worker is streaming).
+  const handleCardSelect = useCallback((missionId: string) => {
+    setPeekMissionId(missionId);
+  }, []);
+  const handlePeekClose = useCallback(() => setPeekMissionId(null), []);
 
   const runningByMissionId = useMemo(() => {
     const map = new Map<string, RunningMissionInfo>();
@@ -345,7 +351,7 @@ export function WorkerPanel({
               mission={mission}
               runningInfo={runningByMissionId.get(mission.id)}
               isViewing={mission.id === viewingMissionId}
-              onSelect={() => setPeekMissionId(mission.id)}
+              onSelect={handleCardSelect}
             />
           ))
         )}
@@ -359,7 +365,7 @@ export function WorkerPanel({
           <WorkerPeekModal
             mission={peekMission}
             runningInfo={runningByMissionId.get(peekMissionId)}
-            onClose={() => setPeekMissionId(null)}
+            onClose={handlePeekClose}
             onOpenFull={onSelectWorker}
           />
         );

@@ -8,16 +8,23 @@ import {
   AlertTriangle,
   Clock,
   Ban,
+  ArrowLeft,
+  Crown,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { getMissionShortName } from '@/lib/mission-display';
 import type { Mission, RunningMissionInfo } from '@/lib/api';
 
 interface WorkersStripProps {
+  /** Workers shown as chips. On a boss view these are children; on a
+   * worker view they are siblings (so you can hop between workers). */
   childMissions: Mission[];
   runningMissions: RunningMissionInfo[];
   viewingMissionId?: string | null;
   onSelectWorker: (missionId: string) => void;
+  /** When set, the strip renders a leading "Back to Boss" pill that
+   * navigates to this mission. Use for worker views. */
+  parentMission?: Mission | null;
   className?: string;
 }
 
@@ -128,6 +135,7 @@ export const WorkersStrip = memo(function WorkersStrip({
   runningMissions,
   viewingMissionId,
   onSelectWorker,
+  parentMission,
   className,
 }: WorkersStripProps) {
   const chips = useMemo(() => {
@@ -146,7 +154,13 @@ export const WorkersStrip = memo(function WorkersStrip({
       });
   }, [childMissions, runningMissions]);
 
-  if (chips.length === 0) return null;
+  // Nothing to show: no parent link AND no worker chips.
+  if (!parentMission && chips.length === 0) return null;
+
+  const onWorkerView = Boolean(parentMission);
+  const parentTitle = parentMission
+    ? parentMission.title?.trim() || getMissionShortName(parentMission.id)
+    : null;
 
   return (
     <div
@@ -155,11 +169,39 @@ export const WorkersStrip = memo(function WorkersStrip({
         'scrollbar-thin scrollbar-thumb-white/10 scrollbar-track-transparent',
         className
       )}
-      aria-label="Active workers"
+      aria-label={onWorkerView ? 'Worker navigation' : 'Active workers'}
     >
-      <span className="shrink-0 text-[10px] uppercase tracking-wider text-white/40 mr-1">
-        Workers
-      </span>
+      {parentMission && (
+        <>
+          <button
+            type="button"
+            onClick={() => onSelectWorker(parentMission.id)}
+            className={cn(
+              'shrink-0 inline-flex items-center gap-1.5 rounded-full border border-violet-500/30',
+              'bg-violet-500/10 hover:bg-violet-500/20 text-violet-300',
+              'px-2.5 py-1 text-xs transition-colors max-w-[300px]'
+            )}
+            title={`Back to boss: ${parentTitle}`}
+            aria-label={`Back to boss mission ${parentTitle}`}
+          >
+            <ArrowLeft className="h-3 w-3 shrink-0" />
+            <Crown className="h-3 w-3 shrink-0" />
+            <span className="hidden sm:inline text-violet-400/80">Boss:</span>
+            <span className="truncate">{parentTitle}</span>
+          </button>
+          {chips.length > 0 && (
+            <span
+              aria-hidden
+              className="shrink-0 h-4 w-px bg-white/10 mx-1"
+            />
+          )}
+        </>
+      )}
+      {chips.length > 0 && (
+        <span className="shrink-0 text-[10px] uppercase tracking-wider text-white/40 mr-1">
+          {onWorkerView ? 'Siblings' : 'Workers'}
+        </span>
+      )}
       {chips.map(({ mission, status }) => {
         const isViewing = mission.id === viewingMissionId;
         const title = mission.title?.trim() || getMissionShortName(mission.id);
