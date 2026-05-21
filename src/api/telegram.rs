@@ -756,6 +756,9 @@ fn paloma_should_alert_long_running_mission_at(
     if mission.status != MissionStatus::Active {
         return false;
     }
+    if mission.mission_mode == MissionMode::Assistant {
+        return false;
+    }
     let Some(started_at) = paloma_mission_started_at(mission) else {
         return true;
     };
@@ -875,6 +878,28 @@ fn paloma_alert_digest_text(alerts: &[TelegramAlert]) -> String {
     redact_for_telegram(&text)
 }
 
+async fn paloma_pending_alert_still_eligible(
+    ctx: &ChannelContext,
+    alert: &TelegramAlert,
+    now: chrono::DateTime<Utc>,
+) -> bool {
+    let Some(mission_id) = alert.mission_id else {
+        return true;
+    };
+    let Ok(Some(mission)) = ctx.mission_store.get_mission(mission_id).await else {
+        return false;
+    };
+    if mission.status != MissionStatus::Active {
+        return false;
+    }
+    let events = ctx
+        .mission_store
+        .get_events(mission.id, None, Some(40), None)
+        .await
+        .unwrap_or_default();
+    paloma_should_alert_long_running_mission_at(&mission, &events, now)
+}
+
 async fn plan_and_deliver_paloma_alerts(ctx: &ChannelContext, http: &Client) {
     let Some(owner_id) =
         configured_telegram_id("PALOMA_TELEGRAM_OWNER_ID", DEFAULT_PALOMA_OWNER_TELEGRAM_ID)
@@ -977,6 +1002,26 @@ async fn plan_and_deliver_paloma_alerts(ctx: &ChannelContext, http: &Client) {
                     != TelegramMissionInterestLevel::Muted
             })
         });
+    }
+    if !pending.is_empty() {
+        let checked_at = Utc::now();
+        let mut eligible_pending = Vec::with_capacity(pending.len());
+        let acknowledged_at = now_string();
+        for alert in pending {
+            if paloma_pending_alert_still_eligible(ctx, &alert, checked_at).await {
+                eligible_pending.push(alert);
+            } else if let Some(mission_id) = alert.mission_id {
+                let _ = ctx
+                    .mission_store
+                    .acknowledge_pending_telegram_alerts_for_mission(
+                        owner_id,
+                        mission_id,
+                        &acknowledged_at,
+                    )
+                    .await;
+            }
+        }
+        pending = eligible_pending;
     }
     if pending.is_empty() {
         return;
@@ -5351,6 +5396,14 @@ mod tests {
         let completed = test_mission("Done", MissionStatus::Completed);
         assert!(!paloma_should_alert_long_running_mission_at(
             &completed,
+            &[],
+            now
+        ));
+
+        let mut assistant = active.clone();
+        assistant.mission_mode = MissionMode::Assistant;
+        assert!(!paloma_should_alert_long_running_mission_at(
+            &assistant,
             &[],
             now
         ));

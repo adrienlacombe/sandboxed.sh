@@ -6503,6 +6503,13 @@ async fn stuck_mission_watchdog_loop(
             if running_ids.contains(&mission.id) {
                 continue;
             }
+            if mission.mission_mode == super::mission_store::MissionMode::Assistant {
+                tracing::debug!(
+                    mission_id = %mission.id,
+                    "Stuck-mission watchdog: leaving idle assistant-mode mission active"
+                );
+                continue;
+            }
             tracing::warn!(
                 "Stuck-mission watchdog: orphan {} (no live runner); marking interrupted",
                 mission.id

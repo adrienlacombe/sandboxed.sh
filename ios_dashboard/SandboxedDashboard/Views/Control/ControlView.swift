@@ -995,13 +995,23 @@ struct ControlView: View {
     private var viewingMissionIsRunning: Bool {
         guard let viewingId = viewingMissionId else {
             // No specific mission being viewed - fall back to global state
+            if let currentMission, missionIsTerminalForInlineThinking(currentMission) {
+                return false
+            }
             return runState != .idle
+        }
+        if let viewingMission, viewingMission.id == viewingId, missionIsTerminalForInlineThinking(viewingMission) {
+            return false
         }
         // Check if this specific mission is in the running missions list
         guard let missionInfo = runningMissions.first(where: { $0.missionId == viewingId }) else {
             return false
         }
         return missionInfo.state == "running" || missionInfo.state == "waiting_for_tool"
+    }
+
+    private func missionIsTerminalForInlineThinking(_ mission: Mission) -> Bool {
+        mission.status.statusType == .completed || mission.status.statusType == .failed
     }
     
     private var agentWorkingIndicator: some View {
@@ -1285,6 +1295,7 @@ struct ControlView: View {
         guard viewingMissionIsRunning else { return nil }
         messages.last { message in
             guard message.isThinking else { return false }
+            guard !message.thinkingDone else { return false }
             return !message.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         }
     }
@@ -5662,7 +5673,7 @@ private struct MissionRow: View {
 
     private var statusColor: Color {
         if isRunning {
-            return Theme.accent
+            return Theme.info
         }
         switch status {
         case .pending: return Theme.warning
@@ -5728,10 +5739,10 @@ private struct MissionRow: View {
             if isRunning, let state = runningState {
                 Text(state)
                     .font(.caption2)
-                    .foregroundStyle(Theme.accent)
+                    .foregroundStyle(Theme.info)
                     .padding(.horizontal, 8)
                     .padding(.vertical, 4)
-                    .background(Theme.accent.opacity(0.12))
+                    .background(Theme.info.opacity(0.12))
                     .clipShape(Capsule())
             } else {
                 Text(status.displayLabel)
@@ -5771,7 +5782,7 @@ private struct MissionRow: View {
                     if isRunning && runningState == "running" {
                         ProgressView()
                             .progressViewStyle(.circular)
-                            .tint(Theme.accent)
+                            .tint(Theme.info)
                             .scaleEffect(0.7)
                     } else {
                         Image(systemName: statusIcon)

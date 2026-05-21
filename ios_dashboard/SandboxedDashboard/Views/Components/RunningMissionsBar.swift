@@ -137,7 +137,7 @@ struct RunningMissionsBar: View {
                     if mission.isRunning && !isStalled {
                         ProgressView()
                             .progressViewStyle(.circular)
-                            .tint(Theme.accent)
+                            .tint(Theme.info)
                             .scaleEffect(0.55)
                             .frame(width: 10, height: 10)
                     } else {
@@ -218,7 +218,7 @@ struct RunningMissionsBar: View {
         } else if mission.isStalled {
             return Theme.warning
         } else if mission.isRunning {
-            return Theme.accent
+            return Theme.info
         } else {
             return Theme.warning
         }
