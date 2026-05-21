@@ -3211,6 +3211,7 @@ fn read_custom_providers_from_file(workspace_root: &Path) -> Vec<AIProvider> {
 /// MCP mints a service JWT scoped to that user — putting any worker missions
 /// it creates into the same per-user mission store as the boss instead of the
 /// MCP's own implicit `orchestrator-mcp` store.
+#[allow(clippy::too_many_arguments)]
 pub async fn prepare_mission_workspace_with_skills_backend(
     workspace: &Workspace,
     mcp: &McpRegistry,
