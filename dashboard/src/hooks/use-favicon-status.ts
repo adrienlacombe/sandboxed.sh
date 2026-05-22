@@ -7,6 +7,7 @@ import type { MissionStatus } from "@/lib/api/missions";
  * Hex colors matching the mission status dot palette used in the UI.
  */
 const STATUS_COLORS: Record<MissionStatus, string> = {
+  pending: "#fbbf24", // amber-400
   active: "#818cf8", // indigo-400
   awaiting_user: "#38bdf8", // sky-400
   acknowledged: "#34d399", // emerald-400
