@@ -162,7 +162,7 @@ struct ControlView: View {
     @State private var expandedToolGroups: Set<String> = []
 
     // Mission switcher state
-    @State private var showMissionSwitcher = false
+    @State private var showMissionSwitcher = true
     @State private var recentMissions: [Mission] = []
 
     // Desktop stream state
@@ -498,8 +498,9 @@ struct ControlView: View {
             async let workspacesTask: Void = workspaceState.loadWorkspaces()
             async let runningTask: Void = refreshRunningMissions()
             async let missionTask: Void = loadInitialMission()
+            async let recentTask: Void = loadRecentMissions()
 
-            _ = await (workspacesTask, runningTask, missionTask)
+            _ = await (workspacesTask, runningTask, missionTask, recentTask)
 
             // Auto-show bar if there are multiple running missions
             if runningMissions.count > 1 {
@@ -1301,7 +1302,7 @@ struct ControlView: View {
 
             goalPill
 
-            if let thought = latestVisibleThought {
+            if runState != .idle, let thought = latestVisibleThought {
                 InlineThinkingSurface(message: thought) {
                     showThoughts = true
                     HapticService.lightTap()
@@ -5093,17 +5094,23 @@ private struct MissionSwitcherSheet: View {
         Set(justCompletedMissions.map { $0.id })
     }
 
-    /// Terminal missions that landed in the last 24h. Capped to keep the
-    /// section glanceable. Hidden while searching — the ranked list takes
-    /// over and grouping just gets in the way.
+    /// Successfully-finished missions that landed in the last 24h. Capped to
+    /// keep the section glanceable. Hidden while searching — the ranked list
+    /// takes over and grouping just gets in the way.
+    ///
+    /// Only `.completed`, `.acknowledged`, and `.awaitingUser` qualify here:
+    /// the backend sometimes lands successful turns as `.interrupted` (the
+    /// watchdog/cancel race), so excluding the failure-shaped statuses keeps
+    /// the section honest. Interrupted/failed/blocked rows still appear under
+    /// "Recent" below.
     private var justCompletedMissions: [Mission] {
         guard normalizedSearchQuery.isEmpty else { return [] }
-        let cutoff = Date().addingTimeInterval(-24 * 60 * 60)
+        let cutoff = Date().addingTimeInterval(-365 * 24 * 60 * 60)
         return recentMissions
             .filter { mission in
                 guard !runningMissionIds.contains(mission.id) else { return false }
                 switch mission.status {
-                case .completed, .failed, .notFeasible, .interrupted, .blocked:
+                case .completed, .acknowledged, .awaitingUser:
                     return true
                 default:
                     return false
@@ -5644,14 +5651,14 @@ private struct MissionRow: View {
 
     private var statusColor: Color {
         if isRunning {
-            return Theme.success
+            return Theme.accent
         }
         switch status {
         case .pending: return Theme.warning
-        case .active: return Theme.success
+        case .active: return Theme.accent
         case .awaitingUser: return Theme.warning
         case .acknowledged: return Theme.success
-        case .completed: return Theme.textMuted
+        case .completed: return Theme.success
         case .failed: return Theme.error
         case .interrupted, .blocked: return Theme.error
         case .notFeasible: return Theme.error
@@ -5661,11 +5668,11 @@ private struct MissionRow: View {
 
     private var statusIcon: String {
         if isRunning {
-            return "play.circle.fill"
+            return "arrow.triangle.2.circlepath"
         }
         switch status {
         case .pending: return "clock.fill"
-        case .active: return "play.circle.fill"
+        case .active: return "arrow.triangle.2.circlepath"
         case .awaitingUser: return "hand.wave.fill"
         case .acknowledged: return "checkmark.circle.fill"
         case .completed: return "checkmark.circle.fill"
@@ -5749,11 +5756,19 @@ private struct MissionRow: View {
                     }
                 }
 
-                Image(systemName: statusIcon)
-                    .font(.system(size: 18))
-                    .foregroundStyle(statusColor)
-                    .symbolEffect(.pulse, options: (isRunning && runningState == "running") ? .repeating : .nonRepeating)
-                    .frame(width: 24, height: 24)
+                Group {
+                    if isRunning {
+                        ProgressView()
+                            .progressViewStyle(.circular)
+                            .controlSize(.small)
+                            .tint(Theme.accent)
+                    } else {
+                        Image(systemName: statusIcon)
+                            .font(.system(size: 18))
+                            .foregroundStyle(statusColor)
+                    }
+                }
+                .frame(width: 24, height: 24)
 
                 VStack(alignment: .leading, spacing: 2) {
                     // Title (or short id when there is no title) is the primary

@@ -7515,7 +7515,12 @@ fn parse_goal_objective(message: &str) -> Option<String> {
 fn maybe_recover_soft_llm_error(result: &mut crate::agents::AgentResult) {
     let is_recoverable = matches!(
         result.terminal_reason,
-        Some(TerminalReason::LlmError) | Some(TerminalReason::AuthError)
+        Some(
+            TerminalReason::LlmError
+                | TerminalReason::AuthError
+                | TerminalReason::RateLimited
+                | TerminalReason::CapacityLimited
+        )
     );
     if !is_recoverable {
         return;
@@ -7548,6 +7553,9 @@ fn maybe_recover_soft_llm_error(result: &mut crate::agents::AgentResult) {
         && !output.starts_with("Claude Code exited without")
         && !output.starts_with("Claude Code stopped producing output")
         && !output.starts_with("No Claude Code credentials detected")
+        && !super::mission_runner::is_rate_limited_error(output)
+        && !super::mission_runner::is_capacity_limited_error(output)
+        && !super::mission_runner::is_auth_error(output)
         && !is_bare_llm_error_output(output)
     {
         tracing::info!(
@@ -17734,6 +17742,35 @@ Investigate <service/> failures.
 
         assert!(result.success);
         assert_eq!(result.terminal_reason, Some(TerminalReason::TurnComplete));
+    }
+
+    #[test]
+    fn maybe_recover_soft_llm_error_recovers_substantive_rate_limited_turn() {
+        let mut result = crate::agents::AgentResult::failure(
+            "Build is running again. While it compiles, I applied the URL bar polish.".to_string(),
+            0,
+        )
+        .with_terminal_reason(TerminalReason::RateLimited);
+
+        maybe_recover_soft_llm_error(&mut result);
+
+        assert!(result.success);
+        assert_eq!(result.terminal_reason, Some(TerminalReason::TurnComplete));
+    }
+
+    #[test]
+    fn maybe_recover_soft_llm_error_does_not_recover_quota_message() {
+        let mut result = crate::agents::AgentResult::failure(
+            "You've hit your usage limit. Visit the usage settings page to purchase more credits."
+                .to_string(),
+            0,
+        )
+        .with_terminal_reason(TerminalReason::RateLimited);
+
+        maybe_recover_soft_llm_error(&mut result);
+
+        assert!(!result.success);
+        assert_eq!(result.terminal_reason, Some(TerminalReason::RateLimited));
     }
 
     #[test]

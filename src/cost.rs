@@ -17,6 +17,312 @@ pub struct ModelPricing {
     pub cache_read_nano_per_token: Option<u64>,
 }
 
+struct PricingEntry {
+    canonical: &'static str,
+    aliases: &'static [&'static str],
+    pricing: ModelPricing,
+}
+
+const fn pricing(
+    input_nano_per_token: u64,
+    output_nano_per_token: u64,
+    cache_create_nano_per_token: Option<u64>,
+    cache_read_nano_per_token: Option<u64>,
+) -> ModelPricing {
+    ModelPricing {
+        input_nano_per_token,
+        output_nano_per_token,
+        cache_create_nano_per_token,
+        cache_read_nano_per_token,
+    }
+}
+
+// Prices are nanodollars per token. Provider rates are published per 1M tokens,
+// so "$1.25 / 1M tokens" becomes 1_250 nanodollars per token.
+//
+// Sources checked May 22, 2026:
+// - OpenAI API pricing and model pages: https://developers.openai.com/api/docs/pricing
+// - xAI model pricing: https://docs.x.ai/developers/models/grok-4
+// - Z.AI pricing: https://docs.z.ai/guides/overview/pricing
+// - MiniMax pay-as-you-go pricing: https://platform.minimax.io/docs/guides/pricing-paygo
+const PRICING_ENTRIES: &[PricingEntry] = &[
+    PricingEntry {
+        canonical: "claude-3-5-sonnet",
+        aliases: &["claude-3-5-sonnet", "claude-3.5-sonnet"],
+        pricing: pricing(3_000, 15_000, Some(3_750), Some(300)),
+    },
+    PricingEntry {
+        canonical: "claude-haiku-4-5",
+        aliases: &["claude-haiku-4-5", "claude-4-5-haiku"],
+        pricing: pricing(1_000, 5_000, Some(1_250), Some(100)),
+    },
+    PricingEntry {
+        canonical: "claude-sonnet-4-5",
+        aliases: &["claude-sonnet-4-5", "claude-4-5-sonnet"],
+        pricing: pricing(3_000, 15_000, Some(3_750), Some(300)),
+    },
+    PricingEntry {
+        canonical: "claude-sonnet-5",
+        aliases: &["claude-sonnet-5", "claude-5-sonnet"],
+        pricing: pricing(3_000, 15_000, Some(3_750), Some(300)),
+    },
+    PricingEntry {
+        canonical: "claude-sonnet-4",
+        aliases: &["claude-sonnet-4", "claude-4-sonnet"],
+        pricing: pricing(3_000, 15_000, Some(3_750), Some(300)),
+    },
+    PricingEntry {
+        canonical: "claude-3-5-haiku",
+        aliases: &["claude-3-5-haiku", "claude-3.5-haiku"],
+        pricing: pricing(800, 4_000, Some(1_000), Some(80)),
+    },
+    PricingEntry {
+        canonical: "claude-3-opus",
+        aliases: &["claude-3-opus", "claude-3.0-opus"],
+        pricing: pricing(15_000, 75_000, Some(18_750), Some(1_500)),
+    },
+    PricingEntry {
+        canonical: "claude-opus-4-7",
+        aliases: &["claude-opus-4-7", "claude-4-7-opus"],
+        pricing: pricing(5_000, 25_000, Some(6_250), Some(500)),
+    },
+    PricingEntry {
+        canonical: "claude-opus-4-6",
+        aliases: &["claude-opus-4-6", "claude-4-6-opus"],
+        pricing: pricing(5_000, 25_000, Some(6_250), Some(500)),
+    },
+    PricingEntry {
+        canonical: "claude-opus-4-5",
+        aliases: &["claude-opus-4-5", "claude-4-5-opus"],
+        pricing: pricing(5_000, 25_000, Some(6_250), Some(500)),
+    },
+    PricingEntry {
+        canonical: "claude-opus-4",
+        aliases: &["claude-opus-4", "claude-4-opus"],
+        pricing: pricing(15_000, 75_000, Some(18_750), Some(1_500)),
+    },
+    PricingEntry {
+        canonical: "gpt-4o-mini",
+        aliases: &["gpt-4o-mini"],
+        pricing: pricing(150, 600, None, Some(75)),
+    },
+    PricingEntry {
+        canonical: "gpt-4o",
+        aliases: &["gpt-4o"],
+        pricing: pricing(2_500, 10_000, None, Some(1_250)),
+    },
+    PricingEntry {
+        canonical: "gpt-4-turbo",
+        aliases: &["gpt-4-turbo"],
+        pricing: pricing(10_000, 30_000, None, None),
+    },
+    PricingEntry {
+        canonical: "gpt-4",
+        aliases: &["gpt-4"],
+        pricing: pricing(30_000, 60_000, None, None),
+    },
+    PricingEntry {
+        canonical: "gpt-5.4-nano",
+        aliases: &["gpt-5.4-nano", "gpt-5-4-nano"],
+        pricing: pricing(200, 1_250, None, Some(20)),
+    },
+    PricingEntry {
+        canonical: "gpt-5-nano",
+        aliases: &["gpt-5-nano"],
+        pricing: pricing(50, 400, None, Some(5)),
+    },
+    PricingEntry {
+        canonical: "gpt-5.4-mini",
+        aliases: &["gpt-5.4-mini", "gpt-5-4-mini"],
+        pricing: pricing(750, 4_500, None, Some(75)),
+    },
+    PricingEntry {
+        canonical: "gpt-5-mini",
+        aliases: &["gpt-5-mini"],
+        pricing: pricing(250, 2_000, None, Some(25)),
+    },
+    PricingEntry {
+        canonical: "gpt-5.5",
+        aliases: &["gpt-5.5", "gpt-5-5"],
+        pricing: pricing(5_000, 30_000, None, Some(500)),
+    },
+    PricingEntry {
+        canonical: "gpt-5.4",
+        aliases: &["gpt-5.4", "gpt-5-4"],
+        pricing: pricing(2_500, 15_000, None, Some(250)),
+    },
+    PricingEntry {
+        canonical: "gpt-5.3",
+        aliases: &["gpt-5.3", "gpt-5-3"],
+        pricing: pricing(1_750, 14_000, None, Some(175)),
+    },
+    PricingEntry {
+        canonical: "gpt-5.2",
+        aliases: &["gpt-5.2", "gpt-5-2"],
+        pricing: pricing(1_750, 14_000, None, Some(175)),
+    },
+    PricingEntry {
+        canonical: "gpt-5",
+        aliases: &["gpt-5.1", "gpt-5-1", "gpt-5"],
+        pricing: pricing(1_250, 10_000, None, Some(125)),
+    },
+    PricingEntry {
+        canonical: "o3",
+        aliases: &["o3"],
+        pricing: pricing(2_000, 8_000, None, Some(500)),
+    },
+    PricingEntry {
+        canonical: "o4-mini",
+        aliases: &["o4-mini"],
+        pricing: pricing(1_100, 4_400, None, Some(550)),
+    },
+    PricingEntry {
+        canonical: "gemini-3.1-pro",
+        aliases: &["gemini-3.1-pro", "gemini-3-1-pro"],
+        pricing: pricing(2_000, 12_000, None, None),
+    },
+    PricingEntry {
+        canonical: "gemini-3-pro",
+        aliases: &["gemini-3-pro"],
+        pricing: pricing(2_000, 12_000, None, None),
+    },
+    PricingEntry {
+        canonical: "gemini-3-flash",
+        aliases: &["gemini-3-flash"],
+        pricing: pricing(150, 600, None, None),
+    },
+    PricingEntry {
+        canonical: "gemini-2.5-pro",
+        aliases: &["gemini-2.5-pro", "gemini-2-5-pro"],
+        pricing: pricing(1_250, 10_000, None, None),
+    },
+    PricingEntry {
+        canonical: "gemini-2.5-flash",
+        aliases: &["gemini-2.5-flash", "gemini-2-5-flash"],
+        pricing: pricing(150, 600, None, None),
+    },
+    PricingEntry {
+        canonical: "gemini-2.0-flash",
+        aliases: &["gemini-2.0-flash", "gemini-2-0-flash"],
+        pricing: pricing(100, 400, None, None),
+    },
+    PricingEntry {
+        canonical: "gemini-1.5-pro",
+        aliases: &["gemini-1.5-pro", "gemini-1-5-pro"],
+        pricing: pricing(1_250, 5_000, None, None),
+    },
+    PricingEntry {
+        canonical: "gemini-1.5-flash",
+        aliases: &["gemini-1.5-flash", "gemini-1-5-flash"],
+        pricing: pricing(75, 300, None, None),
+    },
+    PricingEntry {
+        canonical: "grok-4-fast",
+        aliases: &["grok-4-fast", "grok-inference", "grok-build"],
+        pricing: pricing(1_250, 2_500, None, Some(200)),
+    },
+    PricingEntry {
+        canonical: "grok-4",
+        aliases: &["grok-4"],
+        pricing: pricing(1_250, 2_500, None, Some(200)),
+    },
+    PricingEntry {
+        canonical: "grok-3-mini",
+        aliases: &["grok-3-mini", "grok-2"],
+        pricing: pricing(1_250, 2_500, None, Some(200)),
+    },
+    PricingEntry {
+        canonical: "grok-3",
+        aliases: &["grok-3"],
+        pricing: pricing(1_250, 2_500, None, Some(200)),
+    },
+    PricingEntry {
+        canonical: "glm-5.1",
+        aliases: &["glm-5.1", "glm-5-1"],
+        pricing: pricing(1_400, 4_400, None, Some(260)),
+    },
+    PricingEntry {
+        canonical: "glm-5-turbo",
+        aliases: &["glm-5-turbo"],
+        pricing: pricing(1_200, 4_000, None, Some(240)),
+    },
+    PricingEntry {
+        canonical: "glm-5",
+        aliases: &["glm-5"],
+        pricing: pricing(1_000, 3_200, None, Some(200)),
+    },
+    PricingEntry {
+        canonical: "glm-4.7-flashx",
+        aliases: &["glm-4.7-flashx", "glm-4-7-flashx"],
+        pricing: pricing(70, 400, None, Some(10)),
+    },
+    PricingEntry {
+        canonical: "glm-4.7",
+        aliases: &["glm-4.7", "glm-4-7"],
+        pricing: pricing(600, 2_200, None, Some(110)),
+    },
+    PricingEntry {
+        canonical: "glm-4.6",
+        aliases: &["glm-4.6", "glm-4-6"],
+        pricing: pricing(600, 2_200, None, Some(110)),
+    },
+    PricingEntry {
+        canonical: "glm-4.5-airx",
+        aliases: &["glm-4.5-airx", "glm-4-5-airx"],
+        pricing: pricing(1_100, 4_500, None, Some(220)),
+    },
+    PricingEntry {
+        canonical: "glm-4.5-air",
+        aliases: &["glm-4.5-air", "glm-4-5-air"],
+        pricing: pricing(200, 1_100, None, Some(30)),
+    },
+    PricingEntry {
+        canonical: "glm-4.5-x",
+        aliases: &["glm-4.5-x", "glm-4-5-x"],
+        pricing: pricing(2_200, 8_900, None, Some(450)),
+    },
+    PricingEntry {
+        canonical: "glm-4.5",
+        aliases: &["glm-4.5", "glm-4-5"],
+        pricing: pricing(600, 2_200, None, Some(110)),
+    },
+    PricingEntry {
+        canonical: "minimax-m2.7-highspeed",
+        aliases: &["minimax-m2.7-highspeed", "minimax-m2-7-highspeed"],
+        pricing: pricing(600, 2_400, Some(375), Some(60)),
+    },
+    PricingEntry {
+        canonical: "minimax-m2.7",
+        aliases: &["minimax-m2.7", "minimax-m2-7"],
+        pricing: pricing(300, 1_200, Some(375), Some(60)),
+    },
+    PricingEntry {
+        canonical: "minimax-m2.5-highspeed",
+        aliases: &["minimax-m2.5-highspeed", "minimax-m2-5-highspeed"],
+        pricing: pricing(600, 2_400, Some(375), Some(30)),
+    },
+    PricingEntry {
+        canonical: "minimax-m2.5",
+        aliases: &["minimax-m2.5", "minimax-m2-5"],
+        pricing: pricing(300, 1_200, Some(375), Some(30)),
+    },
+    PricingEntry {
+        canonical: "minimax-m2.1-highspeed",
+        aliases: &["minimax-m2.1-highspeed", "minimax-m2-1-highspeed"],
+        pricing: pricing(600, 2_400, Some(375), Some(30)),
+    },
+    PricingEntry {
+        canonical: "minimax-m2.1",
+        aliases: &["minimax-m2.1", "minimax-m2-1"],
+        pricing: pricing(300, 1_200, Some(375), Some(30)),
+    },
+    PricingEntry {
+        canonical: "minimax-m2",
+        aliases: &["minimax-m2"],
+        pricing: pricing(300, 1_200, Some(375), Some(30)),
+    },
+];
+
 /// Token usage from an API call.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct TokenUsage {
@@ -41,72 +347,17 @@ fn normalize_model(model: &str) -> &str {
     let trimmed = model.trim();
     let normalized_for_match = trimmed.to_ascii_lowercase().replace(['_', ' '], "-");
 
-    // Handle common aliases and versioned names
-    match normalized_for_match.as_str() {
-        // Claude models - normalize to base names
-        s if s.contains("claude-3-5-sonnet") || s.contains("claude-3.5-sonnet") => {
-            "claude-3-5-sonnet"
+    for entry in PRICING_ENTRIES {
+        if entry
+            .aliases
+            .iter()
+            .any(|alias| normalized_for_match.contains(alias))
+        {
+            return entry.canonical;
         }
-        s if s.contains("claude-haiku-4-5") || s.contains("claude-4-5-haiku") => "claude-haiku-4-5",
-        s if s.contains("claude-sonnet-4-5") || s.contains("claude-4-5-sonnet") => {
-            "claude-sonnet-4-5"
-        }
-        s if s.contains("claude-sonnet-5") || s.contains("claude-5-sonnet") => "claude-sonnet-5",
-        s if s.contains("claude-sonnet-4") || s.contains("claude-4-sonnet") => "claude-sonnet-4",
-        s if s.contains("claude-3-5-haiku") || s.contains("claude-3.5-haiku") => "claude-3-5-haiku",
-        s if s.contains("claude-3-opus") || s.contains("claude-3.0-opus") => "claude-3-opus",
-        s if s.contains("claude-opus-4-7") || s.contains("claude-4-7-opus") => "claude-opus-4-7",
-        s if s.contains("claude-opus-4-6") || s.contains("claude-4-6-opus") => "claude-opus-4-6",
-        s if s.contains("claude-opus-4-5") || s.contains("claude-4-5-opus") => "claude-opus-4-5",
-        s if s.contains("claude-opus-4") || s.contains("claude-4-opus") => "claude-opus-4",
-
-        // GPT models
-        s if s.contains("gpt-5-nano") => "gpt-5-nano",
-        s if s.contains("gpt-5.4-mini") || s.contains("gpt-5-4-mini") => "gpt-5.4-mini",
-        s if s.contains("gpt-5-mini") => "gpt-5-mini",
-        s if s.contains("gpt-5.5") || s.contains("gpt-5-5") => "gpt-5.5",
-        s if s.contains("gpt-5.4") || s.contains("gpt-5-4") => "gpt-5.4",
-        s if s.contains("gpt-5.3") || s.contains("gpt-5-3") => "gpt-5.3",
-        s if s.contains("gpt-5.2") || s.contains("gpt-5-2") => "gpt-5.2",
-        s if s.contains("gpt-5.1") || s.contains("gpt-5-1") => "gpt-5",
-        s if s.contains("gpt-4o-mini") => "gpt-4o-mini",
-        s if s.contains("gpt-4o") => "gpt-4o",
-        s if s.contains("gpt-4-turbo") => "gpt-4-turbo",
-        s if s.contains("gpt-4") && !s.contains("gpt-4o") && !s.contains("turbo") => "gpt-4",
-        s if s.contains("gpt-5") => "gpt-5",
-        s if s.contains("o3") && !s.contains("gpt-4o") => "o3",
-        s if s.contains("o4-mini") => "o4-mini",
-
-        // Gemini models (ordered most-specific first to avoid substring conflicts)
-        s if s.contains("gemini-3.1-pro") || s.contains("gemini-3-1-pro") => "gemini-3.1-pro",
-        s if s.contains("gemini-3") && s.contains("pro") => "gemini-3-pro",
-        s if s.contains("gemini-3") && s.contains("flash") => "gemini-3-flash",
-        s if s.contains("gemini-2.5-pro") || s.contains("gemini-2-5-pro") => "gemini-2.5-pro",
-        s if s.contains("gemini-2.5-flash") || s.contains("gemini-2-5-flash") => "gemini-2.5-flash",
-        s if s.contains("gemini-2.0-flash") || s.contains("gemini-2-0-flash") => "gemini-2.0-flash",
-        s if s.contains("gemini-1.5-pro") || s.contains("gemini-1-5-pro") => "gemini-1.5-pro",
-        s if s.contains("gemini-1.5-flash") || s.contains("gemini-1-5-flash") => "gemini-1.5-flash",
-
-        // xAI models
-        s if s.contains("grok-4-fast") => "grok-4-fast",
-        s if s.contains("grok-4") => "grok-4",
-        s if s.contains("grok-3-mini") => "grok-3-mini",
-        s if s.contains("grok-3") => "grok-3",
-        s if s.contains("grok-inference") || s.contains("grok-build") => "grok-4-fast",
-
-        // Z.AI / GLM models
-        s if s.contains("glm-5.1") || s.contains("glm-5-1") => "glm-5.1",
-        s if s.contains("glm-5") => "glm-5",
-        s if s.contains("glm-4.7") || s.contains("glm-4-7") => "glm-4.7",
-        s if s.contains("glm-4.6") || s.contains("glm-4-6") => "glm-4.6",
-        s if s.contains("glm-4.5") || s.contains("glm-4-5") => "glm-4.5",
-
-        // MiniMax models
-        s if s.contains("minimax-m2") => "minimax-m2",
-
-        // Return as-is if no alias found
-        _ => trimmed,
     }
+
+    trimmed
 }
 
 /// Normalize model names to the canonical pricing key.
@@ -121,309 +372,10 @@ pub fn normalized_model(model: &str) -> String {
 /// - $15/1M output = 15_000 nanodollars per token
 pub fn pricing_for_model(model: &str) -> Option<ModelPricing> {
     let normalized = normalize_model(model);
-
-    // Pricing as of January 2026 (in nanodollars per token)
-    // Formula: $X per 1M tokens = X * 1000 nanodollars per token
-    match normalized {
-        // Claude 3.5 Sonnet: $3/1M input, $15/1M output
-        "claude-3-5-sonnet" => Some(ModelPricing {
-            input_nano_per_token: 3_000,
-            output_nano_per_token: 15_000,
-            cache_create_nano_per_token: Some(3_750), // 25% more than input
-            cache_read_nano_per_token: Some(300),     // 90% less than input
-        }),
-
-        // Claude Haiku 4.5: $1/1M input, $5/1M output
-        "claude-haiku-4-5" => Some(ModelPricing {
-            input_nano_per_token: 1_000,
-            output_nano_per_token: 5_000,
-            cache_create_nano_per_token: Some(1_250),
-            cache_read_nano_per_token: Some(100),
-        }),
-
-        // Claude Sonnet 4.5: $3/1M input, $15/1M output
-        "claude-sonnet-4-5" => Some(ModelPricing {
-            input_nano_per_token: 3_000,
-            output_nano_per_token: 15_000,
-            cache_create_nano_per_token: Some(3_750),
-            cache_read_nano_per_token: Some(300),
-        }),
-
-        // Claude Sonnet 5: same public price band as Sonnet 4.x
-        "claude-sonnet-5" => Some(ModelPricing {
-            input_nano_per_token: 3_000,
-            output_nano_per_token: 15_000,
-            cache_create_nano_per_token: Some(3_750),
-            cache_read_nano_per_token: Some(300),
-        }),
-
-        // Claude Sonnet 4: $3/1M input, $15/1M output (same as 3.5)
-        "claude-sonnet-4" => Some(ModelPricing {
-            input_nano_per_token: 3_000,
-            output_nano_per_token: 15_000,
-            cache_create_nano_per_token: Some(3_750),
-            cache_read_nano_per_token: Some(300),
-        }),
-
-        // Claude 3.5 Haiku: $0.80/1M input, $4/1M output
-        "claude-3-5-haiku" => Some(ModelPricing {
-            input_nano_per_token: 800,
-            output_nano_per_token: 4_000,
-            cache_create_nano_per_token: Some(1_000),
-            cache_read_nano_per_token: Some(80),
-        }),
-
-        // Claude 3 Opus: $15/1M input, $75/1M output
-        "claude-3-opus" => Some(ModelPricing {
-            input_nano_per_token: 15_000,
-            output_nano_per_token: 75_000,
-            cache_create_nano_per_token: Some(18_750),
-            cache_read_nano_per_token: Some(1_500),
-        }),
-
-        // Claude Opus 4.7: $5/1M input, $25/1M output
-        "claude-opus-4-7" => Some(ModelPricing {
-            input_nano_per_token: 5_000,
-            output_nano_per_token: 25_000,
-            cache_create_nano_per_token: Some(6_250),
-            cache_read_nano_per_token: Some(500),
-        }),
-
-        // Claude Opus 4.6: $5/1M input, $25/1M output
-        "claude-opus-4-6" => Some(ModelPricing {
-            input_nano_per_token: 5_000,
-            output_nano_per_token: 25_000,
-            cache_create_nano_per_token: Some(6_250),
-            cache_read_nano_per_token: Some(500),
-        }),
-
-        // Claude Opus 4.5: $5/1M input, $25/1M output
-        "claude-opus-4-5" => Some(ModelPricing {
-            input_nano_per_token: 5_000,
-            output_nano_per_token: 25_000,
-            cache_create_nano_per_token: Some(6_250),
-            cache_read_nano_per_token: Some(500),
-        }),
-
-        // Claude Opus 4: $15/1M input, $75/1M output
-        "claude-opus-4" => Some(ModelPricing {
-            input_nano_per_token: 15_000,
-            output_nano_per_token: 75_000,
-            cache_create_nano_per_token: Some(18_750),
-            cache_read_nano_per_token: Some(1_500),
-        }),
-
-        // GPT-4o: $2.50/1M input, $10/1M output
-        "gpt-4o" => Some(ModelPricing {
-            input_nano_per_token: 2_500,
-            output_nano_per_token: 10_000,
-            cache_create_nano_per_token: None,
-            cache_read_nano_per_token: Some(1_250), // 50% discount for cached
-        }),
-
-        // GPT-4o-mini: $0.15/1M input, $0.60/1M output
-        "gpt-4o-mini" => Some(ModelPricing {
-            input_nano_per_token: 150,
-            output_nano_per_token: 600,
-            cache_create_nano_per_token: None,
-            cache_read_nano_per_token: Some(75),
-        }),
-
-        // GPT-4 Turbo: $10/1M input, $30/1M output
-        "gpt-4-turbo" => Some(ModelPricing {
-            input_nano_per_token: 10_000,
-            output_nano_per_token: 30_000,
-            cache_create_nano_per_token: None,
-            cache_read_nano_per_token: None,
-        }),
-
-        // GPT-4: $30/1M input, $60/1M output
-        "gpt-4" => Some(ModelPricing {
-            input_nano_per_token: 30_000,
-            output_nano_per_token: 60_000,
-            cache_create_nano_per_token: None,
-            cache_read_nano_per_token: None,
-        }),
-
-        // GPT-5 / GPT-5.2 / GPT-5.3: $1.25/1M input, $10/1M output, $0.125/1M cached input
-        "gpt-5" | "gpt-5.2" | "gpt-5.3" => Some(ModelPricing {
-            input_nano_per_token: 1_250,
-            output_nano_per_token: 10_000,
-            cache_create_nano_per_token: None,
-            cache_read_nano_per_token: Some(125),
-        }),
-
-        // GPT-5.4: $2.50/1M input, $15/1M output, $0.25/1M cached input
-        "gpt-5.4" => Some(ModelPricing {
-            input_nano_per_token: 2_500,
-            output_nano_per_token: 15_000,
-            cache_create_nano_per_token: None,
-            cache_read_nano_per_token: Some(250),
-        }),
-
-        // GPT-5.5: $5/1M input, $30/1M output, $0.50/1M cached input
-        "gpt-5.5" => Some(ModelPricing {
-            input_nano_per_token: 5_000,
-            output_nano_per_token: 30_000,
-            cache_create_nano_per_token: None,
-            cache_read_nano_per_token: Some(500),
-        }),
-
-        // GPT-5.4 mini: $0.75/1M input, $4.50/1M output, $0.075/1M cached input
-        "gpt-5.4-mini" => Some(ModelPricing {
-            input_nano_per_token: 750,
-            output_nano_per_token: 4_500,
-            cache_create_nano_per_token: None,
-            cache_read_nano_per_token: Some(75),
-        }),
-
-        // GPT-5 mini: $0.25/1M input, $2/1M output, $0.025/1M cached input
-        "gpt-5-mini" => Some(ModelPricing {
-            input_nano_per_token: 250,
-            output_nano_per_token: 2_000,
-            cache_create_nano_per_token: None,
-            cache_read_nano_per_token: Some(25),
-        }),
-
-        // GPT-5 nano: $0.05/1M input, $0.40/1M output, $0.005/1M cached input
-        "gpt-5-nano" => Some(ModelPricing {
-            input_nano_per_token: 50,
-            output_nano_per_token: 400,
-            cache_create_nano_per_token: None,
-            cache_read_nano_per_token: Some(5),
-        }),
-
-        // o3: $10/1M input, $40/1M output (reasoning model)
-        "o3" => Some(ModelPricing {
-            input_nano_per_token: 10_000,
-            output_nano_per_token: 40_000,
-            cache_create_nano_per_token: None,
-            cache_read_nano_per_token: Some(5_000),
-        }),
-
-        // o4-mini: $1.10/1M input, $4.40/1M output
-        "o4-mini" => Some(ModelPricing {
-            input_nano_per_token: 1_100,
-            output_nano_per_token: 4_400,
-            cache_create_nano_per_token: None,
-            cache_read_nano_per_token: Some(550),
-        }),
-
-        // Gemini 3.1 Pro: $2/1M input, $12/1M output (<=200k context)
-        "gemini-3.1-pro" => Some(ModelPricing {
-            input_nano_per_token: 2_000,
-            output_nano_per_token: 12_000,
-            cache_create_nano_per_token: None,
-            cache_read_nano_per_token: None,
-        }),
-
-        // Gemini 3 Pro: $2/1M input, $12/1M output (<=200k context)
-        "gemini-3-pro" => Some(ModelPricing {
-            input_nano_per_token: 2_000,
-            output_nano_per_token: 12_000,
-            cache_create_nano_per_token: None,
-            cache_read_nano_per_token: None,
-        }),
-
-        // Gemini 3 Flash: assume same as 2.5 Flash until pricing confirmed
-        "gemini-3-flash" => Some(ModelPricing {
-            input_nano_per_token: 150,
-            output_nano_per_token: 600,
-            cache_create_nano_per_token: None,
-            cache_read_nano_per_token: None,
-        }),
-
-        // Gemini 2.5 Pro: $1.25/1M input, $10/1M output (>200k context)
-        "gemini-2.5-pro" => Some(ModelPricing {
-            input_nano_per_token: 1_250,
-            output_nano_per_token: 10_000,
-            cache_create_nano_per_token: None,
-            cache_read_nano_per_token: None,
-        }),
-
-        // Gemini 2.5 Flash: $0.15/1M input, $0.60/1M output
-        "gemini-2.5-flash" => Some(ModelPricing {
-            input_nano_per_token: 150,
-            output_nano_per_token: 600,
-            cache_create_nano_per_token: None,
-            cache_read_nano_per_token: None,
-        }),
-
-        // Gemini 2.0 Flash: $0.10/1M input, $0.40/1M output
-        "gemini-2.0-flash" => Some(ModelPricing {
-            input_nano_per_token: 100,
-            output_nano_per_token: 400,
-            cache_create_nano_per_token: None,
-            cache_read_nano_per_token: None,
-        }),
-
-        // Gemini 1.5 Pro: $1.25/1M input, $5/1M output
-        "gemini-1.5-pro" => Some(ModelPricing {
-            input_nano_per_token: 1_250,
-            output_nano_per_token: 5_000,
-            cache_create_nano_per_token: None,
-            cache_read_nano_per_token: None,
-        }),
-
-        // Gemini 1.5 Flash: $0.075/1M input, $0.30/1M output
-        "gemini-1.5-flash" => Some(ModelPricing {
-            input_nano_per_token: 75,
-            output_nano_per_token: 300,
-            cache_create_nano_per_token: None,
-            cache_read_nano_per_token: None,
-        }),
-
-        // xAI Grok pricing
-        "grok-4" => Some(ModelPricing {
-            input_nano_per_token: 3_000,
-            output_nano_per_token: 15_000,
-            cache_create_nano_per_token: None,
-            cache_read_nano_per_token: Some(750),
-        }),
-        "grok-4-fast" => Some(ModelPricing {
-            input_nano_per_token: 200,
-            output_nano_per_token: 500,
-            cache_create_nano_per_token: None,
-            cache_read_nano_per_token: Some(50),
-        }),
-        "grok-3" => Some(ModelPricing {
-            input_nano_per_token: 3_000,
-            output_nano_per_token: 15_000,
-            cache_create_nano_per_token: None,
-            cache_read_nano_per_token: None,
-        }),
-        "grok-3-mini" => Some(ModelPricing {
-            input_nano_per_token: 300,
-            output_nano_per_token: 500,
-            cache_create_nano_per_token: None,
-            cache_read_nano_per_token: None,
-        }),
-
-        // Z.AI / GLM OpenAI-compatible pricing
-        "glm-5" | "glm-5.1" => Some(ModelPricing {
-            input_nano_per_token: 600,
-            output_nano_per_token: 2_200,
-            cache_create_nano_per_token: None,
-            cache_read_nano_per_token: None,
-        }),
-        "glm-4.5" | "glm-4.6" | "glm-4.7" => Some(ModelPricing {
-            input_nano_per_token: 600,
-            output_nano_per_token: 2_200,
-            cache_create_nano_per_token: None,
-            cache_read_nano_per_token: None,
-        }),
-
-        // MiniMax M2
-        "minimax-m2" => Some(ModelPricing {
-            input_nano_per_token: 300,
-            output_nano_per_token: 1_200,
-            cache_create_nano_per_token: None,
-            cache_read_nano_per_token: None,
-        }),
-
-        // Unknown model
-        _ => None,
-    }
+    PRICING_ENTRIES
+        .iter()
+        .find(|entry| entry.canonical == normalized)
+        .map(|entry| entry.pricing)
 }
 
 /// Calculate cost in cents from token usage and model.
@@ -553,8 +505,14 @@ mod tests {
         assert_eq!(normalize_model("grok-build"), "grok-4-fast");
         assert_eq!(normalize_model("zai/glm-5"), "glm-5");
         assert_eq!(normalize_model("zai/glm-5.1"), "glm-5.1");
+        assert_eq!(normalize_model("zai/glm-5-turbo"), "glm-5-turbo");
         assert_eq!(normalize_model("zai/glm-4.7"), "glm-4.7");
-        assert_eq!(normalize_model("minimax/MiniMax-M2.5"), "minimax-m2");
+        assert_eq!(normalize_model("zai/glm-4.5-air"), "glm-4.5-air");
+        assert_eq!(
+            normalize_model("minimax/MiniMax-M2.5-highspeed"),
+            "minimax-m2.5-highspeed"
+        );
+        assert_eq!(normalize_model("minimax/MiniMax-M2.5"), "minimax-m2.5");
     }
 
     #[test]
@@ -578,8 +536,31 @@ mod tests {
         assert!(pricing_for_model("grok-build").is_some());
         assert!(pricing_for_model("glm-5").is_some());
         assert!(pricing_for_model("glm-5.1").is_some());
+        assert!(pricing_for_model("zai/glm-5-turbo").is_some());
         assert!(pricing_for_model("zai/glm-4.7").is_some());
+        assert!(pricing_for_model("zai/glm-4.5-air").is_some());
+        assert!(pricing_for_model("minimax/MiniMax-M2.5-highspeed").is_some());
         assert!(pricing_for_model("minimax/MiniMax-M2.5").is_some());
+    }
+
+    #[test]
+    fn test_official_api_price_points() {
+        let gpt_53 = pricing_for_model("gpt-5.3-codex").expect("gpt-5.3 pricing");
+        assert_eq!(gpt_53.input_nano_per_token, 1_750);
+        assert_eq!(gpt_53.output_nano_per_token, 14_000);
+
+        let grok = pricing_for_model("grok-build").expect("grok pricing");
+        assert_eq!(grok.input_nano_per_token, 1_250);
+        assert_eq!(grok.output_nano_per_token, 2_500);
+        assert_eq!(grok.cache_read_nano_per_token, Some(200));
+
+        let glm = pricing_for_model("zai/glm-5.1").expect("glm-5.1 pricing");
+        assert_eq!(glm.input_nano_per_token, 1_400);
+        assert_eq!(glm.output_nano_per_token, 4_400);
+
+        let minimax = pricing_for_model("minimax/MiniMax-M2.7-highspeed").expect("minimax pricing");
+        assert_eq!(minimax.input_nano_per_token, 600);
+        assert_eq!(minimax.output_nano_per_token, 2_400);
     }
 
     #[test]

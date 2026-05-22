@@ -1342,6 +1342,20 @@ fn stream_sandboxed_update(
 
         yield sse("log", format!("Installing binary to {} (service: {})...", install_dest, service_name), Some(75));
 
+        // Versioned-symlink install: when enabled, write the new binary into
+        // `/usr/local/bin/versions/<sha>/<exe_name>` and atomically retarget
+        // a symlink at `install_dest` to it. This gives us:
+        //   - rollback in one `ln -sfn` (no rebuild needed)
+        //   - the bin/ dir doesn't fill with `.bak`/`.backup` clutter
+        //   - a clear "the active version is wherever the symlink points"
+        //
+        // Opt-in via `SANDBOXED_SH_VERSIONED_INSTALL=1` so a host that's
+        // never had this layout doesn't get a surprise symlink swap.
+        let versioned_install = std::env::var("SANDBOXED_SH_VERSIONED_INSTALL")
+            .ok()
+            .map(|v| matches!(v.trim().to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+            .unwrap_or(false);
+
         // Stop the service before replacing the binary to avoid "Text file busy"
         let _ = Command::new("systemctl")
             .args(["stop", &service_name])
@@ -1349,21 +1363,28 @@ fn stream_sandboxed_update(
             .await;
 
         let src = format!("{}/target/debug/{}", repo_path.display(), exe_name);
-        match Command::new("install")
-            .args(["-m", "0755", &src, &install_dest])
-            .output()
-            .await
-        {
-            Ok(output) if output.status.success() => {}
-            Ok(output) => {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                yield sse("error", format!("Failed to install binary: {}", stderr), None);
-                // Try to restart the service even if install failed
-                let _ = Command::new("systemctl").args(["start", &service_name]).output().await;
-                return;
-            }
-            Err(e) => {
-                yield sse("error", format!("Failed to install binary: {}", e), None);
+
+        let install_result = if versioned_install {
+            install_versioned_binary(&repo_path, &exe_name, &latest_tag, &install_dest).await
+        } else {
+            // Legacy path: write straight to `install_dest`. Keep until the
+            // operator opts into versioned installs.
+            Command::new("install")
+                .args(["-m", "0755", &src, &install_dest])
+                .output()
+                .await
+                .map(|o| if o.status.success() {
+                    Ok(())
+                } else {
+                    Err(String::from_utf8_lossy(&o.stderr).to_string())
+                })
+                .unwrap_or_else(|e| Err(e.to_string()))
+        };
+
+        match install_result {
+            Ok(()) => {}
+            Err(msg) => {
+                yield sse("error", format!("Failed to install binary: {}", msg), None);
                 let _ = Command::new("systemctl").args(["start", &service_name]).output().await;
                 return;
             }
@@ -1396,6 +1417,104 @@ fn stream_sandboxed_update(
             .output()
             .await;
     }
+}
+
+/// Install a new binary into a versioned dir and flip a symlink at
+/// `install_dest` to point at it. The version dir lives under
+/// `<install_dest_parent>/versions/<tag>/` so a single `ls` shows what's
+/// deployable and rolling back is one symlink retarget.
+///
+/// Steps (each one tolerates partial-failure by leaving the previous
+/// symlink target intact):
+///   1. mkdir -p versions/<tag>
+///   2. install --mode 0755 target/debug/<exe> -> versions/<tag>/<exe>
+///   3. ln -sfn versions/<tag>/<exe>  install_dest
+///   4. update `versions/current` text file (for ops visibility)
+///
+/// On first run against an existing real-file install, the live binary at
+/// `install_dest` is moved aside into `versions/legacy/<exe>` and the
+/// symlink is created. After that, every deploy is just step 3.
+async fn install_versioned_binary(
+    repo_path: &std::path::Path,
+    exe_name: &str,
+    tag: &str,
+    install_dest: &str,
+) -> Result<(), String> {
+    use std::path::PathBuf;
+
+    let dest_path = PathBuf::from(install_dest);
+    let parent = dest_path
+        .parent()
+        .ok_or_else(|| format!("install_dest has no parent: {}", install_dest))?;
+    let versions_root = parent.join("versions");
+    // Sanitize tag: refuse `..`, `/`, or empty values so an attacker who
+    // can influence the tag string can't write outside `versions/`.
+    let safe_tag = tag.trim();
+    if safe_tag.is_empty() || safe_tag.contains('/') || safe_tag.contains("..") {
+        return Err(format!("refusing unsafe version tag: {:?}", safe_tag));
+    }
+    let version_dir = versions_root.join(safe_tag);
+
+    tokio::fs::create_dir_all(&version_dir)
+        .await
+        .map_err(|e| format!("create_dir_all {}: {}", version_dir.display(), e))?;
+
+    // If the live file is a real binary (not a symlink), preserve it under
+    // versions/legacy/ so a rollback is possible even though we didn't
+    // version it ourselves.
+    let live_meta = tokio::fs::symlink_metadata(&dest_path).await.ok();
+    if let Some(meta) = live_meta.as_ref() {
+        if !meta.file_type().is_symlink() && meta.file_type().is_file() {
+            let legacy_dir = versions_root.join("legacy");
+            tokio::fs::create_dir_all(&legacy_dir)
+                .await
+                .map_err(|e| format!("create_dir_all {}: {}", legacy_dir.display(), e))?;
+            let legacy_path = legacy_dir.join(exe_name);
+            // Best-effort copy — we don't fail the deploy if the legacy
+            // archive step fails; the new symlink swap below is what
+            // actually has to work.
+            let _ = tokio::fs::copy(&dest_path, &legacy_path).await;
+        }
+    }
+
+    // Install the freshly-built binary into the version dir.
+    let src = repo_path.join("target").join("debug").join(exe_name);
+    let target = version_dir.join(exe_name);
+    let install_status = tokio::process::Command::new("install")
+        .args([
+            "-m",
+            "0755",
+            src.to_string_lossy().as_ref(),
+            target.to_string_lossy().as_ref(),
+        ])
+        .output()
+        .await
+        .map_err(|e| format!("install: {}", e))?;
+    if !install_status.status.success() {
+        return Err(String::from_utf8_lossy(&install_status.stderr).to_string());
+    }
+
+    // `ln -sfn` is the standard "atomic-ish" symlink retarget. `-n` makes
+    // it treat an existing symlink-to-directory as a plain symlink (so we
+    // overwrite it instead of creating a link *inside* it). The kernel
+    // implements `symlink(2)` over a tmpfile + rename, so the swap is
+    // visible to other processes as a single transition.
+    let ln_status = tokio::process::Command::new("ln")
+        .args([
+            "-sfn",
+            target.to_string_lossy().as_ref(),
+            dest_path.to_string_lossy().as_ref(),
+        ])
+        .output()
+        .await
+        .map_err(|e| format!("ln: {}", e))?;
+    if !ln_status.status.success() {
+        return Err(String::from_utf8_lossy(&ln_status.stderr).to_string());
+    }
+
+    // Ops-visible "what's deployed right now" file. Best-effort.
+    let _ = tokio::fs::write(versions_root.join("current"), format!("{}\n", safe_tag)).await;
+    Ok(())
 }
 
 /// Stream the OpenCode update process.

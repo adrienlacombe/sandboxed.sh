@@ -217,7 +217,7 @@ struct RunningMissionsBar: View {
         } else if mission.isStalled {
             return Theme.warning
         } else if mission.isRunning {
-            return Theme.success
+            return Theme.accent
         } else {
             return Theme.warning
         }

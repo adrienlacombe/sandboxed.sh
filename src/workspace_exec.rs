@@ -757,8 +757,34 @@ impl WorkspaceExec {
         };
         let mut cmd = Command::new(nsenter);
         cmd.args([
-            "--target", leader, "--mount", "--uts", "--ipc", "--net", "--pid", "/bin/sh", "-lc",
+            "--target", leader, "--mount", "--uts", "--ipc", "--net", "--pid",
         ]);
+        // `--root` is what stops an attached CLI from writing to the *host*
+        // filesystem. Without it, nsenter enters the container's mount NS
+        // but the new process keeps the caller's (= host's) root directory,
+        // so resolves `/etc/...` and `/usr/local/bin/...` against the host
+        // even though mounts are container-local. That's the path a
+        // goal-mode mission used to drop `sandboxed-sh-prod-hotswap-*`
+        // binaries into the host's `/usr/local/bin` and rewrite the host's
+        // nginx config.
+        //
+        // Gated by an env var while we're confirming every container rootfs
+        // has the harness tools (`claude`, `codex`, `opencode`, MCP binaries)
+        // installed inside it. Default = legacy unsafe behaviour so an
+        // existing deployment doesn't break on upgrade; once a host is
+        // verified, set `SANDBOXED_SH_NSENTER_USE_TARGET_ROOT=1` in the env
+        // file to flip the safe default on.
+        let use_target_root = std::env::var("SANDBOXED_SH_NSENTER_USE_TARGET_ROOT")
+            .ok()
+            .map(|v| matches!(v.trim().to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+            .unwrap_or(false);
+        if use_target_root {
+            // `--root` with no arg = use the *target* process's root, i.e.
+            // the container rootfs. After this flag the new shell can only
+            // see the container's `/etc`, `/usr/local/bin`, etc.
+            cmd.arg("--root");
+        }
+        cmd.args(["/bin/sh", "-lc"]);
         cmd.arg(shell_cmd);
         // Note: env vars are now exported in the shell command, not here.
         // Setting them here with cmd.envs() doesn't propagate into the container.

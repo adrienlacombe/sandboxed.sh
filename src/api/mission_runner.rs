@@ -6434,7 +6434,7 @@ fn ascii_lower(byte: u8) -> u8 {
     }
 }
 
-fn is_auth_error(message: &str) -> bool {
+pub(crate) fn is_auth_error(message: &str) -> bool {
     const AUTH_MARKERS: [&str; 10] = [
         "invalid authentication credentials",
         "authentication_error",
@@ -6457,7 +6457,7 @@ fn is_auth_error(message: &str) -> bool {
         .any(|needle| contains_ascii_case_insensitive(message, needle))
 }
 
-fn is_rate_limited_error(message: &str) -> bool {
+pub(crate) fn is_rate_limited_error(message: &str) -> bool {
     const RATE_LIMIT_MARKERS: [&str; 15] = [
         "overloaded_error",
         "rate limit",
@@ -6686,7 +6686,7 @@ pub(crate) async fn refresh_claude_credentials_after_auth_error(
     }
 }
 
-fn is_capacity_limited_error(message: &str) -> bool {
+pub(crate) fn is_capacity_limited_error(message: &str) -> bool {
     const CAPACITY_LIMIT_MARKERS: [&str; 8] = [
         "already have five missions running",
         "already have 5 missions running",
