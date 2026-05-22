@@ -5699,7 +5699,7 @@ impl MissionStore for SqliteMissionStore {
             conn.execute(
                 "UPDATE telegram_alerts
                  SET status = 'pending', last_error = ?2
-                 WHERE id = ?1",
+                 WHERE id = ?1 AND status = 'pending'",
                 params![id.to_string(), error],
             )
             .map_err(|e| e.to_string())?;
@@ -8326,8 +8326,9 @@ mod tests {
             .expect("pending alerts after sent")
             .is_empty());
 
+        let queued_after_mute_id = Uuid::new_v4();
         let queued_after_mute = TelegramAlert {
-            id: Uuid::new_v4(),
+            id: queued_after_mute_id,
             telegram_user_id: 1_139_694_048,
             mission_id: Some(mission.id),
             event_kind: "mission_awaiting_user".to_string(),
@@ -8360,6 +8361,15 @@ mod tests {
             .list_pending_telegram_alerts(1_139_694_048, 10)
             .await
             .expect("pending alerts after ack")
+            .is_empty());
+        store
+            .mark_telegram_alert_failed(queued_after_mute_id, "late Telegram failure")
+            .await
+            .expect("late failure should not requeue acknowledged alert");
+        assert!(store
+            .list_pending_telegram_alerts(1_139_694_048, 10)
+            .await
+            .expect("pending alerts after late failure")
             .is_empty());
     }
 
