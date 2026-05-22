@@ -162,7 +162,7 @@ struct ControlView: View {
     @State private var expandedToolGroups: Set<String> = []
 
     // Mission switcher state
-    @State private var showMissionSwitcher = true
+    @State private var showMissionSwitcher = false
     @State private var recentMissions: [Mission] = []
 
     // Desktop stream state
@@ -498,9 +498,8 @@ struct ControlView: View {
             async let workspacesTask: Void = workspaceState.loadWorkspaces()
             async let runningTask: Void = refreshRunningMissions()
             async let missionTask: Void = loadInitialMission()
-            async let recentTask: Void = loadRecentMissions()
 
-            _ = await (workspacesTask, runningTask, missionTask, recentTask)
+            _ = await (workspacesTask, runningTask, missionTask)
 
             // Auto-show bar if there are multiple running missions
             if runningMissions.count > 1 {
@@ -5105,7 +5104,7 @@ private struct MissionSwitcherSheet: View {
     /// "Recent" below.
     private var justCompletedMissions: [Mission] {
         guard normalizedSearchQuery.isEmpty else { return [] }
-        let cutoff = Date().addingTimeInterval(-365 * 24 * 60 * 60)
+        let cutoff = Date().addingTimeInterval(-24 * 60 * 60)
         return recentMissions
             .filter { mission in
                 guard !runningMissionIds.contains(mission.id) else { return false }
