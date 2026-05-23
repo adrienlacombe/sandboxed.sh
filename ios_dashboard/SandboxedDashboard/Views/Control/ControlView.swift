@@ -74,11 +74,19 @@ private struct ControlDiagnosticsOverlay: View {
 }
 
 struct ControlView: View {
+    private struct DraftCacheEntry: Codable {
+        var text: String
+        var updatedAt: Date
+    }
+
     private static let draftTextKey = "control_draft_text"
+    private static let missionDraftsKey = "control_mission_drafts_v1"
     private static let lastMissionIdKey = "control_last_mission_id"
+    private static let maxDraftCacheBytes = 64 * 1_024
+    private static let maxDraftCacheEntries = 50
 
     @State private var messages: [ChatMessage] = []
-    @State private var inputText = UserDefaults.standard.string(forKey: ControlView.draftTextKey) ?? ""
+    @State private var inputText = ControlView.loadGlobalDraftText()
     @State private var runState: ControlRunState = .idle
     @State private var queueLength = 0
     @State private var queuedItems: [QueuedMessage] = []
@@ -526,7 +534,7 @@ struct ControlView: View {
         .onChange(of: scenePhase) { oldPhase, newPhase in
             if newPhase != .active {
                 // Save draft text when leaving foreground
-                UserDefaults.standard.set(inputText, forKey: Self.draftTextKey)
+                saveCurrentDraft(inputText)
             }
             // Reload mission history when app becomes active (similar to web's visibility change handler)
             // This ensures we catch any missed SSE events while the app was in background
@@ -539,8 +547,10 @@ struct ControlView: View {
                 }
             }
         }
-        .onChange(of: viewingMissionId) { _, newId in
+        .onChange(of: viewingMissionId) { oldId, newId in
+            saveDraft(inputText, missionId: oldId)
             UserDefaults.standard.set(newId, forKey: Self.lastMissionIdKey)
+            inputText = loadDraft(missionId: newId)
             streamTask?.cancel()
             connectionState = .disconnected
             reconnectAttempt = 0
@@ -552,7 +562,9 @@ struct ControlView: View {
             draftSaveTask = Task {
                 try? await Task.sleep(for: .seconds(1))
                 guard !Task.isCancelled else { return }
-                UserDefaults.standard.set(newText, forKey: Self.draftTextKey)
+                await MainActor.run {
+                    saveCurrentDraft(newText)
+                }
             }
         }
         .onDisappear {
@@ -561,7 +573,7 @@ struct ControlView: View {
             reconnectAttempt = 0
             pollingTask?.cancel()
             // Save draft immediately on disappear
-            UserDefaults.standard.set(inputText, forKey: Self.draftTextKey)
+            saveCurrentDraft(inputText)
             draftSaveTask?.cancel()
         }
         .sheet(isPresented: $showDesktopStream) {
@@ -1424,6 +1436,89 @@ struct ControlView: View {
     // MARK: - Actions
 
     // MARK: - Mission Caching with LRU Eviction
+
+    // MARK: - Composer Draft Cache
+
+    private static func loadGlobalDraftText() -> String {
+        UserDefaults.standard.string(forKey: draftTextKey) ?? ""
+    }
+
+    private func loadDraft(missionId: String?) -> String {
+        guard let missionId else {
+            return Self.loadGlobalDraftText()
+        }
+
+        if let entry = Self.loadDraftCache()[missionId] {
+            return entry.text
+        }
+
+        // One-way compatibility path for the previous global draft. The old
+        // value is claimed by the first mission opened after upgrade, then
+        // removed so it cannot leak into every other mission tab.
+        let legacy = Self.loadGlobalDraftText()
+        if !legacy.isEmpty {
+            saveDraft(legacy, missionId: missionId)
+            UserDefaults.standard.removeObject(forKey: Self.draftTextKey)
+        }
+        return legacy
+    }
+
+    private func saveCurrentDraft(_ text: String) {
+        saveDraft(text, missionId: viewingMissionId)
+    }
+
+    private func saveDraft(_ text: String, missionId: String?) {
+        guard let missionId else {
+            if text.isEmpty {
+                UserDefaults.standard.removeObject(forKey: Self.draftTextKey)
+            } else {
+                UserDefaults.standard.set(text, forKey: Self.draftTextKey)
+            }
+            return
+        }
+
+        var drafts = Self.loadDraftCache()
+        if text.isEmpty {
+            drafts.removeValue(forKey: missionId)
+        } else {
+            drafts[missionId] = DraftCacheEntry(text: text, updatedAt: Date())
+        }
+        Self.storeDraftCache(drafts)
+        UserDefaults.standard.removeObject(forKey: Self.draftTextKey)
+    }
+
+    private func removeCurrentDraft() {
+        saveDraft("", missionId: viewingMissionId)
+    }
+
+    private static func loadDraftCache() -> [String: DraftCacheEntry] {
+        guard let data = UserDefaults.standard.data(forKey: missionDraftsKey),
+              let drafts = try? JSONDecoder().decode([String: DraftCacheEntry].self, from: data) else {
+            return [:]
+        }
+        return drafts
+    }
+
+    private static func storeDraftCache(_ drafts: [String: DraftCacheEntry]) {
+        var pruned = drafts
+        while pruned.count > maxDraftCacheEntries {
+            guard let oldest = pruned.min(by: { $0.value.updatedAt < $1.value.updatedAt })?.key else { break }
+            pruned.removeValue(forKey: oldest)
+        }
+
+        var encoded = try? JSONEncoder().encode(pruned)
+        while let data = encoded, data.count > maxDraftCacheBytes, !pruned.isEmpty {
+            guard let oldest = pruned.min(by: { $0.value.updatedAt < $1.value.updatedAt })?.key else { break }
+            pruned.removeValue(forKey: oldest)
+            encoded = try? JSONEncoder().encode(pruned)
+        }
+
+        if let encoded, !pruned.isEmpty {
+            UserDefaults.standard.set(encoded, forKey: missionDraftsKey)
+        } else {
+            UserDefaults.standard.removeObject(forKey: missionDraftsKey)
+        }
+    }
 
     // Cache both mission metadata and events for consistent display
     private struct CachedMissionData: Codable {
@@ -2522,7 +2617,7 @@ struct ControlView: View {
         guard !content.isEmpty else { return }
 
         inputText = ""
-        UserDefaults.standard.removeObject(forKey: Self.draftTextKey)
+        removeCurrentDraft()
         HapticService.lightTap()
 
         // Generate temp ID and add message optimistically BEFORE the API call

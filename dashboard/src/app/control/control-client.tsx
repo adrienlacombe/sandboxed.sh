@@ -171,6 +171,16 @@ type InputInsertionState = TextSelection & {
   insertedCount: number;
 };
 
+type MissionDraftCacheEntry = {
+  text: string;
+  updatedAt: number;
+};
+
+const LEGACY_CONTROL_DRAFT_KEY = "control-draft";
+const MISSION_DRAFT_CACHE_KEY = "control-mission-drafts-v1";
+const MAX_MISSION_DRAFT_CACHE_BYTES = 64 * 1024;
+const MAX_MISSION_DRAFT_CACHE_ENTRIES = 50;
+
 type EventsWorkerRequest = {
   id: number;
   events: StoredEvent[];
@@ -243,6 +253,123 @@ function streamLog(
     case "error":
       console.error(...args);
       break;
+  }
+}
+
+function readLegacyControlDraft(): string {
+  if (typeof window === "undefined") return "";
+  try {
+    const raw = window.localStorage.getItem(LEGACY_CONTROL_DRAFT_KEY);
+    return raw ? (JSON.parse(raw) as string) : "";
+  } catch {
+    return "";
+  }
+}
+
+function readMissionDraftCache(): Record<string, MissionDraftCacheEntry> {
+  if (typeof window === "undefined") return {};
+  try {
+    const raw = window.localStorage.getItem(MISSION_DRAFT_CACHE_KEY);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return {};
+    }
+    return parsed as Record<string, MissionDraftCacheEntry>;
+  } catch {
+    return {};
+  }
+}
+
+function writeMissionDraftCache(
+  drafts: Record<string, MissionDraftCacheEntry>,
+) {
+  if (typeof window === "undefined") return;
+
+  const pruned = { ...drafts };
+  const removeOldest = () => {
+    const oldest = Object.entries(pruned).sort(
+      (a, b) => a[1].updatedAt - b[1].updatedAt,
+    )[0]?.[0];
+    if (oldest) delete pruned[oldest];
+    return Boolean(oldest);
+  };
+
+  while (Object.keys(pruned).length > MAX_MISSION_DRAFT_CACHE_ENTRIES) {
+    if (!removeOldest()) break;
+  }
+
+  let encoded = JSON.stringify(pruned);
+  while (
+    encoded.length > MAX_MISSION_DRAFT_CACHE_BYTES &&
+    Object.keys(pruned).length > 0
+  ) {
+    if (!removeOldest()) break;
+    encoded = JSON.stringify(pruned);
+  }
+
+  try {
+    if (Object.keys(pruned).length === 0) {
+      window.localStorage.removeItem(MISSION_DRAFT_CACHE_KEY);
+    } else {
+      window.localStorage.setItem(MISSION_DRAFT_CACHE_KEY, encoded);
+    }
+  } catch {
+    // Draft persistence is best-effort; storage quota errors should not
+    // interfere with sending messages.
+  }
+}
+
+function loadControlDraftForMission(missionId: string | null): string {
+  if (!missionId) return readLegacyControlDraft();
+
+  const drafts = readMissionDraftCache();
+  const existing = drafts[missionId];
+  if (existing) return existing.text;
+
+  const legacy = readLegacyControlDraft();
+  if (legacy) {
+    drafts[missionId] = { text: legacy, updatedAt: Date.now() };
+    writeMissionDraftCache(drafts);
+    try {
+      window.localStorage.removeItem(LEGACY_CONTROL_DRAFT_KEY);
+    } catch {
+      // ignore
+    }
+  }
+  return legacy;
+}
+
+function saveControlDraftForMission(text: string, missionId: string | null) {
+  if (typeof window === "undefined") return;
+
+  if (!missionId) {
+    try {
+      if (text) {
+        window.localStorage.setItem(
+          LEGACY_CONTROL_DRAFT_KEY,
+          JSON.stringify(text),
+        );
+      } else {
+        window.localStorage.removeItem(LEGACY_CONTROL_DRAFT_KEY);
+      }
+    } catch {
+      // ignore
+    }
+    return;
+  }
+
+  const drafts = readMissionDraftCache();
+  if (text) {
+    drafts[missionId] = { text, updatedAt: Date.now() };
+  } else {
+    delete drafts[missionId];
+  }
+  writeMissionDraftCache(drafts);
+  try {
+    window.localStorage.removeItem(LEGACY_CONTROL_DRAFT_KEY);
+  } catch {
+    // ignore
   }
 }
 
@@ -3681,8 +3808,7 @@ export default function ControlClient() {
 
   const [items, setItems] = useControlItemsStore();
   const itemsRef = useRef<ChatItem[]>([]);
-  const [draftInput, setDraftInput] = useLocalStorage("control-draft", "");
-  const [input, setInput] = useState(draftInput);
+  const [input, setInput] = useState(() => loadControlDraftForMission(null));
   const [canSubmitInput, setCanSubmitInput] = useState(false);
   const [lastMissionId, setLastMissionId] = useLocalStorage<string | null>(
     "control-last-mission-id",
@@ -4603,6 +4729,23 @@ export default function ControlClient() {
   const viewingMissionRef = useRef<Mission | null>(null);
   const submittingRef = useRef(false); // Guard against double-submission
   const autoTitleAttemptedRef = useRef<Set<string>>(new Set()); // Track missions we've tried to auto-title
+  const inputRef = useRef(input);
+  const draftMissionIdRef = useRef<string | null>(viewingMissionId);
+
+  useEffect(() => {
+    inputRef.current = input;
+  }, [input]);
+
+  useEffect(() => {
+    const previousMissionId = draftMissionIdRef.current;
+    if (previousMissionId === viewingMissionId) return;
+
+    saveControlDraftForMission(inputRef.current, previousMissionId);
+    const nextDraft = loadControlDraftForMission(viewingMissionId);
+    draftMissionIdRef.current = viewingMissionId;
+    inputRef.current = nextDraft;
+    setInput(nextDraft);
+  }, [viewingMissionId]);
 
   // Keep refs in sync with state
   useEffect(() => {
@@ -4683,18 +4826,13 @@ export default function ControlClient() {
       newScrollHeight - pending.oldScrollHeight + pending.oldScrollTop;
   }, [items]);
 
-  // Sync input to localStorage draft
+  // Sync input to the mission-scoped localStorage draft cache.
   useEffect(() => {
-    setDraftInput(input);
-  }, [input, setDraftInput]);
-
-  // Initialize input from draft on mount
-  useEffect(() => {
-    if (draftInput && !input) {
-      setInput(draftInput);
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+    const timeout = window.setTimeout(() => {
+      saveControlDraftForMission(input, draftMissionIdRef.current);
+    }, 250);
+    return () => window.clearTimeout(timeout);
+  }, [input]);
 
   const compressImageFile = useCallback(async (file: File) => {
     if (!file.type.startsWith("image/")) return file;
@@ -8543,7 +8681,7 @@ export default function ControlClient() {
         setItems((prev) => prev.filter((item) => item.id !== tempId));
         enhancedInputRef.current?.restoreDraft(trimmedContent, agent ?? null);
         setInput(trimmedContent);
-        setDraftInput(trimmedContent);
+        saveControlDraftForMission(trimmedContent, targetMissionId);
       };
 
       // Acknowledge the user's send immediately, before any mission sync or
@@ -8561,7 +8699,7 @@ export default function ControlClient() {
       ]);
       enhancedInputRef.current?.clear();
       setInput("");
-      setDraftInput("");
+      saveControlDraftForMission("", targetMissionId);
 
       // Sync mission state before sending (backend needs current_mission set correctly).
       // This now happens after the optimistic row so slow mission sync does not
