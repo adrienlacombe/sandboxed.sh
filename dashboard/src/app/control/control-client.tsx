@@ -2035,6 +2035,9 @@ const ThinkingPanel = memo(function ThinkingPanel({
     },
     overscan: 6,
   });
+  // See `chatVirtualizer` below for rationale.
+  thoughtsVirtualizer.shouldAdjustScrollPositionOnItemSizeChange = () =>
+    false;
   const {
     isAtBottom: isThoughtsAtBottom,
     scrollToBottom: scrollThoughtsToBottom,
@@ -4477,6 +4480,19 @@ export default function ControlClient() {
     },
     overscan: 8,
   });
+  // Suppress tanstack-virtual's automatic scroll-offset compensation.
+  // Default behavior: every time an item above the viewport measures and
+  // differs from its estimate, the virtualizer calls `_scrollToOffset`
+  // to shift `scrollTop` by the delta. Six or seven of these can fire in
+  // a single frame after the user scrolls up into a freshly-rendered
+  // region, and the user perceives the scrollbar sliding back toward
+  // the bottom while they're trying to read. Returning `false` from
+  // this hook stops the per-item shifts; bottom pinning (when the user
+  // is at the bottom) is already handled by `useVirtualTimelineAnchor`'s
+  // `scheduleBottomCorrection`, so we don't need both forces fighting.
+  // This is an instance field on the Virtualizer, not part of
+  // `useVirtualizer`'s typed options — hence the direct assignment.
+  chatVirtualizer.shouldAdjustScrollPositionOnItemSizeChange = () => false;
   const chatAnchorKey = useMemo(
     () =>
       groupedItems
