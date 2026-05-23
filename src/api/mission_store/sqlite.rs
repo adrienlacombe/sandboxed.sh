@@ -5823,35 +5823,32 @@ impl MissionStore for SqliteMissionStore {
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
-            let count: i64 = conn
-                .query_row(
-                    "SELECT COUNT(*)
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, telegram_user_id, mission_id, event_kind, importance, title, body,
+                            status, telegram_message_id, last_error, created_at, sent_at, acknowledged_at
                      FROM telegram_alerts
                      WHERE telegram_user_id = ?1
-                       AND telegram_message_id = ?2",
-                    params![telegram_user_id, telegram_message_id],
-                    |row| row.get(0),
+                       AND telegram_message_id = ?2
+                     ORDER BY sent_at DESC, created_at DESC",
                 )
                 .map_err(|e| e.to_string())?;
-            if count != 1 {
-                if count > 1 {
-                    return Err("ambiguous_digest_reply".to_string());
-                }
+            let alerts = stmt
+                .query_map(params![telegram_user_id, telegram_message_id], row_to_telegram_alert)
+                .map_err(|e| e.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?;
+            if alerts.is_empty() {
                 return Ok(None);
             }
-            conn.query_row(
-                "SELECT id, telegram_user_id, mission_id, event_kind, importance, title, body,
-                        status, telegram_message_id, last_error, created_at, sent_at, acknowledged_at
-                 FROM telegram_alerts
-                 WHERE telegram_user_id = ?1
-                   AND telegram_message_id = ?2
-                 ORDER BY sent_at DESC, created_at DESC
-                 LIMIT 1",
-                params![telegram_user_id, telegram_message_id],
-                row_to_telegram_alert,
-            )
-            .optional()
-            .map_err(|e| e.to_string())
+            let first_mission_id = alerts[0].mission_id;
+            if alerts
+                .iter()
+                .any(|alert| alert.mission_id != first_mission_id)
+            {
+                return Err("ambiguous_digest_reply".to_string());
+            }
+            Ok(alerts.into_iter().next())
         })
         .await
         .map_err(|e| e.to_string())?
@@ -8965,11 +8962,56 @@ mod tests {
             .mark_telegram_alert_sent(second_digest_alert_id, Some(99), "2026-05-20T10:01:40Z")
             .await
             .expect("mark second digest alert sent");
+        let same_mission_digest_alert = store
+            .get_telegram_alert_by_message_id(1_139_694_048, 99)
+            .await
+            .expect("same-mission digest alert lookup")
+            .expect("same-mission digest alert exists");
+        assert_eq!(same_mission_digest_alert.mission_id, Some(mission.id));
+        let other_mission = store
+            .create_mission(
+                Some("Other Paloma state"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("other mission");
+        let cross_mission_digest_alert_id = Uuid::new_v4();
+        store
+            .create_telegram_alert_if_absent(TelegramAlert {
+                id: cross_mission_digest_alert_id,
+                telegram_user_id: 1_139_694_048,
+                mission_id: Some(other_mission.id),
+                event_kind: "mission_failed".to_string(),
+                importance: "high".to_string(),
+                title: "Other Paloma state".to_string(),
+                body: "Other Paloma state failed.".to_string(),
+                status: "pending".to_string(),
+                telegram_message_id: None,
+                last_error: None,
+                created_at: "2026-05-20T10:01:50Z".to_string(),
+                sent_at: None,
+                acknowledged_at: None,
+            })
+            .await
+            .expect("cross-mission digest alert");
+        store
+            .mark_telegram_alert_sent(
+                cross_mission_digest_alert_id,
+                Some(99),
+                "2026-05-20T10:02:00Z",
+            )
+            .await
+            .expect("mark cross-mission digest alert sent");
         assert_eq!(
             store
                 .get_telegram_alert_by_message_id(1_139_694_048, 99)
                 .await
-                .expect_err("ambiguous digest alert lookup"),
+                .expect_err("cross-mission digest alert lookup"),
             "ambiguous_digest_reply"
         );
         assert!(store
