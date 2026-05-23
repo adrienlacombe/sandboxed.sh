@@ -851,7 +851,7 @@ async fn apply_paloma_interest_feedback(
         }
         TelegramMissionInterestLevel::High => {
             format!(
-                "Marked {} high interest. I will still batch updates and respect quiet windows.",
+                "Noted. I will keep {} high interest and batch updates.",
                 mission_label(&mission)
             )
         }
@@ -1172,7 +1172,7 @@ async fn paloma_pending_alert_still_eligible(
     paloma_should_alert_mission_at(&mission, &events, interest, now)
 }
 
-async fn plan_and_deliver_paloma_alerts(ctx: &ChannelContext, http: &Client) {
+async fn plan_and_deliver_paloma_alerts(ctx: &ChannelContext, _http: &Client) {
     let Some(owner_id) =
         configured_telegram_id("PALOMA_TELEGRAM_OWNER_ID", DEFAULT_PALOMA_OWNER_TELEGRAM_ID)
     else {
@@ -1298,166 +1298,8 @@ async fn plan_and_deliver_paloma_alerts(ctx: &ChannelContext, http: &Client) {
             .await;
     }
 
-    let mut pending = ctx
-        .mission_store
-        .list_pending_telegram_alerts(owner_id, PALOMA_ALERT_DIGEST_LIMIT)
-        .await
-        .unwrap_or_default();
-    let muted_pending = pending
-        .iter()
-        .filter_map(|alert| alert.mission_id.map(|mission_id| (alert.id, mission_id)))
-        .filter(|(_, mission_id)| {
-            subscriptions
-                .get(mission_id)
-                .copied()
-                .unwrap_or(TelegramMissionInterestLevel::Normal)
-                == TelegramMissionInterestLevel::Muted
-        })
-        .collect::<Vec<_>>();
-    let failure_only_pending = pending
-        .iter()
-        .filter_map(|alert| alert.mission_id.map(|mission_id| (alert.id, mission_id)))
-        .filter(|(_, mission_id)| {
-            paloma_mission_has_failure_only_preference(&alert_preferences, *mission_id)
-        })
-        .filter(|(alert_id, _)| {
-            pending
-                .iter()
-                .find(|alert| alert.id == *alert_id)
-                .map(|alert| !alert.event_kind.starts_with("mission_failed"))
-                .unwrap_or(false)
-        })
-        .collect::<Vec<_>>();
-    if !muted_pending.is_empty() || !failure_only_pending.is_empty() {
-        let acknowledged_at = now_string();
-        for (_, mission_id) in &muted_pending {
-            let _ = ctx
-                .mission_store
-                .acknowledge_pending_telegram_alerts_for_mission(
-                    owner_id,
-                    *mission_id,
-                    &acknowledged_at,
-                )
-                .await;
-        }
-        for (alert_id, _) in &failure_only_pending {
-            let _ = ctx
-                .mission_store
-                .acknowledge_pending_telegram_alert(owner_id, *alert_id, &acknowledged_at)
-                .await;
-        }
-        pending.retain(|alert| {
-            alert.mission_id.is_none_or(|mission_id| {
-                let muted = subscriptions
-                    .get(&mission_id)
-                    .copied()
-                    .unwrap_or(TelegramMissionInterestLevel::Normal)
-                    == TelegramMissionInterestLevel::Muted;
-                let failure_only_suppressed = failure_only_pending
-                    .iter()
-                    .any(|(pending_alert_id, _)| *pending_alert_id == alert.id);
-                !muted && !failure_only_suppressed
-            })
-        });
-    }
-    if !pending.is_empty() {
-        let checked_at = Utc::now();
-        let mut eligible_pending = Vec::with_capacity(pending.len());
-        let acknowledged_at = now_string();
-        for alert in pending {
-            let interest = alert
-                .mission_id
-                .and_then(|mission_id| subscriptions.get(&mission_id).copied())
-                .unwrap_or(TelegramMissionInterestLevel::Normal);
-            if paloma_pending_alert_still_eligible(ctx, &alert, interest, checked_at).await {
-                eligible_pending.push(alert);
-            } else {
-                let _ = ctx
-                    .mission_store
-                    .acknowledge_pending_telegram_alert(owner_id, alert.id, &acknowledged_at)
-                    .await;
-            }
-        }
-        pending = eligible_pending;
-    }
-    if pending.is_empty() {
-        return;
-    }
-    let digest_checked_at = Utc::now();
-    if let Some(reason) =
-        paloma_digest_suppression_reason_for_user(ctx, owner_id, digest_checked_at).await
-    {
-        if let Some(first_alert) = pending.first() {
-            let snapshot = serde_json::json!({
-                "pending_alerts": pending.len(),
-                "digest_limit": PALOMA_ALERT_DIGEST_LIMIT,
-                "suppression_reason": reason,
-            })
-            .to_string();
-            let decision = decision_log::new_decision(
-                "scheduler",
-                first_alert.mission_id,
-                Some(owner_id),
-                "telegram",
-                "digest_suppressed",
-                "send_digest",
-                false,
-                Some(reason),
-                &snapshot,
-                None,
-                now_string(),
-            );
-            let _ = ctx.mission_store.create_paloma_decision(decision).await;
-        }
-        return;
-    }
-    let base_url = format!("https://api.telegram.org/bot{}", ctx.channel.bot_token);
-    let text = paloma_alert_digest_text(&pending);
-    let digest_snapshot = serde_json::json!({
-        "pending_alerts": pending.len(),
-        "digest_limit": PALOMA_ALERT_DIGEST_LIMIT,
-    })
-    .to_string();
-    match send_message(http, &base_url, owner_id, &text, None).await {
-        Ok(message_id) => {
-            let sent_at = now_string();
-            let _ = ctx
-                .mission_store
-                .update_telegram_user_last_digest_at(owner_id, &sent_at)
-                .await;
-            if let Some(first_alert) = pending.first() {
-                let decision = decision_log::new_decision(
-                    "scheduler",
-                    first_alert.mission_id,
-                    Some(owner_id),
-                    "telegram",
-                    "digest_send",
-                    "send_digest",
-                    true,
-                    None,
-                    &digest_snapshot,
-                    Some(&text),
-                    sent_at.clone(),
-                );
-                let _ = ctx.mission_store.create_paloma_decision(decision).await;
-            }
-            for alert in pending {
-                let _ = ctx
-                    .mission_store
-                    .mark_telegram_alert_sent(alert.id, Some(message_id), &sent_at)
-                    .await;
-            }
-        }
-        Err(err) => {
-            for alert in pending {
-                tracing::warn!("Failed to send Telegram alert {}: {}", alert.id, err);
-                let _ = ctx
-                    .mission_store
-                    .mark_telegram_alert_failed(alert.id, &err)
-                    .await;
-            }
-        }
-    }
+    // Alert scanning only records pending alerts. Delivery is centralized in
+    // `paloma_digest_flush`, which applies user quiet windows and cooldowns.
 }
 
 async fn flush_pending_paloma_digest(
@@ -1751,6 +1593,13 @@ async fn handle_paloma_command(
         )
         .await;
         return true;
+    }
+
+    if let Some(owner) = user.filter(|u| u.role == TelegramUserRole::Owner) {
+        let _ = ctx
+            .mission_store
+            .update_telegram_user_last_alert_ack_at(owner.telegram_user_id, &now_string())
+            .await;
     }
 
     let result = if let Some(user) = owner_failure_only_feedback {
