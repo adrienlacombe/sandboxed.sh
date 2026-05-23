@@ -1991,9 +1991,8 @@ impl TelegramBridge {
         mission_store: Arc<dyn MissionStore>,
         public_base_url: &str,
     ) -> Result<(), String> {
-        self.stop_channel(channel.id).await;
-
         let base_url = format!("https://api.telegram.org/bot{}", channel.bot_token);
+        let channel_id = channel.id;
 
         // Resolve bot username
         let bot_username = if let Some(ref u) = channel.bot_username {
@@ -2021,7 +2020,7 @@ impl TelegramBridge {
         .map_err(|e| {
             let msg = format!(
                 "Failed to set Telegram webhook for channel {}: {}",
-                channel.id, e
+                channel_id, e
             );
             tracing::error!("{}", msg);
             msg
@@ -2034,7 +2033,7 @@ impl TelegramBridge {
         };
         tracing::info!(
             "Registered Telegram webhook for channel {} (bot: @{}, {}, url: {})",
-            channel.id,
+            channel_id,
             bot_username,
             mode_label,
             webhook_url,
@@ -2048,10 +2047,7 @@ impl TelegramBridge {
             mission_store: Arc::clone(&mission_store),
         };
 
-        self.active_channels
-            .write()
-            .await
-            .insert(ctx.channel.id, ctx);
+        self.active_channels.write().await.insert(channel_id, ctx);
 
         self.ensure_scheduler_started(mission_store).await;
 
