@@ -277,6 +277,75 @@ import { RelativeTime } from "@/components/ui/relative-time";
 type ToolItem = Extract<ChatItem, { kind: "tool" }>;
 type SidePanelItem = Extract<ChatItem, { kind: "thinking" | "stream" }>;
 
+// Module-level so all duration consumers share the same implementation.
+function formatDuration(seconds: number): string {
+  if (seconds <= 0) return "<1s";
+  if (seconds < 60) return `${seconds}s`;
+  const mins = Math.floor(seconds / 60);
+  const secs = seconds % 60;
+  return `${mins}m${secs > 0 ? ` ${secs}s` : ""}`;
+}
+
+// Renders a live-updating duration string anchored at `startTime`. ONLY this
+// component subscribes to `useNow()`, so the 1 Hz tick re-renders just the
+// active duration cell — not every visible done item/tool card. Wrapping a
+// parent in this child instead of calling `useNow()` directly avoids the
+// per-second commit storm we used to get on the thoughts panel (which can
+// hold hundreds of done items, each one of which was subscribing for a value
+// it never read).
+const LiveDuration = memo(function LiveDuration({
+  startTime,
+}: {
+  startTime: number;
+}) {
+  const nowMs = useNow();
+  const seconds = Math.max(0, Math.floor((nowMs - startTime) / 1000));
+  return <>{formatDuration(seconds)}</>;
+});
+
+/**
+ * Returns the previous reference when `arr` is element-wise `Object.is` to
+ * the last value. Used to keep derived array props reference-stable so a
+ * memoized child can skip re-rendering when its slice of the world hasn't
+ * actually changed.
+ *
+ * The motivating case: `thinkingItems` falls out of the same `useMemo` as
+ * `groupedItems`, so any `setItems` (e.g. a `text_delta` on the assistant
+ * message) bumps both references. The thinking subset usually hasn't
+ * changed, but `ThinkingPanel` would still re-render on every chat tick.
+ * Wrapping the array through this hook + `React.memo` on the panel cuts
+ * those redundant renders.
+ */
+// `useMemoCompare`-style identity helper. The React Compiler lint plugin
+// forbids ref access during render to keep auto-memoization safe, but this
+// hook is itself the memoization primitive — it must compare against the
+// last render to decide what to return. Local rule disable is intentional.
+/* eslint-disable react-hooks/refs */
+function useStableShallowArray<T>(arr: readonly T[]): readonly T[] {
+  const ref = useRef<readonly T[]>(arr);
+  const prev = ref.current;
+  let stable: readonly T[];
+  if (prev === arr) {
+    stable = prev;
+  } else if (prev.length !== arr.length) {
+    stable = arr;
+  } else {
+    let equal = true;
+    for (let i = 0; i < arr.length; i++) {
+      if (!Object.is(prev[i], arr[i])) {
+        equal = false;
+        break;
+      }
+    }
+    stable = equal ? prev : arr;
+  }
+  useEffect(() => {
+    ref.current = stable;
+  }, [stable]);
+  return stable;
+}
+/* eslint-enable react-hooks/refs */
+
 type ToolGroup = {
   kind: "tool_group";
   groupId: string;
@@ -1514,13 +1583,6 @@ function ThinkingGroupItem({
     ? Math.max(...items.map((item) => item.endTime || item.startTime))
     : undefined;
 
-  // P1-#7: derive elapsed from the shared NowTickProvider so we have
-  // one timer for the whole page instead of one per visible item.
-  const nowMs = useNow();
-  const elapsedSeconds = hasActiveItem
-    ? Math.max(0, Math.floor((nowMs - startTime) / 1000))
-    : 0;
-
   // Auto-collapse when all thinking is done
   useEffect(() => {
     if (!hasActiveItem && expanded && !hasAutoCollapsedRef.current) {
@@ -1537,18 +1599,13 @@ function ThinkingGroupItem({
     }
   }, [hasActiveItem, expanded, startTime]);
 
-  const formatDuration = (seconds: number) => {
-    if (seconds <= 0) return "<1s";
-    if (seconds < 60) return `${seconds}s`;
-    const mins = Math.floor(seconds / 60);
-    const secs = seconds % 60;
-    return `${mins}m${secs > 0 ? ` ${secs}s` : ""}`;
-  };
-
-  const duration =
+  // Only the active branch ticks once per second via `<LiveDuration>`.
+  // When the group is fully done, we render a fixed string and never
+  // subscribe to `useNow()`.
+  const doneDuration =
     !hasActiveItem && endTime
       ? formatDuration(Math.floor((endTime - startTime) / 1000))
-      : formatDuration(elapsedSeconds);
+      : null;
 
   // If no non-empty items, don't render anything
   if (nonEmptyItems.length === 0) {
@@ -1593,9 +1650,13 @@ function ThinkingGroupItem({
           )}
         />
         <span className="text-xs">
-          {hasActiveItem
-            ? `${activeLabel} for ${duration}`
-            : `${label} for ${duration}`}
+          {hasActiveItem ? (
+            <>
+              {activeLabel} for <LiveDuration startTime={startTime} />
+            </>
+          ) : (
+            `${label} for ${doneDuration ?? "<1s"}`
+          )}
         </span>
         {nonEmptyItems.length > 1 && (
           <span className="text-xs text-white/30">
@@ -1662,28 +1723,15 @@ const ThinkingPanelItem = memo(function ThinkingPanelItem({
   workspaceId?: string;
   missionId?: string;
 }) {
-  // P1-#7: shared NowTickProvider drives elapsed for all items.
-  const nowMs = useNow();
-  const elapsedSeconds = item.done
-    ? Math.max(
-        0,
-        Math.floor(((item.endTime ?? item.startTime) - item.startTime) / 1000),
-      )
-    : Math.max(0, Math.floor((nowMs - item.startTime) / 1000));
+  // P1-#7 / re-render fix: only active items live-tick via `<LiveDuration>`.
+  // Done items render a fixed string and never subscribe to `useNow()`, so
+  // visible done cards no longer commit once per second forever.
   const [isExpanded, setIsExpanded] = useState(!item.done);
 
-  const formatDuration = (seconds: number) => {
-    if (seconds <= 0) return "<1s";
-    if (seconds < 60) return `${seconds}s`;
-    const mins = Math.floor(seconds / 60);
-    const secs = seconds % 60;
-    return `${mins}m${secs > 0 ? ` ${secs}s` : ""}`;
-  };
-
-  const duration =
+  const doneDuration =
     item.done && item.endTime
       ? formatDuration(Math.floor((item.endTime - item.startTime) / 1000))
-      : formatDuration(elapsedSeconds);
+      : null;
 
   const activeLabel = item.kind === "stream" ? "Streaming" : "Thinking";
   const pastLabel = item.kind === "stream" ? "Draft" : "Thought";
@@ -1721,9 +1769,13 @@ const ThinkingPanelItem = memo(function ThinkingPanelItem({
             isActive ? "text-indigo-400" : "text-white/50",
           )}
         >
-          {isActive
-            ? `${activeLabel} for ${duration}`
-            : `${pastLabel} for ${duration}`}
+          {isActive ? (
+            <>
+              {activeLabel} for <LiveDuration startTime={item.startTime} />
+            </>
+          ) : (
+            `${pastLabel} for ${doneDuration ?? "<1s"}`
+          )}
         </span>
       </div>
       {/* Content area - no internal scroll, unified text color */}
@@ -1770,8 +1822,15 @@ const ThinkingPanelItem = memo(function ThinkingPanelItem({
   );
 });
 
-// Thinking side panel component
-function ThinkingPanel({
+// Thinking side panel component.
+//
+// `React.memo` short-circuits when props are reference-stable, so the panel
+// no longer re-renders on chat-only updates. The two non-trivial inputs:
+//   - `items`: kept reference-stable upstream via `useStableShallowArray`
+//   - `onClose`: already wrapped in `useCallback`
+// `className` is built from primitive string literals at the call site;
+// `basePath` and `missionId` come from memoized values / the store.
+const ThinkingPanel = memo(function ThinkingPanel({
   items,
   onClose,
   className,
@@ -1984,7 +2043,7 @@ function ThinkingPanel({
       </div>
     </div>
   );
-}
+});
 
 function MissionWorkbenchPanel({
   mission,
@@ -2497,16 +2556,6 @@ const SubagentToolItem = memo(function SubagentToolItem({
 }) {
   const [expanded, setExpanded] = useState(false);
   const isDone = item.result !== undefined;
-  // P1-#7: derived from the shared NowTickProvider instead of a per-row
-  // setInterval. With dozens of visible tool calls this was the biggest
-  // contributor to the timer storm seen in devtools.
-  const nowMs = useNow();
-  const elapsedSeconds = isDone
-    ? Math.max(
-        0,
-        Math.floor(((item.endTime ?? item.startTime) - item.startTime) / 1000),
-      )
-    : Math.max(0, Math.floor((nowMs - item.startTime) / 1000));
 
   // Memoize subagent info extraction
   const { agentName, description, prompt } = useMemo(
@@ -2523,19 +2572,13 @@ const SubagentToolItem = memo(function SubagentToolItem({
     [isDone, item.result],
   );
 
-  const formatDuration = (seconds: number) => {
-    // Handle negative or zero durations
-    if (seconds <= 0) return "<1s";
-    if (seconds < 60) return `${seconds}s`;
-    const mins = Math.floor(seconds / 60);
-    const secs = seconds % 60;
-    return `${mins}m${secs > 0 ? ` ${secs}s` : ""}`;
-  };
-
-  const duration =
+  // Done rows render a fixed duration string; only active rows tick via
+  // `<LiveDuration>`. This keeps the per-second tick from re-rendering
+  // every visible done tool card (see LiveDuration definition).
+  const doneDuration =
     isDone && item.endTime
       ? formatDuration(Math.floor((item.endTime - item.startTime) / 1000))
-      : formatDuration(elapsedSeconds);
+      : null;
 
   // Memoize result string formatting
   const resultStr = useMemo(
@@ -2618,7 +2661,7 @@ const SubagentToolItem = memo(function SubagentToolItem({
               {!isDone ? (
                 <>
                   <span className="text-xs text-white/50">
-                    Running for {duration}
+                    Running for <LiveDuration startTime={item.startTime} />
                   </span>
                   <Loader className="h-3 w-3 animate-spin text-purple-400" />
                 </>
@@ -2634,7 +2677,7 @@ const SubagentToolItem = memo(function SubagentToolItem({
               ) : (
                 <>
                   <span className="text-xs text-white/50">
-                    Completed in {duration}
+                    Completed in {doneDuration ?? "<1s"}
                   </span>
                   {summary && (
                     <span className="text-xs text-white/40 truncate max-w-[200px]">
@@ -2875,28 +2918,14 @@ const ToolCallItem = memo(function ToolCallItem({
 }) {
   const [expanded, setExpanded] = useState(false);
   const isDone = item.result !== undefined;
-  // P1-#7: shared NowTickProvider drives the "elapsed" pill.
-  const nowMs = useNow();
-  const elapsedSeconds = isDone
-    ? Math.max(
-        0,
-        Math.floor(((item.endTime ?? item.startTime) - item.startTime) / 1000),
-      )
-    : Math.max(0, Math.floor((nowMs - item.startTime) / 1000));
 
-  const formatDuration = (seconds: number) => {
-    if (seconds <= 0) return "<1s";
-    if (seconds < 60) return `${seconds}s`;
-    const mins = Math.floor(seconds / 60);
-    const secs = seconds % 60;
-    return `${mins}m${secs > 0 ? ` ${secs}s` : ""}`;
-  };
-
-  // Use endTime for completed tools, otherwise use elapsed time for running tools
-  const duration =
+  // Only running tools live-tick (via `<LiveDuration>` below). Done rows
+  // freeze on a fixed string; previously every visible done tool subscribed
+  // to the 1 Hz tick for a value it never displayed.
+  const doneDuration =
     isDone && item.endTime
       ? formatDuration(Math.floor((item.endTime - item.startTime) / 1000))
-      : formatDuration(elapsedSeconds);
+      : null;
 
   // Memoize expensive string formatting - only recompute when item.args changes
   const argsStr = useMemo(() => formatToolArgs(item.args), [item.args]);
@@ -3000,7 +3029,18 @@ const ToolCallItem = memo(function ToolCallItem({
           </span>
         )}
         <span className="text-xs text-white/30 ml-1">
-          {isDone ? (isCancelled ? "cancelled" : duration) : `${duration}...`}
+          {isDone ? (
+            isCancelled ? (
+              "cancelled"
+            ) : (
+              (doneDuration ?? "<1s")
+            )
+          ) : (
+            <>
+              <LiveDuration startTime={item.startTime} />
+              ...
+            </>
+          )}
         </span>
         {isDone && !isError && !isCancelled && (
           <CheckCircle className="h-3 w-3 text-emerald-400" />
@@ -3113,7 +3153,10 @@ const ToolCallItem = memo(function ToolCallItem({
             {!isDone && (
               <div className="flex items-center gap-2 text-xs text-amber-400/70">
                 <Loader className="h-3 w-3 animate-spin" />
-                <span>Running for {duration}...</span>
+                <span>
+                  Running for <LiveDuration startTime={item.startTime} />
+                  ...
+                </span>
               </div>
             )}
           </div>
@@ -4262,7 +4305,7 @@ export default function ControlClient() {
   // for the rationale).
   const {
     lastNonQueuedItem,
-    thinkingItems,
+    thinkingItems: rawThinkingItems,
     thinkingItemsCount,
     hasActiveThinking,
     groupedItems,
@@ -4281,6 +4324,12 @@ export default function ControlClient() {
       }),
     [items, deferredShowThinkingPanel],
   );
+  // `deriveItemViews` produces a fresh `thinkingItems` array on every change
+  // to `items`, even when the chat update was unrelated to thoughts (e.g. a
+  // `text_delta` on the assistant message). Reuse the previous reference
+  // when the thinking subset is unchanged so `React.memo(ThinkingPanel)`
+  // can skip the re-render.
+  const thinkingItems = useStableShallowArray(rawThinkingItems) as SidePanelItem[];
 
   const containerRef = useRef<HTMLDivElement>(null);
   const chatVirtualizer = useVirtualizer({
