@@ -89,6 +89,11 @@ struct ControlView: View {
     @State private var inputText = ControlView.loadGlobalDraftText()
     @State private var runState: ControlRunState = .idle
     @State private var queueLength = 0
+    /// Number of POST /api/control/message calls currently in flight. Caps
+    /// the send button: with idempotency keys, retries are safe but
+    /// rapid re-taps of the same physical button on a slow connection
+    /// would still spam the server with concurrent distinct sends.
+    @State private var pendingSendCount = 0
     @State private var queuedItems: [QueuedMessage] = []
     @State private var showQueueSheet = false
     @State private var currentMission: Mission?
@@ -130,6 +135,11 @@ struct ControlView: View {
     @State private var isLoadingEarlier = false
     @State private var loadedEventCount = 0  // How many events we've loaded so far
     @State private var controlCacheHit: Bool?
+    /// True when the cached conversation is being shown because a snapshot
+    /// fetch failed. Surfaces a "Cached · Tap to refresh" pill above the
+    /// conversation so a user staring at an old chat understands why it
+    /// isn't updating (Wave 4 fix 5.11).
+    @State private var controlCacheStale = false
     @State private var controlMergeCount = 0
     @State private var controlDroppedEvents = 0
     @AppStorage("control_debug_perf") private var showControlDiagnostics = false
@@ -152,6 +162,14 @@ struct ControlView: View {
     // Connection state for SSE stream - starts as disconnected until first event received
     @State private var connectionState: ConnectionState = .disconnected
     @State private var reconnectAttempt = 0
+    /// Reachability monitor that combines NWPathMonitor + /api/health probes.
+    /// The aggregated `state` is merged with the SSE state below into
+    /// `effectiveConnectionState` and drives the banner. This is what fixes
+    /// the "everything is hanging but the banner says Connected" bug from
+    /// the bad-network audit — the SSE alone can't tell the difference
+    /// between "no events because the agent is quiet" and "no events because
+    /// the path is dead but the socket happens to still be open".
+    @State private var networkMonitor = NetworkMonitor()
 
     // Parallel missions state
     @State private var runningMissions: [RunningMissionInfo] = []
@@ -196,382 +214,37 @@ struct ControlView: View {
     private let bottomAnchorId = "bottom-anchor"
     
     var body: some View {
-        ZStack {
-            // Background with subtle accent glow
-            Theme.backgroundPrimary.ignoresSafeArea()
-            
-            // Subtle radial gradients for liquid glass refraction
-            backgroundGlows
-            
-            VStack(spacing: 0) {
-                // Persistent connection banner. The 9pt wifi-slash glyph in
-                // the principal toolbar is too easy to miss when the SSE
-                // stream drops; a sticky strip across the top keeps the
-                // disconnected state in peripheral vision until reconnect.
-                if !connectionState.isConnected {
-                    connectionBanner
-                        .transition(.move(edge: .top).combined(with: .opacity))
-                }
-
-                // Messages
-                ZStack(alignment: .bottom) {
-                    messagesView
-
-                    // Worker pill overlay for boss missions
-                    if !childMissions.isEmpty {
-                        WorkerPillView(
-                            workers: childMissions,
-                            runningWorkers: runningMissions,
-                            onTap: {
-                                HapticService.lightTap()
-                                showWorkerSheet = true
-                            }
-                        )
-                        .padding(.bottom, 12)
-                        .transition(.move(edge: .bottom).combined(with: .opacity))
-                        .animation(.spring(response: 0.3), value: childMissions.count)
-                    }
-                }
-
-                // Input area
-                inputView
+        bodyContent
+            .navigationTitle(viewingMission?.displayTitle ?? "Control")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .principal) { AnyView(principalToolbarContent) }
+                ToolbarItem(placement: .topBarLeading) { AnyView(leadingToolbarContent) }
+                ToolbarItem(placement: .topBarTrailing) { AnyView(missionSwitcherToolbarButton) }
+                ToolbarItem(placement: .topBarTrailing) { AnyView(overflowMenuToolbarItem) }
             }
-            .animation(.easeInOut(duration: 0.2), value: connectionState.isConnected)
-
-            if showControlDiagnostics {
-                ControlDiagnosticsOverlay(
-                    missionId: viewingMissionId,
-                    transport: "SSE",
-                    streamScope: viewingMissionId == nil ? "global" : "mission",
-                    maxSequence: viewingMissionId.flatMap { missionMaxSeq[$0] },
-                    cacheHit: controlCacheHit,
-                    mergeCount: controlMergeCount,
-                    renderCount: groupedItems.count,
-                    droppedEvents: controlDroppedEvents
-                )
-                .padding(.top, 8)
-                .padding(.trailing, 8)
-                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
-                .allowsHitTesting(false)
-            }
-        }
-        .navigationTitle(viewingMission?.displayTitle ?? "Control")
-        .navigationBarTitleDisplayMode(.inline)
-        .toolbar {
-            ToolbarItem(placement: .principal) {
-                VStack(spacing: 2) {
-                    // Use the raw title with `.lineLimit(1)` rather than the
-                    // pre-truncated `displayTitle` (which silently slices at
-                    // 60 chars with no escape hatch). SwiftUI handles tail
-                    // truncation against the actual nav-bar width, and the
-                    // context menu lets the user pull up the full string.
-                    //
-                    // Fall back to "Untitled Mission" — not "Control" — when a
-                    // mission is being viewed but its title is empty. Showing
-                    // "Control" would falsely imply no mission is active and
-                    // diverges from `.navigationTitle` (which uses
-                    // `displayTitle`, returning "Untitled Mission").
-                    let fullTitle: String = {
-                        if let mission = viewingMission {
-                            let trimmed = mission.title?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-                            return trimmed.isEmpty ? "Untitled Mission" : trimmed
-                        }
-                        return "Control"
-                    }()
-                    Text(fullTitle)
-                        .font(.headline)
-                        .foregroundStyle(Theme.textPrimary)
-                        .lineLimit(1)
-                        .truncationMode(.tail)
-                        .contextMenu {
-                            if viewingMission != nil {
-                                Section(fullTitle) {}
-                                Button {
-                                    UIPasteboard.general.string = fullTitle
-                                    HapticService.lightTap()
-                                } label: {
-                                    Label("Copy title", systemImage: "doc.on.doc")
-                                }
-                            }
-                        }
-
-                    HStack(spacing: 4) {
-                        // Connection state moved to a persistent banner above the
-                        // conversation; this row always shows backend + run state
-                        // so a disconnect doesn't blank out the run-state context.
-                        if let mission = viewingMission {
-                            let backendColor = missionBackendColor(mission)
-                            if let agent = mission.agent, !agent.isEmpty {
-                                Image(systemName: missionBackendIcon(mission))
-                                    .font(.system(size: 9))
-                                    .foregroundStyle(backendColor)
-                                Text(agent)
-                                    .font(.caption2)
-                                    .foregroundStyle(backendColor)
-                                Text("•")
-                                    .foregroundStyle(Theme.textMuted)
-                            }
-                        }
-
-                        StatusDot(status: runState.statusType, size: 5)
-                        Text(runState.label)
-                            .font(.caption2)
-                            .foregroundStyle(Theme.textSecondary)
-
-                        if queueLength > 0 {
-                            Button {
-                                Task { await loadQueueItems() }
-                                showQueueSheet = true
-                                HapticService.lightTap()
-                            } label: {
-                                Text("• \(queueLength) queued")
-                                    .font(.caption2)
-                                    .foregroundStyle(Theme.warning)
-                            }
-                        }
-
-                        // Progress indicator
-                        if let progress, progress.total > 0 {
-                            Text("•")
-                                .foregroundStyle(Theme.textMuted)
-                            Text(progress.displayText)
-                                .font(.caption2.weight(.medium))
-                                .foregroundStyle(Theme.success)
-                        }
-                    }
-                }
-            }
-            
-            ToolbarItem(placement: .topBarLeading) {
-                HStack(spacing: 12) {
-                    // Thoughts panel button
-                    Button {
-                        showThoughts = true
-                        HapticService.lightTap()
-                    } label: {
-                        Image(systemName: "brain")
-                            .font(.system(size: 14))
-                            .foregroundStyle(
-                                messages.contains(where: { $0.isThinking }) ? Theme.accent : Theme.textSecondary
-                            )
-                    }
-
-                    // Workers button (only visible for boss missions)
-                    if !childMissions.isEmpty {
-                        Button {
-                            showWorkerSheet = true
-                            HapticService.lightTap()
-                        } label: {
-                            HStack(spacing: 3) {
-                                Image(systemName: "person.3")
-                                    .font(.system(size: 12))
-                                Text("\(childMissions.count)")
-                                    .font(.caption2.weight(.medium))
-                            }
-                            .foregroundStyle(Theme.accent)
-                        }
-                    }
-                }
-            }
-
-            ToolbarItem(placement: .topBarTrailing) {
-                // Mission switcher button
-                Button {
-                    Task {
-                        await loadRecentMissions()
-                    }
-                    showMissionSwitcher = true
-                    HapticService.lightTap()
-                } label: {
-                    HStack(spacing: 4) {
-                        Image(systemName: "square.stack.3d.up")
-                            .font(.system(size: 14))
-                        if runningMissions.count > 0 {
-                            Text("\(runningMissions.count)")
-                                .font(.caption2.weight(.medium))
-                        }
-                    }
-                    .foregroundStyle(runningMissions.isEmpty ? Theme.textSecondary : Theme.accent)
-                }
-            }
-
-            ToolbarItem(placement: .topBarTrailing) {
-                Menu {
-                    Button {
-                        Task {
-                            await workspaceState.loadWorkspaces()
-                            if let options = await getValidatedDefaultAgentOptions() {
-                                await createNewMission(options: options)
-                            } else {
-                                showNewMissionSheet = true
-                            }
-                        }
-                    } label: {
-                        Label("New Mission", systemImage: "plus")
-                    }
-
-                    // Desktop stream option with display selector
-                    Menu {
-                        ForEach(availableDisplays, id: \.self) { display in
-                            Button {
-                                desktopDisplayId = display
-                                showDesktopStream = true
-                            } label: {
-                                HStack {
-                                    Text(display)
-                                    if display == desktopDisplayId {
-                                        Image(systemName: "checkmark")
-                                    }
-                                }
-                            }
-                        }
-                    } label: {
-                        Label("View Desktop (\(desktopDisplayId))", systemImage: "display")
-                    }
-
-                    Button {
-                        showAutomations = true
-                    } label: {
-                        Label("View Automations", systemImage: "bolt.badge.clock")
-                    }
-
-                    Divider()
-
-                    Button {
-                        showSettings = true
-                    } label: {
-                        Label("Settings", systemImage: "gearshape")
-                    }
-
-                    Toggle(isOn: $showControlDiagnostics) {
-                        Label("Control Diagnostics", systemImage: "gauge.with.dots.needle.bottom.50percent")
-                    }
-
-                    if let mission = viewingMission {
-                        Divider()
-
-                        // Resume button for interrupted/blocked missions
-                        if mission.canResume {
-                            Button {
-                                Task { await resumeMission() }
-                            } label: {
-                                Label("Resume Mission", systemImage: "play.circle")
-                            }
-                        }
-
-                        Button {
-                            Task { await setMissionStatus(.completed) }
-                        } label: {
-                            Label("Mark Complete", systemImage: "checkmark.circle")
-                        }
-
-                        Button(role: .destructive) {
-                            Task { await setMissionStatus(.failed) }
-                        } label: {
-                            Label("Mark Failed", systemImage: "xmark.circle")
-                        }
-
-                        if mission.status != .active && !mission.canResume {
-                            Button {
-                                Task { await setMissionStatus(.active) }
-                            } label: {
-                                Label("Reactivate", systemImage: "arrow.clockwise")
-                            }
-                        }
-                    }
-                } label: {
-                    Image(systemName: "ellipsis.circle")
-                        .font(.body)
-                }
-            }
-        }
-        .task {
-            // Cold-start sequencing. Previously every step here was awaited
-            // serially — workspaces → loadMission → loadCurrentMission →
-            // refreshRunningMissions — which on a slow cellular link stacked
-            // up to a dozen sequential RTTs before the user could read or
-            // type anything. We now:
-            //   1. Kick off the SSE stream first so any live events for the
-            //      restored mission start arriving immediately (the stream
-            //      doesn't depend on which mission we end up viewing — it
-            //      receives all events and the view filters by id).
-            //   2. Fan out the three independent "context" fetches —
-            //      workspaces, mission history, running missions — using
-            //      `async let`. They share zero state at this stage; the
-            //      previous serial chain was incidental, not required.
-            //   3. Start the running-missions poller last; it's a 3s tick
-            //      and starting it before the first refresh is fine.
-            startStreaming()
-
-            async let workspacesTask: Void = workspaceState.loadWorkspaces()
-            async let runningTask: Void = refreshRunningMissions()
-            async let missionTask: Void = loadInitialMission()
-
-            _ = await (workspacesTask, runningTask, missionTask)
-
-            // Auto-show bar if there are multiple running missions
-            if runningMissions.count > 1 {
-                showRunningMissions = true
-            }
-
-            startPollingRunningMissions()
-        }
+        .task { await coldStart() }
         .onChange(of: nav.pendingMissionId) { _, newId in
-            // Handle navigation from History while Control is already visible
-            if let missionId = newId {
-                nav.pendingMissionId = nil
-                Task {
-                    await loadMission(id: missionId)
-                }
-            }
+            handlePendingMissionId(newId)
         }
         .onChange(of: currentMission?.id) { _, newId in
-            // Sync viewing mission with current mission if nothing is being viewed yet
-            if viewingMissionId == nil, let id = newId, let mission = currentMission, mission.id == id {
-                applyViewingMission(mission)
-            }
+            syncViewingMissionFromCurrent(newId: newId)
         }
         .onChange(of: scenePhase) { oldPhase, newPhase in
-            if newPhase != .active {
-                // Save draft text when leaving foreground
-                saveCurrentDraft(inputText)
-            }
-            // Reload mission history when app becomes active (similar to web's visibility change handler)
-            // This ensures we catch any missed SSE events while the app was in background
-            if oldPhase != .active && newPhase == .active {
-                Task {
-                    if let missionId = viewingMissionId {
-                        await reloadMissionFromServer(id: missionId)
-                    }
-                    await refreshRunningMissions()
-                }
-            }
+            handleScenePhaseChange(from: oldPhase, to: newPhase)
         }
         .onChange(of: viewingMissionId) { oldId, newId in
-            saveDraft(inputText, missionId: oldId)
-            UserDefaults.standard.set(newId, forKey: Self.lastMissionIdKey)
-            inputText = loadDraft(missionId: newId)
-            streamTask?.cancel()
-            connectionState = .disconnected
-            reconnectAttempt = 0
-            startStreaming()
+            handleViewingMissionChange(from: oldId, to: newId)
         }
         .onChange(of: inputText) { _, newText in
-            // Debounced save: persist draft after 1 second of inactivity
-            draftSaveTask?.cancel()
-            draftSaveTask = Task {
-                try? await Task.sleep(for: .seconds(1))
-                guard !Task.isCancelled else { return }
-                await MainActor.run {
-                    saveCurrentDraft(newText)
-                }
-            }
+            scheduleDraftSave(newText)
         }
         .onDisappear {
             streamTask?.cancel()
             connectionState = .disconnected
             reconnectAttempt = 0
             pollingTask?.cancel()
+            networkMonitor.stop()
             // Save draft immediately on disappear
             saveCurrentDraft(inputText)
             draftSaveTask?.cancel()
@@ -625,47 +298,7 @@ struct ControlView: View {
             AutomationsView(missionId: viewingMission?.id ?? currentMission?.id)
         }
         .sheet(isPresented: $showMissionSwitcher) {
-            MissionSwitcherSheet(
-                runningMissions: runningMissions,
-                recentMissions: recentMissions,
-                currentMissionId: currentMission?.id,
-                viewingMissionId: viewingMissionId,
-                onSelectMission: { missionId in
-                    showMissionSwitcher = false
-                    Task { await switchToMission(id: missionId) }
-                },
-                onResumeMission: { missionId in
-                    showMissionSwitcher = false
-                    Task { await resumeMission(id: missionId) }
-                },
-                onFollowUpMission: { mission in
-                    showMissionSwitcher = false
-                    Task { await createFollowUpMission(from: mission) }
-                },
-                onOpenFailureMission: { missionId in
-                    showMissionSwitcher = false
-                    Task { await openFailingToolCall(for: missionId) }
-                },
-                onCancelMission: { missionId in
-                    Task { await cancelMission(id: missionId) }
-                },
-                onCreateNewMission: {
-                    showMissionSwitcher = false
-                    Task {
-                        await workspaceState.loadWorkspaces()
-                        if let options = await getValidatedDefaultAgentOptions() {
-                            await createNewMission(options: options)
-                        } else {
-                            showNewMissionSheet = true
-                        }
-                    }
-                },
-                onDismiss: {
-                    showMissionSwitcher = false
-                }
-            )
-            .presentationDetents([.medium, .large])
-            .presentationDragIndicator(.visible)
+            missionSwitcherSheetContent
         }
         .sheet(isPresented: $showQueueSheet) {
             QueueSheet(
@@ -745,27 +378,473 @@ struct ControlView: View {
 
     // MARK: - Connection banner
 
-    /// Sticky strip rendered above the conversation when the SSE stream is
-    /// down. The toolbar already shows a small wifi-slash glyph, but it's
-    /// easy to miss on a long page; this strip stays in peripheral vision.
+    /// The toolbar's full content, declared as a `@ToolbarContentBuilder`
+    /// method so SwiftUI resolves it as one opaque ToolbarContent rather
+    /// than re-typing every item through the View body's modifier chain.
+    @ToolbarContentBuilder
+    private var toolbarItems: some ToolbarContent {
+        ToolbarItem(placement: .principal) { principalToolbarContent }
+        ToolbarItem(placement: .topBarLeading) { leadingToolbarContent }
+        ToolbarItem(placement: .topBarTrailing) { missionSwitcherToolbarButton }
+        ToolbarItem(placement: .topBarTrailing) { overflowMenuToolbarItem }
+    }
+
+    /// Mission switcher sheet body. Extracted from `.sheet` closure so the
+    /// View body modifier chain stays under the type-checker budget.
+    @ViewBuilder
+    private var missionSwitcherSheetContent: some View {
+        MissionSwitcherSheet(
+            runningMissions: runningMissions,
+            recentMissions: recentMissions,
+            currentMissionId: currentMission?.id,
+            viewingMissionId: viewingMissionId,
+            onSelectMission: { missionId in
+                showMissionSwitcher = false
+                Task { await switchToMission(id: missionId) }
+            },
+            onResumeMission: { missionId in
+                showMissionSwitcher = false
+                Task { await resumeMission(id: missionId) }
+            },
+            onFollowUpMission: { mission in
+                showMissionSwitcher = false
+                Task { await createFollowUpMission(from: mission) }
+            },
+            onOpenFailureMission: { missionId in
+                showMissionSwitcher = false
+                Task { await openFailingToolCall(for: missionId) }
+            },
+            onCancelMission: { missionId in
+                Task { await cancelMission(id: missionId) }
+            },
+            onCreateNewMission: {
+                showMissionSwitcher = false
+                Task {
+                    await workspaceState.loadWorkspaces()
+                    if let options = await getValidatedDefaultAgentOptions() {
+                        await createNewMission(options: options)
+                    } else {
+                        showNewMissionSheet = true
+                    }
+                }
+            },
+            onDismiss: {
+                showMissionSwitcher = false
+            }
+        )
+        .presentationDetents([.medium, .large])
+        .presentationDragIndicator(.visible)
+    }
+
+    /// Leading toolbar item: thoughts panel button + workers button.
+    @ViewBuilder
+    private var leadingToolbarContent: some View {
+        HStack(spacing: 12) {
+            Button {
+                showThoughts = true
+                HapticService.lightTap()
+            } label: {
+                Image(systemName: "brain")
+                    .font(.system(size: 14))
+                    .foregroundStyle(
+                        messages.contains(where: { $0.isThinking }) ? Theme.accent : Theme.textSecondary
+                    )
+            }
+            if !childMissions.isEmpty {
+                Button {
+                    showWorkerSheet = true
+                    HapticService.lightTap()
+                } label: {
+                    HStack(spacing: 3) {
+                        Image(systemName: "person.3")
+                            .font(.system(size: 12))
+                        Text("\(childMissions.count)")
+                            .font(.caption2.weight(.medium))
+                    }
+                    .foregroundStyle(Theme.accent)
+                }
+            }
+        }
+    }
+
+    /// Trailing toolbar: mission switcher button.
+    @ViewBuilder
+    private var missionSwitcherToolbarButton: some View {
+        Button {
+            Task { await loadRecentMissions() }
+            showMissionSwitcher = true
+            HapticService.lightTap()
+        } label: {
+            HStack(spacing: 4) {
+                Image(systemName: "square.stack.3d.up")
+                    .font(.system(size: 14))
+                if runningMissions.count > 0 {
+                    Text("\(runningMissions.count)")
+                        .font(.caption2.weight(.medium))
+                }
+            }
+            .foregroundStyle(runningMissions.isEmpty ? Theme.textSecondary : Theme.accent)
+        }
+    }
+
+    /// Trailing toolbar: overflow `...` menu with all the actions.
+    @ViewBuilder
+    private var overflowMenuToolbarItem: some View {
+        Menu {
+            overflowMenuContent
+        } label: {
+            Image(systemName: "ellipsis.circle")
+                .font(.body)
+        }
+    }
+
+    /// Contents of the overflow menu — pulled out separately so the menu's
+    /// label closure stays tiny.
+    @ViewBuilder
+    private var overflowMenuContent: some View {
+        Button {
+            Task {
+                await workspaceState.loadWorkspaces()
+                if let options = await getValidatedDefaultAgentOptions() {
+                    await createNewMission(options: options)
+                } else {
+                    showNewMissionSheet = true
+                }
+            }
+        } label: {
+            Label("New Mission", systemImage: "plus")
+        }
+
+        Menu {
+            ForEach(availableDisplays, id: \.self) { display in
+                Button {
+                    desktopDisplayId = display
+                    showDesktopStream = true
+                } label: {
+                    HStack {
+                        Text(display)
+                        if display == desktopDisplayId {
+                            Image(systemName: "checkmark")
+                        }
+                    }
+                }
+            }
+        } label: {
+            Label("View Desktop (\(desktopDisplayId))", systemImage: "display")
+        }
+
+        Button {
+            showAutomations = true
+        } label: {
+            Label("View Automations", systemImage: "bolt.badge.clock")
+        }
+
+        Divider()
+
+        Button {
+            showSettings = true
+        } label: {
+            Label("Settings", systemImage: "gearshape")
+        }
+
+        Toggle(isOn: $showControlDiagnostics) {
+            Label("Control Diagnostics", systemImage: "gauge.with.dots.needle.bottom.50percent")
+        }
+
+        if let mission = viewingMission {
+            Divider()
+            if mission.canResume {
+                Button {
+                    Task { await resumeMission() }
+                } label: {
+                    Label("Resume Mission", systemImage: "play.circle")
+                }
+            }
+            Button {
+                Task { await setMissionStatus(.completed) }
+            } label: {
+                Label("Mark Complete", systemImage: "checkmark.circle")
+            }
+            Button(role: .destructive) {
+                Task { await setMissionStatus(.failed) }
+            } label: {
+                Label("Mark Failed", systemImage: "xmark.circle")
+            }
+            if mission.status != .active && !mission.canResume {
+                Button {
+                    Task { await setMissionStatus(.active) }
+                } label: {
+                    Label("Reactivate", systemImage: "arrow.clockwise")
+                }
+            }
+        }
+    }
+
+    /// Principal toolbar content — title + status row. Extracted to a
+    /// computed property so the View body stays under the SwiftUI
+    /// type-checker complexity budget.
+    private var principalToolbarContent: some View {
+        let fullTitle: String = {
+            if let mission = viewingMission {
+                let trimmed = mission.title?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                return trimmed.isEmpty ? "Untitled Mission" : trimmed
+            }
+            return "Control"
+        }()
+        return VStack(spacing: 2) {
+            Text(fullTitle)
+                .font(.headline)
+                .foregroundStyle(Theme.textPrimary)
+                .lineLimit(1)
+                .truncationMode(.tail)
+                .contextMenu {
+                    if viewingMission != nil {
+                        Section(fullTitle) {}
+                        Button {
+                            UIPasteboard.general.string = fullTitle
+                            HapticService.lightTap()
+                        } label: {
+                            Label("Copy title", systemImage: "doc.on.doc")
+                        }
+                    }
+                }
+            principalStatusRow
+        }
+    }
+
+    /// The agent · run state · queue · progress row under the title.
+    private var principalStatusRow: some View {
+        HStack(spacing: 4) {
+            if let mission = viewingMission,
+               let agent = mission.agent,
+               !agent.isEmpty {
+                let backendColor = missionBackendColor(mission)
+                Image(systemName: missionBackendIcon(mission))
+                    .font(.system(size: 9))
+                    .foregroundStyle(backendColor)
+                Text(agent)
+                    .font(.caption2)
+                    .foregroundStyle(backendColor)
+                Text("•")
+                    .foregroundStyle(Theme.textMuted)
+            }
+
+            StatusDot(status: runState.statusType, size: 5)
+            Text(runState.label)
+                .font(.caption2)
+                .foregroundStyle(Theme.textSecondary)
+
+            if queueLength > 0 {
+                Button {
+                    Task { await loadQueueItems() }
+                    showQueueSheet = true
+                    HapticService.lightTap()
+                } label: {
+                    Text("• \(queueLength) queued")
+                        .font(.caption2)
+                        .foregroundStyle(Theme.warning)
+                }
+            }
+
+            if let progress, progress.total > 0 {
+                Text("•")
+                    .foregroundStyle(Theme.textMuted)
+                Text(progress.displayText)
+                    .font(.caption2.weight(.medium))
+                    .foregroundStyle(Theme.success)
+            }
+        }
+    }
+
+    /// Top-level body ZStack — opaque single-View so the long modifier
+    /// chain on `body` doesn't blow the SwiftUI type-checker budget.
+    private var bodyContent: some View {
+        ZStack {
+            Theme.backgroundPrimary.ignoresSafeArea()
+            backgroundGlows
+            mainContentStack
+            diagnosticsOverlay
+        }
+    }
+
+    @ViewBuilder
+    private var diagnosticsOverlay: some View {
+        if showControlDiagnostics {
+            ControlDiagnosticsOverlay(
+                missionId: viewingMissionId,
+                transport: "SSE",
+                streamScope: viewingMissionId == nil ? "global" : "mission",
+                maxSequence: viewingMissionId.flatMap { missionMaxSeq[$0] },
+                cacheHit: controlCacheHit,
+                mergeCount: controlMergeCount,
+                renderCount: groupedItems.count,
+                droppedEvents: controlDroppedEvents
+            )
+            .padding(.top, 8)
+            .padding(.trailing, 8)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
+            .allowsHitTesting(false)
+        }
+    }
+
+    /// Main vertical stack: connection banner, optional stale-cache pill,
+    /// the conversation, the input row. Extracted from `body` to keep the
+    /// top-level type-checker scope small.
+    private var mainContentStack: some View {
+        MainContentStack(
+            showBanner: networkMonitor.state.showsBanner,
+            bannerView: ConnectionBannerView(state: networkMonitor.state),
+            showStaleCachePill: controlCacheStale,
+            staleCachePill: staleCachePill,
+            messagesView: messagesView,
+            workerPill: workerPillOrNil,
+            inputView: inputView
+        )
+    }
+
+    @ViewBuilder
+    private var workerPillOrNil: some View {
+        if !childMissions.isEmpty {
+            WorkerPillView(
+                workers: childMissions,
+                runningWorkers: runningMissions,
+                onTap: {
+                    HapticService.lightTap()
+                    showWorkerSheet = true
+                }
+            )
+            .padding(.bottom, 12)
+            .transition(.move(edge: .bottom).combined(with: .opacity))
+            .animation(.spring(response: 0.3), value: childMissions.count)
+        }
+    }
+
+    /// Cold-start sequencing. Previously every step here was awaited
+    /// serially — workspaces → loadMission → loadCurrentMission →
+    /// refreshRunningMissions — which on a slow cellular link stacked up to
+    /// a dozen sequential RTTs before the user could read or type anything.
+    /// Now: SSE first (live events arrive immediately), then the three
+    /// independent context fetches in parallel via `async let`, then start
+    /// the running-missions poller.
+    private func coldStart() async {
+        networkMonitor.start()
+        startStreaming()
+
+        async let workspacesTask: Void = workspaceState.loadWorkspaces()
+        async let runningTask: Bool = refreshRunningMissions()
+        async let missionTask: Void = loadInitialMission()
+
+        _ = await (workspacesTask, runningTask, missionTask)
+
+        if runningMissions.count > 1 {
+            showRunningMissions = true
+        }
+        startPollingRunningMissions()
+    }
+
+    /// Handle navigation from History while Control is already visible.
+    private func handlePendingMissionId(_ newId: String?) {
+        guard let missionId = newId else { return }
+        nav.pendingMissionId = nil
+        Task { await loadMission(id: missionId) }
+    }
+
+    /// On change of `currentMission?.id`: if no mission is being viewed yet,
+    /// apply the new current as the viewing mission. Extracted from the
+    /// View body for type-checker complexity.
+    private func syncViewingMissionFromCurrent(newId: String?) {
+        guard viewingMissionId == nil,
+              let id = newId,
+              let mission = currentMission,
+              mission.id == id else { return }
+        applyViewingMission(mission)
+    }
+
+    /// Handle the user switching missions. Saves the previous mission's
+    /// draft, restores the new mission's draft, tears down and re-starts
+    /// the SSE stream. Extracted from the View body so the SwiftUI
+    /// type-checker doesn't time out on the long modifier chain.
+    private func handleViewingMissionChange(from oldId: String?, to newId: String?) {
+        saveDraft(inputText, missionId: oldId)
+        UserDefaults.standard.set(newId, forKey: Self.lastMissionIdKey)
+        inputText = loadDraft(missionId: newId)
+        streamTask?.cancel()
+        connectionState = .disconnected
+        reconnectAttempt = 0
+        startStreaming()
+    }
+
+    /// Debounced draft autosave (1s after last keystroke).
+    private func scheduleDraftSave(_ newText: String) {
+        draftSaveTask?.cancel()
+        draftSaveTask = Task {
+            try? await Task.sleep(for: .seconds(1))
+            guard !Task.isCancelled else { return }
+            await MainActor.run {
+                saveCurrentDraft(newText)
+            }
+        }
+    }
+
+    /// Handle scenePhase transitions. Extracted from the View body so the
+    /// SwiftUI type-checker doesn't OOM on the long modifier chain.
+    private func handleScenePhaseChange(from oldPhase: ScenePhase, to newPhase: ScenePhase) {
+        if newPhase != .active {
+            // Save draft text when leaving foreground. This is the
+            // synchronous flush path — the debounced .onChange in
+            // inputText handles the steady-state case, but
+            // backgrounding/inactivity needs an immediate write because
+            // iOS may kill the process before the next debounced tick
+            // would have fired (Wave 4 fix 5.8).
+            saveCurrentDraft(inputText)
+        }
+        guard oldPhase != .active && newPhase == .active else { return }
+        // If the SSE is already reconnecting (or its inactivity watchdog
+        // is about to fire), the reconnect path will call
+        // resumeMissionAfterReconnect — duplicating that work here causes
+        // overlapping event-range merges and visible flicker on a slow
+        // link. Skip the explicit reload when SSE is mid-recovery
+        // (Wave 4 fix 5.12).
+        let sseIsRecovering: Bool
+        switch connectionState {
+        case .reconnecting: sseIsRecovering = true
+        default: sseIsRecovering = false
+        }
+        Task {
+            if !sseIsRecovering, let missionId = viewingMissionId {
+                await reloadMissionFromServer(id: missionId)
+            }
+            await refreshRunningMissions()
+        }
+    }
+
+    /// "Cached · Tap to refresh" pill rendered when a snapshot fetch failed
+    /// and we're still showing previously-cached events (Wave 4 fix 5.11).
+    private var staleCachePill: some View {
+        Button {
+            Task { await refreshViewingMissionSnapshot() }
+        } label: {
+            HStack(spacing: 8) {
+                Image(systemName: "clock.arrow.circlepath")
+                    .font(.system(size: 11, weight: .semibold))
+                Text("Cached · Tap to refresh")
+                    .font(.caption.weight(.medium))
+                Spacer()
+            }
+            .foregroundStyle(Theme.textSecondary)
+            .padding(.horizontal, 16)
+            .padding(.vertical, 6)
+            .background(Theme.textSecondary.opacity(0.10))
+        }
+        .buttonStyle(.plain)
+    }
+
+    /// Sticky strip rendered above the conversation when reachability is
+    /// anything other than healthy. The toolbar already shows a small
+    /// wifi-slash glyph, but it's easy to miss on a long page; this strip
+    /// stays in peripheral vision.
     private var connectionBanner: some View {
-        HStack(spacing: 8) {
-            Image(systemName: connectionState.icon)
-                .font(.system(size: 11, weight: .semibold))
-                .symbolEffect(.pulse, options: .repeating)
-            Text(connectionState.label)
-                .font(.caption.weight(.medium))
-            Spacer()
-        }
-        .foregroundStyle(Theme.warning)
-        .padding(.horizontal, 16)
-        .padding(.vertical, 6)
-        .background(Theme.warning.opacity(0.12))
-        .overlay(alignment: .bottom) {
-            Rectangle()
-                .fill(Theme.warning.opacity(0.25))
-                .frame(height: 0.5)
-        }
+        ConnectionBannerView(state: networkMonitor.state)
     }
 
     // MARK: - Messages
@@ -845,7 +924,8 @@ struct ControlView: View {
                             MessageBubble(
                                 message: message,
                                 isCopied: copiedMessageId == message.id,
-                                onCopy: { copyMessage(message) }
+                                onCopy: { copyMessage(message) },
+                                onRetry: message.sendState.isFailed ? { retryFailedMessage(message) } : nil
                             )
                             .id(message.id)
                         case .toolGroup(let groupId, let tools):
@@ -1200,6 +1280,15 @@ struct ControlView: View {
         !inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
+    /// True when the send button should accept taps: non-empty input and no
+    /// in-flight send. Capping concurrent sends to 1 prevents rapid re-taps
+    /// from spamming the server with distinct messages while the network is
+    /// slow; with idempotency keys the *same* message would be deduped, but
+    /// distinct sequential text inputs would not be.
+    private var canSend: Bool {
+        hasInput && pendingSendCount == 0
+    }
+
     /// Visible slash commands for the current backend, filtered by the
     /// prefix after the leading `/` in `inputText`. Empty when the input
     /// doesn't start with `/`, when the catalog hasn't loaded yet, or when
@@ -1401,25 +1490,37 @@ struct ControlView: View {
                         }
                     }
 
-                // Send button - always available when there's text
+                // Send button - disabled while a send is in flight to prevent
+                // double-sends on a slow link. The in-flight count drives the
+                // spinner; the optimistic bubble itself shows the pending
+                // state, so this is just a hand-rest safety net.
                 Button {
                     sendMessage()
                 } label: {
-                    Image(systemName: "arrow.up")
-                        .font(.system(size: 14, weight: .semibold))
-                        .foregroundStyle(hasInput ? .white : Theme.textMuted)
-                        .frame(width: 32, height: 32)
-                        .background(hasInput ? Theme.accent : Color.clear)
-                        .clipShape(Circle())
-                        .overlay(
-                            Circle()
-                                .stroke(!hasInput ? Theme.border : Color.clear, lineWidth: 1)
-                        )
+                    Group {
+                        if pendingSendCount > 0 {
+                            ProgressView()
+                                .controlSize(.mini)
+                                .tint(.white)
+                        } else {
+                            Image(systemName: "arrow.up")
+                                .font(.system(size: 14, weight: .semibold))
+                                .foregroundStyle(canSend ? .white : Theme.textMuted)
+                        }
+                    }
+                    .frame(width: 32, height: 32)
+                    .background(canSend ? Theme.accent : (pendingSendCount > 0 ? Theme.accent.opacity(0.6) : Color.clear))
+                    .clipShape(Circle())
+                    .overlay(
+                        Circle()
+                            .stroke(!canSend && pendingSendCount == 0 ? Theme.border : Color.clear, lineWidth: 1)
+                    )
                 }
-                .disabled(!hasInput)
+                .disabled(!canSend)
                 .padding(.trailing, 8)
             }
             .animation(.easeInOut(duration: 0.15), value: runState)
+            .animation(.easeInOut(duration: 0.15), value: pendingSendCount > 0)
             .animation(.easeInOut(duration: 0.15), value: hasInput)
             .clipShape(RoundedRectangle(cornerRadius: 24, style: .continuous))
             .overlay(
@@ -2620,32 +2721,41 @@ struct ControlView: View {
         removeCurrentDraft()
         HapticService.lightTap()
 
-        // Generate temp ID and add message optimistically BEFORE the API call
-        // This ensures messages appear in send order, not response order.
-        // The `isPending` flag dims the bubble and shows a tiny spinner so
-        // users on a slow network don't re-tap. (UX audit item #11.)
-        let tempId = "temp-\(UUID().uuidString)"
-        let tempMessage = ChatMessage(id: tempId, type: .user, content: content, isPending: true)
+        // The client-generated UUID doubles as the optimistic bubble id, the
+        // server's message id, and the idempotency key. Because the backend
+        // honours `client_message_id` (see control.rs:ControlMessageRequest),
+        // a retry of a POST whose response was lost is safe — the server
+        // returns the cached response with the same id, and the SSE delivery
+        // dedupes by id below. No temp-prefix juggling needed.
+        let clientMessageId = UUID().uuidString
+        let pendingMissionId = viewingMissionId
+        let tempMessage = ChatMessage(
+            id: clientMessageId,
+            type: .user,
+            content: content,
+            sendState: .pending
+        )
         messages.append(tempMessage)
         recomputeGroupedItems()
         scrollToBottomTick += 1
+        pendingSendCount += 1
 
         Task { @MainActor in
+            defer { pendingSendCount = max(0, pendingSendCount - 1) }
             do {
-                let (messageId, queued) = try await api.sendMessage(content: content)
+                let (messageId, queued) = try await api.sendMessageWithRetry(
+                    content: content,
+                    clientMessageId: clientMessageId,
+                    missionId: pendingMissionId
+                )
 
-                // Replace temp ID with server-assigned ID, preserving timestamp
-                // This allows SSE handler to correctly deduplicate. Pending
-                // state is cleared so the bubble snaps back to full opacity.
-                if let index = messages.firstIndex(where: { $0.id == tempId }) {
-                    let originalTimestamp = messages[index].timestamp
-                    messages[index] = ChatMessage(
-                        id: messageId,
-                        type: .user,
-                        content: content,
-                        timestamp: originalTimestamp,
-                        isPending: false
-                    )
+                // With idempotency, `messageId == clientMessageId` by server
+                // contract. Just clear the pending flag; no row rewrite needed.
+                // Defensive: also handle the unlikely case where SSE already
+                // replaced the row with the same id (it would still be at the
+                // same index because we use the id, not the temp- prefix).
+                if let index = messages.firstIndex(where: { $0.id == clientMessageId || $0.id == messageId }) {
+                    messages[index].sendState = .sent
                 }
 
                 // Update queue count when message was queued
@@ -2660,8 +2770,59 @@ struct ControlView: View {
                 }
             } catch {
                 print("Failed to send message: \(error)")
-                // Remove the optimistic message on error
-                messages.removeAll { $0.id == tempId }
+                // Mark the bubble as failed and surface a retry affordance.
+                // Do NOT remove it — preserving the user's intent on screen
+                // is more important than tidiness, and the SSE may still
+                // deliver the underlying message later (in which case the
+                // SSE handler resolves the row by id).
+                let reason = (error as? LocalizedError)?.errorDescription
+                    ?? (error as? URLError)?.localizedDescription
+                    ?? "Send failed"
+                if let index = messages.firstIndex(where: { $0.id == clientMessageId }) {
+                    messages[index].sendState = .failed(reason: reason)
+                }
+                recomputeGroupedItems()
+                HapticService.error()
+            }
+        }
+    }
+
+    /// Re-send a previously-failed user message. Reuses the original id as
+    /// the idempotency key — so even if the original POST actually reached
+    /// the server (and we only failed to receive the response), this retry
+    /// is a no-op on the backend.
+    private func retryFailedMessage(_ message: ChatMessage) {
+        guard message.isUser, message.sendState.isFailed else { return }
+        let id = message.id
+        let content = message.content
+        let pendingMissionId = viewingMissionId
+
+        if let index = messages.firstIndex(where: { $0.id == id }) {
+            messages[index].sendState = .pending
+        }
+        recomputeGroupedItems()
+        HapticService.lightTap()
+        pendingSendCount += 1
+
+        Task { @MainActor in
+            defer { pendingSendCount = max(0, pendingSendCount - 1) }
+            do {
+                let (_, queued) = try await api.sendMessageWithRetry(
+                    content: content,
+                    clientMessageId: id,
+                    missionId: pendingMissionId
+                )
+                if let index = messages.firstIndex(where: { $0.id == id }) {
+                    messages[index].sendState = .sent
+                }
+                if queued { queueLength += 1 }
+            } catch {
+                let reason = (error as? LocalizedError)?.errorDescription
+                    ?? (error as? URLError)?.localizedDescription
+                    ?? "Send failed"
+                if let index = messages.firstIndex(where: { $0.id == id }) {
+                    messages[index].sendState = .failed(reason: reason)
+                }
                 recomputeGroupedItems()
                 HapticService.error()
             }
@@ -2795,6 +2956,11 @@ struct ControlView: View {
                                     }
                                 }
                             }
+                            // Tell the reachability monitor we're hearing
+                            // from the server. This is the truthy signal that
+                            // beats both NWPathMonitor heuristics and a
+                            // half-open-socket false-positive.
+                            self.networkMonitor.noteStreamActivity()
                             for event in batch {
                                 self.handleStreamEvent(
                                     type: event.type,
@@ -2807,8 +2973,17 @@ struct ControlView: View {
 
                 _ = await withCheckedContinuation { continuation in
                     let innerTask = api.streamControl(missionId: missionFilter) { eventType, data in
-                        // Only count non-error events as successful for backoff reset
-                        if eventType != "error" {
+                        // Only server-sourced events count for backoff reset.
+                        // `connected` is a synthetic the client emits when it
+                        // opens the stream — counting it would let a server
+                        // that immediately closes still reset our backoff to
+                        // 1s every cycle, causing a reconnect storm.
+                        // `parseError` doesn't prove the server is healthy
+                        // either; it usually means something else is broken.
+                        let isServerSourced = eventType != "error"
+                            && eventType != "connected"
+                            && eventType != "parseError"
+                        if isServerSourced {
                             receivedSuccessfulEvent.withLock { $0 = true }
                         }
                         let codableData = data.mapValues { AnyCodable($0) }
@@ -2843,6 +3018,7 @@ struct ControlView: View {
                 await MainActor.run {
                     reconnectAttempt += 1
                     connectionState = .reconnecting(attempt: reconnectAttempt)
+                    networkMonitor.noteStreamReconnecting(attempt: reconnectAttempt)
                 }
 
                 // Wait before reconnecting (exponential backoff)
@@ -2857,20 +3033,57 @@ struct ControlView: View {
     
     // MARK: - Parallel Missions
     
-    private func refreshRunningMissions() async {
+    /// Returns true when the call completed (regardless of `runningMissions`
+    /// changing); false when the network call threw. The poller uses this
+    /// to drive its backoff so a hung link doesn't spin at full speed
+    /// (Wave 3 fix 5.7).
+    @discardableResult
+    private func refreshRunningMissions() async -> Bool {
+        var ok = true
         do {
             runningMissions = try await api.getRunningMissions()
         } catch {
             print("Failed to refresh running missions: \(error)")
+            ok = false
         }
 
-        // Also refresh child missions if viewing a boss mission
-        if let id = viewingMissionId {
-            if let workers = try? await api.getChildMissions(parentId: id) {
-                guard viewingMissionId == id else { return }
-                childMissions = workers
-            }
+        // Only fetch the (~35 kB) full mission list when there is reason to
+        // believe this view actually has child missions to display. The
+        // previous code unconditionally downloaded the whole list every 3 s
+        // so it could client-side filter to children of one mission, burning
+        // a quarter of a metered cellular plan's headroom on a no-op for the
+        // common case of a non-boss mission (Wave 3 fix 5.7).
+        guard let id = viewingMissionId else { return ok }
+        let alreadyHasChildren = !childMissions.isEmpty
+        let runningAsParent = runningMissions.contains { $0.missionId == id }
+        guard alreadyHasChildren || runningAsParent || viewingMissionIsBoss else {
+            // Defensive: if we used to have children and now don't, reflect
+            // that in state. Doesn't issue any network call.
+            return ok
         }
+        do {
+            let workers = try await api.getChildMissions(parentId: id)
+            guard viewingMissionId == id else { return ok }
+            childMissions = workers
+        } catch {
+            // Don't flip ok=false: missing child list is non-fatal and we
+            // don't want it to throttle the running-missions cadence.
+            print("Failed to refresh child missions: \(error)")
+        }
+        return ok
+    }
+
+    /// Heuristic: does the currently-viewed mission appear to be a parent?
+    /// Used to gate the (large) full-mission-list fetch in
+    /// `refreshRunningMissions`. We don't have a server-side
+    /// `is_boss` flag, so this is best-effort.
+    private var viewingMissionIsBoss: Bool {
+        // The mission's own metadata may tag it as having parallel workers.
+        // For now, fall back to "we've seen children before, or one is
+        // currently running attributed to this mission". This is the same
+        // signal the existing code used, just expressed positively.
+        guard let id = viewingMissionId else { return false }
+        return childMissions.contains(where: { $0.parentMissionId == id })
     }
 
     private func loadRecentMissions() async {
@@ -2895,11 +3108,22 @@ struct ControlView: View {
     }
 
     private func startPollingRunningMissions() {
+        // Cadence: 5s when healthy, doubled (capped 60s) on each consecutive
+        // failure. This stops the previous "60s URLSession timeout, then
+        // immediately retry, repeat forever" loop on bad networks (Wave 3
+        // fix 5.7). The SSE event handler kicks an immediate refresh on
+        // mission lifecycle events (mission_status_changed etc.) so the
+        // polling cadence is the floor, not the only update path.
+        let baseInterval: TimeInterval = 5
+        let maxInterval: TimeInterval = 60
         pollingTask = Task {
+            var consecutiveFailures = 0
             while !Task.isCancelled {
-                try? await Task.sleep(for: .seconds(3))
+                let interval = min(baseInterval * pow(2, Double(consecutiveFailures)), maxInterval)
+                try? await Task.sleep(for: .seconds(interval))
                 guard !Task.isCancelled else { break }
-                await refreshRunningMissions()
+                let ok = await refreshRunningMissions()
+                consecutiveFailures = ok ? 0 : consecutiveFailures + 1
             }
         }
     }
@@ -2931,10 +3155,12 @@ struct ControlView: View {
             applyViewingMissionWithEvents(cached.mission, events: cached.events)
             hasCache = true
             controlCacheHit = true
+            controlCacheStale = false   // optimistic; flipped true on fetch failure below
         } else {
             hasCache = false
             controlCacheHit = false
             isLoading = true
+            controlCacheStale = false
         }
 
         // Determine the run state for this mission from runningMissions
@@ -2972,6 +3198,7 @@ struct ControlView: View {
 
             if !snapshot.events.isEmpty {
                 controlCacheHit = hasCache
+                controlCacheStale = false
                 hasMoreHistory = snapshot.totalEvents > snapshot.events.count
                 applyViewingMissionWithEvents(mission, events: snapshot.events)
                 if snapshot.latestSequence > 0 { missionMaxSeq[id] = snapshot.latestSequence }
@@ -2995,6 +3222,14 @@ struct ControlView: View {
             print("Failed to switch mission: \(error)")
             HapticService.error()
 
+            // Snapshot fetch failed but we're already showing cached events.
+            // Flag the cache as stale so the UI can surface a "Cached · Tap
+            // to refresh" pill, rather than silently showing potentially
+            // outdated content (Wave 4 fix 5.11).
+            if hasCache {
+                controlCacheStale = true
+            }
+
             // Revert viewing state and status indicators to avoid filtering out events
             runState = previousRunState
             queueLength = previousQueueLength
@@ -3004,6 +3239,29 @@ struct ControlView: View {
             } else {
                 viewingMissionId = previousViewingId
             }
+        }
+    }
+
+    /// Re-fetch the snapshot for the currently-viewed mission, used by the
+    /// stale-cache pill's tap-to-refresh affordance (Wave 4 fix 5.11).
+    private func refreshViewingMissionSnapshot() async {
+        guard let id = viewingMissionId else { return }
+        do {
+            let snapshot = try await api.getMissionSnapshot(id: id)
+            guard viewingMissionId == id else { return }
+            currentMission = currentMission?.id == snapshot.mission.id ? snapshot.mission : currentMission
+            if !snapshot.events.isEmpty {
+                hasMoreHistory = snapshot.totalEvents > snapshot.events.count
+                applyViewingMissionWithEvents(snapshot.mission, events: snapshot.events)
+                if snapshot.latestSequence > 0 { missionMaxSeq[id] = snapshot.latestSequence }
+                childMissions = snapshot.childMissions
+                cacheMissionWithEvents(snapshot.mission, events: snapshot.events)
+            }
+            controlCacheStale = false
+            HapticService.success()
+        } catch {
+            print("Failed to refresh snapshot: \(error)")
+            HapticService.error()
         }
     }
     
@@ -3208,19 +3466,18 @@ struct ControlView: View {
             if let content = data["content"] as? String,
                let id = data["id"] as? String {
                 finalizeActiveThinkingMessages()
-                // Skip if we already have this message with this ID
-                guard !messages.contains(where: { $0.id == id }) else { break }
-
-                // Check if there's a pending temp message with matching content (SSE arrived before API response)
-                // We verify content to avoid mismatching with messages from other sessions/devices
-                if let tempIndex = messages.firstIndex(where: {
-                    $0.isUser && $0.id.hasPrefix("temp-") && $0.content == content
-                }) {
-                    // Replace temp ID with server ID, preserving original timestamp
-                    let originalTimestamp = messages[tempIndex].timestamp
-                    messages[tempIndex] = ChatMessage(id: id, type: .user, content: content, timestamp: originalTimestamp)
+                // With idempotent send (client_message_id == server id), the
+                // optimistic bubble already has this id. We only need to
+                // resolve its send state to `.sent`. If we don't have it at
+                // all, the message came from another client/session — append.
+                if let index = messages.firstIndex(where: { $0.id == id }) {
+                    // Heal any orphaned pending/failed state (POST in flight
+                    // when SSE landed, or a "failed" bubble whose underlying
+                    // POST actually reached the server). Content is taken
+                    // from the SSE event in case the server normalised it.
+                    messages[index].sendState = .sent
+                    messages[index].content = content
                 } else {
-                    // No matching temp message found, add new (message came from another client/session)
                     let message = ChatMessage(id: id, type: .user, content: content)
                     messages.append(message)
                 }
@@ -3745,7 +4002,8 @@ private struct MessageBubble: View {
     let message: ChatMessage
     var isCopied: Bool = false
     var onCopy: (() -> Void)?
-    
+    var onRetry: (() -> Void)?
+
     var body: some View {
         HStack(alignment: .top, spacing: 10) {
             if message.isUser {
@@ -3790,7 +4048,7 @@ private struct MessageBubble: View {
                     .foregroundStyle(.white)
                     .padding(.horizontal, 16)
                     .padding(.vertical, 12)
-                    .background(Theme.accent)
+                    .background(bubbleBackground)
                     .clipShape(
                         .rect(
                             topLeadingRadius: 20,
@@ -3799,33 +4057,79 @@ private struct MessageBubble: View {
                             topTrailingRadius: 20
                         )
                     )
+                    .overlay(
+                        UnevenRoundedRectangle(
+                            topLeadingRadius: 20,
+                            bottomLeadingRadius: 20,
+                            bottomTrailingRadius: 6,
+                            topTrailingRadius: 20
+                        )
+                        .stroke(message.sendState.isFailed ? Theme.error : Color.clear, lineWidth: 1)
+                    )
                     // While the message is awaiting server ack, dim the bubble
                     // and overlay a small spinner so the user has unambiguous
                     // feedback that the send is in flight. (UX audit item #11.)
-                    .opacity(message.isPending ? 0.55 : 1)
+                    .opacity(message.sendState.isPending ? 0.55 : 1)
                     .overlay(alignment: .bottomTrailing) {
-                        if message.isPending {
+                        if message.sendState.isPending {
                             ProgressView()
                                 .controlSize(.mini)
                                 .tint(.white)
                                 .padding(6)
+                        } else if message.sendState.isFailed {
+                            Image(systemName: "exclamationmark.circle.fill")
+                                .font(.caption)
+                                .foregroundStyle(Theme.error)
+                                .padding(6)
                         }
                     }
-                    .animation(.easeOut(duration: 0.15), value: message.isPending)
+                    .animation(.easeOut(duration: 0.15), value: message.sendState.isPending)
+                    .animation(.easeOut(duration: 0.15), value: message.sendState.isFailed)
                     .contextMenu {
                         Button {
                             onCopy?()
                         } label: {
                             Label("Copy", systemImage: "doc.on.doc")
                         }
+                        if message.sendState.isFailed, onRetry != nil {
+                            Button {
+                                onRetry?()
+                            } label: {
+                                Label("Retry send", systemImage: "arrow.clockwise")
+                            }
+                        }
                     }
 
-                // Timestamp
-                Text(message.timestamp, style: .time)
-                    .font(.caption2)
-                    .foregroundStyle(Theme.textMuted)
+                // Inline "Send failed — Tap to retry" affordance directly under
+                // the failed bubble. Mirrors iMessage's "Not Delivered" pattern
+                // so users get an unmistakable signal and a one-tap recovery.
+                if message.sendState.isFailed, let reason = message.sendState.failureReason {
+                    Button(action: { onRetry?() }) {
+                        HStack(spacing: 4) {
+                            Image(systemName: "arrow.clockwise.circle.fill")
+                                .font(.caption2)
+                            Text("Not sent · Tap to retry")
+                                .font(.caption2.weight(.medium))
+                        }
+                        .foregroundStyle(Theme.error)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Retry send. Failed: \(reason)")
+                } else {
+                    // Timestamp
+                    Text(message.timestamp, style: .time)
+                        .font(.caption2)
+                        .foregroundStyle(Theme.textMuted)
+                }
             }
         }
+    }
+
+    /// Background color/material for the user bubble. Failed sends render with
+    /// a dimmed error tint so the row is unmistakably distinct from a normal
+    /// (sent) bubble, in case the user is glancing rather than reading.
+    private var bubbleBackground: Color {
+        message.sendState.isFailed ? Theme.error.opacity(0.55) : Theme.accent
     }
 
     private var assistantBubble: some View {
@@ -5980,6 +6284,71 @@ private struct MissionRow: View {
                     Label("Cancel Mission", systemImage: "xmark.circle.fill")
                 }
             }
+        }
+    }
+}
+
+/// Concrete struct holding the main content stack, parameterised on the
+/// dynamic bits ControlView needs to inject. Pulling this out of
+/// `ControlView` lets SwiftUI's type-checker resolve it independently of
+/// the toolbar + sheet + onChange chain on the parent body.
+private struct MainContentStack<Banner: View, Pill: View, Messages: View, Worker: View, Input: View>: View {
+    let showBanner: Bool
+    let bannerView: Banner
+    let showStaleCachePill: Bool
+    let staleCachePill: Pill
+    let messagesView: Messages
+    let workerPill: Worker
+    let inputView: Input
+
+    var body: some View {
+        VStack(spacing: 0) {
+            if showBanner {
+                bannerView
+                    .transition(.move(edge: .top).combined(with: .opacity))
+            }
+            if showStaleCachePill {
+                staleCachePill
+                    .transition(.move(edge: .top).combined(with: .opacity))
+            }
+            ZStack(alignment: .bottom) {
+                messagesView
+                workerPill
+            }
+            inputView
+        }
+        .animation(.easeInOut(duration: 0.2), value: showBanner)
+        .animation(.easeInOut(duration: 0.2), value: showStaleCachePill)
+    }
+}
+
+/// Renders the connection-state banner. Extracted to a separate struct so
+/// `ControlView.body` doesn't grow past the Swift type-checker's complexity
+/// budget.
+private struct ConnectionBannerView: View {
+    let state: ConnectionState
+
+    var body: some View {
+        // Degraded is a softer signal than disconnect/reconnect; use the
+        // standard textSecondary tone rather than warning so users on a
+        // marginal cell don't get a red flag for every minor slowdown.
+        let tint: Color = state.isDegraded ? Theme.textSecondary : Theme.warning
+        return HStack(spacing: 8) {
+            Image(systemName: state.icon)
+                .font(.system(size: 11, weight: .semibold))
+                .symbolEffect(.pulse, options: state.isDegraded ? .nonRepeating : .repeating)
+            Text(state.label)
+                .font(.caption.weight(.medium))
+            Spacer()
+        }
+        .foregroundStyle(tint)
+        .padding(.horizontal, 16)
+        .padding(.vertical, 6)
+        .background(tint.opacity(0.12))
+        .overlay(alignment: .bottom) {
+            Rectangle()
+                .fill(tint.opacity(0.25))
+                .frame(height: 0.5)
         }
     }
 }

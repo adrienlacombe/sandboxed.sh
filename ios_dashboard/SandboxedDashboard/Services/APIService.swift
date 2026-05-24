@@ -18,17 +18,29 @@ final class APIService {
     /// returning data within this window is treated as failed. Default
     /// `URLSession.shared` ships with 60s, which is far too long for a chat
     /// app's cold-start path — the user sits at "Connecting…" with no feedback.
-    nonisolated static let requestTimeout: TimeInterval = 15
+    /// Combined with retry-on-transient at the call site, a tight 10s surfaces
+    /// failures fast without sacrificing reliability.
+    nonisolated static let requestTimeout: TimeInterval = 10
 
     /// Full-transfer cap for ordinary JSON calls. Default is 7 days; a stalled
     /// large download (e.g. a multi-MB event tail over a flaky cellular link)
-    /// would block the call until the user kills the app.
-    nonisolated static let resourceTimeout: TimeInterval = 60
+    /// would block the call until the user kills the app. 25s caps the longest
+    /// user-attention window on a stuck spinner; the retry layer handles the
+    /// failure cleanly.
+    nonisolated static let resourceTimeout: TimeInterval = 25
 
     /// SSE inactivity threshold. If no bytes arrive for this long the stream is
     /// considered dead and the caller's reconnect logic re-runs. Covers the
     /// silent-half-open-socket case (cell→wifi handoff, NAT idle reset).
-    nonisolated static let streamInactivityTimeout: TimeInterval = 30
+    ///
+    /// Set to 60s rather than 30s because some agents (Codex high-reasoning,
+    /// long-running tool calls) emit no bytes for ≥30s during normal
+    /// operation. The proper fix is server-side pings every ~15s for every
+    /// open stream; until that lands universally, 60s is the safer tradeoff
+    /// — false-positive reconnect storms are worse than slow detection of a
+    /// genuinely dead socket, which `NetworkMonitor` (NWPathMonitor +
+    /// /api/health probes) catches independently.
+    nonisolated static let streamInactivityTimeout: TimeInterval = 60
 
     /// Hard cap on the SSE line-buffer (1 MiB). A pathological server that
     /// never emits a newline must not be allowed to balloon memory.
@@ -369,18 +381,85 @@ final class APIService {
     
     // MARK: - Control
     
-    func sendMessage(content: String) async throws -> (id: String, queued: Bool) {
+    /// Send a control message. `clientMessageId` doubles as an idempotency key
+    /// — the backend (see `control.rs:ControlMessageRequest`) uses it as the
+    /// message id, so a POST whose response is lost can be retried without
+    /// creating two server-side messages. `missionId` pins the send to the
+    /// mission the user is actually looking at; without it the backend routes
+    /// to the user's "current" mission, which can drift when parallel
+    /// missions are juggled.
+    func sendMessage(
+        content: String,
+        clientMessageId: String,
+        missionId: String? = nil
+    ) async throws -> (id: String, queued: Bool) {
         struct MessageRequest: Encodable {
             let content: String
+            let client_message_id: String
+            let mission_id: String?
         }
-        
+
         struct MessageResponse: Decodable {
             let id: String
             let queued: Bool
         }
-        
-        let response: MessageResponse = try await post("/api/control/message", body: MessageRequest(content: content))
+
+        let response: MessageResponse = try await post(
+            "/api/control/message",
+            body: MessageRequest(
+                content: content,
+                client_message_id: clientMessageId,
+                mission_id: missionId
+            )
+        )
         return (response.id, response.queued)
+    }
+
+    /// Retry policy for transient send failures. Combined with idempotency
+    /// (see `sendMessage`), retries are safe — at worst the server sees the
+    /// same `client_message_id` twice and returns the cached response.
+    ///
+    /// Mirrors `postControlMessageWithRetry` in the web client. Jittered
+    /// backoff (200ms, 600ms, 1.5s) keeps total round-trip ≤ ~2.3 s in the
+    /// worst case so the user gets feedback fast.
+    func sendMessageWithRetry(
+        content: String,
+        clientMessageId: String,
+        missionId: String? = nil
+    ) async throws -> (id: String, queued: Bool) {
+        let delays: [UInt64] = [200_000_000, 600_000_000, 1_500_000_000]
+        var attempt = 0
+        while true {
+            do {
+                return try await sendMessage(
+                    content: content,
+                    clientMessageId: clientMessageId,
+                    missionId: missionId
+                )
+            } catch let urlError as URLError where Self.isRetriableSendError(urlError) {
+                guard attempt < delays.count else { throw urlError }
+                // Add ±25% jitter so concurrent retries don't synchronise.
+                let base = Double(delays[attempt])
+                let jitter = Double.random(in: 0.75...1.25)
+                try? await Task.sleep(nanoseconds: UInt64(base * jitter))
+                attempt += 1
+            }
+        }
+    }
+
+    nonisolated private static func isRetriableSendError(_ error: URLError) -> Bool {
+        switch error.code {
+        case .timedOut,
+             .networkConnectionLost,
+             .notConnectedToInternet,
+             .cannotConnectToHost,
+             .dnsLookupFailed,
+             .cannotFindHost,
+             .resourceUnavailable:
+            return true
+        default:
+            return false
+        }
     }
     
     func cancelControl() async throws {

@@ -12,6 +12,7 @@
 		08D9C00F453EE16A24DC9C84 /* FilesView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8D9C3868787C973C5B65DFCD /* FilesView.swift */; };
 		094CD000ADB23893099CC839 /* WorkerPillView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2A514C239AAC192BD2AE8038 /* WorkerPillView.swift */; };
 		0D00520E1A6F2454E3B18A7F /* AnyCodable.swift in Sources */ = {isa = PBXBuildFile; fileRef = E4CA8C69928B3838868EE34A /* AnyCodable.swift */; };
+		110C67FF7A62B86FB7AD4CD0 /* NetworkMonitor.swift in Sources */ = {isa = PBXBuildFile; fileRef = EFD2C112534D498211B26C38 /* NetworkMonitor.swift */; };
 		1750DD5DC204F7506E885D83 /* WorkspacesView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 384691169D9EC024B03AA57F /* WorkspacesView.swift */; };
 		2BBA61051DFCB7A780604B87 /* NetworkResilienceTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1828D2FC9160FC8677E10502 /* NetworkResilienceTests.swift */; };
 		3A706E457E3E27DA1B69E152 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 750C4C8090EAD0168794EEE4 /* Assets.xcassets */; };
@@ -118,6 +119,7 @@
 		D9E023EEFFFA9B1092B66006 /* ANSIParser.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ANSIParser.swift; sourceTree = "<group>"; };
 		E4CA8C69928B3838868EE34A /* AnyCodable.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AnyCodable.swift; sourceTree = "<group>"; };
 		EB3EDA65C036030CC45BAD0E /* NavigationState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NavigationState.swift; sourceTree = "<group>"; };
+		EFD2C112534D498211B26C38 /* NetworkMonitor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NetworkMonitor.swift; sourceTree = "<group>"; };
 		F53686D00374BEDA33228269 /* ToolUIDataTableView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ToolUIDataTableView.swift; sourceTree = "<group>"; };
 		F6993AD59CA0D7392AAACDC2 /* BackendAgentService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BackendAgentService.swift; sourceTree = "<group>"; };
 		FCD083A671640B2F286D7C06 /* ToolUIOptionListView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ToolUIOptionListView.swift; sourceTree = "<group>"; };
@@ -202,6 +204,7 @@
 				3BE62F9666647C1F41F15251 /* DesktopStreamService.swift */,
 				8EB13B92B70F6884D323E5FF /* FidoApprovalState.swift */,
 				EB3EDA65C036030CC45BAD0E /* NavigationState.swift */,
+				EFD2C112534D498211B26C38 /* NetworkMonitor.swift */,
 				6922E2F0E17EDB3A8400D473 /* TerminalState.swift */,
 				ADBAC1664CAF3CD9DCCDB8B4 /* WorkspaceState.swift */,
 			);
@@ -437,6 +440,7 @@
 				F14B1635CFA8338A1C733CAD /* MarkdownView.swift in Sources */,
 				BAA09895377937393FF864A7 /* Mission.swift in Sources */,
 				9380357DC269257F9E693388 /* NavigationState.swift in Sources */,
+				110C67FF7A62B86FB7AD4CD0 /* NetworkMonitor.swift in Sources */,
 				D0646F9EE2D2E984F0446C57 /* NewMissionSheet.swift in Sources */,
 				51E9D9F51934DFC8EAD58CDC /* QueueSheet.swift in Sources */,
 				95B7AB5DBEB42E107EBE06FB /* RunningMissionsBar.swift in Sources */,

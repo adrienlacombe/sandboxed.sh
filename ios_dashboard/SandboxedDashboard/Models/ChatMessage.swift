@@ -203,6 +203,37 @@ enum ChatMessageType {
     case error
 }
 
+/// Delivery state of a user-authored message. Drives the bubble's visual
+/// treatment (dimmed/spinner for pending, red/retry for failed) and decides
+/// whether `sendState == .failed` rows surface a tap-to-retry affordance.
+enum MessageSendState {
+    /// Server has acknowledged or the message came down via SSE — normal render.
+    case sent
+    /// Optimistic bubble awaiting server ack. Renders dimmed with a spinner.
+    case pending
+    /// All retries exhausted (or non-retriable error). Renders with a red
+    /// tint, an error glyph, and a tap-to-retry affordance. We never remove
+    /// the bubble — preserving the user's intent on screen is more important
+    /// than tidiness, and the SSE may still deliver the underlying message
+    /// later (in which case the SSE handler resolves the row by id).
+    case failed(reason: String)
+
+    var isPending: Bool {
+        if case .pending = self { return true }
+        return false
+    }
+
+    var isFailed: Bool {
+        if case .failed = self { return true }
+        return false
+    }
+
+    var failureReason: String? {
+        if case .failed(let reason) = self { return reason }
+        return nil
+    }
+}
+
 struct ChatMessage: Identifiable {
     let id: String
     let type: ChatMessageType
@@ -210,11 +241,22 @@ struct ChatMessage: Identifiable {
     var toolUI: ToolUIContent?
     var toolData: ToolCallData?
     let timestamp: Date
-    /// True while the optimistic user bubble is awaiting server acknowledgement.
-    /// Cleared as soon as `sendMessage` returns or the SSE roundtrip arrives.
-    /// The bubble renders dimmed with a small spinner while pending so users
-    /// don't re-tap send on slow networks. (UX audit item #11.)
-    var isPending: Bool
+    /// Delivery state for user-authored bubbles. For non-user types this is
+    /// always `.sent` and ignored by the renderer.
+    var sendState: MessageSendState
+
+    /// Convenience accessor mirroring the previous `isPending` Bool API so
+    /// existing call sites keep compiling. The single source of truth is
+    /// `sendState`.
+    var isPending: Bool {
+        get { sendState.isPending }
+        set {
+            // Treat any explicit "set to false" as "transition to sent", and
+            // "set to true" as "transition to pending". Used by code that
+            // doesn't care about the failed state.
+            sendState = newValue ? .pending : .sent
+        }
+    }
 
     init(
         id: String = UUID().uuidString,
@@ -223,7 +265,8 @@ struct ChatMessage: Identifiable {
         toolUI: ToolUIContent? = nil,
         toolData: ToolCallData? = nil,
         timestamp: Date = Date(),
-        isPending: Bool = false
+        isPending: Bool = false,
+        sendState: MessageSendState? = nil
     ) {
         self.id = id
         self.type = type
@@ -231,7 +274,11 @@ struct ChatMessage: Identifiable {
         self.toolUI = toolUI
         self.toolData = toolData
         self.timestamp = timestamp
-        self.isPending = isPending
+        if let sendState {
+            self.sendState = sendState
+        } else {
+            self.sendState = isPending ? .pending : .sent
+        }
     }
     
     var isUser: Bool {
@@ -371,8 +418,13 @@ enum ControlRunState: String, Codable {
 
 // MARK: - Connection State
 
-enum ConnectionState {
+enum ConnectionState: Equatable {
     case connected
+    /// Online per `NWPathMonitor` but the SSE stream has been silent and/or
+    /// recent JSON calls have been slow. The user sees a subtle banner saying
+    /// "Slow connection" so they understand why the chat isn't updating;
+    /// nothing is hidden but nothing claims to be working either.
+    case degraded
     case reconnecting(attempt: Int)
     case disconnected
 
@@ -381,17 +433,34 @@ enum ConnectionState {
         return false
     }
 
+    /// True when the user should NOT be told everything is fine but we
+    /// haven't yet concluded the network is dead. Drives the soft banner.
+    var isDegraded: Bool {
+        if case .degraded = self { return true }
+        return false
+    }
+
+    /// True when the banner should be visible at all.
+    var showsBanner: Bool {
+        switch self {
+        case .connected: return false
+        case .degraded, .reconnecting, .disconnected: return true
+        }
+    }
+
     var label: String {
         switch self {
         case .connected: return ""
+        case .degraded: return "Slow connection · using cached data"
         case .reconnecting(let attempt): return attempt > 1 ? "Reconnecting (\(attempt))..." : "Reconnecting..."
-        case .disconnected: return "Disconnected"
+        case .disconnected: return "Offline"
         }
     }
 
     var icon: String {
         switch self {
         case .connected: return "wifi"
+        case .degraded: return "wifi.exclamationmark"
         case .reconnecting: return "wifi.exclamationmark"
         case .disconnected: return "wifi.slash"
         }
