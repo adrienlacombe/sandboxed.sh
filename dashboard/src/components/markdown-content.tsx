@@ -1119,9 +1119,14 @@ export const MarkdownContent = memo(function MarkdownContent({
  *
  * Bubbles smaller than the threshold skip the lazy path entirely — the
  * setup cost of an IO observer + the placeholder swap isn't worth it for
- * a 100-char ack message.
+ * a 100-char ack message. Threshold was 1 KB but raised to 5 KB after we
+ * disabled tanstack-virtual's resize-driven scroll compensation: the
+ * placeholder→markdown swap changes bubble height, and without virtualizer
+ * adjustment, that delta now shifts visible content under the user's
+ * reading position when they scroll into history. Most assistant messages
+ * are under 5 KB; only large summaries take the lazy path.
  */
-const LAZY_THRESHOLD_BYTES = 1_000;
+const LAZY_THRESHOLD_BYTES = 5_000;
 
 export function LazyMarkdownContent(props: MarkdownContentProps) {
   const ref = useRef<HTMLDivElement | null>(null);
@@ -1148,9 +1153,14 @@ export function LazyMarkdownContent(props: MarkdownContentProps) {
           }
         }
       },
-      // 200px rootMargin so the upgrade fires just before the bubble
-      // scrolls into view; users almost never see the placeholder.
-      { rootMargin: "200px" }
+      // Generous rootMargin so the upgrade fires well before the bubble
+      // scrolls into the viewport. The chat virtualizer keeps ~8 items
+      // of overscan (~1500-2500 px); covering that range means the
+      // placeholder→markdown swap happens on mount in overscan, never
+      // while the bubble is visually present. Without this, scrolling
+      // suddenly (scrollbar click, keyboard PgUp) lands the user on a
+      // bubble that then upgrades and shifts every item below it.
+      { rootMargin: "1200px" }
     );
     observer.observe(node);
     return () => observer.disconnect();
