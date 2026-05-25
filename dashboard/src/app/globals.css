@@ -300,16 +300,22 @@ select:focus-visible {
 
 .mission-selector-trigger {
   background-color: rgb(var(--accent) / 0.2);
+  color: rgb(255 255 255 / 0.84);
 }
 
 .mission-selector-trigger:hover {
   background-color: rgb(var(--accent) / 0.3);
 }
 
+.mission-selector-trigger * {
+  color: inherit !important;
+}
+
 @media (prefers-color-scheme: light) {
   .mission-selector-trigger {
     background-color: rgb(224 231 255);
     border: 1px solid rgb(165 180 252 / 0.55);
+    color: rgb(49 46 129);
   }
 
   .mission-selector-trigger:hover {
@@ -319,6 +325,10 @@ select:focus-visible {
 
 .user-message-bubble {
   color: #ffffff;
+}
+
+.user-message-bubble * {
+  color: inherit;
 }
 
 .user-message-bubble-solid {
@@ -332,7 +342,7 @@ select:focus-visible {
 
 @media (prefers-color-scheme: light) {
   .user-message-bubble {
-    color: rgb(30 41 59);
+    color: rgb(49 46 129);
   }
 
   .user-message-bubble-solid {
@@ -343,6 +353,27 @@ select:focus-visible {
   .user-message-bubble-queued {
     background-color: rgb(238 242 255);
     border-color: rgb(129 140 248 / 0.7);
+  }
+}
+
+.mission-switcher-row-selected {
+  color: rgb(255 255 255 / 0.9);
+}
+
+.mission-switcher-row-selected * {
+  color: inherit;
+}
+
+@media (prefers-color-scheme: light) {
+  .mission-switcher-row-selected {
+    color: rgb(49 46 129);
+  }
+
+  .mission-switcher-row-selected [class*="text-white"],
+  .mission-switcher-row-selected [class*="text-indigo"],
+  .mission-switcher-row-selected [class*="text-violet"],
+  .mission-switcher-row-selected [class*="text-cyan"] {
+    color: inherit !important;
   }
 }
 
