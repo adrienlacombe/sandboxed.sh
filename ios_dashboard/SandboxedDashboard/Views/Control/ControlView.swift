@@ -1877,7 +1877,7 @@ struct ControlView: View {
               Self.cacheFileSize(url: url) > Self.maxSynchronousCacheBytes else { return }
         Task {
             guard let cached = await loadCachedMissionDataAsync(id) else { return }
-            guard fetchingMissionId == id || viewingMissionId == id else { return }
+            guard viewingMissionId == id else { return }
             let cachedMaxSeq = cached.events.compactMap(\.sequence).max() ?? 0
             if let currentMaxSeq = missionMaxSeq[id], currentMaxSeq >= cachedMaxSeq {
                 return
@@ -2258,6 +2258,11 @@ struct ControlView: View {
     private func loadMission(id: String) async {
         // Set target immediately for race condition tracking
         fetchingMissionId = id
+        defer {
+            if fetchingMissionId == id {
+                fetchingMissionId = nil
+            }
+        }
         let previousViewingMission = viewingMission
         let previousViewingId = viewingMissionId
         viewingMissionId = id
@@ -3288,6 +3293,11 @@ struct ControlView: View {
         let previousProgress = progress
         viewingMissionId = id
         fetchingMissionId = id
+        defer {
+            if fetchingMissionId == id {
+                fetchingMissionId = nil
+            }
+        }
 
         // Clear stale workers from previous mission immediately
         childMissions = []
