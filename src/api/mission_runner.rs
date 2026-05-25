@@ -14199,12 +14199,24 @@ pub async fn run_codex_turn(
     // Best-effort: try to mint an OpenAI API key from the OAuth refresh token.
     // If this fails (e.g. no API platform org), write_codex_credentials_for_workspace
     // will fall back to auth_mode: "chatgpt" using the access_token directly.
-    if let Err(e) = crate::api::ai_providers::ensure_openai_api_key_for_codex(app_working_dir).await
-    {
-        tracing::warn!(
-            "Could not ensure OpenAI API key for Codex (will try chatgpt auth mode): {}",
-            e
-        );
+    //
+    // Skip this when the rotation layer has already selected a specific
+    // ChatGPT OAuth account. Minting an API key refreshes/rotates the same
+    // refresh token, then the selected credential can become stale before it
+    // is written into Codex auth.json.
+    let should_try_mint_api_key = !matches!(
+        override_credential,
+        Some(crate::api::ai_providers::CodexCredentialOverride::OAuth(_))
+    );
+    if should_try_mint_api_key {
+        if let Err(e) =
+            crate::api::ai_providers::ensure_openai_api_key_for_codex(app_working_dir).await
+        {
+            tracing::warn!(
+                "Could not ensure OpenAI API key for Codex (will try chatgpt auth mode): {}",
+                e
+            );
+        }
     }
 
     // Ensure Codex auth.json is present in the workspace context (host or container).
