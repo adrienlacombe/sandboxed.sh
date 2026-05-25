@@ -282,9 +282,9 @@ pub async fn start_job(
         .arg("-lc")
         .arg(wrapper)
         .current_dir(&cwd)
+        .envs(req.env)
         .env("SANDBOXED_SH_DURABLE_CWD", &cwd)
         .env("SANDBOXED_SH_DURABLE_STATUS", &status_file)
-        .envs(req.env)
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr));
