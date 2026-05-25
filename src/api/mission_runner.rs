@@ -14388,6 +14388,9 @@ pub async fn run_codex_turn(
                             done: false,
                             mission_id: Some(mission_id),
                         });
+                        if !thinking_accumulated.is_empty() {
+                            thinking_done_emitted = false;
+                        }
                         thinking_emitted = true;
                     }
                     ExecutionEvent::ToolCall { id, name, args } => {
@@ -14958,6 +14961,9 @@ pub async fn run_gemini_turn(
                             done: false,
                             mission_id: Some(mission_id),
                         });
+                        if !thinking_accumulated.is_empty() {
+                            thinking_done_emitted = false;
+                        }
                         thinking_emitted = true;
                     }
                     ExecutionEvent::ToolCall { id, name, args } => {
