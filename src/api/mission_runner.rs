@@ -714,7 +714,7 @@ exec "$SCRIPT_DIR/.sandboxed-sh-telegram-action.py" "$@"
 }
 
 const CODEX_ACCOUNT_CONCURRENCY_LIMIT: usize = 5;
-const CODEX_OAUTH_ACCOUNT_CONCURRENCY_LIMIT: usize = 1;
+const CODEX_OAUTH_ACCOUNT_CONCURRENCY_LIMIT: usize = 5;
 const CODEX_ACCOUNT_LEASE_WAIT_TIMEOUT: Duration = Duration::from_secs(15);
 
 static CODEX_ACCOUNT_POOL: LazyLock<StdMutex<HashMap<String, Arc<Semaphore>>>> =
@@ -14219,11 +14219,37 @@ pub async fn run_codex_turn(
         }
     }
 
+    let prepared_oauth_account = match override_credential {
+        Some(crate::api::ai_providers::CodexCredentialOverride::OAuth(account)) => {
+            match crate::api::ai_providers::prepare_codex_oauth_account_for_launch(
+                app_working_dir,
+                account,
+            )
+            .await
+            {
+                Ok(account) => Some(account),
+                Err(e) => {
+                    tracing::error!("Failed to prepare Codex OAuth credentials: {}", e);
+                    return AgentResult::failure(
+                        format!("Failed to prepare Codex OAuth credentials: {}", e),
+                        0,
+                    )
+                    .with_terminal_reason(TerminalReason::AuthError);
+                }
+            }
+        }
+        _ => None,
+    };
+    let prepared_override = prepared_oauth_account
+        .as_ref()
+        .map(crate::api::ai_providers::CodexCredentialOverride::OAuth);
+    let workspace_override = prepared_override.as_ref().or(override_credential);
+
     // Ensure Codex auth.json is present in the workspace context (host or container).
     if let Err(e) = crate::api::ai_providers::write_codex_credentials_for_workspace(
         workspace,
         app_working_dir,
-        override_credential,
+        workspace_override,
     ) {
         tracing::error!("Failed to write Codex credentials: {}", e);
         return AgentResult::failure(

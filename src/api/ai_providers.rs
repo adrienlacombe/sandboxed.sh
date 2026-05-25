@@ -24,10 +24,10 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, Mutex as StdMutex};
 use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use tokio::process::Command as TokioCommand;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex as AsyncMutex};
 use tokio::time::{timeout, Duration};
 
 use crate::ai_providers::{AuthMethod, PendingOAuth, ProviderType};
@@ -1992,6 +1992,7 @@ fn write_codex_chatgpt_auth_file(
     access_token: &str,
     refresh_token: &str,
     source_label: &str,
+    include_refresh_token: bool,
 ) -> Result<(), String> {
     if access_token.trim().is_empty() {
         return Err("OAuth access_token is empty".to_string());
@@ -2011,15 +2012,24 @@ fn write_codex_chatgpt_auth_file(
     let tmp_path = config_dir.join("auth.json.tmp");
 
     let now = chrono::Utc::now().to_rfc3339();
+    let mut tokens = serde_json::json!({
+        "id_token": id_token_value,
+        "access_token": access_token,
+        "account_id": account_id,
+    });
+    if include_refresh_token {
+        if let Some(obj) = tokens.as_object_mut() {
+            obj.insert(
+                "refresh_token".to_string(),
+                serde_json::Value::String(refresh_token.to_string()),
+            );
+        }
+    }
+
     let payload = serde_json::json!({
         "auth_mode": "chatgpt",
         "OPENAI_API_KEY": null,
-        "tokens": {
-            "id_token": id_token_value,
-            "access_token": access_token,
-            "refresh_token": refresh_token,
-            "account_id": account_id,
-        },
+        "tokens": tokens,
         "last_refresh": now,
     });
     let contents = serde_json::to_string_pretty(&payload)
@@ -2052,6 +2062,7 @@ fn write_codex_auth_json_chatgpt(config_dir: &std::path::Path) -> Result<(), Str
         &entry.access_token,
         &entry.refresh_token,
         "credential_store",
+        true,
     )
 }
 
@@ -2371,6 +2382,81 @@ pub struct CodexOAuthAccount {
     pub priority: u32,
 }
 
+static CODEX_OAUTH_REFRESH_LOCKS: LazyLock<StdMutex<HashMap<String, Arc<AsyncMutex<()>>>>> =
+    LazyLock::new(|| StdMutex::new(HashMap::new()));
+
+fn codex_oauth_refresh_lock(account_id: &str) -> Arc<AsyncMutex<()>> {
+    let mut locks = CODEX_OAUTH_REFRESH_LOCKS
+        .lock()
+        .expect("Codex OAuth refresh lock map poisoned");
+    locks
+        .entry(account_id.to_string())
+        .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+        .clone()
+}
+
+/// Return a launch-ready ChatGPT OAuth account for Codex.
+///
+/// Codex workers are launched with access-token-only auth so multiple workers
+/// can use the same ChatGPT account concurrently without racing on a rotating
+/// refresh token. This function is the single refresh point for that account:
+/// it re-reads the latest stored tokens under a per-account lock and refreshes
+/// only when the access token is close to expiry.
+pub async fn prepare_codex_oauth_account_for_launch(
+    working_dir: &Path,
+    selected: &CodexOAuthAccount,
+) -> Result<CodexOAuthAccount, String> {
+    const MIN_ACCESS_TOKEN_TTL_MS: i64 = 10 * 60 * 1000;
+
+    let lock = codex_oauth_refresh_lock(&selected.chatgpt_account_id);
+    let _guard = lock.lock().await;
+
+    let current = get_all_openai_oauth_accounts(working_dir)
+        .into_iter()
+        .find(|account| account.chatgpt_account_id == selected.chatgpt_account_id)
+        .unwrap_or_else(|| selected.clone());
+
+    let now = chrono::Utc::now().timestamp_millis();
+    if current.expires_at > now + MIN_ACCESS_TOKEN_TTL_MS {
+        return Ok(current);
+    }
+
+    let client = reqwest::Client::new();
+    let (access, refresh, expires_at, _id_token) =
+        refresh_openai_oauth_tokens(&client, &current.refresh_token).await?;
+    let refreshed_account_id =
+        extract_chatgpt_account_id(&access).unwrap_or_else(|| current.chatgpt_account_id.clone());
+
+    if refreshed_account_id != current.chatgpt_account_id {
+        tracing::warn!(
+            expected_account_id = %current.chatgpt_account_id,
+            refreshed_account_id = %refreshed_account_id,
+            "OpenAI OAuth refresh returned a different ChatGPT account id"
+        );
+    }
+
+    let updated = update_provider_oauth_for_chatgpt_account(
+        working_dir,
+        &current.chatgpt_account_id,
+        &access,
+        &refresh,
+        expires_at,
+    );
+    if !updated {
+        tracing::warn!(
+            account_id = %current.chatgpt_account_id,
+            "Refreshed Codex OAuth account but could not update ai_providers.json"
+        );
+    }
+
+    Ok(CodexOAuthAccount {
+        access_token: access,
+        refresh_token: refresh,
+        expires_at,
+        ..current
+    })
+}
+
 /// Per-attempt credential override passed to `write_codex_credentials_for_workspace`.
 /// The runner builds one of these for each rotation attempt; the legacy
 /// "process-global creds.json" path is the fallback when the override is `None`.
@@ -2481,7 +2567,19 @@ pub(crate) fn write_codex_auth_json_chatgpt_with_tokens(
     access_token: &str,
     refresh_token: &str,
 ) -> Result<(), String> {
-    write_codex_chatgpt_auth_file(config_dir, access_token, refresh_token, "rotation_override")
+    // Rotation workers deliberately receive an access-token-only auth file.
+    // OpenAI ChatGPT refresh tokens rotate on every use, so allowing multiple
+    // Codex child processes to refresh the same account independently makes
+    // one process consume the token and the others fail with
+    // `refresh_token_reused`. The backend refreshes under a per-account lock
+    // before launch; workers should not perform their own refresh.
+    write_codex_chatgpt_auth_file(
+        config_dir,
+        access_token,
+        refresh_token,
+        "rotation_override",
+        false,
+    )
 }
 
 /// Write Codex credentials to a workspace.
