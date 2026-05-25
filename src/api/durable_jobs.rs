@@ -4,6 +4,7 @@
 //! That places long-running commands under the server's lifecycle and gives
 //! later turns an explicit registry for status, logs, and cancellation.
 
+use std::io::SeekFrom;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -344,7 +345,7 @@ pub async fn start_job(
         .await
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
-    let child = match child.spawn() {
+    let mut child = match child.spawn() {
         Ok(child) => child,
         Err(e) => {
             job.status = DurableJobStatus::Failed;
@@ -361,6 +362,7 @@ pub async fn start_job(
             if let Some(pid) = job.pid {
                 terminate_process_group(pid);
             }
+            let _ = child.wait().await;
             return Err(err(StatusCode::INTERNAL_SERVER_ERROR, e));
         }
     };
@@ -372,7 +374,6 @@ pub async fn start_job(
 
     let watcher_state = Arc::clone(&state);
     tokio::spawn(async move {
-        let mut child = child;
         if let Ok(status) = child.wait().await {
             if let Ok(job) = read_job(&watcher_state, id).await {
                 let job_status = if status.success() {
@@ -439,10 +440,11 @@ async fn tail_file(path: &str, max_bytes: usize) -> String {
         return String::new();
     };
     let start = metadata.len().saturating_sub(keep as u64);
-    if file.seek(std::io::SeekFrom::Start(start)).await.is_err() {
+    if file.seek(SeekFrom::Start(start)).await.is_err() {
         return String::new();
     }
-    let mut bytes = Vec::new();
+
+    let mut bytes = Vec::with_capacity(keep);
     if file.read_to_end(&mut bytes).await.is_err() {
         return String::new();
     }
@@ -563,5 +565,16 @@ mod tests {
         let merged = merge_job_for_write(Some(current), next);
 
         assert_eq!(merged.status, DurableJobStatus::Cancelled);
+    }
+
+    #[tokio::test]
+    async fn tail_file_reads_only_requested_suffix() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stdout.log");
+        std::fs::write(&path, "0123456789abcdef").unwrap();
+
+        let tail = tail_file(path.to_str().unwrap(), 6).await;
+
+        assert_eq!(tail, "abcdef");
     }
 }
