@@ -27,18 +27,22 @@ private data class WsInput(@SerialName("t") val t: String, @SerialName("d") val 
 @Serializable
 private data class WsResize(@SerialName("t") val t: String, @SerialName("c") val c: Int, @SerialName("r") val r: Int)
 
+private data class ActiveTerminalSocket(val connectionId: Long, val webSocket: WebSocket)
+
 class TerminalSocket(
     private val client: OkHttpClient,
     private val provider: () -> AppSettings,
 ) {
-    @Volatile private var ws: WebSocket? = null
+    @Volatile private var activeSocket: ActiveTerminalSocket? = null
     @Volatile private var activeConnectionId: Long = 0
     private val nextConnectionId = AtomicLong(0)
 
     fun connect(workspaceId: String? = null): Flow<TerminalEvent> = callbackFlow {
         val connectionId = nextConnectionId.incrementAndGet()
         activeConnectionId = connectionId
-        ws?.close(1000, "replaced by new terminal connection")
+        val previousSocket = activeSocket?.webSocket
+        activeSocket = null
+        previousSocket?.close(1000, "replaced by new terminal connection")
 
         val s = provider()
         val httpUrl = s.baseUrl.trimEnd('/').ifBlank { error("Server URL not configured") }
@@ -59,7 +63,7 @@ class TerminalSocket(
                     webSocket.close(1000, "stale terminal connection")
                     return
                 }
-                this@TerminalSocket.ws = webSocket
+                this@TerminalSocket.activeSocket = ActiveTerminalSocket(connectionId, webSocket)
                 trySend(TerminalEvent.Connected)
                 webSocket.send(Json.encodeToString(WsResize.serializer(), WsResize(t = "r", c = 80, r = 24)))
             }
@@ -76,14 +80,14 @@ class TerminalSocket(
             override fun onClosing(webSocket: WebSocket, code: Int, reason: String) { webSocket.close(code, reason) }
             override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
                 if (activeConnectionId == connectionId) {
-                    this@TerminalSocket.ws = null
+                    this@TerminalSocket.activeSocket = null
                     trySend(TerminalEvent.Closed(reason))
                     close()
                 }
             }
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
                 if (activeConnectionId == connectionId) {
-                    this@TerminalSocket.ws = null
+                    this@TerminalSocket.activeSocket = null
                     trySend(TerminalEvent.Failure(t))
                     close(t)
                 }
@@ -93,15 +97,20 @@ class TerminalSocket(
         awaitClose {
             socket.close(1000, "client closing")
             if (activeConnectionId == connectionId) {
-                this@TerminalSocket.ws = null
+                this@TerminalSocket.activeSocket = null
             }
         }
     }
 
     fun sendInput(text: String): Boolean =
-        ws?.send(Json.encodeToString(WsInput.serializer(), WsInput(t = "i", d = text))) == true
+        activeWebSocket()?.send(Json.encodeToString(WsInput.serializer(), WsInput(t = "i", d = text))) == true
 
     fun sendResize(cols: Int, rows: Int) {
-        ws?.send(Json.encodeToString(WsResize.serializer(), WsResize(t = "r", c = cols, r = rows)))
+        activeWebSocket()?.send(Json.encodeToString(WsResize.serializer(), WsResize(t = "r", c = cols, r = rows)))
     }
+
+    private fun activeWebSocket(): WebSocket? =
+        activeSocket
+            ?.takeIf { it.connectionId == activeConnectionId }
+            ?.webSocket
 }

@@ -224,6 +224,7 @@ fun TerminalScreen(container: AppContainer) {
 
     var menu by remember { mutableStateOf(false) }
     val activeWorkspace = state.workspaces.firstOrNull { it.id == state.selectedWorkspaceId }
+    val canSend = state.connected
 
     Column(Modifier.fillMaxSize().background(Palette.TerminalBackground)) {
         Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -282,7 +283,7 @@ fun TerminalScreen(container: AppContainer) {
                     modifier = Modifier.fillMaxWidth(),
                     singleLine = true,
                     keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
-                    keyboardActions = KeyboardActions(onSend = { vm.submit() }),
+                    keyboardActions = KeyboardActions(onSend = { if (canSend) vm.submit() }),
                 )
                 if (state.draft.isEmpty()) {
                     Text("$ ", color = Palette.TextMuted, style = TextStyle(fontFamily = FontFamily.Monospace, fontSize = 13.sp))
@@ -290,7 +291,7 @@ fun TerminalScreen(container: AppContainer) {
             }
             IconButton(
                 onClick = vm::submit,
-                enabled = state.connected,
+                enabled = canSend,
                 modifier = Modifier.size(48.dp),
             ) {
                 Icon(
