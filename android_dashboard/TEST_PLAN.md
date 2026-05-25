@@ -23,7 +23,7 @@ local or staging backend.
 ## Required Tools
 
 - Android Studio or Android command-line tools.
-- One running Android Emulator, API 35 or newer preferred.
+- One running Android Emulator, API 33 or newer required; API 35 or newer preferred.
 - `adb` on `PATH`.
 - Java 17.
 - A reachable Sandboxed.sh backend.
