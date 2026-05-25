@@ -37,6 +37,8 @@ private struct ControlDiagnosticsOverlay: View {
     let mergeCount: Int
     let renderCount: Int
     let droppedEvents: Int
+    let performanceRecords: [ControlPerformanceRecord]
+    let hotRenderCounts: [(name: String, count: Int)]
 
     var body: some View {
         VStack(alignment: .leading, spacing: 3) {
@@ -50,6 +52,19 @@ private struct ControlDiagnosticsOverlay: View {
             diagnosticRow("merge", "\(mergeCount) ev")
             diagnosticRow("render", "\(renderCount) rows")
             diagnosticRow("drops", "\(droppedEvents)", warning: droppedEvents > 0)
+            if let slowest = performanceRecords.max(by: { $0.durationMilliseconds < $1.durationMilliseconds }) {
+                Divider()
+                    .overlay(Theme.border)
+                diagnosticRow("slowest", slowest.name)
+                diagnosticRow("time", slowest.compactDuration, warning: slowest.durationMilliseconds >= 16)
+            }
+            if !hotRenderCounts.isEmpty {
+                Divider()
+                    .overlay(Theme.border)
+                ForEach(hotRenderCounts.prefix(3), id: \.name) { item in
+                    diagnosticRow(item.name, "\(item.count)x", warning: item.count > renderCount * 2 && renderCount > 0)
+                }
+            }
         }
         .font(.caption2.monospacedDigit())
         .padding(8)
@@ -142,6 +157,8 @@ struct ControlView: View {
     @State private var controlCacheStale = false
     @State private var controlMergeCount = 0
     @State private var controlDroppedEvents = 0
+    @State private var controlPerformanceRecords: [ControlPerformanceRecord] = []
+    @State private var controlHotRenderCounts: [(name: String, count: Int)] = []
     @AppStorage("control_debug_perf") private var showControlDiagnostics = false
 
     /// Per-mission high-water mark for `sequence`. When non-nil, reload paths
@@ -212,6 +229,10 @@ struct ControlView: View {
     private let api = APIService.shared
     private let nav = NavigationState.shared
     private let bottomAnchorId = "bottom-anchor"
+
+    private var diagnostics: ControlPerformanceDiagnostics {
+        ControlPerformanceDiagnostics.shared
+    }
     
     var body: some View {
         bodyContent
@@ -238,6 +259,12 @@ struct ControlView: View {
         }
         .onChange(of: inputText) { _, newText in
             scheduleDraftSave(newText)
+        }
+        .onChange(of: showControlDiagnostics) { _, enabled in
+            if enabled {
+                diagnostics.reset()
+                updateControlPerformanceSnapshot()
+            }
         }
         .onDisappear {
             streamTask?.cancel()
@@ -678,13 +705,21 @@ struct ControlView: View {
                 cacheHit: controlCacheHit,
                 mergeCount: controlMergeCount,
                 renderCount: groupedItems.count,
-                droppedEvents: controlDroppedEvents
+                droppedEvents: controlDroppedEvents,
+                performanceRecords: controlPerformanceRecords,
+                hotRenderCounts: controlHotRenderCounts
             )
             .padding(.top, 8)
             .padding(.trailing, 8)
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
             .allowsHitTesting(false)
         }
+    }
+
+    private func updateControlPerformanceSnapshot() {
+        guard showControlDiagnostics else { return }
+        controlPerformanceRecords = diagnostics.recentRecords
+        controlHotRenderCounts = diagnostics.hotRenderCounts
     }
 
     /// Main vertical stack: connection banner, optional stale-cache pill,
@@ -927,6 +962,7 @@ struct ControlView: View {
                                 onCopy: { copyMessage(message) },
                                 onRetry: message.sendState.isFailed ? { retryFailedMessage(message) } : nil
                             )
+                            .modifier(ControlBodyRenderProbe(name: "MessageBubble"))
                             .id(message.id)
                         case .toolGroup(let groupId, let tools):
                             ToolGroupView(
@@ -934,6 +970,7 @@ struct ControlView: View {
                                 tools: tools,
                                 expandedGroups: $expandedToolGroups
                             )
+                            .modifier(ControlBodyRenderProbe(name: "ToolGroupView"))
                             .id(item.id)
                         }
                     }
@@ -1023,6 +1060,7 @@ struct ControlView: View {
                 }
             }
             .environment(\.missionFileContext, inlineImageContext)
+            .environment(\.controlPerformanceDiagnosticsEnabled, showControlDiagnostics)
         }
     }
 
@@ -1080,7 +1118,14 @@ struct ControlView: View {
     }
 
     private func recomputeGroupedItems() {
-        groupedItems = Self.buildGroupedItems(from: messages)
+        groupedItems = diagnostics.measure(
+            "control.group_messages",
+            detail: viewingMissionId ?? "none",
+            count: messages.count
+        ) {
+            Self.buildGroupedItems(from: messages)
+        }
+        updateControlPerformanceSnapshot()
     }
 
     /// Check if the currently viewed mission is running (not just any mission)
@@ -1930,56 +1975,46 @@ struct ControlView: View {
     }
 
     private func applyViewingMissionWithEvents(_ mission: Mission, events: [StoredEvent], scrollToBottom: Bool = true) {
-        isLoadingHistory = true  // Suppress animated auto-scroll during history load
+        diagnostics.measure(
+            "control.apply_snapshot",
+            detail: mission.id,
+            count: events.count
+        ) {
+            isLoadingHistory = true  // Suppress animated auto-scroll during history load
 
-        viewingMission = mission
-        viewingMissionId = mission.id
-        goalInfo = mission.goalMode
-            ? GoalPillInfo(iteration: goalInfo?.iteration ?? 0, status: "active", objective: mission.goalObjective ?? "")
-            : nil
+            viewingMission = mission
+            viewingMissionId = mission.id
+            goalInfo = mission.goalMode
+                ? GoalPillInfo(iteration: goalInfo?.iteration ?? 0, status: "active", objective: mission.goalObjective ?? "")
+                : nil
 
-        // Ensure deterministic replay order in case the backend returns unsorted results
-        let orderedEvents = rememberMissionEvents(events, for: mission.id)
-
-        // Track total event count for pagination
-        loadedEventCount = orderedEvents.count
-        controlMergeCount = orderedEvents.count
-
-        // Clear and replay all events to rebuild message history
-        messages.removeAll()
-
-        for event in orderedEvents {
-            var data: [String: Any] = [:]
-
-            // Add metadata first (lower priority)
-            for (key, value) in event.metadata {
-                data[key] = value.value
+            // Ensure deterministic replay order in case the backend returns unsorted results
+            let orderedEvents = diagnostics.measure(
+                "control.sort_remember_events",
+                detail: mission.id,
+                count: events.count
+            ) {
+                rememberMissionEvents(events, for: mission.id)
             }
 
-            // Add core fields last (higher priority - these should never be overwritten)
-            data["mission_id"] = event.missionId
-            data["content"] = event.content
-            if event.eventType == "text_op",
-               let jsonData = event.content.data(using: .utf8),
-               let ops = try? JSONSerialization.jsonObject(with: jsonData) {
-                data["ops"] = ops
+            // Track total event count for pagination
+            loadedEventCount = orderedEvents.count
+            controlMergeCount = orderedEvents.count
+
+            // Clear and replay all events to rebuild message history
+            messages.removeAll(keepingCapacity: true)
+
+            diagnostics.measure(
+                "control.replay_events",
+                detail: mission.id,
+                count: orderedEvents.count
+            ) {
+                messages = ChatHistoryReducer.reduce(events: orderedEvents, mission: mission)
             }
 
-            if let eventId = event.eventId {
-                data["id"] = eventId
-            }
-            if let toolCallId = event.toolCallId {
-                data["tool_call_id"] = toolCallId
-            }
-            if let toolName = event.toolName {
-                data["name"] = toolName
-            }
-
-            handleStreamEvent(type: event.eventType, data: data, isHistoricalReplay: true)
+            // Recompute grouped items once after all events are processed
+            recomputeGroupedItems()
         }
-
-        // Recompute grouped items once after all events are processed
-        recomputeGroupedItems()
 
         if scrollToBottom {
             shouldScrollImmediately = true
@@ -2015,34 +2050,43 @@ struct ControlView: View {
     private func applyDeltaEvents(_ events: [StoredEvent]) {
         guard !events.isEmpty else { return }
 
-        let orderedEvents = events.sorted { lhs, rhs in
-            if lhs.sequence != rhs.sequence { return lhs.sequence < rhs.sequence }
-            if lhs.timestamp != rhs.timestamp { return lhs.timestamp < rhs.timestamp }
-            return lhs.id < rhs.id
-        }
-
-        for event in orderedEvents {
-            var data: [String: Any] = [:]
-            for (key, value) in event.metadata {
-                data[key] = value.value
+        diagnostics.measure(
+            "control.apply_delta",
+            detail: viewingMissionId ?? "none",
+            count: events.count
+        ) {
+            let orderedEvents = events.sorted { lhs, rhs in
+                if lhs.sequence != rhs.sequence { return lhs.sequence < rhs.sequence }
+                if lhs.timestamp != rhs.timestamp { return lhs.timestamp < rhs.timestamp }
+                return lhs.id < rhs.id
             }
-            data["mission_id"] = event.missionId
-            data["content"] = event.content
-            if event.eventType == "text_op",
-               let jsonData = event.content.data(using: .utf8),
-               let ops = try? JSONSerialization.jsonObject(with: jsonData) {
-                data["ops"] = ops
+
+            for event in orderedEvents {
+                handleStreamEvent(type: event.eventType, data: eventDataForReplay(event), isHistoricalReplay: true)
             }
-            if let eventId = event.eventId { data["id"] = eventId }
-            if let toolCallId = event.toolCallId { data["tool_call_id"] = toolCallId }
-            if let toolName = event.toolName { data["name"] = toolName }
 
-            handleStreamEvent(type: event.eventType, data: data, isHistoricalReplay: true)
+            loadedEventCount += orderedEvents.count
+            controlMergeCount = orderedEvents.count
+            recomputeGroupedItems()
         }
+    }
 
-        loadedEventCount += orderedEvents.count
-        controlMergeCount = orderedEvents.count
-        recomputeGroupedItems()
+    private func eventDataForReplay(_ event: StoredEvent) -> [String: Any] {
+        var data: [String: Any] = [:]
+        for (key, value) in event.metadata {
+            data[key] = value.value
+        }
+        data["mission_id"] = event.missionId
+        data["content"] = event.content
+        if event.eventType == "text_op",
+           let jsonData = event.content.data(using: .utf8),
+           let ops = try? JSONSerialization.jsonObject(with: jsonData) {
+            data["ops"] = ops
+        }
+        if let eventId = event.eventId { data["id"] = eventId }
+        if let toolCallId = event.toolCallId { data["tool_call_id"] = toolCallId }
+        if let toolName = event.toolName { data["name"] = toolName }
+        return data
     }
 
     /// Decide what to load on cold start. The previous code did
@@ -2094,7 +2138,12 @@ struct ControlView: View {
                 // Fetch events for event-based display
                 if updateViewing || viewingMissionId == nil || viewingMissionId == mission.id {
                     do {
-                        let snapshot = try await api.getMissionSnapshot(id: mission.id)
+                        let snapshot = try await diagnostics.measureAsync(
+                            "control.fetch_current_snapshot",
+                            detail: mission.id
+                        ) {
+                            try await api.getMissionSnapshot(id: mission.id)
+                        }
                         let events = snapshot.events
                         controlCacheHit = hasCache
 
@@ -2162,7 +2211,12 @@ struct ControlView: View {
         }
 
         do {
-            let snapshot = try await api.getMissionSnapshot(id: id)
+            let snapshot = try await diagnostics.measureAsync(
+                "control.fetch_snapshot",
+                detail: id
+            ) {
+                try await api.getMissionSnapshot(id: id)
+            }
             let mission = snapshot.mission
 
             // Race condition guard: only update if this is still the mission we want
@@ -2224,12 +2278,17 @@ struct ControlView: View {
         defer { isLoadingEarlier = false }
 
         do {
-            let olderEvents = try await api.getMissionEvents(
-                id: missionId,
-                types: historyEventTypes,
-                limit: Self.loadEarlierPageLimit,
-                beforeSeq: missionMinSeq[missionId]
-            )
+            let olderEvents = try await diagnostics.measureAsync(
+                "control.fetch_earlier",
+                detail: missionId
+            ) {
+                try await api.getMissionEvents(
+                    id: missionId,
+                    types: historyEventTypes,
+                    limit: Self.loadEarlierPageLimit,
+                    beforeSeq: missionMinSeq[missionId]
+                )
+            }
             guard viewingMissionId == missionId else { return }
 
             if !olderEvents.isEmpty, let mission = viewingMission {
@@ -2267,12 +2326,17 @@ struct ControlView: View {
     private func tryDeltaResume(missionId id: String) async -> DeltaResumeOutcome {
         guard let knownSeq = missionMaxSeq[id] else { return .noCursor }
         do {
-            let result = try await api.getMissionEventsWithMeta(
-                id: id,
-                types: historyEventTypes,
-                limit: Self.deltaResumePageLimit,
-                sinceSeq: knownSeq
-            )
+            let result = try await diagnostics.measureAsync(
+                "control.fetch_delta",
+                detail: id
+            ) {
+                try await api.getMissionEventsWithMeta(
+                    id: id,
+                    types: historyEventTypes,
+                    limit: Self.deltaResumePageLimit,
+                    sinceSeq: knownSeq
+                )
+            }
             guard viewingMissionId == id else { return .viewChanged }
             let maxSeq = result.maxSequence ?? knownSeq
             _ = mergeMissionEvents(result.events, for: id)
@@ -2329,7 +2393,12 @@ struct ControlView: View {
             // clear the cache and fall back, since the mission really does
             // have no events.
             do {
-                let snapshot = try await api.getMissionSnapshot(id: id)
+                let snapshot = try await diagnostics.measureAsync(
+                    "control.fetch_reload_snapshot",
+                    detail: id
+                ) {
+                    try await api.getMissionSnapshot(id: id)
+                }
                 guard viewingMissionId == id else { return }
                 if snapshot.events.isEmpty {
                     removeMissionFromCache(mission.id)
@@ -3183,7 +3252,12 @@ struct ControlView: View {
         progress = nil
 
         do {
-            let snapshot = try await api.getMissionSnapshot(id: id)
+            let snapshot = try await diagnostics.measureAsync(
+                "control.fetch_switch_snapshot",
+                detail: id
+            ) {
+                try await api.getMissionSnapshot(id: id)
+            }
             let mission = snapshot.mission
 
             // Race condition guard: only update if this is still the mission we want
@@ -3247,7 +3321,12 @@ struct ControlView: View {
     private func refreshViewingMissionSnapshot() async {
         guard let id = viewingMissionId else { return }
         do {
-            let snapshot = try await api.getMissionSnapshot(id: id)
+            let snapshot = try await diagnostics.measureAsync(
+                "control.fetch_refresh_snapshot",
+                detail: id
+            ) {
+                try await api.getMissionSnapshot(id: id)
+            }
             guard viewingMissionId == id else { return }
             currentMission = currentMission?.id == snapshot.mission.id ? snapshot.mission : currentMission
             if !snapshot.events.isEmpty {
@@ -4175,6 +4254,7 @@ private struct MessageBubble: View {
                 }
 
                 MarkdownView(message.content)
+                    .modifier(ControlBodyRenderProbe(name: "MarkdownView"))
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(.horizontal, 16)
                     .padding(.vertical, 12)

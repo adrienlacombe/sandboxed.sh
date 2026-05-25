@@ -36,13 +36,22 @@ extension EnvironmentValues {
 
 struct MarkdownView: View {
     let content: String
+    @Environment(\.controlPerformanceDiagnosticsEnabled) private var diagnosticsEnabled
 
     init(_ content: String) {
         self.content = content
     }
 
     var body: some View {
-        let blocks = MarkdownParser.parse(content)
+        let blocks = diagnosticsEnabled
+            ? ControlPerformanceDiagnostics.shared.measure(
+                "markdown.parse",
+                detail: "\(content.count) chars",
+                count: content.count
+            ) {
+                MarkdownParser.parse(content)
+            }
+            : MarkdownParser.parse(content)
         VStack(alignment: .leading, spacing: 8) {
             ForEach(Array(blocks.enumerated()), id: \.offset) { _, block in
                 switch block {
