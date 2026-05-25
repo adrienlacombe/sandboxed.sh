@@ -67,7 +67,8 @@ import sh.sandboxed.dashboard.ui.theme.Palette
 import java.io.File
 
 private data class FilesState(
-    val path: String = "/",
+    val path: String = ".",
+    val backStack: List<String> = emptyList(),
     val entries: List<FileEntry> = emptyList(),
     val loading: Boolean = false,
     val error: String? = null,
@@ -80,11 +81,16 @@ private class FilesViewModel(private val container: AppContainer) : ViewModel() 
 
     init { refresh() }
 
-    fun cd(path: String) { _state.update { it.copy(path = path) }; refresh() }
+    fun cd(path: String) {
+        _state.update { it.copy(path = path, backStack = it.backStack + it.path) }
+        refresh()
+    }
 
     fun up() {
-        val parent = _state.value.path.trimEnd('/').substringBeforeLast('/', "/")
-        cd(if (parent.isEmpty()) "/" else parent)
+        val stack = _state.value.backStack
+        if (stack.isEmpty()) return
+        _state.update { it.copy(path = stack.last(), backStack = stack.dropLast(1)) }
+        refresh()
     }
 
     fun refresh() {
@@ -96,10 +102,10 @@ private class FilesViewModel(private val container: AppContainer) : ViewModel() 
                     _state.update { st -> st.copy(entries = list.sortedWith(compareBy({ !it.isDirectory }, { it.name.lowercase() })), loading = false) }
                 }
                 .onFailure { e ->
-                    // Fall back to "/" once if the requested path can't be opened (e.g. server returns
+                    // Fall back to "." once if the requested path can't be opened (e.g. server returns
                     // 500 because the directory doesn't exist on this install).
-                    if (path != "/") {
-                        _state.update { it.copy(path = "/", error = "Could not open $path — falling back to /") }
+                    if (path != ".") {
+                        _state.update { it.copy(path = ".", backStack = emptyList(), error = "Could not open $path — falling back to workspace root") }
                         refresh()
                     } else {
                         _state.update { it.copy(error = e.message, loading = false) }
@@ -109,7 +115,7 @@ private class FilesViewModel(private val container: AppContainer) : ViewModel() 
     }
 
     fun mkdir(name: String) {
-        val newPath = (_state.value.path.trimEnd('/') + "/" + name)
+        val newPath = childPath(_state.value.path, name)
         viewModelScope.launch {
             runCatching { container.api.mkdir(newPath) }
                 .onSuccess { refresh() }
@@ -143,6 +149,16 @@ private class FilesViewModel(private val container: AppContainer) : ViewModel() 
     }
 
     fun clearMessages() { _state.update { it.copy(error = null, info = null) } }
+
+    private fun childPath(parent: String, name: String): String {
+        val child = name.trim().trim('/')
+        val base = parent.trim().trimEnd('/')
+        return when {
+            base.isBlank() || base == "." -> "./$child"
+            base == "/" -> "/$child"
+            else -> "$base/$child"
+        }
+    }
 }
 
 @Composable
@@ -180,10 +196,10 @@ fun FilesScreen(container: AppContainer) {
             IconButton(onClick = vm::refresh) { Icon(Icons.Filled.Refresh, "Refresh", tint = Palette.TextSecondary) }
         }
         Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp), verticalAlignment = Alignment.CenterVertically) {
-            IconButton(onClick = vm::up, enabled = state.path != "/") {
+            IconButton(onClick = vm::up, enabled = state.backStack.isNotEmpty()) {
                 Icon(Icons.Filled.ArrowUpward, "Up", tint = Palette.TextSecondary)
             }
-            Text(state.path, color = Palette.TextSecondary, style = MaterialTheme.typography.bodyMedium)
+            Text(if (state.path == ".") "Workspace root" else state.path, color = Palette.TextSecondary, style = MaterialTheme.typography.bodyMedium)
         }
         state.error?.let { Box(Modifier.padding(horizontal = 16.dp, vertical = 8.dp)) { ErrorBanner(it) } }
         if (state.loading && state.entries.isEmpty()) {

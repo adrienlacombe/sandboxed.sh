@@ -11,12 +11,15 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.KeyboardReturn
 import androidx.compose.material3.DropdownMenu
@@ -42,6 +45,7 @@ import androidx.compose.ui.platform.LocalWindowInfo
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.ViewModel
@@ -94,7 +98,7 @@ private class TerminalViewModel(private val container: AppContainer) : ViewModel
                         when (evt) {
                             is TerminalEvent.Connected -> _state.update { it.copy(connected = true, lines = it.lines + "[connected]") }
                             is TerminalEvent.Output -> {
-                                val chunks = evt.text.split('\n')
+                                val chunks = normalizeTerminalOutput(evt.text).split('\n')
                                 _state.update { st ->
                                     val merged = st.lines.toMutableList()
                                     if (chunks.isNotEmpty()) {
@@ -123,11 +127,74 @@ private class TerminalViewModel(private val container: AppContainer) : ViewModel
 
     fun submit() {
         val cmd = _state.value.draft
-        container.terminal.sendInput("$cmd\n")
-        _state.update { it.copy(draft = "") }
+        val sent = container.terminal.sendInput("$cmd\n")
+        if (sent) {
+            _state.update { it.copy(draft = "") }
+        } else {
+            _state.update { it.copy(connected = false, lines = it.lines + "[error: terminal is not connected]") }
+        }
     }
 
     fun resize(cols: Int, rows: Int) { container.terminal.sendResize(cols, rows) }
+}
+
+private fun normalizeTerminalOutput(raw: String): String {
+    val normalized = raw
+        .replace("\r\n", "\n")
+        .replace('\r', '\n')
+    val out = StringBuilder(normalized.length)
+    var i = 0
+    while (i < normalized.length) {
+        val ch = normalized[i]
+        if (ch == '\u0007') {
+            i += 1
+            continue
+        }
+        if (ch != 0x1B.toChar() || i + 1 >= normalized.length) {
+            out.append(ch)
+            i += 1
+            continue
+        }
+
+        when (normalized[i + 1]) {
+            '[' -> {
+                val end = findCsiEnd(normalized, i + 2)
+                if (end == -1) {
+                    i += 1
+                } else {
+                    if (normalized[end] == 'm') {
+                        out.append(normalized, i, end + 1)
+                    }
+                    i = end + 1
+                }
+            }
+            ']' -> {
+                i = findOscEnd(normalized, i + 2).takeIf { it != -1 } ?: (i + 1)
+            }
+            else -> i += 2
+        }
+    }
+    return out.toString()
+}
+
+private fun findCsiEnd(input: String, start: Int): Int {
+    var i = start
+    while (i < input.length) {
+        val code = input[i].code
+        if (code in 0x40..0x7E) return i
+        i += 1
+    }
+    return -1
+}
+
+private fun findOscEnd(input: String, start: Int): Int {
+    var i = start
+    while (i < input.length) {
+        if (input[i] == '\u0007') return i + 1
+        if (input[i] == 0x1B.toChar() && i + 1 < input.length && input[i + 1] == '\\') return i + 2
+        i += 1
+    }
+    return -1
 }
 
 @Composable
@@ -213,12 +280,24 @@ fun TerminalScreen(container: AppContainer) {
                     textStyle = TextStyle(fontFamily = FontFamily.Monospace, color = Palette.TextPrimary, fontSize = 13.sp),
                     modifier = Modifier.fillMaxWidth(),
                     singleLine = true,
+                    keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
+                    keyboardActions = KeyboardActions(onSend = { vm.submit() }),
                 )
                 if (state.draft.isEmpty()) {
                     Text("$ ", color = Palette.TextMuted, style = TextStyle(fontFamily = FontFamily.Monospace, fontSize = 13.sp))
                 }
             }
-            IconButton(onClick = vm::submit) { Icon(Icons.AutoMirrored.Filled.KeyboardReturn, "Send", tint = Palette.Accent) }
+            IconButton(
+                onClick = vm::submit,
+                enabled = state.connected,
+                modifier = Modifier.size(48.dp),
+            ) {
+                Icon(
+                    Icons.AutoMirrored.Filled.KeyboardReturn,
+                    "Send",
+                    tint = if (state.connected) Palette.Accent else Palette.TextTertiary,
+                )
+            }
         }
     }
 }
