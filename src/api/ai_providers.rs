@@ -2138,17 +2138,29 @@ fn update_provider_oauth_for_chatgpt_account(
 
     let mut updated = false;
     for provider in items.iter_mut() {
-        let matches = provider
+        let is_openai = provider
             .get("provider_type")
             .and_then(|v| v.as_str())
             .map(|s| s == "openai")
-            .unwrap_or(false)
-            && provider
-                .get("oauth")
-                .and_then(|o| o.get("chatgpt_account_id"))
-                .and_then(|v| v.as_str())
-                .map(|s| s == account_id)
-                .unwrap_or(false);
+            .unwrap_or(false);
+        if !is_openai {
+            continue;
+        }
+
+        let oauth = provider.get("oauth");
+        let stored_account_id = oauth
+            .and_then(|o| o.get("chatgpt_account_id"))
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        let decoded_account_id = oauth
+            .and_then(|o| o.get("access_token"))
+            .and_then(|v| v.as_str())
+            .and_then(extract_chatgpt_account_id);
+        let matches = stored_account_id
+            .as_deref()
+            .or(decoded_account_id.as_deref())
+            .map(|s| s == account_id)
+            .unwrap_or(false);
         if !matches {
             continue;
         }
@@ -2170,6 +2182,10 @@ fn update_provider_oauth_for_chatgpt_account(
             oauth_obj.insert(
                 "expires_at".to_string(),
                 serde_json::Value::from(expires_at_ms),
+            );
+            oauth_obj.insert(
+                "chatgpt_account_id".to_string(),
+                serde_json::Value::String(account_id.to_string()),
             );
             updated = true;
         }
@@ -2410,6 +2426,15 @@ pub fn get_all_openai_oauth_accounts(working_dir: &Path) -> Vec<CodexOAuthAccoun
             .and_then(|v| v.as_i64())
             .unwrap_or(0);
         if refresh.is_empty() || access.is_empty() {
+            continue;
+        }
+        if oauth_token_expired(expires_at) {
+            tracing::warn!(
+                provider_id = p.get("id").and_then(|v| v.as_str()).unwrap_or("<unknown>"),
+                account_email = p.get("account_email").and_then(|v| v.as_str()),
+                expires_at,
+                "Skipping expired OpenAI OAuth provider entry for Codex rotation"
+            );
             continue;
         }
         let chatgpt_account_id = match extract_chatgpt_account_id(access) {
@@ -8417,6 +8442,29 @@ pub fn sync_oauth_to_all_tiers(
                     "Failed to sync token to Tier 3 (Claude CLI credentials) - continuing"
                 );
                 // Don't fail the entire sync if Claude CLI sync fails
+            }
+        }
+    }
+
+    if matches!(provider_type, ProviderType::OpenAI) {
+        if let Some(account_id) = extract_chatgpt_account_id(access_token) {
+            let working_dir = PathBuf::from(home_dir());
+            if update_provider_oauth_for_chatgpt_account(
+                &working_dir,
+                &account_id,
+                access_token,
+                refresh_token,
+                expires_at,
+            ) {
+                tracing::info!(
+                    account_id = %account_id,
+                    "Synced OpenAI OAuth token to ai_providers.json"
+                );
+            } else {
+                tracing::debug!(
+                    account_id = %account_id,
+                    "No matching OpenAI provider row found while syncing OAuth token"
+                );
             }
         }
     }

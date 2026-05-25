@@ -714,6 +714,7 @@ exec "$SCRIPT_DIR/.sandboxed-sh-telegram-action.py" "$@"
 }
 
 const CODEX_ACCOUNT_CONCURRENCY_LIMIT: usize = 5;
+const CODEX_OAUTH_ACCOUNT_CONCURRENCY_LIMIT: usize = 1;
 const CODEX_ACCOUNT_LEASE_WAIT_TIMEOUT: Duration = Duration::from_secs(15);
 
 static CODEX_ACCOUNT_POOL: LazyLock<StdMutex<HashMap<String, Arc<Semaphore>>>> =
@@ -740,6 +741,13 @@ impl CodexCredential {
         match self {
             CodexCredential::ApiKey(k) => format!("apikey:{}", k),
             CodexCredential::OAuth(acc) => format!("oauth:{}", acc.chatgpt_account_id),
+        }
+    }
+
+    fn concurrency_limit(&self) -> usize {
+        match self {
+            CodexCredential::ApiKey(_) => CODEX_ACCOUNT_CONCURRENCY_LIMIT,
+            CodexCredential::OAuth(_) => CODEX_OAUTH_ACCOUNT_CONCURRENCY_LIMIT,
         }
     }
 
@@ -839,12 +847,12 @@ pub(crate) fn codex_tool_stall_should_retry_with_default_model(
     requested_model.is_some_and(is_generic_gpt_codex_model)
 }
 
-fn codex_account_semaphore_for_fingerprint(fingerprint: &str) -> Arc<Semaphore> {
+fn codex_account_semaphore_for_credential(credential: &CodexCredential) -> Arc<Semaphore> {
     let mut pool = CODEX_ACCOUNT_POOL
         .lock()
         .expect("Codex account pool mutex poisoned");
-    pool.entry(fingerprint.to_string())
-        .or_insert_with(|| Arc::new(Semaphore::new(CODEX_ACCOUNT_CONCURRENCY_LIMIT)))
+    pool.entry(credential.fingerprint())
+        .or_insert_with(|| Arc::new(Semaphore::new(credential.concurrency_limit())))
         .clone()
 }
 
@@ -1205,7 +1213,7 @@ async fn lease_codex_account(
         .into_iter()
         .filter(|cred| !tried_fingerprints.contains(&cred.fingerprint()))
         .map(|cred| {
-            let sem = codex_account_semaphore_for_fingerprint(&cred.fingerprint());
+            let sem = codex_account_semaphore_for_credential(&cred);
             let available = sem.available_permits();
             (cred, sem, available)
         })
