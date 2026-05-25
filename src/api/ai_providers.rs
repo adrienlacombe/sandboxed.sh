@@ -2418,14 +2418,15 @@ pub fn get_all_openai_oauth_accounts(working_dir: &Path) -> Vec<CodexOAuthAccoun
             .get("access_token")
             .and_then(|v| v.as_str())
             .unwrap_or("");
-        let expires_at = oauth
-            .get("expires_at")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(0);
+        let stored_expires_at = oauth.get("expires_at").and_then(|v| v.as_i64());
         if refresh.is_empty() || access.is_empty() {
             continue;
         }
-        if oauth_token_expired(expires_at) {
+        let decoded_expires_at = extract_jwt_exp_ms(access);
+        let expires_at = decoded_expires_at.or(stored_expires_at).unwrap_or(i64::MAX);
+        if (stored_expires_at.is_some() || decoded_expires_at.is_some())
+            && oauth_token_expired(expires_at)
+        {
             tracing::warn!(
                 provider_id = p.get("id").and_then(|v| v.as_str()).unwrap_or("<unknown>"),
                 account_email = p.get("account_email").and_then(|v| v.as_str()),
