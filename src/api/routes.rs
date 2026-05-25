@@ -66,6 +66,7 @@ use super::control;
 use super::deferred_proxy as deferred_proxy_api;
 use super::desktop;
 use super::desktop_stream;
+use super::durable_jobs;
 use super::fs;
 use super::github_auth;
 use super::library as library_api;
@@ -979,6 +980,8 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         .nest("/api/settings", settings_api::routes())
         // Desktop session management endpoints
         .nest("/api/desktop", desktop::routes())
+        // Durable background jobs launched outside ephemeral agent-turn shells
+        .nest("/api/durable-jobs", durable_jobs::routes())
         // System component management endpoints
         .nest("/api/system", system_api::routes())
         // Auth management endpoints

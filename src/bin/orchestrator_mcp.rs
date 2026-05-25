@@ -170,6 +170,29 @@ struct BackendAuthStatusParams {
 }
 
 #[derive(Debug, Deserialize)]
+struct DurableJobStartParams {
+    command: String,
+    #[serde(default)]
+    cwd: Option<String>,
+    #[serde(default)]
+    env: std::collections::HashMap<String, String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DurableJobIdParams {
+    job_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct DurableJobLogsParams {
+    job_id: String,
+    #[serde(default)]
+    tail_bytes: Option<usize>,
+    #[serde(default)]
+    stream: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct CreateWorktreeParams {
     /// Path relative to the workspace root where the worktree will be created
     path: String,
@@ -354,6 +377,55 @@ impl OrchestratorMcp {
                             "description": "Optional single backend to inspect. If omitted, returns all common backends."
                         }
                     }
+                }),
+            },
+            ToolDefinition {
+                name: "durable_job_start".to_string(),
+                description: "Start a long-running server-managed background command that survives ephemeral agent session cleanup. Use this for multi-hour builds, large test suites, image builds, and similar work.".to_string(),
+                input_schema: json!({
+                    "type": "object",
+                    "required": ["command"],
+                    "properties": {
+                        "command": {"type": "string", "description": "Shell command to run."},
+                        "cwd": {"type": "string", "description": "Working directory. Relative paths resolve from the server working directory."},
+                        "env": {"type": "object", "additionalProperties": {"type": "string"}, "description": "Environment variables to add."}
+                    }
+                }),
+            },
+            ToolDefinition {
+                name: "durable_job_list".to_string(),
+                description: "List durable background jobs with current status, pid, command, cwd, and log paths.".to_string(),
+                input_schema: json!({"type": "object", "properties": {}}),
+            },
+            ToolDefinition {
+                name: "durable_job_status".to_string(),
+                description: "Get current status for a durable background job.".to_string(),
+                input_schema: json!({
+                    "type": "object",
+                    "required": ["job_id"],
+                    "properties": {"job_id": {"type": "string", "description": "Durable job UUID."}}
+                }),
+            },
+            ToolDefinition {
+                name: "durable_job_logs".to_string(),
+                description: "Read the tail of stdout and/or stderr logs for a durable background job.".to_string(),
+                input_schema: json!({
+                    "type": "object",
+                    "required": ["job_id"],
+                    "properties": {
+                        "job_id": {"type": "string", "description": "Durable job UUID."},
+                        "tail_bytes": {"type": "integer", "description": "Maximum bytes to return from each selected stream. Defaults to 16384."},
+                        "stream": {"type": "string", "enum": ["stdout", "stderr"], "description": "Optional single stream to return. Omit for both."}
+                    }
+                }),
+            },
+            ToolDefinition {
+                name: "durable_job_cancel".to_string(),
+                description: "Cancel a running durable background job by terminating its process group.".to_string(),
+                input_schema: json!({
+                    "type": "object",
+                    "required": ["job_id"],
+                    "properties": {"job_id": {"type": "string", "description": "Durable job UUID."}}
                 }),
             },
             ToolDefinition {
@@ -1030,6 +1102,96 @@ impl OrchestratorMcp {
         })
     }
 
+    async fn durable_job_start(&self, params: DurableJobStartParams) -> Result<Value, String> {
+        let cwd = params.cwd.or_else(|| {
+            std::env::var("WORKING_DIR")
+                .ok()
+                .or_else(|| std::env::var("SANDBOXED_SH_WORKSPACE").ok())
+        });
+        let body = json!({
+            "command": params.command,
+            "cwd": cwd,
+            "env": params.env,
+            "started_by_mission_id": self.mission_id,
+        });
+        let response = self.api_post("/api/durable-jobs", body).await?;
+        if !response.status().is_success() {
+            let text = response.text().await.unwrap_or_default();
+            return Err(format!("Failed to start durable job: {}", text));
+        }
+        response
+            .json()
+            .await
+            .map_err(|e| format!("Failed to parse durable job response: {}", e))
+    }
+
+    async fn durable_job_list(&self) -> Result<Value, String> {
+        let response = self.api_get("/api/durable-jobs").await?;
+        if !response.status().is_success() {
+            return Err(format!(
+                "Failed to list durable jobs: {}",
+                response.status()
+            ));
+        }
+        response
+            .json()
+            .await
+            .map_err(|e| format!("Failed to parse durable job list: {}", e))
+    }
+
+    async fn durable_job_status(&self, params: DurableJobIdParams) -> Result<Value, String> {
+        let id = Uuid::parse_str(&params.job_id)
+            .map_err(|_| "Invalid durable job ID format".to_string())?;
+        let response = self.api_get(&format!("/api/durable-jobs/{}", id)).await?;
+        if !response.status().is_success() {
+            let text = response.text().await.unwrap_or_default();
+            return Err(format!("Durable job not found: {}", text));
+        }
+        response
+            .json()
+            .await
+            .map_err(|e| format!("Failed to parse durable job status: {}", e))
+    }
+
+    async fn durable_job_logs(&self, params: DurableJobLogsParams) -> Result<Value, String> {
+        let id = Uuid::parse_str(&params.job_id)
+            .map_err(|_| "Invalid durable job ID format".to_string())?;
+        let mut path = format!(
+            "/api/durable-jobs/{}/logs?tail_bytes={}",
+            id,
+            params.tail_bytes.unwrap_or(16 * 1024)
+        );
+        if let Some(stream) = params.stream {
+            path.push_str("&stream=");
+            path.push_str(&urlencoding::encode(&stream));
+        }
+        let response = self.api_get(&path).await?;
+        if !response.status().is_success() {
+            let text = response.text().await.unwrap_or_default();
+            return Err(format!("Failed to read durable job logs: {}", text));
+        }
+        response
+            .json()
+            .await
+            .map_err(|e| format!("Failed to parse durable job logs: {}", e))
+    }
+
+    async fn durable_job_cancel(&self, params: DurableJobIdParams) -> Result<Value, String> {
+        let id = Uuid::parse_str(&params.job_id)
+            .map_err(|_| "Invalid durable job ID format".to_string())?;
+        let response = self
+            .api_post(&format!("/api/durable-jobs/{}/cancel", id), json!({}))
+            .await?;
+        if !response.status().is_success() {
+            let text = response.text().await.unwrap_or_default();
+            return Err(format!("Failed to cancel durable job: {}", text));
+        }
+        response
+            .json()
+            .await
+            .map_err(|e| format!("Failed to parse durable job cancellation: {}", e))
+    }
+
     fn create_worktree(&self, params: CreateWorktreeParams) -> Result<Value, String> {
         let path = &params.path;
         let branch = &params.branch;
@@ -1463,6 +1625,27 @@ impl OrchestratorMcp {
                 let params: BackendAuthStatusParams =
                     serde_json::from_value(params).map_err(|e| format!("Invalid params: {}", e))?;
                 Ok(self.get_backend_auth_status(params))
+            }
+            "durable_job_start" => {
+                let params: DurableJobStartParams =
+                    serde_json::from_value(params).map_err(|e| format!("Invalid params: {}", e))?;
+                self.durable_job_start(params).await
+            }
+            "durable_job_list" => self.durable_job_list().await,
+            "durable_job_status" => {
+                let params: DurableJobIdParams =
+                    serde_json::from_value(params).map_err(|e| format!("Invalid params: {}", e))?;
+                self.durable_job_status(params).await
+            }
+            "durable_job_logs" => {
+                let params: DurableJobLogsParams =
+                    serde_json::from_value(params).map_err(|e| format!("Invalid params: {}", e))?;
+                self.durable_job_logs(params).await
+            }
+            "durable_job_cancel" => {
+                let params: DurableJobIdParams =
+                    serde_json::from_value(params).map_err(|e| format!("Invalid params: {}", e))?;
+                self.durable_job_cancel(params).await
             }
             "create_worker_mission" => {
                 let params: CreateWorkerParams =
