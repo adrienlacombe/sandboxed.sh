@@ -1879,7 +1879,7 @@ struct ControlView: View {
             guard let cached = await loadCachedMissionDataAsync(id) else { return }
             guard fetchingMissionId == id || viewingMissionId == id else { return }
             let cachedMaxSeq = cached.events.compactMap(\.sequence).max() ?? 0
-            if let currentMaxSeq = missionMaxSeq[id], currentMaxSeq > cachedMaxSeq {
+            if let currentMaxSeq = missionMaxSeq[id], currentMaxSeq >= cachedMaxSeq {
                 return
             }
             controlCacheHit = true
