@@ -115,7 +115,13 @@ private class FilesViewModel(private val container: AppContainer) : ViewModel() 
     }
 
     fun mkdir(name: String) {
-        val newPath = childPath(_state.value.path, name)
+        val child = normalizedFolderName(name)
+        if (child == null) {
+            _state.update { it.copy(error = folderNameValidationError(name) ?: "Invalid folder name") }
+            return
+        }
+
+        val newPath = childPath(_state.value.path, child)
         viewModelScope.launch {
             runCatching { container.api.mkdir(newPath) }
                 .onSuccess { refresh() }
@@ -151,13 +157,27 @@ private class FilesViewModel(private val container: AppContainer) : ViewModel() 
     fun clearMessages() { _state.update { it.copy(error = null, info = null) } }
 
     private fun childPath(parent: String, name: String): String {
-        val child = name.trim().trim('/')
         val base = parent.trim().trimEnd('/')
         return when {
-            base.isBlank() || base == "." -> "./$child"
-            base == "/" -> "/$child"
-            else -> "$base/$child"
+            base.isBlank() || base == "." -> "./$name"
+            base == "/" -> "/$name"
+            else -> "$base/$name"
         }
+    }
+}
+
+private fun normalizedFolderName(name: String): String? {
+    val child = name.trim()
+    return child.takeIf { folderNameValidationError(it) == null }
+}
+
+private fun folderNameValidationError(name: String): String? {
+    val child = name.trim()
+    return when {
+        child.isBlank() -> "Enter a folder name"
+        child == "." || child == ".." -> "Folder name cannot be . or .."
+        child.any { it == '/' || it == '\\' } -> "Folder name cannot contain path separators"
+        else -> null
     }
 }
 
@@ -240,6 +260,7 @@ fun FilesScreen(container: AppContainer) {
 
     if (showMkdir) {
         var name by remember { mutableStateOf("") }
+        val nameError = folderNameValidationError(name).takeIf { name.isNotEmpty() }
         AlertDialog(
             onDismissRequest = { showMkdir = false },
             title = { Text("New folder") },
@@ -247,6 +268,8 @@ fun FilesScreen(container: AppContainer) {
                 OutlinedTextField(
                     value = name, onValueChange = { name = it }, singleLine = true,
                     label = { Text("Folder name") },
+                    isError = nameError != null,
+                    supportingText = nameError?.let { { Text(it) } },
                     colors = TextFieldDefaults.colors(
                         focusedContainerColor = Palette.Card,
                         unfocusedContainerColor = Palette.Card,
@@ -259,7 +282,7 @@ fun FilesScreen(container: AppContainer) {
             confirmButton = {
                 Button(
                     onClick = { vm.mkdir(name); showMkdir = false },
-                    enabled = name.isNotBlank(),
+                    enabled = folderNameValidationError(name) == null,
                     colors = ButtonDefaults.buttonColors(containerColor = Palette.Accent),
                 ) { Text("Create") }
             },

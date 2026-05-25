@@ -83,12 +83,13 @@ private class TerminalViewModel(private val container: AppContainer) : ViewModel
     }
 
     fun selectWorkspace(id: String?) {
-        _state.update { it.copy(selectedWorkspaceId = id, lines = listOf("Connecting…")) }
+        _state.update { it.copy(selectedWorkspaceId = id, connected = false, lines = listOf("Connecting…")) }
         connect()
     }
 
     fun connect() {
         job?.cancel()
+        _state.update { it.copy(connected = false) }
         job = viewModelScope.launch {
             var attempt = 0
             while (true) {
