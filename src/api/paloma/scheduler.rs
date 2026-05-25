@@ -22,6 +22,7 @@ impl PalomaJobRegistry {
             "paloma_memory_consolidation",
             "paloma_digest_flush",
             "paloma_stale_recovery",
+            "paloma_mission_cards",
         ] {
             registry.jobs.insert(
                 name,

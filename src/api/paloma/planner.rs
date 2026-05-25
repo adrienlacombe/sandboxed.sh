@@ -137,13 +137,16 @@ pub fn alert_event_kind_at(
     mission: &Mission,
     base_kind: &str,
     events: &[StoredEvent],
-    now: DateTime<Utc>,
-    long_running_alert_bucket: Duration,
+    _now: DateTime<Utc>,
+    _long_running_alert_bucket: Duration,
 ) -> String {
     if mission.status == MissionStatus::Active && base_kind == "mission_long_running" {
-        let bucket_seconds = long_running_alert_bucket.num_seconds().max(1);
-        let bucket = now.timestamp().div_euclid(bucket_seconds);
-        return format!("{base_kind}:{bucket}");
+        // Long-running alerts now collide on a single key per mission. Cadence
+        // is governed by `paloma_cooldown_state` instead of by an
+        // ever-changing event_kind suffix, so the user only gets one "still
+        // running" alert per backoff window instead of one per 30-minute
+        // bucket boundary.
+        return base_kind.to_string();
     }
 
     let status = mission.status.to_string();

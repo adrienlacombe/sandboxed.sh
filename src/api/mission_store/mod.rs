@@ -623,6 +623,101 @@ pub struct PalomaSchedulerJob {
     pub updated_at: String,
 }
 
+/// Per-user notification preferences. Owns quiet hours, rate ceilings, and
+/// per-class / per-mission overrides for the Paloma delivery policy.
+///
+/// Two JSON columns (`alert_class_overrides`, `mission_overrides`) intentionally
+/// hold loose JSON: their schemas are still being shaped by Phase 4+ and we'd
+/// rather not migrate the table every time the policy evolves.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PalomaUserPreferences {
+    pub telegram_user_id: i64,
+    /// IANA timezone name (e.g. `"Europe/Paris"`). UTC fallback if unparseable.
+    pub timezone: String,
+    /// Inclusive start hour (0..23) of the daily quiet window. `None` disables
+    /// quiet hours entirely.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quiet_hours_start: Option<i64>,
+    /// Exclusive end hour (0..23) of the daily quiet window. May be less than
+    /// `start` for windows that span midnight (e.g. 23 → 8).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quiet_hours_end: Option<i64>,
+    pub max_interrupts_per_hour: i64,
+    pub max_interrupts_per_day: i64,
+    /// When true, alerts whose policy decision marks them `critical`
+    /// (production failures, hard breakage) are still delivered during quiet
+    /// hours.
+    pub failure_override_quiet: bool,
+    pub alert_class_overrides_json: String,
+    pub mission_overrides_json: String,
+    /// Coarse digest cadence selector: `"daily"`, `"hourly"`, or `"off"`.
+    pub digest_cadence: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+impl PalomaUserPreferences {
+    /// Conservative defaults for a brand-new owner: quiet hours 23:00–08:00
+    /// local, one interrupt per hour, four per day, failures override quiet.
+    pub fn default_for(telegram_user_id: i64, now: &str) -> Self {
+        Self {
+            telegram_user_id,
+            timezone: "UTC".to_string(),
+            quiet_hours_start: Some(23),
+            quiet_hours_end: Some(8),
+            max_interrupts_per_hour: 1,
+            max_interrupts_per_day: 4,
+            failure_override_quiet: true,
+            alert_class_overrides_json: "{}".to_string(),
+            mission_overrides_json: "{}".to_string(),
+            digest_cadence: "daily".to_string(),
+            created_at: now.to_string(),
+            updated_at: now.to_string(),
+        }
+    }
+}
+
+/// Per-mission, per-alert-class cooldown state. The decision pipeline owns
+/// cadence here instead of smuggling it through `event_kind` suffixes. When an
+/// interrupt fires for a given `(mission_id, alert_class)` we bump the
+/// `backoff_step` and push `next_eligible_at` further out — exponential backoff
+/// per mission, reset by user reply or status change.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PalomaCooldownState {
+    pub mission_id: Uuid,
+    pub alert_class: String,
+    pub telegram_user_id: i64,
+    pub last_sent_at: String,
+    pub next_eligible_at: String,
+    /// 0-indexed step into the backoff ladder. Phase 2 ladder is
+    /// `[0, 30m, 2h, 8h, 24h]`; higher steps clamp to the last entry.
+    pub backoff_step: i64,
+}
+
+/// Persistent anchor for a per-mission Telegram card. The card is a single
+/// Telegram message that is edited in place as mission state changes, instead
+/// of producing one new alert per status transition.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PalomaMissionCard {
+    pub mission_id: Uuid,
+    pub telegram_user_id: i64,
+    pub channel_id: Uuid,
+    pub chat_id: i64,
+    pub message_id: i64,
+    /// Hash of the most recently rendered card content. Lets the scheduler
+    /// skip `editMessageText` when nothing visible has changed.
+    pub content_hash: String,
+    /// Timestamp of the most recent (re-)anchor: when this message_id was first
+    /// posted. Used to detect the 48-hour edit-window cutoff.
+    pub anchor_ts: String,
+    pub last_edit_ts: String,
+    /// Edit version counter, useful for debugging churn.
+    pub version: i64,
+    /// True once the mission is in a terminal state and the card should no
+    /// longer be updated.
+    pub archived: bool,
+}
+
 /// A mapping from a Telegram chat to an auto-created mission.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TelegramChatMission {
@@ -1187,6 +1282,21 @@ pub trait MissionStore: Send + Sync {
         Ok(vec![])
     }
 
+    /// Get the last `limit` events for a mission, returned in chronological
+    /// order (sequence ASC). Equivalent to `ORDER BY sequence DESC LIMIT N`
+    /// then re-sorted. Use this for "show me what just happened" surfaces
+    /// like the Paloma mission card: `get_events` paginates from the
+    /// *oldest* event and silently drops anything past the limit, which
+    /// makes the card's "Latest" line stale for long-running missions.
+    async fn get_latest_events(
+        &self,
+        mission_id: Uuid,
+        limit: usize,
+    ) -> Result<Vec<StoredEvent>, String> {
+        let _ = (mission_id, limit);
+        Ok(vec![])
+    }
+
     /// Get events with `sequence > since_seq`, ordered by sequence ASC.
     /// Used by the client for delta reconnect — pass the highest
     /// sequence the client has seen and get only events that arrived
@@ -1742,6 +1852,149 @@ pub trait MissionStore: Send + Sync {
     /// List named Paloma scheduler job state/history.
     async fn list_paloma_scheduler_jobs(&self) -> Result<Vec<PalomaSchedulerJob>, String> {
         Ok(vec![])
+    }
+
+    // === Paloma Mission Card (per-mission rolling Telegram message) ===
+
+    /// Get the persistent card anchor for a mission, if any.
+    async fn get_paloma_mission_card(
+        &self,
+        mission_id: Uuid,
+    ) -> Result<Option<PalomaMissionCard>, String> {
+        let _ = mission_id;
+        Ok(None)
+    }
+
+    /// Insert or overwrite the card anchor for a mission. Callers use this both
+    /// when posting a brand-new card (insert) and when re-anchoring after the
+    /// Telegram 48-hour edit window closes (replace `message_id`).
+    async fn upsert_paloma_mission_card(
+        &self,
+        card: PalomaMissionCard,
+    ) -> Result<PalomaMissionCard, String> {
+        let _ = card;
+        Err("Not supported".to_string())
+    }
+
+    /// Update only the content hash, last-edit timestamp, and version counter
+    /// after a successful `editMessageText` round-trip. The message_id and
+    /// anchor_ts are unchanged.
+    async fn touch_paloma_mission_card(
+        &self,
+        mission_id: Uuid,
+        content_hash: &str,
+        last_edit_ts: &str,
+    ) -> Result<(), String> {
+        let _ = (mission_id, content_hash, last_edit_ts);
+        Ok(())
+    }
+
+    /// Mark a card archived. The card row is retained so callers can detect
+    /// "already shown a final message for this mission", but the scheduler
+    /// stops editing it.
+    async fn archive_paloma_mission_card(&self, mission_id: Uuid) -> Result<(), String> {
+        let _ = mission_id;
+        Ok(())
+    }
+
+    /// List active (non-archived) cards for a user. Used by the scheduler to
+    /// refresh anything that may have drifted.
+    async fn list_active_paloma_mission_cards(
+        &self,
+        telegram_user_id: i64,
+    ) -> Result<Vec<PalomaMissionCard>, String> {
+        let _ = telegram_user_id;
+        Ok(vec![])
+    }
+
+    // === Paloma cooldown state (exponential backoff per mission+class) ===
+
+    /// Get the cooldown row for a given mission + alert class + user.
+    async fn get_paloma_cooldown_state(
+        &self,
+        telegram_user_id: i64,
+        mission_id: Uuid,
+        alert_class: &str,
+    ) -> Result<Option<PalomaCooldownState>, String> {
+        let _ = (telegram_user_id, mission_id, alert_class);
+        Ok(None)
+    }
+
+    /// Insert or replace a cooldown row.
+    async fn upsert_paloma_cooldown_state(
+        &self,
+        state: PalomaCooldownState,
+    ) -> Result<PalomaCooldownState, String> {
+        let _ = state;
+        Err("Not supported".to_string())
+    }
+
+    /// Drop all cooldown rows for a mission. Called when the user replies to
+    /// the mission, when status changes, or on explicit `/resume`.
+    async fn reset_paloma_cooldown_for_mission(&self, mission_id: Uuid) -> Result<(), String> {
+        let _ = mission_id;
+        Ok(())
+    }
+
+    // === Paloma user preferences (quiet hours, rate ceiling) ===
+
+    /// Get the preferences for a user, or `None` if they have not been set.
+    /// Callers should fall back to `PalomaUserPreferences::default_for(...)`
+    /// when this returns `None`.
+    async fn get_paloma_user_preferences(
+        &self,
+        telegram_user_id: i64,
+    ) -> Result<Option<PalomaUserPreferences>, String> {
+        let _ = telegram_user_id;
+        Ok(None)
+    }
+
+    /// Insert or replace preferences for a user. Used by the future settings
+    /// UI and by `/quiet` / `/mute` Telegram commands.
+    async fn upsert_paloma_user_preferences(
+        &self,
+        preferences: PalomaUserPreferences,
+    ) -> Result<PalomaUserPreferences, String> {
+        let _ = preferences;
+        Err("Not supported".to_string())
+    }
+
+    /// Count the interrupt-class messages already delivered to this user
+    /// within the given time window. Used by the delivery policy to enforce
+    /// `max_interrupts_per_hour` and `max_interrupts_per_day`.
+    async fn count_paloma_sent_alerts_since(
+        &self,
+        telegram_user_id: i64,
+        since: &str,
+    ) -> Result<i64, String> {
+        let _ = (telegram_user_id, since);
+        Ok(0)
+    }
+
+    /// Refresh the body / title / importance of a pending Telegram alert.
+    /// Called after `create_telegram_alert_if_absent` so collapsed alert
+    /// classes (e.g. `mission_long_running`) reflect the latest mission state
+    /// at digest time, instead of being frozen at first insert. No-op when
+    /// the row was just inserted (idempotent over-write) or already
+    /// acknowledged/sent.
+    async fn refresh_pending_telegram_alert_body(
+        &self,
+        telegram_user_id: i64,
+        mission_id: Uuid,
+        event_kind: &str,
+        title: &str,
+        body: &str,
+        importance: &str,
+    ) -> Result<bool, String> {
+        let _ = (
+            telegram_user_id,
+            mission_id,
+            event_kind,
+            title,
+            body,
+            importance,
+        );
+        Ok(false)
     }
 
     /// Consolidate explicit Telegram memory rows, keeping the latest user-provided rule/fact.

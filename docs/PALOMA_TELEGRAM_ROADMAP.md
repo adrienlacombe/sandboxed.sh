@@ -16,7 +16,8 @@ Paloma should feel like a trusted operations aide:
 - She lets Thomas steer long-running agents from Telegram.
 - She can answer or help Benjamin in shared chats, but never expose secrets or
   grant mission control to anyone except Thomas.
-- She learns notification preferences from direct feedback.
+- She learns notification preferences from direct feedback and from implicit
+  signals (what Thomas replies to vs. ignores).
 - She handles useful media without turning Telegram into a noisy file dump.
 
 ## User Model
@@ -33,7 +34,8 @@ Thomas can:
 - Start small worker missions.
 - Answer agent questions from Telegram.
 - Receive proactive alerts.
-- Teach Paloma alert preferences.
+- Teach Paloma alert preferences (explicitly via commands, implicitly via
+  reply/ignore behaviour).
 
 ### Benjamin
 
@@ -56,67 +58,256 @@ Benjamin cannot:
 
 Ignored by default unless explicitly allowed.
 
-## Minimal Command Set
+## Architectural Principles
 
-Keep the command surface intentionally small:
+Three principles drive the design:
 
-| Command | Purpose |
-| --- | --- |
-| `/status` | Delta summary since Thomas last checked. |
-| `/missions` | Compact list of active/interested missions. |
-| `/summary` | Succinct summary of one mission or the current situation. |
-| `/send` | Send a steering message to a mission or selected agent. |
-| `/approve` | Answer agent questions/options from Telegram. |
+1. **Telegram is a chat, not a notification stream.** The unit of
+   communication is a conversation per mission, not an alert per event. Each
+   active mission gets one persistent, in-place-updated message — a card — that
+   reflects current state.
+2. **Interrupts are earned, not default.** A new message that pings the user is
+   a budgeted resource. Most events update the mission card silently or roll
+   into a digest. Only deliberately-classified-as-important events page the
+   user.
+3. **Decisions are auditable.** Every send / suppress / downgrade is logged
+   with rationale, so Thomas can see why Paloma stayed quiet — or why she
+   didn't.
 
-Natural replies to Paloma alerts should work whenever possible, so commands are
-fallbacks rather than the main UX.
+## Communication Channels
 
-## Core Concepts
+Every mission event flows through a pipeline that picks exactly one channel:
 
-### Last-Seen Cursors
+| Channel        | Vehicle                              | Latency | User cost                  |
+| -------------- | ------------------------------------ | ------- | -------------------------- |
+| Mission Card   | edit pinned per-mission message      | seconds | none — ambient             |
+| Interrupt      | new message, notification on         | seconds | high — interrupts the user |
+| Digest         | one composed message per cadence     | hours   | low — read on demand       |
+| Silent log     | DB only                              | —       | none                       |
 
-Paloma needs per-user cursors, not just message history.
+## Components
 
-Track:
+### 1. MissionCard service
 
-- Last Telegram `/status`.
-- Last Telegram alert acknowledged.
-- Last dashboard session activity.
-- Last dashboard mission viewed.
-- Last mission event summarized to Thomas.
-- Last digest sent.
+One Telegram message per active mission, edited in place via `editMessageText`.
 
-This lets `/status` answer the real question: "What changed since I last paid
-attention?"
+Responsibilities:
 
-### Mission Interest
+- Maintain `(mission_id) → (chat_id, message_id, content_hash, anchor_ts)`.
+- Render mission status (emoji, title, current step, last assistant message
+  truncated to a few lines).
+- Inline buttons: Reply, Open in dashboard, Mute mission, Acknowledge.
+- Re-render on displayable events; only call `editMessageText` when the content
+  hash changes.
+- Debounce edits at ~2 seconds per mission to respect Telegram's ~1 edit/sec
+  per-chat rate limit.
+- 48-hour re-anchor: when the anchor message exceeds Telegram's edit window,
+  post a fresh card and quote-reply the old one. Once per 48 hours max.
+- Auto-archive on mission completion (stops updating; final status emoji
+  shown).
 
-Not every mission deserves alerts.
+### 2. Significance classifier
 
-Track interest signals:
+Decides the channel for each incoming event.
 
-- Thomas explicitly subscribed.
-- Thomas recently viewed or messaged the mission.
-- Mission is long-running.
-- Mission is a parent goal mission.
-- Mission asks for input.
-- Mission has failed, completed, or become blocked/unblocked.
+Pipeline:
 
-Interest should decay over time unless refreshed by user activity.
+1. **Hard rules** (deterministic, no LLM):
+   - `MissionFailed`, `MissionFinished`, `AwaitingUser` → interrupt candidate.
+   - `AssistantMessage`, `ToolCall`, `StatusChanged` while Active → card
+     update.
+   - Heartbeats, low-level tool events → silent.
+2. **Cooldown / budget check**: interrupt candidates must clear per-mission and
+   per-class cooldown.
+3. **LLM gate** (only for candidates that survive cooldown): a small model
+   (Haiku) gets recent interaction history and user prefs and returns
+   `{decision, rationale}` where decision ∈ `{send, downgrade_to_card,
+   downgrade_to_digest}`.
 
-### Alert Preferences
+The LLM call is bounded by the cooldown — at most a handful per hour total
+across all missions.
 
-Paloma should store explicit notification rules learned from feedback.
+### 3. Delivery policy
 
-Examples:
+Sits between "we want to send" and "actually call Telegram".
 
-- "Do not alert me about routine worker completions."
-- "Tell me when a proof mission becomes unblocked."
-- "Send fewer updates about this mission."
-- "Tell me more about deployment failures."
-- "Never share raw logs in group chats."
+- **Quiet hours**: default 23:00–08:00 user-local. Interrupts queue for the
+  next morning. Events flagged `severity=critical` (e.g. production deploy
+  failure) can override.
+- **Per-user rate ceiling**: default 1 interrupt/hour, 4/day for non-critical.
+  Excess → digest.
+- **Per-mission backoff**: 0m → 30m → 2h → 8h → 24h. Resets on (a) user reply
+  to that mission, (b) status change, (c) explicit `/resume`.
+- **Cross-mission dedup**: collapse multiple awaiting-input alerts within a
+  short window into one combined interrupt.
 
-Preference updates should be auditable and editable later.
+### 4. Digest composer
+
+Runs at the end of quiet hours and on `/digest`. Composes a single message from
+queued alerts via an LLM that knows what was sent recently, current mission
+states, and user prefs.
+
+Output is a short summary with clickable per-mission deep links, not a list of
+individual alerts.
+
+### 5. Conversational memory
+
+Per-user rolling store: last ~50 alerts with `{mission_id, class,
+content_summary, sent_at, user_replied, user_reacted}` plus an inferred
+preference summary.
+
+Exposed to the LLM gate as context. Enables implicit learning: if Thomas
+ignores a class of alerts, the classifier downgrades them automatically without
+any configuration.
+
+### 6. Owner control plane
+
+Two surfaces sharing one `paloma_user_preferences` table:
+
+- **Telegram commands**: `/quiet 22-08`, `/mute mission <id>`, `/only
+  failures`, `/digest now`.
+- **Dashboard panel**: same settings plus visualization of alert history with
+  rationale ("why did/didn't you send this?").
+
+Paloma also surfaces preference suggestions proactively, e.g. after a noisy
+night: "I sent 11 alerts overnight and you replied to none. Mute overnight by
+default? [Yes / Only failures / No]". This converts annoyance into a permanent
+fix.
+
+## Decision Pipeline
+
+```text
+event
+  -> MissionCard.render_if_changed()              [always; ambient]
+  -> SignificanceClassifier.classify(event)
+       hard rules -> {silent | card_only | interrupt_candidate | digest_candidate}
+  -> if interrupt_candidate:
+       Cooldown.check()      -> fail -> digest
+       Budget.check()        -> fail -> digest
+       QuietHours.check()    -> fail -> digest (unless critical)
+       LLM.gate(event, history, prefs) -> {send | card_only | digest}
+  -> if send: Telegram.send_interrupt() + alert_history.record(decision, rationale)
+  -> if digest: enqueue
+```
+
+All decisions write to `paloma_alert_history` with rationale.
+
+## Existing Telegram plumbing
+
+Webhook and command intake stay as today:
+
+```text
+Telegram webhook
+  -> /api/telegram/webhook/:channel_id
+  -> TelegramBridge
+  -> ControlCommand::UserMessage
+  -> mission runner
+  -> AgentEvent stream
+```
+
+The new pipeline replaces the path from `AgentEvent stream` onward. The
+current `paloma::planner` + `paloma::policy` per-event alert path is removed
+once the new pipeline is in production.
+
+## Data Model
+
+New tables:
+
+### `paloma_mission_card`
+
+- `mission_id` PK
+- `chat_id`
+- `message_id`
+- `content_hash`
+- `anchor_ts`
+- `last_edit_ts`
+- `version`
+
+### `paloma_cooldown_state`
+
+- `(mission_id, class)` PK
+- `last_sent_at`
+- `next_eligible_at`
+- `backoff_step`
+
+### `paloma_user_preferences`
+
+- `telegram_user_id` PK
+- `timezone`
+- `quiet_hours_start`
+- `quiet_hours_end`
+- `max_interrupts_per_hour`
+- `max_interrupts_per_day`
+- `alert_class_overrides` JSON  -- per-class on/off/digest-only
+- `mission_overrides` JSON      -- per-mission mute / pin
+- `digest_cadence`
+- `failure_override_quiet` BOOL
+
+### `paloma_alert_history`
+
+- `id` PK
+- `telegram_user_id`
+- `mission_id`
+- `class`
+- `channel`  -- card | interrupt | digest | silent
+- `content_summary`
+- `sent_at`
+- `user_replied_at`
+- `user_reacted`
+- `suppressed_reason`
+- `classifier_decision`
+- `classifier_rationale`
+
+### `paloma_conversation_memory`
+
+- `telegram_user_id` PK
+- `recent_alerts_json`        -- rolling ~50
+- `inferred_preferences_summary`
+- `updated_at`
+
+Existing tables retained:
+
+- `telegram_users` (roles)
+- `telegram_user_cursors` (for `/status` delta)
+- `telegram_mission_subscriptions` (interest, used as input to the classifier)
+- `telegram_agent_questions` (input-needed routing)
+
+Removed:
+
+- `event_kind` bucket-ID hack in `planner.rs` (cadence moves to
+  `paloma_cooldown_state`).
+- Ad-hoc 30-minute bucketing in `policy.rs`.
+
+## Delivery Rules
+
+### Owner DM
+
+Allowed:
+
+- Full mission control.
+- Status summaries.
+- Steering.
+- Agent questions.
+- Worker creation.
+- Media and files.
+
+Protected:
+
+- Secrets redacted by default.
+- Dangerous actions may be gated later; first version focuses on answering
+  agent questions rather than broad approval workflows.
+
+### Shared Chats
+
+Allowed only when:
+
+- Thomas or Benjamin is in the chat.
+- The chat is allowlisted.
+- The message is directly relevant.
+- The answer is safe after redaction.
+- Paloma's intervention is likely to save time.
+
+Paloma should usually stay silent.
 
 ### Friend-Safe Output
 
@@ -140,179 +331,28 @@ Default allow:
 - Non-sensitive calendar availability if Thomas explicitly enables it.
 - Helpful answers that save Thomas time.
 
-## Architecture
+## Minimal Command Set
 
-Current Telegram architecture:
+Keep the command surface intentionally small:
 
-```text
-Telegram webhook
-  -> /api/telegram/webhook/:channel_id
-  -> TelegramBridge
-  -> ControlCommand::UserMessage
-  -> mission runner
-  -> AgentEvent stream
-  -> Telegram send/edit/media delivery
-```
+| Command       | Purpose                                                  |
+| ------------- | -------------------------------------------------------- |
+| `/status`     | Delta summary since Thomas last checked.                 |
+| `/missions`   | Compact list of active/interested missions.              |
+| `/summary`    | Succinct summary of one mission or the current situation.|
+| `/send`       | Send a steering message to a mission or selected agent.  |
+| `/approve`    | Answer agent questions/options from Telegram.            |
+| `/quiet`      | Set or clear quiet hours.                                |
+| `/mute`       | Mute a mission or alert class.                           |
+| `/digest`     | Force the digest now.                                    |
 
-Paloma should extend this with a notification and preference layer:
+Natural replies to Paloma alerts and inline-button taps on mission cards
+should work whenever possible, so commands are fallbacks rather than the main
+UX.
 
-```text
-Mission events + dashboard activity + Telegram messages
-  -> Paloma classifier
-  -> interest and preference store
-  -> alert/digest planner
-  -> Telegram delivery
-  -> feedback parser
-  -> preference updates
-```
+## Status / Missions / Summary UX
 
-Do not rebuild an OpenClaw-style gateway. Sandboxed.sh is mission-first. Paloma
-should make missions usable from Telegram.
-
-## Data Model
-
-Proposed tables:
-
-### `telegram_users`
-
-- `id`
-- `telegram_user_id`
-- `username`
-- `display_name`
-- `role`: `owner`, `trusted_friend`, `observer`, `blocked`
-- `created_at`
-- `updated_at`
-
-### `telegram_user_cursors`
-
-- `id`
-- `telegram_user_id`
-- `last_status_at`
-- `last_dashboard_seen_at`
-- `last_alert_ack_at`
-- `last_digest_at`
-- `last_seen_event_sequence_by_mission_json`
-- `created_at`
-- `updated_at`
-
-### `telegram_mission_subscriptions`
-
-- `id`
-- `telegram_user_id`
-- `mission_id`
-- `interest_level`: `muted`, `normal`, `high`
-- `reason`
-- `expires_at`
-- `created_at`
-- `updated_at`
-
-### `telegram_alert_preferences`
-
-- `id`
-- `telegram_user_id`
-- `scope`: `global`, `mission`, `chat`, `event_kind`
-- `scope_value`
-- `rule_text`
-- `enabled`
-- `created_from_message_id`
-- `created_at`
-- `updated_at`
-
-### `telegram_alerts`
-
-- `id`
-- `telegram_user_id`
-- `mission_id`
-- `event_kind`
-- `importance`
-- `title`
-- `body`
-- `status`: `pending`, `sent`, `muted`, `failed`, `acknowledged`
-- `telegram_message_id`
-- `last_error`
-- `created_at`
-- `sent_at`
-- `acknowledged_at`
-
-### `telegram_agent_questions`
-
-- `id`
-- `mission_id`
-- `telegram_user_id`
-- `question`
-- `options_json`
-- `status`: `pending`, `answered`, `expired`
-- `telegram_message_id`
-- `answer_text`
-- `created_at`
-- `answered_at`
-
-## Delivery Rules
-
-### Owner DM
-
-Allowed:
-
-- Full mission control.
-- Status summaries.
-- Steering.
-- Agent questions.
-- Worker creation.
-- Media and files.
-
-Still protected:
-
-- Secrets should be redacted by default.
-- Dangerous actions can be gated later, but the first version should focus on
-  answering agent questions rather than broad approval workflows.
-
-### Shared Chats
-
-Allowed only when:
-
-- Thomas or Benjamin is in the chat.
-- The chat is allowlisted.
-- The message is directly relevant.
-- The answer is safe after redaction.
-- Paloma's intervention is likely to save time.
-
-Paloma should usually stay silent.
-
-## Alert Policy
-
-Start with simple rules:
-
-Alert Thomas when:
-
-- A mission asks for user input.
-- A long-running mission completes.
-- A long-running mission fails.
-- A mission becomes stuck or repeatedly errors.
-- A subscribed mission has meaningful progress.
-- A deployment completes or fails.
-- A generated media/report artifact is ready.
-
-Do not alert Thomas for:
-
-- Routine worker completions unless subscribed.
-- Noisy low-level tool events.
-- Every text delta.
-- Repeated failures with the same cause after the first alert.
-
-Cadence:
-
-- Immediate for input-needed, failed, completed, or explicitly high-interest
-  events.
-- Digest after a few hours of quiet.
-- Exponential backoff until daily summaries.
-- Reset cadence when Thomas replies, views the dashboard, or marks a mission as
-  high-interest.
-
-## Status UX
-
-`/status` should return a delta summary.
-
-Example:
+`/status` returns a delta summary, e.g.:
 
 ```text
 3 meaningful changes since you last checked.
@@ -322,14 +362,7 @@ Example:
 3. Keel UI worker failed screenshot validation twice; likely CSS overflow.
 ```
 
-If there are many missions, send a compact text summary first and optionally a
-status card image second.
-
-## Missions UX
-
-`/missions` should be compact.
-
-Example:
+`/missions` is compact:
 
 ```text
 Active missions
@@ -343,65 +376,40 @@ Other
 - 2 completed since last status
 ```
 
-## Summary UX
+`/summary` picks a sensible target (reply context > selected mission >
+high-interest active). Default length is terse.
 
-`/summary` should choose a sensible target:
+## Steering / Approval UX
 
-- If replying to an alert, summarize that mission.
-- If a mission is selected in the owner DM, summarize that mission.
-- Otherwise summarize high-interest active missions.
-
-Default length should be terse.
-
-## Steering UX
-
-`/send` should support:
+`/send` supports natural targets:
 
 ```text
-/send <mission selector> <message>
 /send latest focus on tests and report only blockers
 /send verity spawn a small worker to inspect docs
 ```
 
-Natural replies to alerts should be preferred:
+Natural replies to alerts and mission cards are preferred:
 
 ```text
 Focus it on tests first.
-Ask a small worker to check docs.
 Stop this mission.
 ```
 
-Paloma should confirm the target before sending if ambiguous.
+Paloma confirms the target only when ambiguous.
 
-## Approval/Input UX
-
-`/approve` is primarily for answering agent questions.
-
-When a mission waits for input, Paloma should DM:
-
-```text
-Verity proof mission needs your input:
-Should it pin the merged Verity commit or keep tracking main?
-
-Reply:
-1. Pin merged commit
-2. Track main
-3. Ask agent to decide
-```
-
-Thomas can reply with a number or plain text. Paloma forwards the answer into
-the mission.
+`/approve` is the fallback for answering agent questions. The primary surface
+is the mission card's inline buttons or a natural reply.
 
 ## Media Roadmap
 
-### Phase 1
+### Phase A
 
 - Forward mission `shared_files` to Telegram.
 - Send images as photos when safe.
 - Send reports and non-image files as documents.
 - Include captions with origin mission and short context.
 
-### Phase 2
+### Phase B
 
 - Treat inbound Telegram files as mission attachments, not just temp paths.
 - Persist attachment metadata.
@@ -409,31 +417,13 @@ the mission.
 - Add OCR for images and screenshots.
 - Add transcription for voice notes.
 
-### Phase 3
+### Phase C
 
 - Generate compact status cards as images.
 - Send graph/image summaries for complex mission states.
 - Support media bundles when a mission produces multiple artifacts.
 
 Voice is lowest priority.
-
-## Preference Learning
-
-Paloma should parse feedback messages such as:
-
-- "Don't tell me about this again."
-- "Tell me more about this kind of thing."
-- "Only alert me if this fails."
-- "Summarize this daily."
-- "Benjamin can see this level of detail."
-
-Implementation should create explicit preference records, then confirm tersely:
-
-```text
-Noted. I will mute routine updates for this mission unless it fails or asks for input.
-```
-
-Avoid opaque memory. Preference changes should be visible in Settings later.
 
 ## Safety Rules
 
@@ -448,166 +438,193 @@ Hard requirements:
   friends.
 - Treat generated files as private unless explicitly shared.
 
-Future approval gates can cover deploy, push, merge, external messages, spending
-money, and sharing files. The first version should not overbuild approvals.
+Future approval gates can cover deploy, push, merge, external messages,
+spending money, and sharing files. The first version should not overbuild
+approvals.
 
 ## Implementation Phases
 
-### Phase 0: Confirm Current Baseline
+Each phase is shippable independently. Phase 1 + Phase 2 together fix the
+overnight-spam class of bugs even without any LLM involvement.
 
-- Verify active production bot registration.
-- Verify webhook secret validation.
-- Verify `scripts/telegram_user_smoke.py` works from Thomas's Telegram account.
-- Verify current inbound text, media download, outbound text, and shared-file
-  delivery.
-- Document the production DB path clearly. Current production has been observed
-  using `missions-dev.db`; either rename it or document why this is intentional.
+### Phase 1 — MissionCard service
 
-### Phase 1: Owner Identity and `/status`
+Build the rolling per-mission message. Keep the old alert path running in
+parallel; each event updates both the card and the existing alert pipeline.
+Validate the card UX with a few real missions.
 
-- Add Telegram user role storage.
-- Mark Thomas as owner.
-- Track last-seen cursors.
-- Add `/status` command.
-- Generate delta summaries from mission events since last cursor.
-- Update cursor after successful status delivery.
-- Test with Telethon from Thomas's account.
+Definition of Done:
 
-Acceptance:
+- [x] `paloma_mission_card` table created and migrated.
+- [x] New mission → card posted to owner DM; `message_id` persisted.
+- [x] Mission events update the card via `editMessageText` only when content
+      hash changes (`mission_card::content_hash`).
+- [x] Edits debounced at ~2 seconds per mission. The card-refresh job runs on
+      the existing scheduler tick (`TELEGRAM_SCHEDULE_POLL_INTERVAL = 2s`); the
+      hash-skip path means a flood of mission events collapses to at most one
+      `editMessageText` per tick per changed mission.
+- [partial] Card includes inline buttons. `CardButton` enum and `buttons_for`
+      defined for all four labels. **Open in dashboard** is wired as a real
+      URL button (works today when `SANDBOXED_PUBLIC_URL` is set, no callback
+      handler needed). **Reply / Mute mission / Acknowledge** require
+      `callback_query` webhook routing, which lands in Phase 5 (owner control
+      plane) — deferred deliberately to keep Phase 1 scoped to the rolling
+      message itself.
+- [x] 48-hour re-anchor implemented. When `anchor_ts` is ≥47h old, the next
+      refresh posts a fresh card and the row's `message_id` is replaced.
+      Reply-quoting the old anchor is a UX nice-to-have left for follow-up;
+      it's not required for correctness.
+- [x] Finished missions auto-archive: terminal status renders `card.archived =
+      true`, which the bridge persists via `archive_paloma_mission_card`. The
+      next tick skips archived rows entirely.
+- [x] Backfill: active missions at deploy time get a card on their next event
+      (the scheduler scans missions every tick and posts a card when none
+      exists, skipping missions that are already terminal at first sight).
+- [blocked] Manual verification: a long-running mission shows one card that
+      updates, not multiple messages. **Blocked** on live Telegram credentials
+      (`TELEGRAM_API_ID`, `TELEGRAM_API_HASH`, `TELEGRAM_PHONE`,
+      `TELEGRAM_CHAT`) not present in this environment.
 
-- `/status` returns only changes since the previous `/status`.
-- Dashboard activity can advance or influence the cursor.
-- Non-owner DMs cannot access mission status.
+### Phase 2 — Cooldown, preferences, quiet hours
 
-### Phase 2: Mission Interest and `/missions`
+Per-mission cooldown table, exponential backoff, quiet hours. Drop the
+30-minute bucket hack from `event_kind`. At end of phase the spam is fixed.
 
-- Add mission subscriptions and interest scoring.
-- Add `/missions` command.
-- Rank long-running, recently viewed, parent, awaiting-user, failed, and
-  subscribed missions first.
-- Support muting and high-interest marking from Telegram replies.
+Definition of Done:
 
-Acceptance:
+- [x] `paloma_cooldown_state` and `paloma_user_preferences` tables created
+      (additions in `mission_store/sqlite.rs`).
+- [x] Bucket-ID removed from `event_kind`; cooldown owns cadence
+      (`planner::alert_event_kind_at` collapses `mission_long_running` to a
+      single key).
+- [x] Exponential backoff (0m → 30m → 2h → 8h → 24h) implemented
+      (`paloma::cooldown::BACKOFF_LADDER`) and reset on user reply / status
+      change. Reset is triggered at the existing alert-acknowledgement sites
+      and, more importantly, directly inside
+      `SqliteMissionStore::update_mission_status_with_reason` so any status
+      transition automatically wipes cooldown rows for that mission.
+- [x] Per-user quiet hours respected; non-critical interrupts queue; criticals
+      override (`paloma::preferences::is_quiet_hours` +
+      `critical_overrides_quiet`, integrated in `flush_pending_paloma_digest`
+      via `paloma_preference_suppression_reason`).
+- [x] Per-user rate ceiling enforced. Defaults: 1/hour, 4/day for non-critical
+      (`PalomaUserPreferences::default_for`); failure-class alerts can
+      override when `failure_override_quiet` is set.
+- [x] Per-mission dedup in the digest collapses multiple pending alerts for
+      the same mission into one entry (`digest::dedupe_by_mission`), fixing
+      the "2 mission updates: same mission listed twice" pattern. Full
+      cross-mission `awaiting_user` collapse into a single composed
+      interrupt is a Phase 6 concern (LLM-composed digest).
+- [x] Verified against a simulated overnight run: ≤4 alerts per mission for a
+      single long-running mission over a 7.5h window, vs. the ~14 the old
+      bucket approach produced
+      (`cooldown::tests::simulated_overnight_run_produces_only_a_handful_of_alerts`).
 
-- `/missions` shows a compact list.
-- Muted missions disappear from proactive alerts.
-- High-interest missions surface first.
+#### Phase 1+2 verification log
 
-### Phase 3: Proactive Alerts
+- Unit tests added in this phase: `paloma::mission_card` (10 tests),
+  `paloma::cooldown` (6 tests), `paloma::preferences` (10 tests),
+  `paloma::digest` (4 dedup tests).
+- SQLite roundtrip tests added: card upsert/touch/archive, cooldown
+  upsert/reset, preferences upsert + sent-count window, cooldown reset on
+  mission status change.
+- Full library test suite: 869 passing, 0 failing, 2 ignored (unchanged).
+- `cargo fmt --all --check` clean.
+- Live Telegram smoke (`scripts/telegram_user_smoke.py`): **not run** —
+  requires `TELEGRAM_API_ID` / `TELEGRAM_API_HASH` / `TELEGRAM_PHONE` /
+  `TELEGRAM_CHAT` credentials that aren't present in this environment.
 
-- Add alert classifier for mission events.
-- Add `telegram_alerts` store.
-- Add alert deduplication and cooldowns.
-- Add exponential digest cadence.
-- Deliver input-needed, completed, failed, stuck, and important-progress alerts.
-- Parse feedback to update alert preferences.
+### Phase 3 — Significance classifier (rules) + audit log
 
-Acceptance:
+Replace ad-hoc checks in `policy.rs` / `planner.rs` with the explicit pipeline.
+Add `paloma_alert_history` and the dashboard view of rationale.
 
-- A completed interested mission sends one concise DM alert.
-- Repeated identical failures do not spam.
-- "Don't tell me about this again" creates a persistent mute rule.
-- "Tell me more about this" raises interest/preference.
+Definition of Done:
 
-### Phase 4: Agent Questions and `/approve`
+- [ ] `paloma_alert_history` records every event with channel + rationale +
+      suppressed_reason.
+- [ ] Hard-rule classifier replaces the existing alert decision code; old
+      `planner.rs` per-event alert path removed.
+- [ ] Dashboard panel lists last 100 alert decisions with mission filter and
+      rationale.
+- [ ] Unit tests cover each hard rule and cooldown edge case.
+- [ ] No regressions: every alert previously sent for a known mission set is
+      still produced (verified against a staging replay).
 
-- Detect missions awaiting user input.
-- Send question alerts to Thomas.
-- Support numbered options and free-text replies.
-- Route answer back into the correct mission.
-- Add `/approve` fallback command.
+### Phase 4 — LLM gate + conversational memory
 
-Acceptance:
+Wire the LLM gate for interrupt candidates that pass cooldown. Build the
+conversational memory store.
 
-- A mission question appears in Telegram.
-- Thomas answers in Telegram.
-- The answer reaches the mission.
-- The question is marked answered and not re-alerted.
+Definition of Done:
 
-### Phase 5: Steering and Small Workers
+- [ ] `paloma_conversation_memory` rolls last ~50 alerts per user.
+- [ ] `brain.rs` calls Haiku for interrupt candidates with prefs + memory in
+      the prompt; uses prompt caching for the system prompt.
+- [ ] LLM returns `{decision, rationale}`; rationale persisted to
+      `alert_history`.
+- [ ] Fallback on LLM failure: send (safe default), log failure.
+- [ ] LLM call rate observed ≤ 20/hour across all missions in production.
+- [ ] Verified: an ignored alert class gets downgraded by the LLM within 3
+      consecutive ignores.
 
-- Add `/send`.
-- Add natural reply routing for alert threads.
-- Support selecting latest/high-interest mission.
-- Support creating small worker missions from Telegram when Thomas asks.
-- Require confirmation only when the target is ambiguous.
+### Phase 5 — Owner control plane
 
-Acceptance:
+Telegram commands and dashboard preferences UI. Proactive suggestions.
 
-- Thomas can steer an existing long-running mission from Telegram.
-- Thomas can start a small worker from Telegram.
-- Benjamin cannot start or steer missions.
+Definition of Done:
 
-### Phase 6: Shared Chat Intelligence
+- [ ] `/quiet`, `/mute mission`, `/only failures`, `/digest now` implemented
+      and persist to `paloma_user_preferences`.
+- [ ] Dashboard panel exposes `paloma_user_preferences` with edit controls.
+- [ ] Dashboard alert-history view is filterable by mission and channel.
+- [ ] Proactive preference suggestion sent once when ignore-rate exceeds
+      threshold (e.g. ≥5 unanswered interrupts in 24h).
+- [ ] Verified: Thomas can change quiet hours via Telegram and the next
+      overnight respects them.
 
-- Add trusted friend role for Benjamin.
-- Add allowlisted shared chat behavior.
-- Add friend-safe redaction and summary policy.
-- Let Paloma answer when directly useful, but stay silent by default.
+### Phase 6 — Digest composer rewrite
 
-Acceptance:
+Replace the current per-alert digest with an LLM-composed summary.
 
-- Benjamin can ask a safe high-level question in the shared chat.
-- Paloma answers without secrets or control access.
-- Random users cannot control or query private state.
+Definition of Done:
 
-### Phase 7: Media
-
-- Persist inbound Telegram attachment metadata.
-- Show Telegram attachments in mission history.
-- Improve outbound shared-file captions.
-- Add status card image generation for complex status.
-- Add OCR for images and transcription for voice notes if still useful.
-
-Acceptance:
-
-- Thomas can send an image/file and the mission receives a durable attachment.
-- Mission-generated images/files can be sent back to Telegram.
-- `/status` can optionally include a compact image card.
-
-### Phase 8: Dashboard Settings
-
-- Add UI for:
-  - Telegram users and roles.
-  - Allowed chats.
-  - Alert preferences.
-  - Mission subscriptions.
-  - Last delivered alerts.
-  - Test-send button.
-
-Acceptance:
-
-- Thomas can inspect and edit Paloma's learned preferences.
-- Thomas can see why an alert was sent or muted.
+- [ ] Digest composer takes queued alerts + active missions + recent activity
+      → single composed message via Haiku.
+- [ ] Digest runs at end of quiet hours and on `/digest`.
+- [ ] Digest contains clickable per-mission deep links to the dashboard.
+- [ ] Verified: a night with 10 queued alerts produces one digest message, not
+      10.
 
 ## Testing Strategy
 
-Use three test layers.
+Three test layers.
 
-### Unit Tests
+### Unit tests
 
 Cover:
 
-- Command parsing.
-- Role checks.
+- Hard-rule classifier branches.
+- Cooldown / backoff math.
+- Quiet-hours timezone handling.
+- Card content-hash change detection.
 - Redaction.
-- Alert classification.
 - Preference feedback parsing.
 - Delta summary cursor logic.
-- Mission interest ranking.
 
-### Local/Backend Integration Tests
+### Local / backend integration tests
 
 Cover:
 
-- SQLite migrations.
-- Alert store deduplication.
-- Cursor updates.
-- Mission event to alert flow.
+- SQLite migrations for the new tables.
+- Card render → edit debounce → Telegram call boundary.
+- Cooldown table state transitions across simulated event streams.
+- Cross-mission interrupt dedup.
+- LLM gate with a stubbed model (decision + rationale persisted).
 - Webhook update dedup.
 - Agent question routing.
 
-### Live Telegram Smoke Tests
+### Live Telegram smoke tests
 
 Use `scripts/telegram_user_smoke.py` with a real Telegram user session.
 
@@ -631,45 +648,43 @@ python3 scripts/telegram_user_smoke.py \
   --print-history
 ```
 
-The production bot token is stored server-side and should not be needed for
-Telethon client-side smoke tests. If bot-token API checks are needed, retrieve
-only masked metadata or use server-side authenticated control APIs; do not print
-tokens in logs.
+Per phase, smoke must verify:
 
-Each feature phase should include a live smoke:
+- The phase's primary surface works from Thomas's account.
+- Non-owner behaviour is denied.
+- No secrets appear in Telegram output.
+- DB state changed as expected.
 
-- Send command from Thomas account.
-- Verify Paloma response appears.
-- Verify DB state changed correctly.
-- Verify non-owner behavior is denied.
-- Verify no secrets appear in Telegram output.
+The production bot token stays server-side; do not print tokens in logs.
 
 ## Open Questions
 
-- Should dashboard views update the same cursor as Telegram `/status`, or should
-  dashboard and Telegram have separate "briefed" cursors?
+- Card UX: one card per mission, or one consolidated "active missions" message
+  that updates as a list? Per-mission threads cleanly but clutters chat over
+  time; list is tidy but loses reply-threading per mission. Default lean:
+  per-mission card with auto-archive on completion.
+- LLM gate failure mode: default to send (safe) or suppress (quiet)? Default
+  lean: send, with a hard cooldown floor that's strictly better than today.
+- Migration: backfill cards for active missions at deploy time, or only
+  forward-going? Default lean: backfill on the next event after deploy.
+- Multi-user prefs: do we expect anyone besides Thomas to have full owner
+  prefs? If yes, dashboard prefs UI needs a per-user view.
+- Should dashboard activity advance the same cursor as Telegram `/status`, or
+  should dashboard and Telegram have separate "briefed" cursors?
 - Should Paloma DM Thomas before answering Benjamin in a shared chat when the
   answer depends on private context?
-- How should "small worker" defaults be chosen: same workspace as parent,
-  current dashboard mission, or Paloma's own control workspace?
-- Should status card images be generated by backend code or by an agent tool?
 
 ## Suggested First Slice
 
-Build Phase 1 and part of Phase 3:
-
-- Owner role.
-- `/status` delta summary.
-- Last-seen cursor.
-- Input-needed proactive alert.
-- Telethon smoke test.
-
-This is the smallest version that changes the daily workflow.
+Phase 1 + Phase 2 together. The card service kills the spam by giving events a
+non-interrupt destination; cooldowns + quiet hours kill the residual.
+Everything after that is quality and intelligence improvements on top of a
+clean foundation.
 
 ## Simple Goal Prompt
 
 Use this with an agent:
 
 ```text
-/goal Implement the Paloma Telegram roadmap in docs/PALOMA_TELEGRAM_ROADMAP.md, starting with the smallest useful slice and continuing phase by phase. Keep the UX simple: one bot, Thomas-only mission control, concise /status deltas, proactive important alerts, and safe limited shared-chat behavior for Benjamin. For every completed feature, add focused tests and run live Telegram smoke tests with scripts/telegram_user_smoke.py from my Telegram account when credentials are available. Do not print bot tokens or secrets. Before stopping, audit the roadmap checklist against code, tests, production config, and Telegram smoke results; keep going until each implemented phase is genuinely verified or clearly marked blocked with the exact missing credential/config.
+/goal Implement the Paloma Telegram roadmap in docs/PALOMA_TELEGRAM_ROADMAP.md, starting with Phase 1 (MissionCard service) and Phase 2 (cooldown, preferences, quiet hours) which together eliminate the current overnight-alert spam. Continue phase by phase, each one shippable independently. Keep the UX simple: one bot, Thomas-only mission control, per-mission rolling card as the default channel, interrupts only when classified as important, daily digest for the rest, safe limited shared-chat behavior for Benjamin. For every completed feature, add focused tests and run live Telegram smoke tests with scripts/telegram_user_smoke.py from my Telegram account when credentials are available. Do not print bot tokens or secrets. Before marking a phase done, walk its Definition of Done checklist against code, tests, production config, and Telegram smoke results; keep going until each item is genuinely verified or clearly marked blocked with the exact missing credential/config.
 ```
