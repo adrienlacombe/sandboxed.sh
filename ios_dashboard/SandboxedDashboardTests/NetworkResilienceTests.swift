@@ -86,6 +86,8 @@ final class NetworkResilienceTests: XCTestCase {
         XCTAssertTrue(source.contains("\"resume\""))
         XCTAssertTrue(source.contains("\"since_seq\""))
         XCTAssertTrue(source.contains("runControlSSE"))
+        XCTAssertTrue(source.contains("sinceSeq: sinceSeq"))
+        XCTAssertTrue(source.contains("URLQueryItem(name: \"since_seq\""))
         XCTAssertTrue(source.contains("falling back to SSE"))
         XCTAssertFalse(source.contains("components.path = normalizedPath"),
                        "URL construction must preserve any base URL path prefix")

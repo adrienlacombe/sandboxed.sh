@@ -737,6 +737,7 @@ final class APIService {
             }
             await self.runControlSSE(
                 missionId: missionId,
+                sinceSeq: sinceSeq,
                 token: token,
                 generation: generation,
                 onDiagnostic: onDiagnostic,
@@ -747,6 +748,7 @@ final class APIService {
 
     private func runControlSSE(
         missionId: String?,
+        sinceSeq: Int64?,
         token: String?,
         generation: Int,
         onDiagnostic: ((ControlStreamDiagnostic) -> Void)?,
@@ -755,7 +757,11 @@ final class APIService {
         let maxBuffer = Self.streamMaxBufferBytes
         let inactivity = Self.streamInactivityTimeout
         let session = Self.streamSession
-        guard let url = makeURL("/api/control/stream", queryItems: missionId.map { [URLQueryItem(name: "mission", value: $0)] } ?? []) else {
+        var queryItems = missionId.map { [URLQueryItem(name: "mission", value: $0)] } ?? []
+        if let sinceSeq {
+            queryItems.append(URLQueryItem(name: "since_seq", value: String(sinceSeq)))
+        }
+        guard let url = makeURL("/api/control/stream", queryItems: queryItems) else {
             emitDiagnostic(transport: .sse, phase: .error, host: nil, status: nil, bytes: nil, error: "Invalid server URL", eventType: nil, generation: generation, onDiagnostic: onDiagnostic)
             onEvent("error", ["message": "Invalid server URL", "reason": "invalid_configuration"])
             return

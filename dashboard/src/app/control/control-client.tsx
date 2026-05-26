@@ -4101,7 +4101,6 @@ export default function ControlClient() {
   const [reconnectAttempt, setReconnectAttempt] = useState(0);
   const [streamDiagnostics, setStreamDiagnostics] =
     useControlStreamingDiagnosticsStore();
-  const [diagTick, setDiagTick] = useState(0);
 
   // Progress state (for "Subtask X of Y" indicator), tracked per mission
   const [progressByMission, setProgressByMission] = useState<
@@ -4126,17 +4125,6 @@ export default function ControlClient() {
   const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
 
   // Library context for agents
-
-  // Only tick when stream is active to avoid unnecessary re-renders
-  const streamIsActive =
-    streamDiagnostics.phase === "open" ||
-    streamDiagnostics.phase === "streaming" ||
-    streamDiagnostics.phase === "connecting";
-  useEffect(() => {
-    if (!streamIsActive) return;
-    const interval = setInterval(() => setDiagTick((prev) => prev + 1), 1000);
-    return () => clearInterval(interval);
-  }, [streamIsActive]);
 
   // Parallel missions state
   const [runningMissions, setRunningMissions] = useState<RunningMissionInfo[]>(
