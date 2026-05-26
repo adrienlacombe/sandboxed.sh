@@ -231,10 +231,67 @@ select:focus-visible {
 
   [class~="text-white/45"],
   [class~="text-white/40"],
+  [class~="text-white/35"],
   [class~="text-white/30"],
+  [class~="text-white/25"],
   [class~="text-white/20"],
   [class~="text-white/10"] {
     color: rgb(var(--foreground-tertiary) / 0.92);
+  }
+
+  [class~="placeholder-white/30"]::placeholder,
+  [class~="placeholder:text-white/30"]::placeholder,
+  [class~="placeholder:text-white/25"]::placeholder,
+  [class~="placeholder:text-white/20"]::placeholder {
+    color: rgb(var(--foreground-tertiary) / 0.72) !important;
+  }
+
+  [class~="text-indigo-300"] {
+    color: rgb(67 56 202);
+  }
+
+  [class~="text-indigo-400"] {
+    color: rgb(79 70 229);
+  }
+
+  [class~="text-indigo-400/70"],
+  [class~="text-indigo-400/60"],
+  [class~="text-indigo-400/50"],
+  [class~="text-indigo-300/60"] {
+    color: rgb(79 70 229 / 0.86);
+  }
+
+  [class~="text-emerald-400"] {
+    color: rgb(4 120 87);
+  }
+
+  [class~="text-emerald-400/70"] {
+    color: rgb(4 120 87 / 0.9);
+  }
+
+  [class~="text-amber-400"] {
+    color: rgb(180 83 9);
+  }
+
+  [class~="text-red-400"] {
+    color: rgb(185 28 28);
+  }
+
+  [class~="text-red-400/70"] {
+    color: rgb(185 28 28 / 0.85);
+  }
+
+  [class~="text-red-300"],
+  [class~="text-red-300/80"] {
+    color: rgb(185 28 28 / 0.9);
+  }
+
+  [class~="hover:text-indigo-300"]:hover {
+    color: rgb(67 56 202);
+  }
+
+  [class~="hover:text-red-300"]:hover {
+    color: rgb(153 27 27);
   }
 
   [class~="bg-white/[0.01]"],
@@ -246,6 +303,26 @@ select:focus-visible {
   [class~="bg-white/5"],
   [class~="bg-white/10"] {
     background-color: rgb(17 24 39 / 0.04);
+  }
+
+  [class~="bg-indigo-500/10"] {
+    background-color: rgb(224 231 255 / 0.82);
+  }
+
+  [class~="bg-indigo-500/15"] {
+    background-color: rgb(224 231 255 / 0.9);
+  }
+
+  [class~="bg-indigo-500/20"],
+  [class~="bg-indigo-500/25"],
+  [class~="bg-indigo-500/30"],
+  [class~="bg-indigo-500/40"] {
+    background-color: rgb(199 210 254 / 0.72);
+  }
+
+  [class~="hover:bg-indigo-500/25"]:hover,
+  [class~="hover:bg-indigo-500/30"]:hover {
+    background-color: rgb(165 180 252 / 0.6);
   }
 
   [class*="hover:bg-white"]:hover {
@@ -265,6 +342,7 @@ select:focus-visible {
     border-color: rgb(17 24 39 / 0.16);
   }
 
+  [class~="bg-black/20"],
   [class~="bg-black/40"],
   [class~="bg-black/50"],
   [class~="bg-black/60"],
@@ -274,6 +352,8 @@ select:focus-visible {
 
   [class~="bg-[#1a1a1c]"],
   [class~="bg-[#1a1a1a]"],
+  [class~="bg-[#1a1a1f]"],
+  [class~="bg-[#1a1a2e]"],
   [class~="bg-[#1c1c1e]/95"],
   [class~="bg-[#121214]"],
   [class~="bg-[#111113]"],
