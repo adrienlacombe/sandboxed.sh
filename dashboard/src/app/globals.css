@@ -214,7 +214,8 @@ select:focus-visible {
    * Remap those neutral utilities in light mode so the existing dark theme
    * stays intact while system light mode gets readable surfaces and text.
    */
-  [class~="text-white"] {
+  [class~="text-white"],
+  .text-white {
     color: rgb(var(--foreground) / 0.88);
   }
 
@@ -222,14 +223,23 @@ select:focus-visible {
   [class~="text-white/85"],
   [class~="text-white/80"],
   [class~="text-white/75"],
-  [class~="text-white/70"] {
+  [class~="text-white/70"],
+  .text-white\/90,
+  .text-white\/85,
+  .text-white\/80,
+  .text-white\/75,
+  .text-white\/70 {
     color: rgb(var(--foreground) / 0.78);
   }
 
   [class~="text-white/65"],
   [class~="text-white/60"],
   [class~="text-white/55"],
-  [class~="text-white/50"] {
+  [class~="text-white/50"],
+  .text-white\/65,
+  .text-white\/60,
+  .text-white\/55,
+  .text-white\/50 {
     color: rgb(var(--foreground-secondary) / 0.9);
   }
 
@@ -240,7 +250,15 @@ select:focus-visible {
   [class~="text-white/25"],
   [class~="text-white/20"],
   [class~="text-white/15"],
-  [class~="text-white/10"] {
+  [class~="text-white/10"],
+  .text-white\/45,
+  .text-white\/40,
+  .text-white\/35,
+  .text-white\/30,
+  .text-white\/25,
+  .text-white\/20,
+  .text-white\/15,
+  .text-white\/10 {
     color: rgb(var(--foreground-tertiary) / 0.92);
   }
 
@@ -323,7 +341,15 @@ select:focus-visible {
   [class~="bg-white/[0.06]"],
   [class~="bg-white/[0.08]"],
   [class~="bg-white/5"],
-  [class~="bg-white/10"] {
+  [class~="bg-white/10"],
+  .bg-white\/\[0\.01\],
+  .bg-white\/\[0\.02\],
+  .bg-white\/\[0\.03\],
+  .bg-white\/\[0\.04\],
+  .bg-white\/\[0\.06\],
+  .bg-white\/\[0\.08\],
+  .bg-white\/5,
+  .bg-white\/10 {
     background-color: rgb(17 24 39 / 0.04);
   }
 
@@ -356,7 +382,13 @@ select:focus-visible {
   [class~="border-white/[0.08]"],
   [class~="border-white/[0.12]"],
   [class~="border-white/10"],
-  [class~="border-white/20"] {
+  [class~="border-white/20"],
+  .border-white\/\[0\.04\],
+  .border-white\/\[0\.06\],
+  .border-white\/\[0\.08\],
+  .border-white\/\[0\.12\],
+  .border-white\/10,
+  .border-white\/20 {
     border-color: rgb(17 24 39 / 0.09);
   }
 
