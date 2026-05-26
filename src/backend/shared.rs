@@ -431,7 +431,10 @@ pub fn convert_cli_event(
                 }
                 if let Some(thinking) = delta.thinking {
                     if !thinking.is_empty() {
-                        results.push(ExecutionEvent::Thinking { content: thinking });
+                        results.push(ExecutionEvent::Thinking {
+                            content: thinking,
+                            item_id: None,
+                        });
                     }
                 }
                 if let Some(partial) = delta.partial_json {
@@ -453,7 +456,10 @@ pub fn convert_cli_event(
                 match block {
                     ContentBlock::Text { text } => {
                         if !text.is_empty() {
-                            results.push(ExecutionEvent::Thinking { content: text });
+                            results.push(ExecutionEvent::Thinking {
+                                content: text,
+                                item_id: None,
+                            });
                         }
                     }
                     ContentBlock::ToolUse { id, name, input } => {
@@ -466,7 +472,10 @@ pub fn convert_cli_event(
                     }
                     ContentBlock::Thinking { thinking } => {
                         if !thinking.is_empty() {
-                            results.push(ExecutionEvent::Thinking { content: thinking });
+                            results.push(ExecutionEvent::Thinking {
+                                content: thinking,
+                                item_id: None,
+                            });
                         }
                     }
                     ContentBlock::ToolResult { .. } | ContentBlock::RedactedThinking { .. } => {}
@@ -767,7 +776,7 @@ mod tests {
         let results = convert_cli_event(event, &mut pending);
         assert_eq!(results.len(), 1);
         match &results[0] {
-            ExecutionEvent::Thinking { content } => assert_eq!(content, "I need to think"),
+            ExecutionEvent::Thinking { content, .. } => assert_eq!(content, "I need to think"),
             other => panic!("Expected Thinking, got {:?}", other),
         }
     }
@@ -830,7 +839,7 @@ mod tests {
         let results = convert_cli_event(event, &mut pending);
         assert_eq!(results.len(), 1);
         match &results[0] {
-            ExecutionEvent::Thinking { content } => {
+            ExecutionEvent::Thinking { content, .. } => {
                 assert_eq!(content, "I will run a command")
             }
             other => panic!("Expected Thinking, got {:?}", other),
@@ -884,7 +893,7 @@ mod tests {
         let results = convert_cli_event(event, &mut pending);
         assert_eq!(results.len(), 1);
         match &results[0] {
-            ExecutionEvent::Thinking { content } => assert_eq!(content, "deep thought"),
+            ExecutionEvent::Thinking { content, .. } => assert_eq!(content, "deep thought"),
             other => panic!("Expected Thinking, got {:?}", other),
         }
     }
@@ -1125,7 +1134,7 @@ mod tests {
         let results = convert_cli_event(event, &mut pending);
         assert_eq!(results.len(), 1);
         match &results[0] {
-            ExecutionEvent::Thinking { content } => {
+            ExecutionEvent::Thinking { content, .. } => {
                 assert_eq!(content, "Let me think about this...");
             }
             ExecutionEvent::TextDelta { .. } => {

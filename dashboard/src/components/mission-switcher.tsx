@@ -1250,10 +1250,10 @@ export function MissionSwitcher({
                         handleSelect(item.id);
                       }}
                       className={cn(
-                        'group flex items-center gap-3 py-2 mx-2 rounded-lg cursor-pointer transition-colors no-underline',
+                        'mission-switcher-row group flex items-center gap-3 py-2 mx-2 rounded-lg cursor-pointer transition-colors no-underline',
                         isWorkerItem ? 'px-3 ml-6 border-l-2 border-white/[0.06]' : 'px-3',
                         isSelected
-                          ? 'bg-indigo-500/15 text-white'
+                          ? 'mission-switcher-row-selected bg-indigo-500/15 text-white'
                           : 'text-white/70 hover:bg-white/[0.04]',
                         isSeverlyStalled && 'bg-red-500/10',
                         isStalled && !isSeverlyStalled && 'bg-amber-500/10',
@@ -1355,12 +1355,12 @@ export function MissionSwitcher({
                         {mission && (
                           <>
                             {cardTitle && (
-                              <p className="text-xs text-white/55 truncate mt-0.5">
+                              <p className="mission-switcher-description text-xs text-white/55 truncate mt-0.5">
                                 {cardTitle}
                               </p>
                             )}
                             {cardDescription && (
-                              <p className="text-[11px] text-white/40 truncate">
+                              <p className="mission-switcher-description mission-switcher-description-muted text-[11px] text-white/40 truncate">
                                 {cardDescription}
                               </p>
                             )}

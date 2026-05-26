@@ -548,7 +548,7 @@ function FilePreviewModalContent({
                                     customStyle={{
                                       padding: "1rem",
                                       borderRadius: "0.5rem",
-                                      background: "rgba(0, 0, 0, 0.3)",
+                                      background: "rgb(var(--code-background))",
                                     }}
                                   >
                                     {codeString}
@@ -1043,14 +1043,14 @@ export const MarkdownContent = memo(function MarkdownContent({
               customStyle={{
                 padding: "1rem",
                 borderRadius: "0.5rem",
-                background: "rgba(0, 0, 0, 0.3)",
+                background: "rgb(var(--code-background))",
               }}
             >
               {codeString}
             </LazyCodeBlock>
           ) : (
-            <pre className="p-4 bg-black/30 rounded-lg overflow-x-auto">
-              <code className="text-xs font-mono text-white/80">{codeString}</code>
+            <pre className="p-4 rounded-lg overflow-x-auto">
+              <code className="text-xs font-mono">{codeString}</code>
             </pre>
           )}
           {match && (
@@ -1093,7 +1093,7 @@ export const MarkdownContent = memo(function MarkdownContent({
             Render markdown
           </button>
         </div>
-        <pre className="max-h-[60vh] overflow-auto whitespace-pre-wrap break-words rounded bg-white/5 p-3 text-xs leading-relaxed">
+        <pre className="max-h-[60vh] overflow-auto whitespace-pre-wrap break-words rounded border border-white/[0.06] bg-[rgb(var(--code-background))] p-3 text-xs leading-relaxed text-[rgb(var(--code-foreground))]">
           {content}
         </pre>
       </div>

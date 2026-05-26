@@ -2344,7 +2344,7 @@ function MissionWorkbenchPanel({
                 </div>
               </div>
               {mission.short_description && (
-                <p className="rounded-md border border-white/[0.05] bg-white/[0.02] p-2 text-xs leading-relaxed text-white/50">
+                <p className="workbench-mission-description rounded-md border border-white/[0.05] bg-white/[0.02] p-2 text-xs leading-relaxed text-white/50">
                   {mission.short_description}
                 </p>
               )}
@@ -3454,10 +3454,10 @@ const ChatItemRow = memo(function ChatItemRow({
         <div className="max-w-[80%]">
           <div
             className={cn(
-              "rounded-2xl rounded-tr-md px-4 py-3 text-white selection-light",
+              "user-message-bubble rounded-2xl rounded-tr-md px-4 py-3 selection-light",
               item.queued
-                ? "border-2 border-dashed border-indigo-500/60 bg-indigo-500/20"
-                : "bg-indigo-500",
+                ? "user-message-bubble-queued border-2 border-dashed"
+                : "user-message-bubble-solid",
             )}
           >
             <p className="whitespace-pre-wrap text-sm break-words">
@@ -9338,8 +9338,7 @@ export default function ControlClient() {
               <button
                 onClick={() => setShowMissionSwitcher(true)}
                 className={cn(
-                  "flex h-9 items-center gap-2 px-3 rounded-lg transition-colors",
-                  "bg-indigo-500/20 hover:bg-indigo-500/30",
+                  "mission-selector-trigger flex h-9 items-center gap-2 px-3 rounded-lg transition-colors",
                 )}
                 title="Switch mission (⌘K)"
               >
@@ -9892,7 +9891,7 @@ export default function ControlClient() {
                                     ].includes(w.status) && "bg-white/30",
                                   )}
                                 />
-                                <span className="font-mono text-[11px] text-white/70 truncate">
+                                <span className="font-mono text-[11px] text-foreground/80 truncate">
                                   {w.title || w.id.slice(0, 8)}
                                 </span>
                               </a>

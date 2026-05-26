@@ -215,11 +215,10 @@ async fn send_message_streaming_app_server(
     };
 
     // Note: codex app-server does NOT honor `OPENAI_API_KEY`/`OPENAI_OAUTH_TOKEN`
-    // env vars (per `app-server/src/lib.rs:646-647`) — it reads `~/.codex/auth.json`
-    // (CODEX_HOME-relative). Auth flows through the per-mission codexhome-XXXX
-    // dir already populated by the workspace bootstrap; the legacy
-    // `oauth_token`-via-env path used by exec mode is dead here, so we don't
-    // forward it.
+    // env vars (per `app-server/src/lib.rs:646-647`). For ChatGPT OAuth
+    // rotation we use app-server's external token mode instead: the backend
+    // supplies an access token at startup and answers refresh requests under
+    // our per-account lock.
     let app_cfg = AppServerConfig {
         cli_path: cfg.cli_path.clone(),
         enabled_features: vec!["goals".to_string()],
@@ -241,6 +240,27 @@ async fn send_message_streaming_app_server(
     if let Err(e) = session_arc.initialize("sandboxed-sh", "1.2.0").await {
         let _ = session_arc.shutdown().await;
         return Err(anyhow::anyhow!("codex app-server initialize failed: {}", e));
+    }
+
+    if let Some(external_auth) = cfg.external_chatgpt_auth.as_ref() {
+        if let Err(e) = session_arc
+            .login_chatgpt_auth_tokens(
+                &external_auth.access_token,
+                &external_auth.chatgpt_account_id,
+                external_auth.chatgpt_plan_type.as_deref(),
+            )
+            .await
+        {
+            let _ = session_arc.shutdown().await;
+            return Err(anyhow::anyhow!(
+                "codex account/login/start chatgptAuthTokens failed: {}",
+                e
+            ));
+        }
+        tracing::info!(
+            chatgpt_account_id = %external_auth.chatgpt_account_id,
+            "Configured Codex app-server external ChatGPT OAuth tokens"
+        );
     }
     // Best-effort `notifications/initialized` — codex tolerates clients that
     // skip this but it matches the LSP-style handshake.
@@ -388,28 +408,57 @@ async fn send_message_streaming_app_server(
                             terminal = true;
                         }
                     }
-                    InboundMessage::ServerRequest {
-                        id,
-                        method,
-                        params: _,
-                    } => {
+                    InboundMessage::ServerRequest { id, method, params } => {
                         // Codex elicits permission for command exec, file change,
                         // and dynamic-tool invocations through server-initiated
                         // requests. Exec mode runs with
                         // `--dangerously-bypass-approvals-and-sandbox`; we mirror
                         // that policy here by auto-approving every elicitation.
-                        // Auth-refresh requests get a typed JSON-RPC error
-                        // because we don't carry refresh credentials in the
-                        // app-server path (codex reads its own auth.json).
                         let send_err = if method == "account/chatgptAuthTokens/refresh" {
-                            session_arc
-                                .respond_to_server_request_error(
-                                    id,
-                                    -32603,
-                                    "sandboxed-sh: auth refresh not supported by client; \
-                                     codex must re-read $CODEX_HOME/auth.json",
-                                )
-                                .await
+                            match cfg.external_chatgpt_auth.as_ref() {
+                                Some(external_auth) => {
+                                    let previous_account_id = params
+                                        .get("previousAccountId")
+                                        .and_then(|value| value.as_str());
+                                    match crate::api::ai_providers::refresh_codex_oauth_account_for_app_server(
+                                        &external_auth.working_dir,
+                                        previous_account_id,
+                                        Some(&external_auth.chatgpt_account_id),
+                                    )
+                                    .await
+                                    {
+                                        Ok(account) => {
+                                            let result = serde_json::json!({
+                                                "accessToken": account.access_token,
+                                                "chatgptAccountId": account.chatgpt_account_id,
+                                                "chatgptPlanType": external_auth.chatgpt_plan_type,
+                                            });
+                                            session_arc.respond_to_server_request(id, result).await
+                                        }
+                                        Err(error) => {
+                                            session_arc
+                                                .respond_to_server_request_error(
+                                                    id,
+                                                    -32603,
+                                                    &format!(
+                                                        "sandboxed-sh: ChatGPT OAuth refresh failed: {}",
+                                                        error
+                                                    ),
+                                                )
+                                                .await
+                                        }
+                                    }
+                                }
+                                None => {
+                                    session_arc
+                                        .respond_to_server_request_error(
+                                            id,
+                                            -32603,
+                                            "sandboxed-sh: auth refresh requested without external ChatGPT OAuth context",
+                                        )
+                                        .await
+                                }
+                            }
                         } else {
                             let result = elicitation_auto_approve(&method);
                             session_arc.respond_to_server_request(id, result).await
@@ -602,10 +651,11 @@ impl AppServerEventTranslator {
                         ("reasoning", DeltaSemantics::Incremental)
                     };
                     let key = format!("{}:{}", kind, item_id);
-                    let entry = self.delta_buffers.entry(key).or_default();
+                    let entry = self.delta_buffers.entry(key.clone()).or_default();
                     fold_delta_into(entry, delta, semantics);
                     events.push(ExecutionEvent::Thinking {
                         content: entry.clone(),
+                        item_id: Some(key),
                     });
                 }
             }
@@ -836,6 +886,8 @@ pub fn registry_entry() -> Arc<dyn Backend> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+    use std::collections::{HashMap, HashSet};
 
     #[test]
     fn parse_goal_prefix_detects_simple_goal() {
@@ -949,6 +1001,93 @@ mod tests {
         fold_delta_into(&mut buf, "stable", DeltaSemantics::CumulativeSnapshot);
         fold_delta_into(&mut buf, "stable", DeltaSemantics::CumulativeSnapshot);
         assert_eq!(buf, "stable");
+    }
+
+    #[test]
+    fn reasoning_thinking_events_carry_distinct_item_ids() {
+        // Regression for mission dbc8a7e9 seq 6651: the translator must
+        // tag each Thinking event with the per-item buffer key so the
+        // mission_runner can detect when codex moves to a new reasoning
+        // item and finalize the previous thought instead of concatenating
+        // unrelated cumulative snapshots into one buffer.
+        let mut translator = AppServerEventTranslator {
+            delta_buffers: HashMap::new(),
+            emitted_usage_for_turn: HashSet::new(),
+            counted_turn_ids: HashSet::new(),
+            goal_iteration: 0,
+            goal_objective: String::new(),
+        };
+
+        let notify = |item_id: &str, delta: &str| {
+            json!({
+                "itemId": item_id,
+                "delta": delta,
+            })
+        };
+
+        let collect = |events: Vec<ExecutionEvent>| -> Vec<(Option<String>, String)> {
+            events
+                .into_iter()
+                .filter_map(|e| match e {
+                    ExecutionEvent::Thinking { content, item_id } => Some((item_id, content)),
+                    _ => None,
+                })
+                .collect()
+        };
+
+        // Item A: cumulative summary snapshots.
+        let mut events = Vec::new();
+        events.extend(
+            translator
+                .handle_notification(
+                    "item/reasoning/summaryTextDelta",
+                    &notify("A", "The recovery log."),
+                    false,
+                )
+                .events,
+        );
+        events.extend(
+            translator
+                .handle_notification(
+                    "item/reasoning/summaryTextDelta",
+                    &notify("A", "The recovery log. Do not duplicate."),
+                    false,
+                )
+                .events,
+        );
+        // Item B: brand new reasoning, starts at "Work".
+        events.extend(
+            translator
+                .handle_notification(
+                    "item/reasoning/summaryTextDelta",
+                    &notify("B", "Work"),
+                    false,
+                )
+                .events,
+        );
+        events.extend(
+            translator
+                .handle_notification(
+                    "item/reasoning/summaryTextDelta",
+                    &notify("B", "Worktrees are ready"),
+                    false,
+                )
+                .events,
+        );
+
+        let thinkings = collect(events);
+        assert_eq!(thinkings.len(), 4);
+        // Item A's snapshots share an item_id.
+        assert_eq!(thinkings[0].0, Some("summary:A".to_string()));
+        assert_eq!(thinkings[1].0, Some("summary:A".to_string()));
+        // Item B's snapshots share a *different* item_id.
+        assert_eq!(thinkings[2].0, Some("summary:B".to_string()));
+        assert_eq!(thinkings[3].0, Some("summary:B".to_string()));
+        assert_ne!(thinkings[1].0, thinkings[2].0);
+        // Per-item contents are clean cumulative snapshots (the runner is
+        // free to REPLACE per item, no overlap merging required).
+        assert_eq!(thinkings[1].1, "The recovery log. Do not duplicate.");
+        assert_eq!(thinkings[3].1, "Worktrees are ready");
     }
 
     #[tokio::test]

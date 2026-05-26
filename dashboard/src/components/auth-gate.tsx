@@ -138,7 +138,7 @@ export function AuthGate({ children }: { children: React.ReactNode }) {
 
   if (!ready) {
     return (
-      <div className="min-h-screen bg-[#121214] text-white" aria-label="Checking authentication">
+      <div className="min-h-screen bg-background text-foreground" aria-label="Checking authentication">
         <div className="flex min-h-screen items-center justify-center">
           <div className="h-6 w-6 animate-spin rounded-full border-2 border-white/20 border-t-indigo-400" />
         </div>

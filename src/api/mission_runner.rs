@@ -714,6 +714,7 @@ exec "$SCRIPT_DIR/.sandboxed-sh-telegram-action.py" "$@"
 }
 
 const CODEX_ACCOUNT_CONCURRENCY_LIMIT: usize = 5;
+const CODEX_OAUTH_ACCOUNT_CONCURRENCY_LIMIT: usize = 5;
 const CODEX_ACCOUNT_LEASE_WAIT_TIMEOUT: Duration = Duration::from_secs(15);
 
 static CODEX_ACCOUNT_POOL: LazyLock<StdMutex<HashMap<String, Arc<Semaphore>>>> =
@@ -740,6 +741,13 @@ impl CodexCredential {
         match self {
             CodexCredential::ApiKey(k) => format!("apikey:{}", k),
             CodexCredential::OAuth(acc) => format!("oauth:{}", acc.chatgpt_account_id),
+        }
+    }
+
+    fn concurrency_limit(&self) -> usize {
+        match self {
+            CodexCredential::ApiKey(_) => CODEX_ACCOUNT_CONCURRENCY_LIMIT,
+            CodexCredential::OAuth(_) => CODEX_OAUTH_ACCOUNT_CONCURRENCY_LIMIT,
         }
     }
 
@@ -839,12 +847,12 @@ pub(crate) fn codex_tool_stall_should_retry_with_default_model(
     requested_model.is_some_and(is_generic_gpt_codex_model)
 }
 
-fn codex_account_semaphore_for_fingerprint(fingerprint: &str) -> Arc<Semaphore> {
+fn codex_account_semaphore_for_credential(credential: &CodexCredential) -> Arc<Semaphore> {
     let mut pool = CODEX_ACCOUNT_POOL
         .lock()
         .expect("Codex account pool mutex poisoned");
-    pool.entry(fingerprint.to_string())
-        .or_insert_with(|| Arc::new(Semaphore::new(CODEX_ACCOUNT_CONCURRENCY_LIMIT)))
+    pool.entry(credential.fingerprint())
+        .or_insert_with(|| Arc::new(Semaphore::new(credential.concurrency_limit())))
         .clone()
 }
 
@@ -1205,7 +1213,7 @@ async fn lease_codex_account(
         .into_iter()
         .filter(|cred| !tried_fingerprints.contains(&cred.fingerprint()))
         .map(|cred| {
-            let sem = codex_account_semaphore_for_fingerprint(&cred.fingerprint());
+            let sem = codex_account_semaphore_for_credential(&cred);
             let available = sem.available_permits();
             (cred, sem, available)
         })
@@ -14191,19 +14199,74 @@ pub async fn run_codex_turn(
     // Best-effort: try to mint an OpenAI API key from the OAuth refresh token.
     // If this fails (e.g. no API platform org), write_codex_credentials_for_workspace
     // will fall back to auth_mode: "chatgpt" using the access_token directly.
-    if let Err(e) = crate::api::ai_providers::ensure_openai_api_key_for_codex(app_working_dir).await
-    {
-        tracing::warn!(
-            "Could not ensure OpenAI API key for Codex (will try chatgpt auth mode): {}",
-            e
-        );
+    //
+    // Skip this when the rotation layer has already selected a specific
+    // ChatGPT OAuth account. Minting an API key refreshes/rotates the same
+    // refresh token, then the selected credential can become stale before it
+    // is written into Codex auth.json.
+    let should_try_mint_api_key = !matches!(
+        override_credential,
+        Some(crate::api::ai_providers::CodexCredentialOverride::OAuth(_))
+    );
+    if should_try_mint_api_key {
+        if let Err(e) =
+            crate::api::ai_providers::ensure_openai_api_key_for_codex(app_working_dir).await
+        {
+            tracing::warn!(
+                "Could not ensure OpenAI API key for Codex (will try chatgpt auth mode): {}",
+                e
+            );
+        }
     }
+
+    let oauth_account_to_prepare = match override_credential {
+        Some(crate::api::ai_providers::CodexCredentialOverride::OAuth(account)) => {
+            Some((*account).clone())
+        }
+        Some(crate::api::ai_providers::CodexCredentialOverride::ApiKey(_)) => None,
+        None => {
+            if crate::api::ai_providers::get_openai_api_key_for_codex_default(app_working_dir)
+                .is_none()
+            {
+                crate::api::ai_providers::get_all_openai_oauth_accounts(app_working_dir)
+                    .into_iter()
+                    .next()
+            } else {
+                None
+            }
+        }
+    };
+    let prepared_oauth_account = match oauth_account_to_prepare.as_ref() {
+        Some(account) => {
+            match crate::api::ai_providers::prepare_codex_oauth_account_for_launch(
+                app_working_dir,
+                account,
+            )
+            .await
+            {
+                Ok(account) => Some(account),
+                Err(e) => {
+                    tracing::error!("Failed to prepare Codex OAuth credentials: {}", e);
+                    return AgentResult::failure(
+                        format!("Failed to prepare Codex OAuth credentials: {}", e),
+                        0,
+                    )
+                    .with_terminal_reason(TerminalReason::AuthError);
+                }
+            }
+        }
+        None => None,
+    };
+    let prepared_override = prepared_oauth_account
+        .as_ref()
+        .map(crate::api::ai_providers::CodexCredentialOverride::OAuth);
+    let workspace_override = prepared_override.as_ref().or(override_credential);
 
     // Ensure Codex auth.json is present in the workspace context (host or container).
     if let Err(e) = crate::api::ai_providers::write_codex_credentials_for_workspace(
         workspace,
         app_working_dir,
-        override_credential,
+        workspace_override,
     ) {
         tracing::error!("Failed to write Codex credentials: {}", e);
         return AgentResult::failure(
@@ -14238,6 +14301,14 @@ pub async fn run_codex_turn(
     let codex_config = crate::backend::codex::client::CodexConfig {
         cli_path,
         model_effort: model_effort.map(|s| s.to_string()),
+        external_chatgpt_auth: prepared_oauth_account.as_ref().map(|account| {
+            crate::backend::codex::client::CodexExternalChatgptAuth {
+                access_token: account.access_token.clone(),
+                chatgpt_account_id: account.chatgpt_account_id.clone(),
+                chatgpt_plan_type: None,
+                working_dir: app_working_dir.to_path_buf(),
+            }
+        }),
         ..Default::default()
     };
 
@@ -14291,6 +14362,13 @@ pub async fn run_codex_turn(
     let mut thinking_emitted = false;
     let mut thinking_done_emitted = false;
     let mut thinking_accumulated = String::new();
+    // Tracks which codex reasoning item `thinking_accumulated` currently
+    // belongs to. When a Thinking event arrives with a different `item_id`,
+    // we finalize the existing buffer and start a fresh one — codex emits
+    // multiple reasoning items per turn (each with its own cumulative
+    // snapshots), and merging them into one buffer produced concatenated
+    // thoughts in stored history (see mission dbc8a7e9 seq 6651).
+    let mut thinking_item: Option<String> = None;
     let mut last_summary: Option<String> = None;
     let mut total_input_tokens: u64 = 0;
     let mut total_output_tokens: u64 = 0;
@@ -14330,14 +14408,52 @@ pub async fn run_codex_turn(
                             text_delta_pending = true;
                         }
                     }
-                    ExecutionEvent::Thinking { content } => {
-                        merge_stream_fragment(&mut thinking_accumulated, &content);
-                        // Stream the canonical cumulative buffer for real-time UI.
+                    ExecutionEvent::Thinking { content, item_id } => {
+                        // Codex emits per-item cumulative snapshots: every
+                        // emit with the same `item_id` contains the previous
+                        // emit as a prefix. When `item_id` changes we're on a
+                        // new reasoning item — finalize the existing buffer
+                        // as `done: true` so it persists as its own thought,
+                        // and start fresh. Falling back to `merge_stream_fragment`
+                        // (the pre-fix behaviour) concatenated unrelated items
+                        // into one buffer because it only knows about byte
+                        // overlap, not item identity.
+                        let item_changed = match (&thinking_item, &item_id) {
+                            (Some(prev), Some(cur)) => prev != cur,
+                            // First event of the turn, or backend doesn't
+                            // expose item IDs: treat as continuation.
+                            _ => false,
+                        };
+                        if item_changed && !thinking_accumulated.is_empty() {
+                            let _ = events_tx.send(AgentEvent::Thinking {
+                                content: std::mem::take(&mut thinking_accumulated),
+                                done: true,
+                                mission_id: Some(mission_id),
+                            });
+                            thinking_done_emitted = true;
+                        }
+                        if item_id.is_some() {
+                            thinking_item = item_id;
+                            // Per-item cumulative: each new snapshot replaces
+                            // the buffer (longest wins; shorter echoes are
+                            // dropped to keep the buffer monotone).
+                            if content.len() >= thinking_accumulated.len() {
+                                thinking_accumulated = content;
+                            }
+                        } else {
+                            // Unknown-item backends still use overlap-based
+                            // merging so a CLI that resends a partial
+                            // snapshot doesn't double words.
+                            merge_stream_fragment(&mut thinking_accumulated, &content);
+                        }
                         let _ = events_tx.send(AgentEvent::Thinking {
                             content: thinking_accumulated.clone(),
                             done: false,
                             mission_id: Some(mission_id),
                         });
+                        if !thinking_accumulated.is_empty() {
+                            thinking_done_emitted = false;
+                        }
                         thinking_emitted = true;
                     }
                     ExecutionEvent::ToolCall { id, name, args } => {
@@ -14352,6 +14468,7 @@ pub async fn run_codex_turn(
                             });
                             thinking_done_emitted = true;
                         }
+                        thinking_item = None;
                         pending_tools.insert(id.clone(), name.clone());
                         let _ = events_tx.send(AgentEvent::ToolCall {
                             tool_call_id: id,
@@ -14899,7 +15016,7 @@ pub async fn run_gemini_turn(
                             mission_id: Some(mission_id),
                         });
                     }
-                    ExecutionEvent::Thinking { content } => {
+                    ExecutionEvent::Thinking { content, item_id: _ } => {
                         merge_stream_fragment(&mut thinking_accumulated, &content);
                         // Stream the canonical cumulative buffer for real-time UI.
                         let _ = events_tx.send(AgentEvent::Thinking {
@@ -14907,6 +15024,9 @@ pub async fn run_gemini_turn(
                             done: false,
                             mission_id: Some(mission_id),
                         });
+                        if !thinking_accumulated.is_empty() {
+                            thinking_done_emitted = false;
+                        }
                         thinking_emitted = true;
                     }
                     ExecutionEvent::ToolCall { id, name, args } => {

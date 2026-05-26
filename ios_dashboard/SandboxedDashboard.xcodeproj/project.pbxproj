@@ -17,6 +17,9 @@
 		2BBA61051DFCB7A780604B87 /* NetworkResilienceTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1828D2FC9160FC8677E10502 /* NetworkResilienceTests.swift */; };
 		3A706E457E3E27DA1B69E152 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 750C4C8090EAD0168794EEE4 /* Assets.xcassets */; };
 		40C09530EC6F9C083B5474C4 /* GlassButton.swift in Sources */ = {isa = PBXBuildFile; fileRef = D81DFFD4B67ABE07FB546B2B /* GlassButton.swift */; };
+		43B4C08E9D841043B1413176 /* ControlPerformanceDiagnostics.swift in Sources */ = {isa = PBXBuildFile; fileRef = 43B4C08D9D841043B1413176 /* ControlPerformanceDiagnostics.swift */; };
+		43B4C0909D841043B1413176 /* ChatHistoryReducer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 43B4C08F9D841043B1413176 /* ChatHistoryReducer.swift */; };
+		43B4C0929D841043B1413176 /* ImageMemoryCache.swift in Sources */ = {isa = PBXBuildFile; fileRef = 43B4C0919D841043B1413176 /* ImageMemoryCache.swift */; };
 		46420BF679A3BD9FD381FB0A /* ModelTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7559F3F4553AD74130B1BC34 /* ModelTests.swift */; };
 		48ADF499E7EE67D254FBE45A /* LoadingView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4CC2B6E9848FF220F103DED2 /* LoadingView.swift */; };
 		4A639CAB6EE0ED8079A721C2 /* ToolUIView.swift in Sources */ = {isa = PBXBuildFile; fileRef = FF491A4406AFF7E284592477 /* ToolUIView.swift */; };
@@ -88,6 +91,9 @@
 		384691169D9EC024B03AA57F /* WorkspacesView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspacesView.swift; sourceTree = "<group>"; };
 		3B74AB5DF6829813AE79229D /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
 		3BE62F9666647C1F41F15251 /* DesktopStreamService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DesktopStreamService.swift; sourceTree = "<group>"; };
+		43B4C08D9D841043B1413176 /* ControlPerformanceDiagnostics.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ControlPerformanceDiagnostics.swift; sourceTree = "<group>"; };
+		43B4C08F9D841043B1413176 /* ChatHistoryReducer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatHistoryReducer.swift; sourceTree = "<group>"; };
+		43B4C0919D841043B1413176 /* ImageMemoryCache.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ImageMemoryCache.swift; sourceTree = "<group>"; };
 		4802677F01F1504267EC2BE2 /* SandboxedDashboardTests.xctest */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.cfbundle; path = SandboxedDashboardTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		492E8CF2E0A3AEF64A472C85 /* FileEntry.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FileEntry.swift; sourceTree = "<group>"; };
 		4CC2B6E9848FF220F103DED2 /* LoadingView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LoadingView.swift; sourceTree = "<group>"; };
@@ -201,8 +207,10 @@
 				D9E023EEFFFA9B1092B66006 /* ANSIParser.swift */,
 				55F4658A2D65748FC7AC5DE3 /* APIService.swift */,
 				F6993AD59CA0D7392AAACDC2 /* BackendAgentService.swift */,
+				43B4C08D9D841043B1413176 /* ControlPerformanceDiagnostics.swift */,
 				3BE62F9666647C1F41F15251 /* DesktopStreamService.swift */,
 				8EB13B92B70F6884D323E5FF /* FidoApprovalState.swift */,
+				43B4C0919D841043B1413176 /* ImageMemoryCache.swift */,
 				EB3EDA65C036030CC45BAD0E /* NavigationState.swift */,
 				EFD2C112534D498211B26C38 /* NetworkMonitor.swift */,
 				6922E2F0E17EDB3A8400D473 /* TerminalState.swift */,
@@ -288,6 +296,7 @@
 				7BF62094FF29193B33EC7009 /* Automation.swift */,
 				CAC389FA8B9B5C969E606A22 /* Backend.swift */,
 				370F364BA05D1236D9B630AB /* ChatMessage.swift */,
+				43B4C08F9D841043B1413176 /* ChatHistoryReducer.swift */,
 				CCD9630B60B3E470E64B1AB4 /* FidoSignRequest.swift */,
 				492E8CF2E0A3AEF64A472C85 /* FileEntry.swift */,
 				0C6DBBABC4AE0FD4368A185C /* Mission.swift */,
@@ -423,10 +432,13 @@
 				D5968B6DE2272A9C8C3A4A0E /* AutomationsView.swift in Sources */,
 				F6B883AB96DE0FFF99A2A614 /* Backend.swift in Sources */,
 				BFD7D29C1F46E9F130A05F34 /* BackendAgentService.swift in Sources */,
+				43B4C0909D841043B1413176 /* ChatHistoryReducer.swift in Sources */,
 				B6263AC356BE51962E2D0145 /* ChatMessage.swift in Sources */,
 				66E208F9D4759B79ED653374 /* ContentView.swift in Sources */,
+				43B4C08E9D841043B1413176 /* ControlPerformanceDiagnostics.swift in Sources */,
 				5D1FB1BE4D58CC95A500B684 /* ControlView.swift in Sources */,
 				B3680EB29951C459A8C8A35A /* DesktopStreamService.swift in Sources */,
+				43B4C0929D841043B1413176 /* ImageMemoryCache.swift in Sources */,
 				8573A897FBBC1697AE1AA7BA /* DesktopStreamView.swift in Sources */,
 				50EBDCFBA58915481F5EC995 /* FidoApprovalOverlay.swift in Sources */,
 				D057B578B2884C4B2B36B1C3 /* FidoApprovalState.swift in Sources */,

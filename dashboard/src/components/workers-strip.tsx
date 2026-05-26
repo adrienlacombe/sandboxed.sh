@@ -41,7 +41,7 @@ function chipStatusFor(mission: Mission, info?: RunningMissionInfo): ChipStatus 
     if (info.state === 'running') {
       return {
         icon: <Loader2 className="h-3 w-3 animate-spin" />,
-        color: 'text-indigo-300',
+        color: 'text-indigo-700 dark:text-indigo-300',
         bg: 'bg-indigo-500/10 border-indigo-500/25 hover:bg-indigo-500/15',
         activity: info.current_activity || null,
         isActive: true,
@@ -50,7 +50,7 @@ function chipStatusFor(mission: Mission, info?: RunningMissionInfo): ChipStatus 
     if (info.state === 'waiting_for_tool') {
       return {
         icon: <Clock className="h-3 w-3" />,
-        color: 'text-amber-300',
+        color: 'text-amber-700 dark:text-amber-300',
         bg: 'bg-amber-500/10 border-amber-500/25 hover:bg-amber-500/15',
         activity: info.current_activity || 'Waiting for tool',
         isActive: true,
@@ -59,7 +59,7 @@ function chipStatusFor(mission: Mission, info?: RunningMissionInfo): ChipStatus 
     if (info.state === 'queued') {
       return {
         icon: <Clock className="h-3 w-3" />,
-        color: 'text-white/60',
+        color: 'text-foreground/65 dark:text-white/60',
         bg: 'bg-white/[0.03] border-white/[0.08] hover:bg-white/[0.06]',
         activity: 'Queued',
         isActive: false,
@@ -71,7 +71,7 @@ function chipStatusFor(mission: Mission, info?: RunningMissionInfo): ChipStatus 
     case 'completed':
       return {
         icon: <CheckCircle className="h-3 w-3" />,
-        color: 'text-emerald-300',
+        color: 'text-emerald-700 dark:text-emerald-300',
         bg: 'bg-emerald-500/10 border-emerald-500/20 hover:bg-emerald-500/15',
         activity: null,
         isActive: false,
@@ -79,7 +79,7 @@ function chipStatusFor(mission: Mission, info?: RunningMissionInfo): ChipStatus 
     case 'failed':
       return {
         icon: <XCircle className="h-3 w-3" />,
-        color: 'text-red-300',
+        color: 'text-red-700 dark:text-red-300',
         bg: 'bg-red-500/10 border-red-500/20 hover:bg-red-500/15',
         activity: null,
         isActive: false,
@@ -87,7 +87,7 @@ function chipStatusFor(mission: Mission, info?: RunningMissionInfo): ChipStatus 
     case 'interrupted':
       return {
         icon: <AlertTriangle className="h-3 w-3" />,
-        color: 'text-amber-300',
+        color: 'text-amber-700 dark:text-amber-300',
         bg: 'bg-amber-500/10 border-amber-500/20 hover:bg-amber-500/15',
         activity: null,
         isActive: false,
@@ -95,7 +95,7 @@ function chipStatusFor(mission: Mission, info?: RunningMissionInfo): ChipStatus 
     case 'not_feasible':
       return {
         icon: <Ban className="h-3 w-3" />,
-        color: 'text-rose-300',
+        color: 'text-rose-700 dark:text-rose-300',
         bg: 'bg-rose-500/10 border-rose-500/20 hover:bg-rose-500/15',
         activity: null,
         isActive: false,
@@ -103,7 +103,7 @@ function chipStatusFor(mission: Mission, info?: RunningMissionInfo): ChipStatus 
     case 'active':
       return {
         icon: <Loader2 className="h-3 w-3 animate-spin" />,
-        color: 'text-indigo-300',
+        color: 'text-indigo-700 dark:text-indigo-300',
         bg: 'bg-indigo-500/10 border-indigo-500/25 hover:bg-indigo-500/15',
         activity: null,
         isActive: true,
@@ -111,7 +111,7 @@ function chipStatusFor(mission: Mission, info?: RunningMissionInfo): ChipStatus 
     default:
       return {
         icon: <Clock className="h-3 w-3" />,
-        color: 'text-white/50',
+        color: 'text-foreground/60 dark:text-white/50',
         bg: 'bg-white/[0.03] border-white/[0.08] hover:bg-white/[0.06]',
         activity: null,
         isActive: false,
@@ -217,7 +217,7 @@ export const WorkersStrip = memo(function WorkersStrip({
             title={status.activity ? `${title}: ${status.activity}` : title}
           >
             <span className={cn('shrink-0', status.color)}>{status.icon}</span>
-            <span className="truncate text-white/85">{title}</span>
+            <span className="truncate text-foreground/85">{title}</span>
             {status.activity && (
               <span className="hidden md:inline truncate text-white/40 max-w-[120px]">
                 · {status.activity}

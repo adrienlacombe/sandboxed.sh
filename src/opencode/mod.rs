@@ -953,7 +953,10 @@ fn handle_part_update(props: &serde_json::Value, state: &mut SseState) -> Option
             content_preview = %content.chars().take(100).collect::<String>(),
             "Emitting Thinking event from SSE"
         );
-        Some(OpenCodeEvent::Thinking { content })
+        Some(OpenCodeEvent::Thinking {
+            content,
+            item_id: None,
+        })
     } else {
         // Skip if content is identical to last emitted text
         if state.last_emitted_text.as_ref() == Some(&content) {

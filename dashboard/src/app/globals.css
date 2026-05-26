@@ -24,6 +24,8 @@
    ========================================================================= */
 
 :root {
+  color-scheme: dark;
+
   /* Backgrounds (dark mode) - No pure black */
   --background: 18 18 20; /* #121214 - primary surface */
   --background-elevated: 28 28 30; /* #1C1C1E - cards, panels */
@@ -47,6 +49,41 @@
   /* Borders - subtle */
   --border: 255 255 255; /* Used with /0.06 */
   --border-elevated: 255 255 255; /* Used with /0.08 */
+
+  /* Code surfaces */
+  --code-background: 30 32 38;
+  --code-border: 255 255 255;
+  --code-foreground: 220 224 232;
+  --code-inline-background: 255 255 255;
+  --code-inline-foreground: 165 180 252;
+}
+
+@media (prefers-color-scheme: light) {
+  :root {
+    color-scheme: light;
+
+    /* Backgrounds (light mode) */
+    --background: 247 248 251; /* #F7F8FB - primary surface */
+    --background-elevated: 255 255 255; /* cards, panels */
+    --background-tertiary: 235 238 244; /* nested elements */
+
+    /* Text Hierarchy */
+    --foreground: 17 24 39; /* #111827 */
+    --foreground-secondary: 75 85 99; /* #4B5563 */
+    --foreground-tertiary: 107 114 128; /* #6B7280 */
+    --foreground-muted: 156 163 175; /* #9CA3AF */
+
+    /* Borders */
+    --border: 17 24 39;
+    --border-elevated: 17 24 39;
+
+    /* Code surfaces */
+    --code-background: 244 246 250;
+    --code-border: 17 24 39;
+    --code-foreground: 31 41 55;
+    --code-inline-background: 224 231 255;
+    --code-inline-foreground: 49 46 129;
+  }
 }
 
 @theme inline {
@@ -105,6 +142,18 @@ body {
   min-height: 100vh;
 }
 
+@media (prefers-color-scheme: light) {
+  button:focus-visible,
+  a:focus-visible {
+    background-color: rgba(17, 24, 39, 0.06) !important;
+  }
+
+  input::placeholder,
+  textarea::placeholder {
+    color: rgb(var(--foreground-tertiary) / 0.75) !important;
+  }
+}
+
 /* =========================================================================
    Focus States - subtle background changes, no outlines
    ========================================================================= */
@@ -156,6 +205,211 @@ select:focus-visible {
 
 ::-webkit-scrollbar-thumb:hover {
   background: rgb(var(--foreground-tertiary));
+}
+
+@media (prefers-color-scheme: light) {
+  /*
+   * The dashboard was originally authored with dark-mode utility classes
+   * such as text-white/60, bg-white/[0.04], and border-white/[0.06].
+   * Remap those neutral utilities in light mode so the existing dark theme
+   * stays intact while system light mode gets readable surfaces and text.
+   */
+  [class~="text-white"] {
+    color: rgb(var(--foreground) / 0.88);
+  }
+
+  [class~="text-white/90"],
+  [class~="text-white/80"],
+  [class~="text-white/70"] {
+    color: rgb(var(--foreground) / 0.78);
+  }
+
+  [class~="text-white/60"],
+  [class~="text-white/50"] {
+    color: rgb(var(--foreground-secondary) / 0.9);
+  }
+
+  [class~="text-white/45"],
+  [class~="text-white/40"],
+  [class~="text-white/30"],
+  [class~="text-white/20"],
+  [class~="text-white/10"] {
+    color: rgb(var(--foreground-tertiary) / 0.92);
+  }
+
+  [class~="bg-white/[0.01]"],
+  [class~="bg-white/[0.02]"],
+  [class~="bg-white/[0.03]"],
+  [class~="bg-white/[0.04]"],
+  [class~="bg-white/[0.06]"],
+  [class~="bg-white/[0.08]"],
+  [class~="bg-white/5"],
+  [class~="bg-white/10"] {
+    background-color: rgb(17 24 39 / 0.04);
+  }
+
+  [class*="hover:bg-white"]:hover {
+    background-color: rgb(17 24 39 / 0.07);
+  }
+
+  [class~="border-white/[0.04]"],
+  [class~="border-white/[0.06]"],
+  [class~="border-white/[0.08]"],
+  [class~="border-white/[0.12]"],
+  [class~="border-white/10"],
+  [class~="border-white/20"] {
+    border-color: rgb(17 24 39 / 0.09);
+  }
+
+  [class*="hover:border-white"]:hover {
+    border-color: rgb(17 24 39 / 0.16);
+  }
+
+  [class~="bg-black/40"],
+  [class~="bg-black/50"],
+  [class~="bg-black/60"],
+  [class~="bg-black/80"] {
+    background-color: rgb(255 255 255 / 0.82);
+  }
+
+  [class~="bg-[#1a1a1c]"],
+  [class~="bg-[#1a1a1a]"],
+  [class~="bg-[#1c1c1e]/95"],
+  [class~="bg-[#121214]"],
+  [class~="bg-[#111113]"],
+  [class~="bg-[#0f0f11]"] {
+    background-color: rgb(255 255 255);
+  }
+
+  [class~="bg-slate-800"],
+  [class~="[&>option]:bg-slate-800"] > option,
+  [class~="[&>optgroup]:bg-slate-900"] > optgroup {
+    background-color: rgb(255 255 255);
+  }
+
+  [class~="[&>option]:text-white"] > option,
+  [class~="[&>optgroup]:text-white/70"] > optgroup {
+    color: rgb(var(--foreground));
+  }
+
+  [class*="bg-indigo-"][class*="text-white"],
+  [class*="bg-violet-"][class*="text-white"],
+  [class*="bg-red-"][class*="text-white"],
+  [class*="bg-emerald-"][class*="text-white"],
+  [class*="bg-green-"][class*="text-white"],
+  [class*="bg-blue-"][class*="text-white"],
+  [class*="bg-cyan-"][class*="text-white"],
+  [class*="bg-amber-"][class*="text-white"],
+  [class*="bg-orange-"][class*="text-white"] {
+    color: #ffffff;
+  }
+
+  [class~="bg-indigo-500/10"][class*="text-white"],
+  [class~="bg-indigo-500/15"][class*="text-white"],
+  [class~="bg-indigo-500/20"][class*="text-white"],
+  [class~="bg-indigo-500/30"][class*="text-white"] {
+    color: rgb(var(--foreground) / 0.88);
+  }
+}
+
+.mission-selector-trigger {
+  background-color: rgb(var(--accent) / 0.2);
+  color: rgb(255 255 255 / 0.84);
+}
+
+.mission-selector-trigger:hover {
+  background-color: rgb(var(--accent) / 0.3);
+}
+
+.mission-selector-trigger * {
+  color: inherit !important;
+}
+
+@media (prefers-color-scheme: light) {
+  .mission-selector-trigger {
+    background-color: rgb(224 231 255);
+    border: 1px solid rgb(165 180 252 / 0.55);
+    color: rgb(49 46 129);
+  }
+
+  .mission-selector-trigger:hover {
+    background-color: rgb(199 210 254);
+  }
+}
+
+.user-message-bubble {
+  color: #ffffff;
+}
+
+.user-message-bubble * {
+  color: inherit;
+}
+
+.user-message-bubble-solid {
+  background-color: rgb(var(--accent));
+}
+
+.user-message-bubble-queued {
+  background-color: rgb(var(--accent) / 0.2);
+  border-color: rgb(var(--accent) / 0.6);
+}
+
+@media (prefers-color-scheme: light) {
+  .user-message-bubble {
+    color: rgb(49 46 129);
+  }
+
+  .user-message-bubble-solid {
+    background-color: rgb(224 231 255);
+    border: 1px solid rgb(165 180 252 / 0.55);
+  }
+
+  .user-message-bubble-queued {
+    background-color: rgb(238 242 255);
+    border-color: rgb(129 140 248 / 0.7);
+  }
+}
+
+.mission-switcher-row-selected {
+  color: rgb(255 255 255 / 0.9);
+}
+
+.mission-switcher-row-selected * {
+  color: inherit;
+}
+
+@media (prefers-color-scheme: light) {
+  .mission-switcher-row-selected {
+    color: rgb(49 46 129);
+  }
+
+  .mission-switcher-description {
+    color: rgb(var(--foreground-secondary) / 0.92) !important;
+  }
+
+  .mission-switcher-description-muted {
+    color: rgb(var(--foreground-tertiary) / 0.96) !important;
+  }
+
+  .mission-switcher-row-selected [class*="text-white"],
+  .mission-switcher-row-selected [class*="text-indigo"],
+  .mission-switcher-row-selected [class*="text-violet"],
+  .mission-switcher-row-selected [class*="text-cyan"] {
+    color: inherit !important;
+  }
+
+  .mission-switcher-row-selected .mission-switcher-description,
+  .mission-switcher-row-selected .mission-switcher-description-muted {
+    color: rgb(49 46 129 / 0.82) !important;
+  }
+}
+
+@media (prefers-color-scheme: light) {
+  .workbench-mission-description {
+    background-color: rgb(255 255 255 / 0.76) !important;
+    border-color: rgb(17 24 39 / 0.1) !important;
+    color: rgb(var(--foreground-secondary) / 0.95) !important;
+  }
 }
 
 /* =========================================================================
@@ -296,6 +550,14 @@ select:focus-visible {
   border: 1px solid rgba(255, 255, 255, 0.06);
 }
 
+@media (prefers-color-scheme: light) {
+  .glass-panel {
+    background: rgba(255, 255, 255, 0.76);
+    border-color: rgba(17, 24, 39, 0.09);
+    box-shadow: 0 1px 2px rgba(17, 24, 39, 0.04);
+  }
+}
+
 .glass {
   background: rgb(var(--background-elevated) / 0.7);
   backdrop-filter: blur(20px) saturate(180%);
@@ -312,9 +574,28 @@ select:focus-visible {
   transition: background-color 150ms ease-out, border-color 150ms ease-out;
 }
 
+@media (prefers-color-scheme: light) {
+  .card {
+    background: rgba(255, 255, 255, 0.78);
+    border-color: rgba(17, 24, 39, 0.08);
+  }
+
+  .card:hover {
+    background: rgba(255, 255, 255, 0.95);
+    border-color: rgba(17, 24, 39, 0.14);
+  }
+}
+
 .card:hover {
   background: rgba(255, 255, 255, 0.04);
   border-color: rgba(255, 255, 255, 0.08);
+}
+
+@media (prefers-color-scheme: light) {
+  .card:hover {
+    background: rgba(255, 255, 255, 0.95);
+    border-color: rgba(17, 24, 39, 0.14);
+  }
 }
 
 .card-interactive {
@@ -332,6 +613,13 @@ select:focus-visible {
   backdrop-filter: blur(20px);
 }
 
+@media (prefers-color-scheme: light) {
+  .stat-panel {
+    background: rgba(255, 255, 255, 0.82);
+    border-color: rgba(17, 24, 39, 0.09);
+  }
+}
+
 .stat-label {
   font-size: 10px;
   text-transform: uppercase;
@@ -343,13 +631,13 @@ select:focus-visible {
 .stat-value {
   font-size: 1.5rem;
   font-weight: 300;
-  color: white;
+  color: rgb(var(--foreground));
   font-variant-numeric: tabular-nums;
 }
 
 .stat-suffix {
   font-size: 0.875rem;
-  color: rgba(255, 255, 255, 0.5);
+  color: rgb(var(--foreground-secondary) / 0.85);
   margin-left: 0.125rem;
 }
 
@@ -439,6 +727,13 @@ select:focus-visible {
   font-family: var(--font-mono);
 }
 
+@media (prefers-color-scheme: light) {
+  .tag {
+    color: rgb(var(--foreground-tertiary));
+    background: rgba(17, 24, 39, 0.05);
+  }
+}
+
 /* =========================================================================
    XTerm Terminal Fixes
    ========================================================================= */
@@ -452,12 +747,12 @@ select:focus-visible {
    Prose styles for markdown
    ========================================================================= */
 .prose-glass {
-  color: rgba(255, 255, 255, 0.9);
+  color: rgb(var(--foreground) / 0.9);
   overflow-wrap: anywhere;
 }
 
 .prose-glass strong {
-  color: white;
+  color: rgb(var(--foreground));
 }
 
 .prose-glass a {
@@ -466,14 +761,17 @@ select:focus-visible {
 }
 
 .prose-glass code {
-  background: rgb(var(--background-tertiary));
+  background: rgb(var(--code-inline-background) / 0.72);
+  color: rgb(var(--code-inline-foreground));
   padding: 0.125rem 0.25rem;
   border-radius: 0.25rem;
   font-size: 0.875em;
 }
 
 .prose-glass pre {
-  background: rgb(var(--background-tertiary));
+  background: rgb(var(--code-background));
+  color: rgb(var(--code-foreground));
+  border: 1px solid rgb(var(--code-border) / 0.08);
   border-radius: 0.5rem;
   padding: 1rem;
   overflow-x: auto;
@@ -481,7 +779,19 @@ select:focus-visible {
 
 .prose-glass pre code {
   background: transparent;
+  color: inherit;
   padding: 0;
+}
+
+@media (prefers-color-scheme: light) {
+  .prose-glass pre {
+    border-color: rgb(var(--code-border) / 0.1);
+    box-shadow: inset 0 0 0 1px rgb(255 255 255 / 0.65);
+  }
+
+  .prose-glass [class*="text-indigo-300"] {
+    color: rgb(var(--code-inline-foreground));
+  }
 }
 
 .prose-glass img {
@@ -506,7 +816,7 @@ select:focus-visible {
   border-left: 3px solid rgb(var(--accent));
   padding-left: 1rem;
   margin: 0.5rem 0;
-  color: rgba(255, 255, 255, 0.7);
+  color: rgb(var(--foreground-secondary) / 0.9);
   font-style: italic;
 }
 
@@ -514,7 +824,7 @@ select:focus-visible {
 .prose-glass h2,
 .prose-glass h3,
 .prose-glass h4 {
-  color: white;
+  color: rgb(var(--foreground));
   font-weight: 600;
   margin-top: 1rem;
   margin-bottom: 0.5rem;

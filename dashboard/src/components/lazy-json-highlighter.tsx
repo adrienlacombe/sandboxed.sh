@@ -13,7 +13,8 @@ import type { CSSProperties } from "react";
 // Lazy-loaded module — only fetched on first render of a highlighted block.
 let highlighterModulePromise: Promise<{
   Highlighter: typeof import("react-syntax-highlighter").default;
-  theme: Record<string, CSSProperties>;
+  darkTheme: Record<string, CSSProperties>;
+  lightTheme: Record<string, CSSProperties>;
 }> | null = null;
 
 function getHighlighterModule() {
@@ -23,7 +24,14 @@ function getHighlighterModule() {
       import("react-syntax-highlighter/dist/esm/styles/prism").then(
         (m) => m.oneDark
       ),
-    ]).then(([Highlighter, theme]) => ({ Highlighter, theme }));
+      import("react-syntax-highlighter/dist/esm/styles/prism").then(
+        (m) => m.oneLight
+      ),
+    ]).then(([Highlighter, darkTheme, lightTheme]) => ({
+      Highlighter,
+      darkTheme,
+      lightTheme,
+    }));
   }
   return highlighterModulePromise;
 }
@@ -36,13 +44,15 @@ interface LazyJsonHighlighterProps {
 
 export const LazyJsonHighlighter = memo(function LazyJsonHighlighter({
   children,
-  background = "rgba(0, 0, 0, 0.2)",
+  background = "rgb(var(--code-background))",
   textColor,
 }: LazyJsonHighlighterProps) {
   const [Loaded, setLoaded] = useState<{
     Highlighter: typeof import("react-syntax-highlighter").default;
-    theme: Record<string, CSSProperties>;
+    darkTheme: Record<string, CSSProperties>;
+    lightTheme: Record<string, CSSProperties>;
   } | null>(null);
+  const [isLight, setIsLight] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -52,6 +62,14 @@ export const LazyJsonHighlighter = memo(function LazyJsonHighlighter({
     return () => {
       cancelled = true;
     };
+  }, []);
+
+  useEffect(() => {
+    const query = window.matchMedia("(prefers-color-scheme: light)");
+    const update = () => setIsLight(query.matches);
+    update();
+    query.addEventListener("change", update);
+    return () => query.removeEventListener("change", update);
   }, []);
 
   const monoFont =
@@ -68,7 +86,8 @@ export const LazyJsonHighlighter = memo(function LazyJsonHighlighter({
           fontSize: "0.75rem",
           borderRadius: "0.25rem",
           background,
-          color: textColor ?? "#abb2bf",
+          color: textColor ?? "rgb(var(--code-foreground))",
+          border: "1px solid rgb(var(--code-border) / 0.08)",
           fontFamily: monoFont,
           whiteSpace: "pre-wrap",
           wordBreak: "break-word",
@@ -80,17 +99,18 @@ export const LazyJsonHighlighter = memo(function LazyJsonHighlighter({
     );
   }
 
-  const { Highlighter, theme } = Loaded;
+  const { Highlighter, darkTheme, lightTheme } = Loaded;
   return (
     <Highlighter
       language="json"
-      style={theme}
+      style={isLight ? lightTheme : darkTheme}
       customStyle={{
         margin: 0,
         padding: "0.5rem",
         fontSize: "0.75rem",
         borderRadius: "0.25rem",
         background,
+        border: "1px solid rgb(var(--code-border) / 0.08)",
       }}
       codeTagProps={{
         style: {

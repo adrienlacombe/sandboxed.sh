@@ -891,7 +891,13 @@ final class APIService {
     }
 
     private func executeWithResponse<T: Decodable>(_ request: URLRequest) async throws -> (T, HTTPURLResponse) {
-        let (data, response) = try await Self.jsonSession.data(for: request)
+        let requestLabel = "\(request.httpMethod ?? "GET") \(request.url?.path ?? "?")"
+        let (data, response) = try await ControlPerformanceDiagnostics.shared.measureAsync(
+            "api.request",
+            detail: requestLabel
+        ) {
+            try await Self.jsonSession.data(for: request)
+        }
 
         guard let httpResponse = response as? HTTPURLResponse else {
             throw APIError.invalidResponse
@@ -921,9 +927,15 @@ final class APIService {
         // value is treated as immutable from the moment we ship it back.
         let box: DecodedBox<T>
         do {
-            box = try await Task.detached(priority: .userInitiated) {
-                try DecodedBox(value: JSONDecoder().decode(T.self, from: data))
-            }.value
+            box = try await ControlPerformanceDiagnostics.shared.measureAsync(
+                "api.decode",
+                detail: requestLabel,
+                count: data.count
+            ) {
+                try await Task.detached(priority: .userInitiated) {
+                    try DecodedBox(value: JSONDecoder().decode(T.self, from: data))
+                }.value
+            }
         } catch {
             throw APIError.decodingError(error)
         }
