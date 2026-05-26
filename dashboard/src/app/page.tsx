@@ -455,12 +455,17 @@ function OverviewPageContent() {
   const handleDelete = useCallback(
     async (id: string) => {
       try {
-        await deleteMission(id);
+        const result = await deleteMission(id);
+        const deletedIds = new Set(result.deleted_ids ?? [id]);
         mutateMissions(
-          (current) => (current ? current.filter((m) => m.id !== id) : current),
+          (current) => (current ? current.filter((m) => !deletedIds.has(m.id)) : current),
           false
         );
-        toast.success('Mission deleted');
+        toast.success(
+          result.deleted_count && result.deleted_count > 1
+            ? `Mission and ${result.deleted_count - 1} workers deleted`
+            : 'Mission deleted'
+        );
       } catch {
         toast.error('Failed to delete mission');
       }

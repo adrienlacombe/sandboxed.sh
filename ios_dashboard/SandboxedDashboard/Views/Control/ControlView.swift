@@ -874,7 +874,15 @@ struct ControlView: View {
         case .reconnecting: sseIsRecovering = true
         default: sseIsRecovering = false
         }
+        let streamIsTerminalBadState: Bool
+        switch connectionState {
+        case .authExpired, .invalidConfiguration:
+            streamIsTerminalBadState = true
+        default:
+            streamIsTerminalBadState = false
+        }
         Task {
+            guard !streamIsTerminalBadState else { return }
             if !sseIsRecovering, let missionId = viewingMissionId {
                 if !shouldSkipForegroundReload(missionId: missionId) {
                     await reloadMissionFromServer(id: missionId)
@@ -3164,7 +3172,6 @@ struct ControlView: View {
         let generation = streamGeneration
         streamTask?.cancel()
         let missionFilter = viewingMissionId
-        let sinceSeq = missionFilter.flatMap { missionMaxSeq[$0] }
         streamTask = Task {
             // Exponential backoff with jitter: 1s, 2s, 4s, 8s, 16s, max 30s.
             let maxBackoff: UInt64 = 30
@@ -3207,7 +3214,9 @@ struct ControlView: View {
                         await MainActor.run {
                             guard generation == self.streamGeneration else { return }
                             let hasLiveSignal = batch.contains { event in
-                                event.type != "error" && event.type != "parseError"
+                                event.type != "error"
+                                    && event.type != "connected"
+                                    && event.type != "parseError"
                             }
                             let wasReconnecting = !self.connectionState.isConnected && self.reconnectAttempt > 0
                             if hasLiveSignal && !self.connectionState.isConnected {

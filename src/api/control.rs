@@ -5136,28 +5136,93 @@ pub async fn delete_mission(
     let control = control_for_user(&state, &user).await;
     let running = get_running_missions(&control).await?;
 
-    if running.iter().any(|m| m.mission_id == mission_id) {
+    let deleted_ids =
+        delete_mission_with_children(&control.mission_store, mission_id, &running).await?;
+
+    for id in &deleted_ids {
+        clear_mission_metadata_refresh_state(*id);
+    }
+
+    Ok(Json(serde_json::json!({
+        "ok": true,
+        "deleted": mission_id,
+        "deleted_ids": deleted_ids,
+        "deleted_count": deleted_ids.len()
+    })))
+}
+
+async fn collect_child_mission_ids(
+    mission_store: &Arc<dyn MissionStore>,
+    parent_id: Uuid,
+) -> Result<Vec<Uuid>, (StatusCode, String)> {
+    let mut visited = HashSet::new();
+    let mut stack = vec![parent_id];
+    let mut child_ids = Vec::new();
+
+    while let Some(id) = stack.pop() {
+        let children = mission_store
+            .get_child_missions(id)
+            .await
+            .map_err(internal_error)?;
+
+        for child in children {
+            if visited.insert(child.id) {
+                child_ids.push(child.id);
+                stack.push(child.id);
+            }
+        }
+    }
+
+    Ok(child_ids)
+}
+
+async fn delete_mission_with_children(
+    mission_store: &Arc<dyn MissionStore>,
+    mission_id: Uuid,
+    running: &[super::mission_runner::RunningMissionInfo],
+) -> Result<Vec<Uuid>, (StatusCode, String)> {
+    let Some(_) = mission_store
+        .get_mission(mission_id)
+        .await
+        .map_err(internal_error)?
+    else {
+        return Err((StatusCode::NOT_FOUND, "Mission not found".to_string()));
+    };
+
+    let child_ids = collect_child_mission_ids(mission_store, mission_id).await?;
+    let mut ids_to_delete = Vec::with_capacity(child_ids.len() + 1);
+    ids_to_delete.push(mission_id);
+    ids_to_delete.extend(child_ids.iter().copied());
+
+    if let Some(running_mission) = running
+        .iter()
+        .find(|m| ids_to_delete.contains(&m.mission_id))
+    {
         return Err((
             StatusCode::CONFLICT,
-            "Cannot delete a running mission. Cancel it first.".to_string(),
+            format!(
+                "Cannot delete a running mission or worker ({}). Cancel it first.",
+                running_mission.mission_id
+            ),
         ));
     }
 
-    let deleted = control
-        .mission_store
+    for child_id in child_ids.iter().rev() {
+        mission_store
+            .delete_mission(*child_id)
+            .await
+            .map_err(internal_error)?;
+    }
+
+    let deleted = mission_store
         .delete_mission(mission_id)
         .await
         .map_err(internal_error)?;
-
-    if deleted {
-        clear_mission_metadata_refresh_state(mission_id);
-        Ok(Json(serde_json::json!({
-            "ok": true,
-            "deleted": mission_id
-        })))
-    } else {
-        Err((StatusCode::NOT_FOUND, "Mission not found".to_string()))
+    if !deleted {
+        return Err((StatusCode::NOT_FOUND, "Mission not found".to_string()));
     }
+
+    Ok(ids_to_delete)
 }
 
 /// Delete all empty "Untitled" missions.
@@ -14939,6 +15004,54 @@ mod tests {
             synthetic_thought_from_text_delta(&mut pending, mission_id, &tool_call),
             Some("Now let me run the build.".to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn delete_mission_with_children_removes_worker_missions() {
+        let store: Arc<dyn MissionStore> = Arc::new(mission_store::InMemoryMissionStore::new());
+        let boss = store
+            .create_mission(Some("Boss mission"), None, None, None, None, None, None)
+            .await
+            .expect("boss mission should be created");
+        let worker = store
+            .create_mission_with_parent(
+                Some("Worker mission"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(boss.id),
+                None,
+            )
+            .await
+            .expect("worker mission should be created");
+        let nested_worker = store
+            .create_mission_with_parent(
+                Some("Nested worker mission"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(worker.id),
+                None,
+            )
+            .await
+            .expect("nested worker mission should be created");
+
+        let deleted_ids = delete_mission_with_children(&store, boss.id, &[])
+            .await
+            .expect("delete should cascade to workers");
+
+        assert_eq!(deleted_ids[0], boss.id);
+        assert!(deleted_ids.contains(&worker.id));
+        assert!(deleted_ids.contains(&nested_worker.id));
+        assert!(store.get_mission(boss.id).await.unwrap().is_none());
+        assert!(store.get_mission(worker.id).await.unwrap().is_none());
+        assert!(store.get_mission(nested_worker.id).await.unwrap().is_none());
     }
 
     #[test]
