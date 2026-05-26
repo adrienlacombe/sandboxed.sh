@@ -15,6 +15,12 @@ async function mountThemeFixture(page: import("@playwright/test").Page) {
         <div class="user-message-bubble user-message-bubble-solid" data-testid="user-message">
           User message
         </div>
+        <button class="mission-selector-trigger" data-testid="mission-trigger">
+          Mission selector
+        </button>
+        <div class="mission-switcher-row-selected" data-testid="mission-row">
+          Selected mission row
+        </div>
       </div>
     `;
     document.body.appendChild(fixture);
@@ -70,11 +76,19 @@ test("semantic components switch to light theme via data-theme", async ({ page }
   const userText = parseRgb(
     await page.getByTestId("user-message").evaluate((el) => getComputedStyle(el).color)
   );
+  const triggerText = parseRgb(
+    await page.getByTestId("mission-trigger").evaluate((el) => getComputedStyle(el).color)
+  );
+  const rowText = parseRgb(
+    await page.getByTestId("mission-row").evaluate((el) => getComputedStyle(el).color)
+  );
 
   expect(inlineBg[0]).toBeGreaterThan(200);
   expect(inlineBg[1]).toBeGreaterThan(210);
   expect(inlineText[2]).toBeLessThan(160);
-  expect(userText[0]).toBeLessThan(90);
-  expect(userText[1]).toBeLessThan(90);
-  expect(userText[2]).toBeLessThan(160);
+  for (const color of [userText, triggerText, rowText]) {
+    expect(color[0]).toBeLessThan(90);
+    expect(color[1]).toBeLessThan(90);
+    expect(color[2]).toBeLessThan(160);
+  }
 });

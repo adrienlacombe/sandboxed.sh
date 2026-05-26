@@ -495,12 +495,13 @@ select:focus-visible {
 }
 
 .mission-selector-trigger {
-  background-color: rgb(var(--accent) / 0.2);
-  color: rgb(255 255 255 / 0.84);
+  background-color: rgb(var(--accent-soft) / 0.24);
+  border: 1px solid rgb(var(--accent) / 0.22);
+  color: rgb(var(--message-user-text) / 0.92);
 }
 
 .mission-selector-trigger:hover {
-  background-color: rgb(var(--accent) / 0.3);
+  background-color: rgb(var(--accent-soft) / 0.34);
 }
 
 .mission-selector-trigger * {
@@ -509,9 +510,9 @@ select:focus-visible {
 
 @media (prefers-color-scheme: light) {
   .mission-selector-trigger {
-    background-color: rgb(224 231 255);
-    border: 1px solid rgb(165 180 252 / 0.55);
-    color: rgb(49 46 129);
+    background-color: rgb(var(--accent-soft));
+    border-color: rgb(var(--accent) / 0.28);
+    color: rgb(var(--message-user-text));
   }
 
   .mission-selector-trigger:hover {
@@ -520,7 +521,7 @@ select:focus-visible {
 }
 
 .user-message-bubble {
-  color: #ffffff;
+  color: rgb(var(--message-user-text));
 }
 
 .user-message-bubble * {
@@ -528,32 +529,29 @@ select:focus-visible {
 }
 
 .user-message-bubble-solid {
-  background-color: rgb(var(--accent));
+  background-color: rgb(var(--message-user-bg));
+  border: 1px solid rgb(var(--accent) / 0.24);
 }
 
 .user-message-bubble-queued {
-  background-color: rgb(var(--accent) / 0.2);
-  border-color: rgb(var(--accent) / 0.6);
+  background-color: rgb(var(--message-user-bg) / 0.2);
+  border-color: rgb(var(--accent) / 0.58);
 }
 
 @media (prefers-color-scheme: light) {
-  .user-message-bubble {
-    color: rgb(49 46 129);
-  }
-
   .user-message-bubble-solid {
-    background-color: rgb(224 231 255);
-    border: 1px solid rgb(165 180 252 / 0.55);
+    background-color: rgb(var(--message-user-bg));
+    border-color: rgb(var(--accent) / 0.34);
   }
 
   .user-message-bubble-queued {
     background-color: rgb(238 242 255);
-    border-color: rgb(129 140 248 / 0.7);
+    border-color: rgb(var(--accent) / 0.58);
   }
 }
 
 .mission-switcher-row-selected {
-  color: rgb(255 255 255 / 0.9);
+  color: rgb(var(--message-user-text) / 0.92);
 }
 
 .mission-switcher-row-selected * {
@@ -561,10 +559,6 @@ select:focus-visible {
 }
 
 @media (prefers-color-scheme: light) {
-  .mission-switcher-row-selected {
-    color: rgb(49 46 129);
-  }
-
   .mission-switcher-description {
     color: rgb(var(--foreground-secondary) / 0.92) !important;
   }
@@ -582,7 +576,7 @@ select:focus-visible {
 
   .mission-switcher-row-selected .mission-switcher-description,
   .mission-switcher-row-selected .mission-switcher-description-muted {
-    color: rgb(49 46 129 / 0.82) !important;
+    color: rgb(var(--message-user-text) / 0.82) !important;
   }
 }
 
