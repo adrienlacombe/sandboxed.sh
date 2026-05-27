@@ -1131,7 +1131,7 @@ function missionStatusLabel(
     case "active":
       return { label: "Active", className: "bg-indigo-500/20 text-indigo-400" };
     case "awaiting_user":
-      return { label: "Needs You", className: "bg-sky-500/20 text-sky-400" };
+      return { label: "Needs You", className: "bg-amber-500/20 text-amber-400" };
     case "acknowledged":
       return {
         label: "Acknowledged",

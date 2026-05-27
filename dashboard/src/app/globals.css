@@ -469,16 +469,22 @@ select:focus-visible {
 
   [class~="bg-white/[0.01]"],
   [class~="bg-white/[0.02]"],
+  [class~="bg-white/[0.025]"],
   [class~="bg-white/[0.03]"],
   [class~="bg-white/[0.04]"],
+  [class~="bg-white/[0.045]"],
+  [class~="bg-white/[0.05]"],
   [class~="bg-white/[0.06]"],
   [class~="bg-white/[0.08]"],
   [class~="bg-white/5"],
   [class~="bg-white/10"],
   .bg-white\/\[0\.01\],
   .bg-white\/\[0\.02\],
+  .bg-white\/\[0\.025\],
   .bg-white\/\[0\.03\],
   .bg-white\/\[0\.04\],
+  .bg-white\/\[0\.045\],
+  .bg-white\/\[0\.05\],
   .bg-white\/\[0\.06\],
   .bg-white\/\[0\.08\],
   .bg-white\/5,
@@ -511,12 +517,14 @@ select:focus-visible {
   }
 
   [class~="border-white/[0.04]"],
+  [class~="border-white/[0.05]"],
   [class~="border-white/[0.06]"],
   [class~="border-white/[0.08]"],
   [class~="border-white/[0.12]"],
   [class~="border-white/10"],
   [class~="border-white/20"],
   .border-white\/\[0\.04\],
+  .border-white\/\[0\.05\],
   .border-white\/\[0\.06\],
   .border-white\/\[0\.08\],
   .border-white\/\[0\.12\],
@@ -575,6 +583,34 @@ select:focus-visible {
   [class~="bg-indigo-500/15"][class*="text-white"],
   [class~="bg-indigo-500/20"][class*="text-white"],
   [class~="bg-indigo-500/30"][class*="text-white"] {
+    color: rgb(var(--foreground) / 0.88);
+  }
+
+  /* Soft-tinted warning/error/accent backgrounds keep dark foreground in light
+     mode — the broad bg-X + text-white rule above is intended for solid color
+     buttons, not 10-15% alpha tints used as row highlights. */
+  [class~="bg-amber-500/10"][class*="text-white"],
+  [class~="bg-amber-500/15"][class*="text-white"],
+  [class~="bg-amber-500/20"][class*="text-white"],
+  [class~="bg-amber-500/25"][class*="text-white"],
+  [class~="bg-amber-500/30"][class*="text-white"],
+  [class~="bg-red-500/10"][class*="text-white"],
+  [class~="bg-red-500/15"][class*="text-white"],
+  [class~="bg-red-500/20"][class*="text-white"],
+  [class~="bg-red-500/25"][class*="text-white"],
+  [class~="bg-red-500/30"][class*="text-white"],
+  [class~="bg-orange-500/10"][class*="text-white"],
+  [class~="bg-orange-500/15"][class*="text-white"],
+  [class~="bg-orange-500/20"][class*="text-white"],
+  [class~="bg-emerald-500/10"][class*="text-white"],
+  [class~="bg-emerald-500/15"][class*="text-white"],
+  [class~="bg-emerald-500/20"][class*="text-white"],
+  [class~="bg-cyan-500/10"][class*="text-white"],
+  [class~="bg-cyan-500/15"][class*="text-white"],
+  [class~="bg-cyan-500/20"][class*="text-white"],
+  [class~="bg-violet-500/10"][class*="text-white"],
+  [class~="bg-violet-500/15"][class*="text-white"],
+  [class~="bg-violet-500/20"][class*="text-white"] {
     color: rgb(var(--foreground) / 0.88);
   }
 }
@@ -923,6 +959,231 @@ select:focus-visible {
   font-size: 0.875rem;
   color: rgb(var(--foreground-secondary) / 0.85);
   margin-left: 0.125rem;
+}
+
+/* =========================================================================
+   Harness Component Controls
+   ========================================================================= */
+.harness-status-badge {
+  min-height: 1.25rem;
+  border-width: 1px;
+  font-weight: 500;
+  white-space: nowrap;
+}
+
+.harness-status-badge-emerald {
+  border-color: rgb(16 185 129 / 0.3);
+  background-color: rgb(16 185 129 / 0.1);
+  color: rgb(110 231 183);
+}
+
+.harness-status-badge-amber {
+  border-color: rgb(245 158 11 / 0.3);
+  background-color: rgb(245 158 11 / 0.1);
+  color: rgb(252 211 77);
+}
+
+.harness-status-badge-red {
+  border-color: rgb(239 68 68 / 0.3);
+  background-color: rgb(239 68 68 / 0.1);
+  color: rgb(252 165 165);
+}
+
+.harness-status-dot-emerald {
+  background-color: rgb(52 211 153);
+}
+
+.harness-status-dot-amber {
+  background-color: rgb(251 191 36);
+}
+
+.harness-status-dot-red {
+  background-color: rgb(248 113 113);
+}
+
+.harness-action {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.375rem;
+  min-height: 1.625rem;
+  border-radius: 0.5rem;
+  border-width: 1px;
+  padding: 0.25rem 0.625rem;
+  font-size: 0.75rem;
+  font-weight: 500;
+  line-height: 1rem;
+  white-space: nowrap;
+  flex-shrink: 0;
+  transition:
+    background-color 150ms ease,
+    border-color 150ms ease,
+    color 150ms ease;
+  cursor: pointer;
+}
+
+.harness-action svg {
+  width: 0.75rem;
+  height: 0.75rem;
+  flex-shrink: 0;
+}
+
+.harness-action:disabled,
+.harness-icon-action:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+.harness-action-compact {
+  min-height: 1.375rem;
+  border-radius: 0.375rem;
+  padding: 0.125rem 0.45rem;
+  font-size: 0.625rem;
+  line-height: 0.875rem;
+}
+
+.harness-action-primary {
+  border-color: rgb(99 102 241 / 0.3);
+  background-color: rgb(99 102 241 / 0.18);
+  color: rgb(199 210 254);
+}
+
+.harness-action-primary:hover {
+  background-color: rgb(99 102 241 / 0.28);
+}
+
+.harness-action-success {
+  border-color: rgb(16 185 129 / 0.3);
+  background-color: rgb(16 185 129 / 0.16);
+  color: rgb(110 231 183);
+}
+
+.harness-action-success:hover {
+  background-color: rgb(16 185 129 / 0.26);
+}
+
+.harness-action-warning {
+  border-color: rgb(245 158 11 / 0.3);
+  background-color: rgb(245 158 11 / 0.16);
+  color: rgb(252 211 77);
+}
+
+.harness-action-warning:hover {
+  background-color: rgb(245 158 11 / 0.26);
+}
+
+.harness-icon-action {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.75rem;
+  height: 1.75rem;
+  border-radius: 0.5rem;
+  transition:
+    background-color 150ms ease,
+    color 150ms ease;
+  cursor: pointer;
+}
+
+.harness-icon-action-danger {
+  color: rgb(255 255 255 / 0.34);
+}
+
+.harness-icon-action-danger:hover {
+  background-color: rgb(239 68 68 / 0.1);
+  color: rgb(248 113 113);
+}
+
+.harness-icon-action svg {
+  width: 0.875rem;
+  height: 0.875rem;
+}
+
+.harness-workspace-version-synced {
+  color: rgb(110 231 183 / 0.8);
+}
+
+.harness-workspace-version-stale {
+  color: rgb(252 211 77 / 0.86);
+}
+
+:root[data-theme="light"] {
+  .harness-status-badge-emerald {
+    border-color: rgb(5 150 105 / 0.22);
+    background-color: rgb(209 250 229 / 0.7);
+    color: rgb(6 95 70);
+  }
+
+  .harness-status-badge-amber {
+    border-color: rgb(217 119 6 / 0.18);
+    background-color: rgb(255 251 235 / 0.82);
+    color: rgb(120 53 15);
+  }
+
+  .harness-status-badge-red {
+    border-color: rgb(220 38 38 / 0.2);
+    background-color: rgb(254 226 226 / 0.74);
+    color: rgb(153 27 27);
+  }
+
+  .harness-status-dot-emerald {
+    background-color: rgb(5 150 105);
+  }
+
+  .harness-status-dot-amber {
+    background-color: rgb(245 158 11);
+  }
+
+  .harness-status-dot-red {
+    background-color: rgb(220 38 38);
+  }
+
+  .harness-action-primary {
+    border-color: rgb(79 70 229 / 0.22);
+    background-color: rgb(224 231 255 / 0.78);
+    color: rgb(67 56 202);
+  }
+
+  .harness-action-primary:hover {
+    background-color: rgb(199 210 254 / 0.86);
+  }
+
+  .harness-action-success {
+    border-color: rgb(5 150 105 / 0.22);
+    background-color: rgb(209 250 229 / 0.78);
+    color: rgb(6 95 70);
+  }
+
+  .harness-action-success:hover {
+    background-color: rgb(167 243 208 / 0.86);
+  }
+
+  .harness-action-warning {
+    border-color: rgb(217 119 6 / 0.2);
+    background-color: rgb(255 251 235 / 0.9);
+    color: rgb(120 53 15);
+  }
+
+  .harness-action-warning:hover {
+    background-color: rgb(254 243 199 / 0.95);
+  }
+
+  .harness-icon-action-danger {
+    color: rgb(107 114 128);
+  }
+
+  .harness-icon-action-danger:hover {
+    background-color: rgb(254 226 226 / 0.8);
+    color: rgb(185 28 28);
+  }
+
+  .harness-workspace-version-synced {
+    color: rgb(6 95 70);
+  }
+
+  .harness-workspace-version-stale {
+    color: rgb(120 53 15);
+  }
 }
 
 /* =========================================================================

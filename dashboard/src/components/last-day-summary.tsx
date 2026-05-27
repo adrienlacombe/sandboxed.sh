@@ -108,7 +108,7 @@ export function LastDaySummary({ missions, runningMissionIds }: LastDaySummaryPr
       <div className="rounded-xl border border-white/[0.06] bg-white/[0.025] p-3">
         <div className="mb-3 flex items-center justify-between">
           <div className="flex items-center gap-2 text-xs font-medium text-white/65">
-            <BarChart3 className="h-3.5 w-3.5 text-indigo-300/70" />
+            <BarChart3 className="h-3.5 w-3.5 text-indigo-400/70" />
             <span>Activity shape</span>
           </div>
           <span className="text-[10px] tabular-nums text-white/35">
@@ -131,7 +131,7 @@ export function LastDaySummary({ missions, runningMissionIds }: LastDaySummaryPr
         </div>
         <div className="mt-3 flex h-1.5 overflow-hidden rounded-full bg-white/[0.06]">
           <div
-            className="bg-indigo-300/70"
+            className="bg-emerald-300/70"
             style={{ width: `${completedPct}%` }}
           />
           <div
@@ -164,10 +164,10 @@ function SummaryTile({
   live?: boolean;
 }) {
   const toneIcon = {
-    emerald: 'text-indigo-300/75',
-    red: 'text-red-300/70',
-    indigo: 'text-indigo-300/75',
-    muted: 'text-white/40',
+    emerald: 'text-emerald-400/80',
+    red: 'text-red-400/70',
+    indigo: 'text-indigo-400/70',
+    muted: 'text-white/50',
   }[tone];
 
   const toneValue = {
@@ -212,10 +212,10 @@ function MetricRow({
   return (
     <div className="rounded-lg border border-white/[0.05] bg-white/[0.02] px-2.5 py-2">
       <div className="flex items-center gap-1.5 text-[10px] text-white/40">
-        <Icon className={cn('h-3 w-3', attention ? 'text-amber-300/80' : 'text-white/35')} />
+        <Icon className={cn('h-3 w-3', attention ? 'text-amber-400' : 'text-white/35')} />
         <span>{label}</span>
       </div>
-      <div className={cn('mt-1 text-sm font-medium tabular-nums', attention ? 'text-amber-200/90' : 'text-white/75')}>
+      <div className={cn('mt-1 text-sm font-medium tabular-nums', attention ? 'text-amber-400' : 'text-white/75')}>
         {value}
       </div>
     </div>
