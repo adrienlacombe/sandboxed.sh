@@ -42,10 +42,20 @@ export default function RootLayout({
           {`
               (() => {
                 try {
-                  const stored = localStorage.getItem("sandboxed-theme");
-                  const system = window.matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark";
-                  const theme = stored === "light" || stored === "dark" ? stored : system;
-                  document.documentElement.dataset.theme = theme;
+                  const query = window.matchMedia("(prefers-color-scheme: light)");
+                  const getSystemTheme = () => query.matches ? "light" : "dark";
+                  const getStoredTheme = () => {
+                    const stored = localStorage.getItem("sandboxed-theme");
+                    return stored === "light" || stored === "dark" ? stored : null;
+                  };
+                  const applyTheme = () => {
+                    document.documentElement.dataset.theme = getStoredTheme() || getSystemTheme();
+                  };
+                  applyTheme();
+                  query.addEventListener("change", applyTheme);
+                  window.addEventListener("storage", (event) => {
+                    if (event.key === "sandboxed-theme") applyTheme();
+                  });
                 } catch {
                   document.documentElement.dataset.theme = "dark";
                 }
