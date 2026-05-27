@@ -3095,7 +3095,16 @@ fn build_response_from_store(provider: &crate::ai_providers::AIProvider) -> Prov
     let pt = provider.provider_type;
     let has_api_key = provider.api_key.is_some();
     let has_oauth = provider.oauth.is_some();
-    let status = if has_api_key || has_oauth || provider.base_url.is_some() {
+    let oauth_expired = provider
+        .oauth
+        .as_ref()
+        .is_some_and(|oauth| oauth_token_expired(oauth.expires_at));
+    let status = if pt == ProviderType::Xai && has_oauth && !has_api_key && oauth_expired {
+        ProviderStatusResponse::NeedsReauth {
+            reason: "xAI OAuth token expired; reconnect Grok Build".to_string(),
+            auth_url: None,
+        }
+    } else if has_api_key || has_oauth || provider.base_url.is_some() {
         ProviderStatusResponse::Connected
     } else {
         ProviderStatusResponse::NeedsAuth { auth_url: None }
@@ -6883,6 +6892,40 @@ async fn get_provider_usage(
                     serde_json::json!("No credentials configured"),
                 );
             }
+            info
+        }
+        ProviderType::Xai => {
+            let mut info = serde_json::json!({
+                "provider_type": "xai",
+                "provider_name": provider_name,
+                "account_email": account_email,
+            });
+
+            if api_key_opt.is_some() {
+                info.as_object_mut()
+                    .unwrap()
+                    .insert("status".to_string(), serde_json::json!("connected"));
+            } else if let Some(ref o) = oauth {
+                if oauth_token_expired(o.expires_at) {
+                    info.as_object_mut()
+                        .unwrap()
+                        .insert("status".to_string(), serde_json::json!("needs_reauth"));
+                    info.as_object_mut().unwrap().insert(
+                        "error".to_string(),
+                        serde_json::json!("xAI OAuth token expired; reconnect Grok Build"),
+                    );
+                } else {
+                    info.as_object_mut()
+                        .unwrap()
+                        .insert("status".to_string(), serde_json::json!("connected"));
+                }
+            } else {
+                info.as_object_mut().unwrap().insert(
+                    "error".to_string(),
+                    serde_json::json!("No credentials configured"),
+                );
+            }
+
             info
         }
         _ => {

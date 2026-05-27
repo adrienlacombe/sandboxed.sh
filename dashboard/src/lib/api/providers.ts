@@ -36,8 +36,9 @@ export interface AIProviderTypeInfo {
 }
 
 export interface AIProviderStatus {
-  type: "unknown" | "connected" | "needs_auth" | "error";
+  type: "unknown" | "connected" | "needs_auth" | "needs_reauth" | "error";
   auth_url?: string;
+  reason?: string;
   message?: string;
 }
 
