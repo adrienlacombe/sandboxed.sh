@@ -276,13 +276,17 @@ export function ServerConnectionCard({
 
   const toneBadgeClass = (tone: 'emerald' | 'amber' | 'red') =>
     tone === 'emerald'
-      ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-300'
+      ? 'harness-status-badge harness-status-badge-emerald'
       : tone === 'amber'
-      ? 'border-amber-500/30 bg-amber-500/10 text-amber-300'
-      : 'border-red-500/30 bg-red-500/10 text-red-300';
+      ? 'harness-status-badge harness-status-badge-amber'
+      : 'harness-status-badge harness-status-badge-red';
 
   const toneDotClass = (tone: 'emerald' | 'amber' | 'red') =>
-    tone === 'emerald' ? 'bg-emerald-400' : tone === 'amber' ? 'bg-amber-400' : 'bg-red-400';
+    tone === 'emerald'
+      ? 'harness-status-dot-emerald'
+      : tone === 'amber'
+      ? 'harness-status-dot-amber'
+      : 'harness-status-dot-red';
 
   const isOpInProgress = (key: OpKey) => activeOps[key] === 'update';
   const hasActiveOpsForComponent = (componentName: string) =>
@@ -475,7 +479,7 @@ export function ServerConnectionCard({
                           <button
                             onClick={() => handleHostUpdate(component)}
                             disabled={!!activeOps[component.name]}
-                            className="flex items-center gap-1.5 rounded-lg bg-indigo-500/20 border border-indigo-500/30 px-2.5 py-1 text-xs text-indigo-300 hover:bg-indigo-500/30 transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
+                            className="harness-action harness-action-primary"
                             title="Update host installation"
                           >
                             {hostOpInFlight ? (
@@ -490,7 +494,7 @@ export function ServerConnectionCard({
                           <button
                             onClick={() => handleHostUpdate(component)}
                             disabled={!!activeOps[component.name]}
-                            className="flex items-center gap-1.5 rounded-lg bg-emerald-500/20 border border-emerald-500/30 px-2.5 py-1 text-xs text-emerald-300 hover:bg-emerald-500/30 transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
+                            className="harness-action harness-action-success"
                           >
                             <ArrowUp className="h-3 w-3" />
                             Install
@@ -500,7 +504,7 @@ export function ServerConnectionCard({
                           <button
                             onClick={() => handleSyncAll(report)}
                             disabled={hasActiveOpsForComponent(component.name)}
-                            className="flex items-center gap-1.5 rounded-lg bg-amber-500/20 border border-amber-500/30 px-2.5 py-1 text-xs text-amber-300 hover:bg-amber-500/30 transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
+                            className="harness-action harness-action-warning"
                             title="Sync installed workspaces that are behind the host version"
                           >
                             <ArrowUp className="h-3 w-3" />
@@ -511,7 +515,7 @@ export function ServerConnectionCard({
                           <button
                             onClick={() => handleHostUninstall(component)}
                             disabled={!!activeOps[component.name]}
-                            className="p-1.5 rounded-lg text-white/30 hover:text-red-400 hover:bg-red-500/10 transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
+                            className="harness-icon-action harness-icon-action-danger"
                             title={`Uninstall ${componentNames[component.name] || component.name}`}
                           >
                             <Trash2 className="h-3.5 w-3.5" />
@@ -555,7 +559,9 @@ export function ServerConnectionCard({
                               <span
                                 className={cn(
                                   'shrink-0',
-                                  ws.in_sync ? 'text-emerald-300/80' : 'text-amber-300/80'
+                                  ws.in_sync
+                                    ? 'harness-workspace-version-synced'
+                                    : 'harness-workspace-version-stale'
                                 )}
                               >
                                 {versionLabel}
@@ -568,7 +574,7 @@ export function ServerConnectionCard({
                                 <button
                                   onClick={() => handleWorkspaceUpdate(component.name, ws)}
                                   disabled={!!activeOps[opKey]}
-                                  className="flex items-center gap-1.5 rounded-md bg-indigo-500/15 border border-indigo-500/25 px-2 py-0.5 text-[10px] text-indigo-300 hover:bg-indigo-500/25 transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
+                                  className="harness-action harness-action-primary harness-action-compact"
                                 >
                                   {inFlight ? (
                                     <Loader className="h-3 w-3 animate-spin" />
