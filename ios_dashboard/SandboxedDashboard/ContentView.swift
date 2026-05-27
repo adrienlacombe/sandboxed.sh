@@ -20,8 +20,13 @@ struct ContentView: View {
             if isCheckingAuth {
                 LoadingView(message: "Connecting...")
                     .background(Theme.backgroundPrimary.ignoresSafeArea())
-            } else if authRequired && !isAuthenticated {
-                LoginView(onLogin: { isAuthenticated = true })
+            } else if authRequired && (!isAuthenticated || api.authSessionExpired) {
+                LoginView(
+                    sessionExpired: api.authSessionExpired,
+                    onLogin: {
+                        isAuthenticated = true
+                    }
+                )
             } else {
                 MainTabView()
             }
@@ -39,6 +44,12 @@ struct ContentView: View {
             // Re-check auth when server URL is configured
             if isConfigured {
                 Task { await checkAuth() }
+            }
+        }
+        .onChange(of: api.authSessionExpired) { _, expired in
+            if expired {
+                authRequired = true
+                isAuthenticated = false
             }
         }
     }
@@ -213,6 +224,7 @@ struct SetupSheet: View {
 // MARK: - Login View
 
 struct LoginView: View {
+    let sessionExpired: Bool
     let onLogin: () -> Void
     
     @State private var username = ""
@@ -226,7 +238,8 @@ struct LoginView: View {
     
     private let api = APIService.shared
     
-    init(onLogin: @escaping () -> Void) {
+    init(sessionExpired: Bool = false, onLogin: @escaping () -> Void) {
+        self.sessionExpired = sessionExpired
         self.onLogin = onLogin
         _serverURL = State(initialValue: APIService.shared.baseURL)
         _username = State(initialValue: UserDefaults.standard.string(forKey: "last_username") ?? "")
@@ -274,6 +287,20 @@ struct LoginView: View {
                                 .font(.title3)
                                 .foregroundStyle(Theme.textSecondary)
                         }
+                    }
+
+                    if sessionExpired {
+                        GlassCard(padding: 16, cornerRadius: 18) {
+                            HStack(spacing: 10) {
+                                PhosphorIcon(symbol: .warning, weight: .fill, color: Theme.warning)
+                                    .frame(width: 18, height: 18)
+                                Text("Session expired. Sign in again to continue.")
+                                    .font(.subheadline)
+                                    .foregroundStyle(Theme.textPrimary)
+                                Spacer()
+                            }
+                        }
+                        .padding(.horizontal, 24)
                     }
                     
                     // Login form

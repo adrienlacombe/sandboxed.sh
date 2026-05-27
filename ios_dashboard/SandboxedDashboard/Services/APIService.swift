@@ -118,6 +118,7 @@ final class APIService {
     
     var authRequired: Bool = false
     var authMode: AuthMode = .singleTenant
+    var authSessionExpired: Bool = false
     var onSuccessfulAuthenticatedRequest: (() -> Void)?
 
     enum AuthMode: String {
@@ -169,11 +170,18 @@ final class APIService {
         
         let response: LoginResponse = try await post("/api/auth/login", body: LoginRequest(password: password, username: username), authenticated: false)
         jwtToken = response.token
+        authSessionExpired = false
         return true
     }
     
     func logout() {
         jwtToken = nil
+        authSessionExpired = false
+    }
+
+    func markSessionExpired() {
+        jwtToken = nil
+        authSessionExpired = true
     }
     
     func checkHealth() async throws -> Bool {
@@ -602,7 +610,7 @@ final class APIService {
         }
 
         if httpResponse.statusCode == 401 {
-            logout()
+            markSessionExpired()
             throw APIError.unauthorized
         }
 
@@ -1152,7 +1160,7 @@ final class APIService {
         }
 
         if httpResponse.statusCode == 401 {
-            logout()
+            markSessionExpired()
             throw APIError.unauthorized
         }
 

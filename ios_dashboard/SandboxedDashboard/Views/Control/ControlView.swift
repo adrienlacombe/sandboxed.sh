@@ -3284,6 +3284,7 @@ struct ControlView: View {
                                 stopRetrying.withLock { $0 = true }
                                 Task { @MainActor in
                                     guard generation == self.streamGeneration else { return }
+                                    api.markSessionExpired()
                                     self.connectionState = .authExpired
                                     self.networkMonitor.noteStreamAuthExpired()
                                 }
