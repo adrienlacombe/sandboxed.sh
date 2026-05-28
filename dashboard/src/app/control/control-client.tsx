@@ -614,6 +614,7 @@ type ItemViews = {
 export function deriveItemViews(
   items: ChatItem[],
   showThinkingPanel: boolean,
+  missionIsRunning = false,
 ): ItemViews {
   // Pass 1: dedup by id (last occurrence wins, preserve original order).
   // Record the last index per id, then emit items whose index matches.
@@ -775,6 +776,7 @@ export function deriveItemViews(
         continue;
       }
       if (
+        !missionIsRunning &&
         lastAssistantItemIndex !== -1 &&
         index > lastAssistantItemIndex &&
         item.done
@@ -783,6 +785,12 @@ export function deriveItemViews(
         // leave completed thought groups after the final assistant row.
         // Completed thoughts remain available in the Thoughts panel; they
         // should not appear as the visual bottom of a finished turn.
+        //
+        // Only applies once the mission has stopped: while it is still
+        // running, every thought after the last assistant reply belongs to
+        // the in-progress turn (a continued mission or a goal-mode auto
+        // iteration whose previous reply is now the "last assistant"), so
+        // those must keep rendering inline when the side panel is closed.
         continue;
       }
       // Inline thinking/streaming: break the current tool group so ordering
@@ -4388,6 +4396,7 @@ export default function ControlClient() {
 
   const loadHistoryEvents = useCallback(
     async (id: string, opts?: { sinceSeq?: number }) => {
+      const cacheKey = `${getRuntimeApiBase()}::${id}`;
       if (opts?.sinceSeq !== undefined) {
         // Delta load — used on reconnect/visibility/periodic sync.
         // The server returns events with sequence > sinceSeq already
@@ -4419,7 +4428,7 @@ export default function ControlClient() {
       let metaMaxSeq: number | undefined;
       let metaTotal: number | undefined;
 
-      const cached = await readCachedEvents(id).catch(() => null);
+      const cached = await readCachedEvents(cacheKey).catch(() => null);
       let cacheHit = false;
       let eventMergeCount = 0;
       if (cached && cached.events.length > 0) {
@@ -4437,7 +4446,15 @@ export default function ControlClient() {
           // If the server's max sequence is *behind* what we cached, the
           // mission was reset or replaced server-side and our cache is
           // bogus — drop it and reload fresh.
-          if ((delta.meta.maxSequence ?? 0) >= cachedTailMaxSequence) {
+          const maxSequence = delta.meta.maxSequence ?? 0;
+          const lastDeltaSeq =
+            delta.events.length > 0
+              ? delta.events[delta.events.length - 1].sequence
+              : cachedTailMaxSequence;
+          const deltaWasCapped =
+            delta.events.length >= HISTORY_DELTA_PAGE_SIZE &&
+            lastDeltaSeq < maxSequence;
+          if (maxSequence >= cachedTailMaxSequence && !deltaWasCapped) {
             // Merge cached tail + delta. Both are sorted by sequence;
             // dedup defensively in case the server re-sent an overlap row.
             const seen = new Set<number>();
@@ -4456,7 +4473,7 @@ export default function ControlClient() {
             }
             merged.sort((a, b) => a.sequence - b.sequence);
             sorted = merged;
-            metaMaxSeq = delta.meta.maxSequence;
+            metaMaxSeq = maxSequence;
             metaTotal = delta.meta.totalEvents;
             cacheHit = true;
             eventMergeCount = merged.length;
@@ -4520,7 +4537,7 @@ export default function ControlClient() {
         metaTotal !== undefined &&
         sorted.length > 0
       ) {
-        void writeCachedEvents(id, sorted, metaMaxSeq, metaTotal).catch(
+        void writeCachedEvents(cacheKey, sorted, metaMaxSeq, metaTotal).catch(
           () => undefined,
         );
       }
@@ -4596,6 +4613,56 @@ export default function ControlClient() {
     new Set(),
   );
 
+  const runningMissionById = useMemo(() => {
+    return new Map(runningMissions.map((m) => [m.mission_id, m]));
+  }, [runningMissions]);
+
+  const viewingRunningInfo = useMemo(() => {
+    if (!viewingMissionId) return null;
+    return runningMissionById.get(viewingMissionId) ?? null;
+  }, [runningMissionById, viewingMissionId]);
+
+  const viewingRunState = useMemo<ControlRunState>(() => {
+    if (!viewingMissionId) return "idle";
+    if (viewingRunningInfo) {
+      if (viewingRunningInfo.state === "waiting_for_tool")
+        return "waiting_for_tool";
+      if (
+        viewingRunningInfo.state === "queued" ||
+        viewingRunningInfo.state === "running"
+      ) {
+        return "running";
+      }
+      return "idle";
+    }
+    if (runStateMissionId === viewingMissionId) {
+      return runState;
+    }
+    return "idle";
+  }, [viewingMissionId, viewingRunningInfo, runStateMissionId, runState]);
+
+  const viewingQueueLen = useMemo(() => {
+    if (!viewingMissionId) return 0;
+    if (viewingRunningInfo) return viewingRunningInfo.queue_len;
+    if (runStateMissionId === viewingMissionId) return queueLen;
+    return 0;
+  }, [viewingMissionId, viewingRunningInfo, runStateMissionId, queueLen]);
+
+  const viewingMissionIsRunning = useMemo(() => {
+    if (!viewingMissionId) return false;
+    if (viewingRunningInfo) {
+      return (
+        viewingRunningInfo.state === "running" ||
+        viewingRunningInfo.state === "waiting_for_tool" ||
+        viewingRunningInfo.state === "queued"
+      );
+    }
+    if (runStateMissionId === viewingMissionId) {
+      return runState !== "idle";
+    }
+    return false;
+  }, [viewingMissionId, viewingRunningInfo, runStateMissionId, runState]);
+
   // Single O(n) pass derives every downstream view. Replaces 7 separate
   // `useMemo` hooks that each looped over `items` (see `deriveItemViews`
   // for the rationale).
@@ -4608,11 +4675,15 @@ export default function ControlClient() {
   } = useMemo(
     () =>
       perfBus.time("replay:group", () => {
-        const views = deriveItemViews(items, showThinkingPanel);
+        const views = deriveItemViews(
+          items,
+          showThinkingPanel,
+          viewingMissionIsRunning,
+        );
         perfBus.updateDiagnostics({ renderCount: views.groupedItems.length });
         return views;
       }),
-    [items, showThinkingPanel],
+    [items, showThinkingPanel, viewingMissionIsRunning],
   );
   // `deriveItemViews` produces a fresh `thinkingItems` array on every change
   // to `items`, even when the chat update was unrelated to thoughts (e.g. a
@@ -4743,56 +4814,6 @@ export default function ControlClient() {
   // `groupedItems`, `thinkingItems`, etc. are all produced in the single
   // `deriveItemViews` pass above. The old per-view `useMemo` hooks used
   // to live here and have been removed.
-
-  const runningMissionById = useMemo(() => {
-    return new Map(runningMissions.map((m) => [m.mission_id, m]));
-  }, [runningMissions]);
-
-  const viewingRunningInfo = useMemo(() => {
-    if (!viewingMissionId) return null;
-    return runningMissionById.get(viewingMissionId) ?? null;
-  }, [runningMissionById, viewingMissionId]);
-
-  const viewingRunState = useMemo<ControlRunState>(() => {
-    if (!viewingMissionId) return "idle";
-    if (viewingRunningInfo) {
-      if (viewingRunningInfo.state === "waiting_for_tool")
-        return "waiting_for_tool";
-      if (
-        viewingRunningInfo.state === "queued" ||
-        viewingRunningInfo.state === "running"
-      ) {
-        return "running";
-      }
-      return "idle";
-    }
-    if (runStateMissionId === viewingMissionId) {
-      return runState;
-    }
-    return "idle";
-  }, [viewingMissionId, viewingRunningInfo, runStateMissionId, runState]);
-
-  const viewingQueueLen = useMemo(() => {
-    if (!viewingMissionId) return 0;
-    if (viewingRunningInfo) return viewingRunningInfo.queue_len;
-    if (runStateMissionId === viewingMissionId) return queueLen;
-    return 0;
-  }, [viewingMissionId, viewingRunningInfo, runStateMissionId, queueLen]);
-
-  const viewingMissionIsRunning = useMemo(() => {
-    if (!viewingMissionId) return false;
-    if (viewingRunningInfo) {
-      return (
-        viewingRunningInfo.state === "running" ||
-        viewingRunningInfo.state === "waiting_for_tool" ||
-        viewingRunningInfo.state === "queued"
-      );
-    }
-    if (runStateMissionId === viewingMissionId) {
-      return runState !== "idle";
-    }
-    return false;
-  }, [viewingMissionId, viewingRunningInfo, runStateMissionId, runState]);
 
   const viewingProgress = useMemo(() => {
     if (!viewingMissionId) return null;
@@ -7605,14 +7626,21 @@ export default function ControlClient() {
         pendingStreamRef.current = null;
 
         setItems((prev) => {
-          // Mark any in-progress thinking as done instead of dropping it,
-          // so the Thinking panel can show a scrollable history.
-          let filtered = prev.map((it) => {
-            if ((it.kind === "thinking" || it.kind === "stream") && !it.done) {
-              return { ...it, done: true, endTime: now };
-            }
-            return it;
-          });
+          // Mark any in-progress thinking as done instead of dropping it, so
+          // the Thinking panel keeps a scrollable history. The in-progress
+          // text_delta draft is dropped, though: the assistant message
+          // appended below supersedes it, so keeping it would duplicate the
+          // reply as a stale "Draft". Mirrors the history reducer, which only
+          // keeps a trailing text_delta when no assistant message exists yet.
+          let filtered = prev
+            .map((it) =>
+              (it.kind === "thinking" || it.kind === "stream") && !it.done
+                ? { ...it, done: true, endTime: now }
+                : it,
+            )
+            .filter(
+              (it) => !(it.kind === "stream" && it.id === "text_delta_latest"),
+            );
 
           // When mission fails, mark all pending tool calls as failed
           // This ensures subagent headers don't stay stuck showing "Running for X"
@@ -8052,6 +8080,33 @@ export default function ControlClient() {
           name === "question" ||
           name === "AskUserQuestion";
         const toolCallId = String(data["tool_call_id"] ?? "");
+        const now = Date.now();
+
+        // Mirror the history reducer (events-reducer.ts `tool_call`), which
+        // runs `finalizePendingThinking()` + `lastTextDelta = null` on every
+        // tool call. Without this the live `text_delta_latest` draft keeps
+        // mutating in place at the position it was first inserted (above this
+        // tool), so the "Streaming…" bubble never follows the conversation to
+        // the bottom. Cancel any buffered flush and forget the in-progress
+        // draft so the next text delta re-creates the bubble *after* the tool.
+        if (thinkingFlushRafRef.current !== null) {
+          cancelAnimationFrame(thinkingFlushRafRef.current);
+          thinkingFlushRafRef.current = null;
+        }
+        if (thinkingFlushTimeoutRef.current) {
+          clearTimeout(thinkingFlushTimeoutRef.current);
+          thinkingFlushTimeoutRef.current = null;
+        }
+        pendingThinkingRef.current = null;
+        if (streamFlushRafRef.current !== null) {
+          cancelAnimationFrame(streamFlushRafRef.current);
+          streamFlushRafRef.current = null;
+        }
+        if (streamFlushTimeoutRef.current) {
+          clearTimeout(streamFlushTimeoutRef.current);
+          streamFlushTimeoutRef.current = null;
+        }
+        pendingStreamRef.current = null;
 
         setItems((prev) => {
           const existingIdx = prev.findIndex(
@@ -8061,27 +8116,41 @@ export default function ControlClient() {
             return prev;
           }
 
+          // Finalize any in-flight thinking (kept as a completed Thought, like
+          // the history reducer) and drop the in-progress text_delta draft so
+          // post-tool text streams fresh below this tool rather than rewriting
+          // a bubble stuck above it.
+          const base = prev
+            .map((it) =>
+              it.kind === "thinking" && !it.done
+                ? { ...it, done: true, endTime: now }
+                : it,
+            )
+            .filter(
+              (it) => !(it.kind === "stream" && it.id === "text_delta_latest"),
+            );
+
           const toolItem: ChatItem = {
             kind: "tool",
-            id: `tool-${toolCallId || Date.now()}`,
+            id: `tool-${toolCallId || now}`,
             toolCallId,
             name,
             args: data["args"],
             isUiTool,
-            startTime: Date.now(),
+            startTime: now,
           };
 
           // Important: keep queued user messages at the end of the timeline.
           // If we append tool calls after a queued message, the UI can appear to "lose"
           // the assistant reply (it may be inserted before the queued message and then
           // scrolled out of view under a long tail of tools).
-          const firstQueuedIdx = prev.findIndex(
+          const firstQueuedIdx = base.findIndex(
             (item) => item.kind === "user" && item.queued === true,
           );
           if (firstQueuedIdx === -1) {
-            return [...prev, toolItem];
+            return [...base, toolItem];
           }
-          const updated = [...prev];
+          const updated = [...base];
           updated.splice(firstQueuedIdx, 0, toolItem);
           return updated;
         });

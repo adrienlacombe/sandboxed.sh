@@ -89,6 +89,32 @@ describe("deriveItemViews", () => {
     expect(views.groupedItems).toEqual([assistantItem]);
   });
 
+  it("keeps completed thoughts of a new turn inline while the mission runs", () => {
+    // A continued mission / goal-mode iteration: the previous turn's reply is
+    // now the "last assistant", but the freshly completed thought belongs to
+    // the in-progress turn and must stay visible inline (panel closed).
+    const completedThinking: Extract<ChatItem, { kind: "thinking" }> = {
+      ...thinkingItem,
+      done: true,
+      endTime: 3,
+    };
+
+    const views = deriveItemViews(
+      [assistantItem, completedThinking],
+      false,
+      true,
+    );
+
+    expect(views.groupedItems).toEqual([
+      assistantItem,
+      {
+        kind: "thinking_group",
+        groupId: completedThinking.id,
+        thoughts: [completedThinking],
+      },
+    ]);
+  });
+
   it("keeps active streams after the final assistant row visible inline", () => {
     const views = deriveItemViews([assistantItem, streamItem], false);
 
