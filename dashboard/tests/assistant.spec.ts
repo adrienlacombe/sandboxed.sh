@@ -180,6 +180,8 @@ test.describe('Assistant page', () => {
     await page.goto('/assistant');
 
     await expect(page.getByText('@hermes_devbot')).toBeVisible();
+    await expect(page.getByText('Compatibility gateway still active')).toBeVisible();
+    await expect(page.getByText('Hermes runtime is active while 1 compatibility gateway remains active. Move bot webhook ownership to Hermes, then deactivate the matching gateway here.')).toBeVisible();
     await expect(page.getByRole('button', { name: 'Edit @hermes_devbot' })).toBeVisible();
     await expect(page.getByRole('button', { name: 'Deactivate @hermes_devbot' })).toBeVisible();
     await expect(page.getByRole('button', { name: 'Delete @hermes_devbot' })).toBeVisible();
