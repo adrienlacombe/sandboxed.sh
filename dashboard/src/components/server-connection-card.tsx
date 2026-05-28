@@ -28,6 +28,8 @@ import { cn } from '@/lib/utils';
 const componentNames: Record<string, string> = {
   open_agent: 'sandboxed.sh',
   sandboxed_sh: 'sandboxed.sh',
+  assistant_mcp: 'Assistant MCP',
+  hermes_assistant: 'Hermes Assistant',
   opencode: 'OpenCode',
   claude_code: 'Claude Code',
   codex: 'Codex',
@@ -38,11 +40,15 @@ const componentNames: Record<string, string> = {
 const componentIcons: Record<string, string> = {
   open_agent: '🚀',
   sandboxed_sh: '🚀',
+  assistant_mcp: '🔌',
+  hermes_assistant: '◈',
   opencode: '⚡',
   claude_code: '🤖',
   codex: '🧠',
   grok: '𝕏',
 };
+
+const readonlyComponents = new Set(['assistant_mcp', 'hermes_assistant']);
 
 interface UpdateLog {
   message: string;
@@ -177,6 +183,7 @@ export function ServerConnectionCard({
   };
 
   const handleHostUpdate = (component: ComponentInfo) => {
+    if (readonlyComponents.has(component.name)) return;
     runOperation(
       component.name,
       'update',
@@ -190,6 +197,7 @@ export function ServerConnectionCard({
       toast.error('Cannot uninstall sandboxed.sh - it is the main application');
       return;
     }
+    if (readonlyComponents.has(component.name)) return;
     runOperation(
       component.name,
       'uninstall',
@@ -472,7 +480,7 @@ export function ServerConnectionCard({
 
                       <div className="flex items-center gap-2" onClick={(e) => e.stopPropagation()}>
                         {/* Host-level Update/Install button stays available even when collapsed. */}
-                        {component.status === 'update_available' && (
+                        {component.status === 'update_available' && !readonlyComponents.has(component.name) && (
                           <button
                             onClick={() => handleHostUpdate(component)}
                             disabled={!!activeOps[component.name]}
@@ -487,7 +495,7 @@ export function ServerConnectionCard({
                             Update host
                           </button>
                         )}
-                        {component.status === 'not_installed' && (
+                        {component.status === 'not_installed' && !readonlyComponents.has(component.name) && (
                           <button
                             onClick={() => handleHostUpdate(component)}
                             disabled={!!activeOps[component.name]}
@@ -508,7 +516,7 @@ export function ServerConnectionCard({
                             Sync {outOfSync.length}
                           </button>
                         )}
-                        {component.installed && component.name !== 'sandboxed_sh' && (
+                        {component.installed && component.name !== 'sandboxed_sh' && !readonlyComponents.has(component.name) && (
                           <button
                             onClick={() => handleHostUninstall(component)}
                             disabled={!!activeOps[component.name]}
