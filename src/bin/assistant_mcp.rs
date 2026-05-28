@@ -351,11 +351,7 @@ impl AssistantMcp {
     }
 
     async fn start_mission(&self, params: StartMissionParams) -> Result<Value, String> {
-        let workspace_id = params
-            .workspace_id
-            .or_else(|| std::env::var("HERMES_DEFAULT_WORKSPACE_ID").ok())
-            .or_else(|| std::env::var("ASSISTANT_DEFAULT_WORKSPACE_ID").ok())
-            .filter(|value| !value.trim().is_empty());
+        let workspace_id = resolve_default_workspace_id(params.workspace_id);
         let body = json!({
             "title": params.title,
             "workspace_id": workspace_id,
@@ -519,6 +515,13 @@ fn parse_uuid(raw: &str) -> Result<Uuid, String> {
     Uuid::parse_str(raw.trim()).map_err(|_| format!("Invalid UUID: {raw}"))
 }
 
+fn resolve_default_workspace_id(explicit_workspace_id: Option<String>) -> Option<String> {
+    explicit_workspace_id
+        .or_else(|| std::env::var("HERMES_DEFAULT_WORKSPACE_ID").ok())
+        .or_else(|| std::env::var("ASSISTANT_DEFAULT_WORKSPACE_ID").ok())
+        .filter(|value| !value.trim().is_empty())
+}
+
 fn compact_mission_summary(mission: Value) -> Value {
     json!({
         "id": mission.get("id").cloned().unwrap_or(Value::Null),
@@ -594,6 +597,8 @@ mod tests {
         "HERMES_SANDBOXED_API_TOKEN",
         "SANDBOXED_API_TOKEN",
         "OPEN_AGENT_API_TOKEN",
+        "HERMES_DEFAULT_WORKSPACE_ID",
+        "ASSISTANT_DEFAULT_WORKSPACE_ID",
     ];
 
     fn clear_env() {
@@ -676,6 +681,44 @@ mod tests {
 
         assert_eq!(server.api_url, "https://sandboxed.example");
         assert_eq!(server.api_token.as_deref(), Some("sandboxed-token"));
+        clear_env();
+    }
+
+    #[test]
+    fn explicit_workspace_id_takes_precedence_over_default_envs() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env();
+        std::env::set_var("HERMES_DEFAULT_WORKSPACE_ID", "hermes-workspace");
+        std::env::set_var("ASSISTANT_DEFAULT_WORKSPACE_ID", "assistant-workspace");
+
+        let workspace_id = resolve_default_workspace_id(Some("tool-workspace".to_string()));
+
+        assert_eq!(workspace_id.as_deref(), Some("tool-workspace"));
+        clear_env();
+    }
+
+    #[test]
+    fn hermes_default_workspace_env_takes_precedence_over_legacy_name() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env();
+        std::env::set_var("HERMES_DEFAULT_WORKSPACE_ID", "hermes-workspace");
+        std::env::set_var("ASSISTANT_DEFAULT_WORKSPACE_ID", "assistant-workspace");
+
+        let workspace_id = resolve_default_workspace_id(None);
+
+        assert_eq!(workspace_id.as_deref(), Some("hermes-workspace"));
+        clear_env();
+    }
+
+    #[test]
+    fn legacy_default_workspace_env_remains_supported_for_compatibility() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env();
+        std::env::set_var("ASSISTANT_DEFAULT_WORKSPACE_ID", "assistant-workspace");
+
+        let workspace_id = resolve_default_workspace_id(None);
+
+        assert_eq!(workspace_id.as_deref(), Some("assistant-workspace"));
         clear_env();
     }
 }
