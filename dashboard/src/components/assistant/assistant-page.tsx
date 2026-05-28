@@ -518,11 +518,18 @@ export default function AssistantPage() {
                 Hermes runtime is active while {activeGatewayCount} compatibility gateway{activeGatewayCount === 1 ? '' : 's'} {activeGatewayCount === 1 ? 'remains' : 'remain'} active.
                 Move bot webhook ownership to Hermes, then deactivate the matching gateway here.
               </p>
+              <a
+                href="#assistant-gateways"
+                className="mt-3 inline-flex text-xs font-medium text-amber-200 hover:text-amber-100"
+              >
+                Review gateways
+              </a>
             </div>
           </div>
         )}
 
         {/* Gateway list */}
+        <section id="assistant-gateways" aria-label="Assistant gateways">
         {botsLoading ? (
           <div className="space-y-4" aria-busy="true" aria-label="Loading assistant gateways">
             {Array.from({ length: 2 }).map((_, i) => (
@@ -974,6 +981,7 @@ export default function AssistantPage() {
             ))}
           </div>
         )}
+        </section>
 
         {/* Info card */}
         <div className="rounded-xl border border-white/[0.06] bg-white/[0.02] p-6">
