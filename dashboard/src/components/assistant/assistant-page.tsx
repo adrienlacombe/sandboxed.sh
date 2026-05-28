@@ -32,8 +32,11 @@ import {
   Power,
   PowerOff,
   Bot,
+  Cable,
   ChevronDown,
   ChevronUp,
+  CheckCircle2,
+  CircleDashed,
   Settings,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
@@ -363,6 +366,18 @@ export default function AssistantPage() {
     },
     [missionsById]
   );
+  const activeGatewayCount = useMemo(
+    () => bots.filter((bot) => bot.active).length,
+    [bots]
+  );
+  const knownConversationCount = useMemo(
+    () => Object.values(chatsByBot).reduce((count, chats) => count + chats.length, 0),
+    [chatsByBot]
+  );
+  const knownMemoryCount = useMemo(
+    () => Object.values(memoryByBot).reduce((count, entries) => count + entries.length, 0),
+    [memoryByBot]
+  );
 
   // ESC to close dialogs
   useEffect(() => {
@@ -378,13 +393,13 @@ export default function AssistantPage() {
 
   return (
     <div className="flex-1 flex flex-col items-center p-6 overflow-auto">
-      <div className="w-full max-w-4xl space-y-6">
+      <div className="w-full max-w-5xl space-y-6">
         {/* Header */}
         <header className="flex flex-wrap items-center justify-between gap-3">
           <div className="min-w-0">
             <h1 className="text-xl font-semibold text-white">Assistant</h1>
             <p className="mt-1 text-sm text-white/50">
-              Manage the Hermes migration path, Telegram gateway, mission defaults, and assistant memory.
+              Hermes readiness, Telegram gateway compatibility, mission defaults, and assistant memory.
             </p>
           </div>
           <button
@@ -396,9 +411,42 @@ export default function AssistantPage() {
           </button>
         </header>
 
-        {/* Bot list */}
+        <div className="grid gap-3 md:grid-cols-3">
+          <div className="rounded-lg border border-emerald-500/15 bg-emerald-500/[0.04] p-4">
+            <div className="flex items-center justify-between gap-3">
+              <p className="text-xs font-medium uppercase tracking-[0.08em] text-emerald-300/80">MCP</p>
+              <CheckCircle2 className="h-4 w-4 text-emerald-300" />
+            </div>
+            <p className="mt-2 text-sm font-medium text-white">assistant-mcp ready</p>
+            <p className="mt-1 text-xs text-white/45">Hermes can use sandboxed.sh mission tools.</p>
+          </div>
+          <div className="rounded-lg border border-sky-500/15 bg-sky-500/[0.04] p-4">
+            <div className="flex items-center justify-between gap-3">
+              <p className="text-xs font-medium uppercase tracking-[0.08em] text-sky-300/80">Gateway</p>
+              <Cable className="h-4 w-4 text-sky-300" />
+            </div>
+            <p className="mt-2 text-sm font-medium text-white">
+              {activeGatewayCount} active / {bots.length || 0} configured
+            </p>
+            <p className="mt-1 text-xs text-white/45">
+              {knownConversationCount} known conversation{knownConversationCount === 1 ? '' : 's'}.
+            </p>
+          </div>
+          <div className="rounded-lg border border-amber-500/15 bg-amber-500/[0.04] p-4">
+            <div className="flex items-center justify-between gap-3">
+              <p className="text-xs font-medium uppercase tracking-[0.08em] text-amber-300/80">Runtime</p>
+              <CircleDashed className="h-4 w-4 text-amber-300" />
+            </div>
+            <p className="mt-2 text-sm font-medium text-white">Hermes handoff pending</p>
+            <p className="mt-1 text-xs text-white/45">
+              {knownMemoryCount} visible memory entr{knownMemoryCount === 1 ? 'y' : 'ies'} in compatibility mode.
+            </p>
+          </div>
+        </div>
+
+        {/* Gateway list */}
         {botsLoading ? (
-          <div className="space-y-4" aria-busy="true" aria-label="Loading Telegram bots">
+          <div className="space-y-4" aria-busy="true" aria-label="Loading assistant gateways">
             {Array.from({ length: 2 }).map((_, i) => (
               <div
                 key={i}
@@ -842,7 +890,7 @@ export default function AssistantPage() {
 
         {/* Info card */}
         <div className="rounded-xl border border-white/[0.06] bg-white/[0.02] p-6">
-          <h3 className="text-base font-medium text-white mb-3">Hermes cutover</h3>
+          <h3 className="text-base font-medium text-white mb-3">Cutover path</h3>
           <div className="grid gap-3 text-sm text-white/60 md:grid-cols-3">
             <div>
               <p className="text-white/80">Gateway</p>
