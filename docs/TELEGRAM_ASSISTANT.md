@@ -13,13 +13,16 @@ any other mission.
 There are two ways to create a Telegram assistant:
 
 1. **Standalone bot** (recommended) — auto-creates a new mission per Telegram
-   chat. Configured from **Settings → Telegram** in the dashboard.
+   chat. Configured from **Assistant** in the dashboard.
 2. **Per-mission channel** — attaches a bot to an existing mission via the API.
    All chats share one mission context.
 
+The legacy `/settings/telegram` dashboard route redirects to the top-level
+Assistant page. New operator docs and links should use `/assistant`.
+
 ## Dashboard Setup (Standalone Bot)
 
-1. Open **Settings → Telegram** in the dashboard.
+1. Open **Assistant** in the dashboard.
 2. Click **Create Bot**.
 3. Paste your bot token (from [@BotFather](https://t.me/BotFather)).
 4. Choose a backend, model, workspace, and trigger mode.
