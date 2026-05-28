@@ -41,6 +41,32 @@ test.describe('Assistant page', () => {
     await expect(page.getByRole('button', { name: /Add Gateway/i }).first()).toBeVisible();
   });
 
+  test('shows MCP handoff warning when assistant-mcp is unavailable', async ({ page }) => {
+    await page.route('**/api/system/components', async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          components: [
+            {
+              name: 'assistant_mcp',
+              version: null,
+              installed: false,
+              update_available: null,
+              path: null,
+              status: 'missing',
+            },
+          ],
+        }),
+      });
+    });
+
+    await page.goto('/assistant');
+
+    await expect(page.getByText('assistant-mcp not ready')).toBeVisible();
+    await expect(page.getByText('Install assistant-mcp before handing mission control to Hermes.')).toBeVisible();
+  });
+
   test('keeps the old Telegram settings route as a redirect', async ({ page }) => {
     await page.goto('/settings/telegram');
 
