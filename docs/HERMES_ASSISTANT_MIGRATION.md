@@ -103,6 +103,10 @@ For an end-to-end stdio MCP smoke against dev, run:
 scripts/assistant_mcp_smoke.sh --base-url https://agent-backend-dev.thomas.md
 ```
 
+After `hermes-assistant-dev.service` is installed and active, add
+`--require-hermes-runtime` to make the same smoke fail unless the runtime service
+is also ready.
+
 The component is ready for Hermes only when `installed` is `true` and `status` is
 `ok`. Gateway and runtime readiness still need to come from the Hermes service
 itself, because this repository only owns the sandboxed.sh API/UI and MCP bridge.

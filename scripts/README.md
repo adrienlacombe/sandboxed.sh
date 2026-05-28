@@ -14,9 +14,10 @@ Runs:
 Use `--help` for all options, including backend-specific model overrides and expected model assertions.
 
 ### assistant_mcp_smoke.sh
-Stdio smoke test for the Hermes assistant MCP bridge. It initializes
-`assistant-mcp`, calls `list_active_missions`, and validates the JSON-RPC
-responses.
+Smoke test for the Hermes assistant MCP bridge. It checks
+`/api/system/components` for `assistant_mcp`, initializes `assistant-mcp`, calls
+`list_active_missions`, and validates the JSON-RPC responses. Use
+`--require-hermes-runtime` after installing the external Hermes service.
 
 Example:
 - `scripts/assistant_mcp_smoke.sh --base-url https://agent-backend-dev.thomas.md`
