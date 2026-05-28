@@ -91,6 +91,12 @@ Expected dev output once the bridge is installed:
 {"name":"assistant_mcp","version":"0.1.0","installed":true,"update_available":null,"path":"/usr/local/bin/assistant-mcp","status":"ok"}
 ```
 
+For an end-to-end stdio MCP smoke against dev, run:
+
+```bash
+scripts/assistant_mcp_smoke.sh --base-url https://agent-backend-dev.thomas.md
+```
+
 The component is ready for Hermes only when `installed` is `true` and `status` is
 `ok`. Gateway and runtime readiness still need to come from the Hermes service
 itself, because this repository only owns the sandboxed.sh API/UI and MCP bridge.

@@ -13,6 +13,14 @@ Runs:
 
 Use `--help` for all options, including backend-specific model overrides and expected model assertions.
 
+### assistant_mcp_smoke.sh
+Stdio smoke test for the Hermes assistant MCP bridge. It initializes
+`assistant-mcp`, calls `list_active_missions`, and validates the JSON-RPC
+responses.
+
+Example:
+- `scripts/assistant_mcp_smoke.sh --base-url https://agent-backend-dev.thomas.md`
+
 ### harness_contract_tests.sh
 Runs a curated set of fast cross-harness contract tests that guard event-conversion invariants and OpenCode SSE parsing behavior.
 Used by CI job `harness-contract`.
