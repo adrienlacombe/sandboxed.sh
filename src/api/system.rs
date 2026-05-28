@@ -1255,7 +1255,7 @@ fn stream_sandboxed_update(
         yield sse("log", "Building sandboxed.sh (this may take a few minutes)...", Some(20));
 
         match Command::new("bash")
-            .args(["-c", "source /root/.cargo/env && cargo build --bin sandboxed-sh --bin workspace-mcp --bin desktop-mcp"])
+            .args(["-c", "source /root/.cargo/env && cargo build --bin sandboxed-sh --bin workspace-mcp --bin desktop-mcp --bin assistant-mcp"])
             .current_dir(repo_path)
             .output()
             .await
@@ -1340,7 +1340,7 @@ fn stream_sandboxed_update(
         }
 
         // Also install MCP binaries if they were built
-        for mcp_bin in ["workspace-mcp", "desktop-mcp"] {
+        for mcp_bin in ["workspace-mcp", "desktop-mcp", "assistant-mcp"] {
             let mcp_src = format!("{}/target/debug/{}", repo_path.display(), mcp_bin);
             let mcp_dest = format!("/usr/local/bin/{}", mcp_bin);
             if std::path::Path::new(&mcp_src).exists() {
@@ -1701,21 +1701,26 @@ fn stream_deploy(
         };
         // The cargo bin name is always `sandboxed-sh` regardless of how we
         // rename it on install (e.g. `sandboxed-sh-prod` or `sandboxed-sh-dev`).
-        // Same for `orchestrator-mcp`.
+        // Same for MCP binaries.
         const MAIN_CARGO_BIN: &str = "sandboxed-sh";
         const MCP_CARGO_BIN: &str = "orchestrator-mcp";
+        const ASSISTANT_MCP_CARGO_BIN: &str = "assistant-mcp";
         let install_dest_main = current_exe.to_string_lossy().to_string();
         // Match the MCP install location: same dir as the main binary, fixed name.
         let install_dest_mcp = current_exe
             .parent()
             .map(|p| p.join(MCP_CARGO_BIN).to_string_lossy().to_string())
             .unwrap_or_else(|| format!("/usr/local/bin/{}", MCP_CARGO_BIN));
+        let install_dest_assistant_mcp = current_exe
+            .parent()
+            .map(|p| p.join(ASSISTANT_MCP_CARGO_BIN).to_string_lossy().to_string())
+            .unwrap_or_else(|| format!("/usr/local/bin/{}", ASSISTANT_MCP_CARGO_BIN));
 
         if !req.skip_build {
-            yield sse("log", format!("Building {} + {} (cargo build, debug)", MAIN_CARGO_BIN, MCP_CARGO_BIN), Some(25));
+            yield sse("log", format!("Building {} + {} + {} (cargo build, debug)", MAIN_CARGO_BIN, MCP_CARGO_BIN, ASSISTANT_MCP_CARGO_BIN), Some(25));
             let build_cmd = format!(
-                "source /root/.cargo/env 2>/dev/null; cargo build --bin {} --bin {}",
-                MAIN_CARGO_BIN, MCP_CARGO_BIN
+                "source /root/.cargo/env 2>/dev/null; cargo build --bin {} --bin {} --bin {}",
+                MAIN_CARGO_BIN, MCP_CARGO_BIN, ASSISTANT_MCP_CARGO_BIN
             );
             match Command::new("bash")
                 .args(["-c", &build_cmd])
@@ -1747,12 +1752,20 @@ fn stream_deploy(
         // clean refusal instead of a half-applied deploy.
         let src_main = repo_path.join("target").join("debug").join(MAIN_CARGO_BIN);
         let src_mcp = repo_path.join("target").join("debug").join(MCP_CARGO_BIN);
+        let src_assistant_mcp = repo_path
+            .join("target")
+            .join("debug")
+            .join(ASSISTANT_MCP_CARGO_BIN);
         if !src_main.exists() {
             yield sse("error", format!("Build artifact missing: {}. Either set skip_build=false, or point repo_path at a checkout that has been built.", src_main.display()), None);
             return;
         }
         if !src_mcp.exists() {
             yield sse("error", format!("Build artifact missing: {}. Either set skip_build=false, or point repo_path at a checkout that has been built.", src_mcp.display()), None);
+            return;
+        }
+        if !src_assistant_mcp.exists() {
+            yield sse("error", format!("Build artifact missing: {}. Either set skip_build=false, or point repo_path at a checkout that has been built.", src_assistant_mcp.display()), None);
             return;
         }
 
@@ -1833,7 +1846,36 @@ fn stream_deploy(
                 return;
             }
         }
-        yield sse("log", format!("Backups: {}, {}", bkp_main, bkp_mcp), Some(88));
+
+        yield sse("log", format!("Installing {} → {}", src_assistant_mcp.display(), install_dest_assistant_mcp), Some(85));
+        let bkp_assistant_mcp = format!("{}.pre-deploy-{}", install_dest_assistant_mcp, sha);
+        if std::path::Path::new(&install_dest_assistant_mcp).exists() {
+            let _ = tokio::fs::copy(&install_dest_assistant_mcp, &bkp_assistant_mcp).await;
+        }
+        let install_assistant_mcp = Command::new("install")
+            .args([
+                "-m", "0755",
+                src_assistant_mcp.to_string_lossy().as_ref(),
+                &install_dest_assistant_mcp,
+            ])
+            .output()
+            .await;
+        match install_assistant_mcp {
+            Ok(o) if o.status.success() => {}
+            Ok(o) => {
+                let _ = tokio::fs::rename(&bkp_main, &install_dest_main).await;
+                let _ = tokio::fs::rename(&bkp_mcp, &install_dest_mcp).await;
+                yield sse("error", format!("Install of assistant-mcp failed (main/orchestrator binaries rolled back): {}", String::from_utf8_lossy(&o.stderr)), None);
+                return;
+            }
+            Err(e) => {
+                let _ = tokio::fs::rename(&bkp_main, &install_dest_main).await;
+                let _ = tokio::fs::rename(&bkp_mcp, &install_dest_mcp).await;
+                yield sse("error", format!("install command error for assistant-mcp (main/orchestrator rolled back): {}", e), None);
+                return;
+            }
+        }
+        yield sse("log", format!("Backups: {}, {}, {}", bkp_main, bkp_mcp, bkp_assistant_mcp), Some(88));
 
         // Schedule the restart in a fully detached process so this SSE
         // response can flush its final event before systemd SIGTERMs us.

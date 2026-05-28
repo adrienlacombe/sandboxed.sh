@@ -107,6 +107,10 @@ name = "orchestrator-mcp"
 path = "src/bin/orchestrator_mcp.rs"
 
 [[bin]]
+name = "assistant-mcp"
+path = "src/bin/assistant_mcp.rs"
+
+[[bin]]
 name = "fido-agent-proxy"
 path = "src/bin/fido_agent_proxy.rs"
 

@@ -1,0 +1,122 @@
+# Hermes Assistant Migration
+
+This document captures the target architecture for replacing the built-in
+Telegram assistant path with a standalone Hermes assistant connected to
+sandboxed.sh over MCP.
+
+## Current Architecture
+
+The existing Telegram assistant is not just a workspace. It is a backend-owned
+assistant stack:
+
+- `src/api/telegram.rs` owns Telegram webhook routing, trigger filtering,
+  per-chat mission creation, file download, streaming edits, Paloma commands,
+  proactive mission cards, scheduled messages, workflow relays, and memory.
+- `src/api/control.rs` exposes the Telegram CRUD endpoints and routes webhook
+  updates into `ControlCommand::UserMessage`.
+- `dashboard/src/app/assistant/page.tsx` is the new top-level UI surface,
+  while `dashboard/src/app/settings/telegram/page.tsx` redirects for
+  compatibility.
+- Standalone bot mode creates a placeholder assistant mission and then one
+  assistant-mode mission per Telegram chat.
+
+This makes Telegram the assistant runtime. The agent loop, memory policy,
+Telegram transport, mission steering, and proactive notification logic are all
+coupled inside sandboxed.sh.
+
+## Target Architecture
+
+Hermes should become the assistant runtime. Sandboxed.sh should become the
+workspace, mission, model-routing, and control provider.
+
+```text
+Telegram / other chat
+  -> Hermes messaging gateway
+  -> Hermes agent session + memory
+  -> assistant-mcp
+  -> sandboxed.sh control/workspace/model APIs
+```
+
+The assistant should run from a dedicated sandboxed workspace, preferably the
+existing `assistant` container workspace. It should be managed as a persistent
+service, not as an assistant-mode mission that receives every Telegram message.
+
+## Experimental MCP
+
+This branch adds `assistant-mcp`, a narrow MCP server for Hermes. It intentionally
+does not expose deployment or durable-job tools.
+
+Tools:
+
+- `list_active_missions`
+- `list_missions`
+- `get_mission`
+- `get_mission_events`
+- `start_mission`
+- `send_message_to_mission`
+- `cancel_mission`
+- `list_workspaces`
+
+Configuration:
+
+```text
+SANDBOXED_API_URL=https://agent-backend-dev.thomas.md
+SANDBOXED_API_TOKEN=<token when auth is enabled>
+ASSISTANT_DEFAULT_WORKSPACE_ID=<workspace uuid>
+HERMES_SANDBOXED_API_URL=https://agent-backend-dev.thomas.md
+HERMES_SANDBOXED_API_TOKEN=<token when auth is enabled>
+HERMES_DEFAULT_WORKSPACE_ID=<workspace uuid>
+```
+
+Security choices from the dev smoke:
+
+- Tool output is recursively scrubbed for secret-like keys and values.
+- Mission list tools return compact summaries instead of raw mission rows.
+- Detailed mission/event access requires explicit tool calls.
+
+## Model Routing
+
+Hermes should use the sandboxed.sh OpenAI-compatible proxy as its model
+endpoint:
+
+```yaml
+model:
+  provider: custom
+  base_url: https://agent-backend.thomas.md/v1
+  api_key: ${SANDBOXED_PROXY_KEY}
+  model: builtin/assistant
+```
+
+This keeps GLM, MiniMax, custom inference, and fallback chains in one place:
+the existing Routing UI and `/v1/models` proxy surface.
+
+## Telegram Migration
+
+Hermes already has a Telegram-capable messaging gateway, so the preferred cutover
+is not to port sandboxed.sh's Telegram webhook code into Hermes. Instead:
+
+1. Keep the old Telegram backend path active behind compatibility flags.
+2. Add an `Assistant` dashboard tab that controls Hermes config, service status,
+   selected model chain, MCP permissions, and Telegram settings.
+3. Configure Hermes gateway for Telegram using the existing bot token and
+   allowed users.
+4. Point Hermes at `assistant-mcp` for sandboxed mission control.
+5. Disable sandboxed.sh webhook registration for that bot after Hermes is live,
+   because Telegram only supports one active webhook per bot.
+6. Migrate or archive Paloma-specific tables after command parity is tested.
+
+## Deployment Shape
+
+Deploy these artifacts to dev first:
+
+- `sandboxed-sh-dev` only if backend APIs/UI change.
+- `assistant-mcp` beside the existing MCP binaries.
+- A persistent `hermes-assistant-dev.service` running in the assistant workspace.
+
+Only promote to production after:
+
+- Hermes gateway can receive Telegram DMs.
+- `assistant-mcp` can list missions and start a dev mission.
+- Routing uses `builtin/assistant` or the selected custom chain.
+- Secret redaction is verified on workspace and mission outputs.
+- Old webhook and Hermes gateway are not both claiming the same bot token.
