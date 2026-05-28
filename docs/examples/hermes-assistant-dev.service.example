@@ -1,0 +1,22 @@
+[Unit]
+Description=Hermes Assistant dev gateway
+After=network-online.target sandboxed-sh-dev.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/sandboxed-sh/hermes-assistant-dev.env
+WorkingDirectory=/opt/hermes-assistant
+
+# Replace this with the Hermes runtime entrypoint. The environment file above
+# defines the sandboxed.sh API, model proxy, Telegram gateway, and assistant-mcp
+# command that Hermes should use.
+ExecStart=/opt/hermes-assistant/bin/hermes-assistant
+
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

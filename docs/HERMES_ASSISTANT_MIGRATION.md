@@ -134,6 +134,15 @@ Deploy these artifacts to dev first:
 - `assistant-mcp` beside the existing MCP binaries.
 - A persistent `hermes-assistant-dev.service` running in the assistant workspace.
 
+This repository does not ship the Hermes runtime, but it now defines the
+sandboxed.sh side of the service contract:
+
+- `docs/examples/hermes-assistant-dev.env.example` lists the API, model proxy,
+  Telegram gateway, and MCP bridge variables Hermes needs.
+- `docs/examples/hermes-assistant-dev.service.example` shows a minimal systemd
+  shape for the external Hermes runtime. Replace the placeholder `ExecStart`
+  with the actual Hermes binary or launcher from the Hermes repository.
+
 Only promote to production after:
 
 - Hermes gateway can receive Telegram DMs.
