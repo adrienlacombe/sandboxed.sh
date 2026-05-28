@@ -74,6 +74,27 @@ Security choices from the dev smoke:
 - Mission list tools return compact summaries instead of raw mission rows.
 - Detailed mission/event access requires explicit tool calls.
 
+## Readiness Checks
+
+After deploying `assistant-mcp`, sandboxed.sh exposes its install status through
+the existing system components endpoint. The Assistant dashboard reads the same
+component record, so this API is the operator source of truth for the MCP bridge:
+
+```bash
+curl -fsS https://agent-backend-dev.thomas.md/api/system/components \
+  | jq -c '.components[] | select(.name == "assistant_mcp")'
+```
+
+Expected dev output once the bridge is installed:
+
+```json
+{"name":"assistant_mcp","version":"0.1.0","installed":true,"update_available":null,"path":"/usr/local/bin/assistant-mcp","status":"ok"}
+```
+
+The component is ready for Hermes only when `installed` is `true` and `status` is
+`ok`. Gateway and runtime readiness still need to come from the Hermes service
+itself, because this repository only owns the sandboxed.sh API/UI and MCP bridge.
+
 ## Model Routing
 
 Hermes should use the sandboxed.sh OpenAI-compatible proxy as its model
