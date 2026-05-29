@@ -6,6 +6,8 @@
 
 use std::io::{BufRead, BufReader, Write};
 
+use chrono::Utc;
+use jsonwebtoken::{EncodingKey, Header};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use uuid::Uuid;
@@ -118,12 +120,49 @@ struct SendMessageParams {
     content: String,
 }
 
+#[derive(Debug, Serialize)]
+struct JwtClaims {
+    sub: String,
+    usr: String,
+    iat: i64,
+    exp: i64,
+}
+
 fn default_limit() -> usize {
     50
 }
 
 fn default_event_limit() -> usize {
     40
+}
+
+fn mint_service_jwt(secret: &str) -> Option<String> {
+    let now = Utc::now();
+    let exp = now + chrono::Duration::hours(24);
+    let user_id = std::env::var("HERMES_ASSISTANT_USER_ID")
+        .or_else(|_| std::env::var("SANDBOXED_ASSISTANT_USER_ID"))
+        .or_else(|_| std::env::var("SANDBOXED_SINGLE_TENANT_USER_ID"))
+        .or_else(|_| std::env::var("SINGLE_TENANT_USER_ID"))
+        .unwrap_or_else(|_| "default".to_string());
+    let user_id = user_id.trim();
+    let user_id = if user_id.is_empty() {
+        "default"
+    } else {
+        user_id
+    };
+
+    let claims = JwtClaims {
+        sub: user_id.to_string(),
+        usr: user_id.to_string(),
+        iat: now.timestamp(),
+        exp: exp.timestamp(),
+    };
+    jsonwebtoken::encode(
+        &Header::default(),
+        &claims,
+        &EncodingKey::from_secret(secret.as_bytes()),
+    )
+    .ok()
 }
 
 struct AssistantMcp {
@@ -144,7 +183,13 @@ impl AssistantMcp {
             .or_else(|_| std::env::var("SANDBOXED_API_TOKEN"))
             .or_else(|_| std::env::var("OPEN_AGENT_API_TOKEN"))
             .ok()
-            .filter(|token| !token.trim().is_empty());
+            .filter(|token| !token.trim().is_empty())
+            .or_else(|| {
+                std::env::var("JWT_SECRET")
+                    .ok()
+                    .filter(|secret| !secret.trim().is_empty())
+                    .and_then(|secret| mint_service_jwt(&secret))
+            });
         Self {
             api_url,
             api_token,

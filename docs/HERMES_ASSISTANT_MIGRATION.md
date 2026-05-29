@@ -77,7 +77,9 @@ SANDBOXED_API_URL=https://agent-backend-dev.thomas.md
 SANDBOXED_API_TOKEN=<token when auth is enabled>
 ASSISTANT_DEFAULT_WORKSPACE_ID=<workspace uuid>
 HERMES_SANDBOXED_API_URL=https://agent-backend-dev.thomas.md
-HERMES_SANDBOXED_API_TOKEN=<token when auth is enabled>
+HERMES_SANDBOXED_API_TOKEN=<optional static token>
+JWT_SECRET=<preferred for auth-enabled deployments; assistant-mcp mints service JWTs>
+HERMES_ASSISTANT_USER_ID=<single-tenant mission owner, usually default in prod and dev in dev>
 HERMES_DEFAULT_WORKSPACE_ID=<workspace uuid>
 ```
 
