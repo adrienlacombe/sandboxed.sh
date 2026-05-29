@@ -1487,17 +1487,29 @@ async fn get_systemd_service_component(
             "--property=LoadState",
             "--property=ActiveState",
             "--property=FragmentPath",
-            "--value",
         ])
         .output()
         .await
         .ok()?;
 
+    // `systemctl show` emits `Key=Value` lines, but NOT necessarily in the
+    // order the `--property` flags were given (it follows internal property
+    // ordering — see systemd#28205). Parse by key instead of by position so we
+    // never swap LoadState/ActiveState/FragmentPath.
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut lines = stdout.lines();
-    let load_state = lines.next().unwrap_or_default().trim();
-    let active_state = lines.next().unwrap_or_default().trim();
-    let fragment_path = lines.next().unwrap_or_default().trim();
+    let mut load_state = "";
+    let mut active_state = "";
+    let mut fragment_path = "";
+    for line in stdout.lines() {
+        if let Some((key, value)) = line.split_once('=') {
+            match key.trim() {
+                "LoadState" => load_state = value.trim(),
+                "ActiveState" => active_state = value.trim(),
+                "FragmentPath" => fragment_path = value.trim(),
+                _ => {}
+            }
+        }
+    }
 
     systemd_service_component_from_states(
         component_name,

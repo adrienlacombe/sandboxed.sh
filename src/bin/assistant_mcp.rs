@@ -342,10 +342,16 @@ impl AssistantMcp {
     }
 
     async fn list_active_missions(&self, limit: usize) -> Result<Value, String> {
+        let requested = limit.clamp(1, 100);
+        // The API returns the most recent missions regardless of status, so a
+        // narrow fetch limit can be fully consumed by recent completed missions
+        // and starve the active filter below. Fetch a wider window than the
+        // caller asked for, then filter and truncate to the requested count.
+        let fetch_limit = requested.saturating_mul(4).clamp(50, 100);
         let mut result = self
             .list_missions(ListMissionsParams {
                 status: None,
-                limit,
+                limit: fetch_limit,
             })
             .await?;
         if let Some(missions) = result["missions"].as_array_mut() {
@@ -355,7 +361,7 @@ impl AssistantMcp {
                     Some("active" | "pending" | "awaiting_user" | "blocked")
                 )
             });
-            missions.truncate(limit.clamp(1, 100));
+            missions.truncate(requested);
         }
         Ok(result)
     }
@@ -375,7 +381,20 @@ impl AssistantMcp {
     async fn get_mission_events(&self, params: MissionEventsParams) -> Result<Value, String> {
         let id = parse_uuid(&params.mission_id)?;
         let limit = params.limit.clamp(1, 200);
-        let view = params.view.unwrap_or_else(|| "transcript".to_string());
+        // Validate against the declared enum rather than interpolating a
+        // free-form string into the URL, which would let a caller smuggle
+        // extra query parameters (e.g. `all&foo=bar`) into the internal request.
+        let view = match params.view.as_deref() {
+            None | Some("transcript") => "transcript",
+            Some("trace") => "trace",
+            Some("history") => "history",
+            Some("all") => "all",
+            Some(other) => {
+                return Err(format!(
+                    "Invalid view '{other}'; expected one of: transcript, trace, history, all"
+                ))
+            }
+        };
         let mut path = format!(
             "/api/control/missions/{id}/events?limit={limit}&view={view}&include_counts=false"
         );
@@ -787,13 +806,28 @@ async fn main() {
             continue;
         }
 
-        let response = match serde_json::from_str::<JsonRpcRequest>(&line) {
-            Ok(request) => server.handle_request(request).await,
+        let request = match serde_json::from_str::<JsonRpcRequest>(&line) {
+            Ok(request) => request,
             Err(error) => {
-                JsonRpcResponse::error(Value::Null, -32700, format!("Parse error: {error}"))
+                let response =
+                    JsonRpcResponse::error(Value::Null, -32700, format!("Parse error: {error}"));
+                if let Ok(serialized) = serde_json::to_string(&response) {
+                    let _ = writeln!(stdout, "{serialized}");
+                    let _ = stdout.flush();
+                }
+                continue;
             }
         };
 
+        // Notifications (no id), e.g. the `notifications/initialized` the MCP
+        // client sends after `initialize`, expect no reply per JSON-RPC.
+        // Returning a "-32601 Method not found" error here breaks the handshake
+        // with stricter clients.
+        if request.id.is_null() && request.method.starts_with("notifications/") {
+            continue;
+        }
+
+        let response = server.handle_request(request).await;
         if let Ok(serialized) = serde_json::to_string(&response) {
             let _ = writeln!(stdout, "{serialized}");
             let _ = stdout.flush();

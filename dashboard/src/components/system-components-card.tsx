@@ -22,6 +22,7 @@ import { cn } from '@/lib/utils';
 
 // Component display names
 const componentNames: Record<string, string> = {
+  open_agent: 'sandboxed.sh',
   sandboxed_sh: 'sandboxed.sh',
   assistant_mcp: 'Assistant MCP',
   hermes_assistant: 'Hermes Assistant',
@@ -33,6 +34,7 @@ const componentNames: Record<string, string> = {
 
 // Component icons
 const componentIcons: Record<string, string> = {
+  open_agent: '🚀',
   sandboxed_sh: '🚀',
   assistant_mcp: '🔌',
   hermes_assistant: '◈',
@@ -41,6 +43,10 @@ const componentIcons: Record<string, string> = {
   codex: '🧠',
   grok: '𝕏',
 };
+
+// Components whose lifecycle is owned elsewhere (external runtime / installer),
+// so they render as read-only status rows with no in-dashboard update action.
+const readonlyComponents = new Set(['assistant_mcp', 'hermes_assistant']);
 
 interface UpdateLog {
   message: string;
@@ -216,7 +222,7 @@ export function SystemComponentsCard() {
                   </div>
 
                   {/* Update button */}
-                  {component.status === 'update_available' && component.name !== 'sandboxed_sh' && (
+                  {component.status === 'update_available' && component.name !== 'sandboxed_sh' && !readonlyComponents.has(component.name) && (
                     <button
                       onClick={() => handleUpdate(component)}
                       disabled={updatingComponent !== null}

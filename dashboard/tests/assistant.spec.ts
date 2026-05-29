@@ -137,7 +137,7 @@ test.describe('Assistant page', () => {
           ],
         });
       }
-      if (path === '/api/control/telegram/bots') {
+      if (path === '/api/control/assistant/gateways') {
         return json([
           {
             id: 'bot-1',
@@ -171,7 +171,7 @@ test.describe('Assistant page', () => {
       if (path === '/api/providers/backend-models') {
         return json({ backends: {} });
       }
-      if (path.startsWith('/api/control/telegram/bots/bot-1/')) {
+      if (path.startsWith('/api/control/assistant/gateways/bot-1/')) {
         return json([]);
       }
 
@@ -182,7 +182,7 @@ test.describe('Assistant page', () => {
 
     await expect(page.getByText('@hermes_devbot')).toBeVisible();
     await expect(page.getByText('Compatibility gateway still active')).toBeVisible();
-    await expect(page.getByText('Hermes runtime is active while 1 compatibility gateway remains active. Move bot webhook ownership to Hermes, then deactivate the matching gateway here.')).toBeVisible();
+    await expect(page.getByText('Hermes runtime is active while 1 compatibility gateway remains active. Use Adopt on the matching gateway to copy the existing token into Hermes and stop the legacy webhook.')).toBeVisible();
     await expect(page.getByRole('link', { name: 'Review gateways' })).toHaveAttribute('href', '#assistant-gateways');
     await expect(page.getByText('Compatibility webhook')).toBeVisible();
     await expect(page.getByRole('button', { name: 'Edit @hermes_devbot' })).toBeVisible();

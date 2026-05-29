@@ -3554,14 +3554,27 @@ pub async fn clear_queue(
 // ==================== Mission Endpoints ====================
 
 /// List all missions.
+#[derive(Debug, Default, Deserialize)]
+pub struct ListMissionsQuery {
+    #[serde(default)]
+    pub limit: Option<usize>,
+    #[serde(default)]
+    pub offset: Option<usize>,
+}
+
 pub async fn list_missions(
     State(state): State<Arc<AppState>>,
     Extension(user): Extension<AuthUser>,
+    Query(query): Query<ListMissionsQuery>,
 ) -> Result<Json<Vec<Mission>>, (StatusCode, String)> {
     let control = control_for_user(&state, &user).await;
+    // Default to the most recent 50; honor an explicit limit so callers (e.g.
+    // the assistant MCP) can request more, capped to keep the response bounded.
+    let limit = query.limit.unwrap_or(50).clamp(1, 200);
+    let offset = query.offset.unwrap_or(0);
     let mut missions = control
         .mission_store
-        .list_missions(50, 0)
+        .list_missions(limit, offset)
         .await
         .map_err(internal_error)?;
     populate_workspace_names(&state, &mut missions).await;
