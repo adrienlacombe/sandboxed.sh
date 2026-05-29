@@ -142,11 +142,15 @@ model:
   provider: custom
   base_url: https://agent-backend.thomas.md/v1
   api_key: ${SANDBOXED_PROXY_KEY}
-  model: builtin/assistant
+  model: builtin/smart
 ```
 
 This keeps GLM, MiniMax, custom inference, and fallback chains in one place:
 the existing Routing UI and `/v1/models` proxy surface.
+`builtin/smart` is the safer Hermes default because it currently starts with a
+MiniMax route that emits visible OpenAI-compatible `message.content`; GLM 5.1
+can emit long `reasoning_content` before visible text, which some Hermes
+gateway flows treat as an empty provider response.
 
 ## Telegram Migration
 
@@ -236,6 +240,6 @@ Only promote to production after:
 
 - Hermes gateway can receive Telegram DMs.
 - `assistant-mcp` can list missions and start a dev mission.
-- Routing uses `builtin/assistant` or the selected custom chain.
+- Routing uses `builtin/smart` or the selected custom chain.
 - Secret redaction is verified on workspace and mission outputs.
 - Old webhook and Hermes gateway are not both claiming the same bot token.

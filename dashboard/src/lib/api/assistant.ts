@@ -54,6 +54,7 @@ export interface AdoptHermesAssistantResult {
 export interface HermesAssistantStatus {
   service_name: string;
   service_active: boolean;
+  model: string | null;
   env_path: string;
   config_path: string;
   env_present: boolean;

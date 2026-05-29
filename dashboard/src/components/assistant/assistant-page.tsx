@@ -355,7 +355,7 @@ export default function AssistantPage() {
       const result = await adoptHermesAssistant({
         gateway_id: bot.id,
         allow_all_users: allowAllUsers,
-        model: assistantChain?.id || 'builtin/assistant',
+        model: assistantChain?.id || 'builtin/smart',
         install_hermes_if_missing: true,
       });
       await Promise.all([mutateBots(), mutateSystemComponents(), mutateHermesStatus()]);
@@ -441,10 +441,10 @@ export default function AssistantPage() {
   const hermesRuntimeReady = hermesRuntime?.installed && hermesRuntime.status === 'ok';
   const assistantChain = useMemo(
     () =>
+      modelChains.find((chain) => chain.id === 'builtin/smart') ||
       modelChains.find((chain) => chain.id === 'builtin/assistant') ||
       modelChains.find((chain) => chain.id === 'assistant') ||
       modelChains.find((chain) => chain.is_default) ||
-      modelChains.find((chain) => chain.id === 'builtin/smart') ||
       null,
     [modelChains]
   );
@@ -572,7 +572,7 @@ export default function AssistantPage() {
               <GitBranch className="h-4 w-4 text-violet-300" />
             </div>
             <p className="mt-2 text-sm font-medium text-white">
-              {assistantChain?.id || 'builtin/assistant'}
+              {hermesStatus?.model || assistantChain?.id || 'builtin/smart'}
             </p>
             <p className="mt-1 text-xs text-white/45">
               {assistantChain

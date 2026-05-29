@@ -835,6 +835,7 @@ pub struct AdoptHermesAssistantResponse {
 pub struct HermesAssistantStatusResponse {
     pub service_name: String,
     pub service_active: bool,
+    pub model: Option<String>,
     pub env_path: String,
     pub dotenv_path: String,
     pub config_path: String,
@@ -885,7 +886,12 @@ struct TelegramWebhookInfoResult {
 }
 
 fn default_hermes_model() -> String {
-    "builtin/assistant".to_string()
+    // GLM 5.1 currently returns extended reasoning in `reasoning_content`
+    // through the OpenAI-compatible proxy before it emits visible `content`.
+    // Hermes' Telegram gateway expects visible assistant text, so the assistant
+    // runtime defaults to the Smart chain, which currently starts with MiniMax
+    // and still keeps the operator-controlled routing surface.
+    "builtin/smart".to_string()
 }
 
 fn assistant_runtime_name(config: &crate::config::Config) -> &'static str {
@@ -1398,6 +1404,10 @@ async fn get_hermes_assistant_status(
         .and_then(|contents| parse_env_value(contents, "TELEGRAM_BOT_TOKEN"))
         .filter(|value| !value.trim().is_empty());
     let token_present = token.is_some();
+    let model = env_contents
+        .as_deref()
+        .and_then(|contents| parse_env_value(contents, "HERMES_ASSISTANT_MODEL"))
+        .filter(|value| !value.trim().is_empty());
 
     let mut telegram_ok = None;
     let mut telegram_bot_username = None;
@@ -1484,6 +1494,7 @@ async fn get_hermes_assistant_status(
     Json(HermesAssistantStatusResponse {
         service_name,
         service_active,
+        model,
         env_path,
         dotenv_path,
         config_path,
