@@ -62,8 +62,8 @@ literature. Local inference, isolated containers, nothing leaves your machines.
   with per-mission directories
 - **Git-backed Library**: Skills, tools, rules, agents, and MCPs versioned in a
   single repo
-- **Telegram Integration**: Connect bots to missions for chat-based AI
-  assistants with auto-mission creation per chat
+- **Assistant Gateway**: Manage Telegram gateway compatibility from the
+  top-level Assistant UI while Hermes takes over assistant runtime over MCP
 - **Automations**: Schedule recurring agent runs with cron-like triggers
 - **Model Routing**: Provider fallback chains with health checks and
   rate-limit handling
@@ -185,7 +185,8 @@ deployment:
 - **[Backend API](docs/BACKEND_API.md)** - Backend configuration
 
 ### Setup Guides
-- **[Telegram Assistant](docs/TELEGRAM_ASSISTANT.md)** - Connect Telegram bots to missions
+- **[Assistant Gateway](docs/TELEGRAM_ASSISTANT.md)** - Connect Telegram bots and manage the Assistant cutover
+- **[Hermes Assistant Migration](docs/HERMES_ASSISTANT_MIGRATION.md)** - MCP bridge and runtime handoff notes
 - **[Desktop Setup](docs/DESKTOP_SETUP.md)** - X11/Xvfb configuration for GUI automation
 
 ### Reference

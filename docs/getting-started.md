@@ -92,7 +92,7 @@ When you first access the sandboxed.sh dashboard, you'll see the global monitor 
 ![Initial Dashboard](images/getting-started/01-dashboard-initial.webp)
 
 The dashboard shows:
-- **Navigation sidebar** - Access different sections (Overview, Mission, Workspaces, Library, Settings)
+- **Navigation sidebar** - Access different sections (Overview, Mission, Workspaces, Assistant, Library, Settings)
 - **Global Monitor** - Real-time view of running missions
 - **Recent Missions** - History of completed tasks
 - **Agent Status** - Current state (Ready, Busy, etc.)

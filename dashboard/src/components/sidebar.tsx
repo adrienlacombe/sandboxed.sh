@@ -47,6 +47,7 @@ const navigation: NavItem[] = [
   { name: 'Mission', href: '/control', icon: ChatCircleText },
   { name: 'Workspaces', href: '/workspaces', icon: SidebarSimple },
   { name: 'Console', href: '/console', icon: TerminalWindow },
+  { name: 'Assistant', href: '/assistant', icon: Robot },
   { name: 'Routing', href: '/model-routing', icon: GitBranch },
   {
     name: 'Library',
@@ -77,7 +78,6 @@ const navigation: NavItem[] = [
       { name: 'Backends', href: '/settings/backends', icon: Cpu },
       { name: 'Providers', href: '/settings/providers', icon: Key },
       { name: 'LLM', href: '/settings/llm', icon: Sparkle },
-      { name: 'Telegram', href: '/settings/telegram', icon: Robot },
       { name: 'Security', href: '/settings/secrets', icon: Lock },
       { name: 'Data', href: '/settings/data', icon: Archive },
     ],

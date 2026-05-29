@@ -2537,6 +2537,25 @@ impl TelegramBridge {
                 .cloned()
                 .collect();
             for ctx in channels {
+                match ctx.mission_store.get_telegram_channel(ctx.channel.id).await {
+                    Ok(Some(channel)) if channel.active => {}
+                    Ok(_) => {
+                        self.active_channels.write().await.remove(&ctx.channel.id);
+                        tracing::info!(
+                            channel_id = %ctx.channel.id,
+                            "Removed inactive Telegram gateway from legacy scheduler"
+                        );
+                        continue;
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            channel_id = %ctx.channel.id,
+                            "Failed to refresh Telegram gateway state before scheduler tick: {}",
+                            err
+                        );
+                    }
+                }
+
                 let card_job_name = paloma_channel_job_name("paloma_mission_cards", ctx.channel.id);
                 let card_job_started = now_string();
                 let card_job_lease_expires = paloma_scheduler_lease_expires_at();

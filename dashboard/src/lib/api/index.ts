@@ -192,3 +192,29 @@ export {
   searchBotStructuredMemory,
   listBotActionExecutions,
 } from "./telegram";
+
+// Assistant gateways
+export {
+  type AssistantGateway,
+  type AssistantGatewayChat,
+  type AssistantGatewayScheduledMessage,
+  type AssistantGatewayMemoryEntry,
+  type AssistantGatewayMemorySearchHit,
+  type AssistantGatewayActionExecution,
+  type CreateAssistantGatewayInput,
+  type UpdateAssistantGatewayInput,
+  type AdoptHermesAssistantInput,
+  type AdoptHermesAssistantResult,
+  type HermesAssistantStatus,
+  listAssistantGateways,
+  createAssistantGateway,
+  updateAssistantGateway,
+  deleteAssistantGateway,
+  listAssistantGatewayChats,
+  listAssistantGatewayScheduledMessages,
+  listAssistantGatewayActions,
+  listAssistantGatewayMemory,
+  searchAssistantGatewayMemory,
+  adoptHermesAssistant,
+  getHermesAssistantStatus,
+} from "./assistant";

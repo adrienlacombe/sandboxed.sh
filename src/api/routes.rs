@@ -807,6 +807,50 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
             "/api/control/assistants",
             get(control::list_assistant_missions),
         )
+        // Assistant gateway endpoints. These are assistant-owned aliases over
+        // the existing Telegram compatibility bridge while Hermes cutover is
+        // staged. Keep the Telegram routes below for older clients.
+        .route(
+            "/api/control/assistant/gateways",
+            get(control::list_telegram_bots).post(control::create_telegram_bot),
+        )
+        .route(
+            "/api/control/assistant/gateways/:id",
+            axum::routing::delete(control::delete_telegram_channel)
+                .patch(control::update_telegram_channel),
+        )
+        .route(
+            "/api/control/assistant/gateways/:id/toggle",
+            post(control::toggle_telegram_channel),
+        )
+        .route(
+            "/api/control/assistant/gateways/:id/chats",
+            get(control::list_bot_chats),
+        )
+        .route(
+            "/api/control/assistant/gateways/:id/scheduled",
+            get(control::list_bot_scheduled_messages),
+        )
+        .route(
+            "/api/control/assistant/gateways/:id/actions",
+            get(control::list_bot_action_executions),
+        )
+        .route(
+            "/api/control/assistant/gateways/:id/conversations",
+            get(control::list_bot_conversations),
+        )
+        .route(
+            "/api/control/assistant/gateways/:id/workflows",
+            get(control::list_bot_workflows),
+        )
+        .route(
+            "/api/control/assistant/gateways/:id/memory",
+            get(control::list_bot_structured_memory),
+        )
+        .route(
+            "/api/control/assistant/gateways/:id/memory-search",
+            get(control::search_bot_structured_memory),
+        )
         // Telegram channel endpoints
         .route(
             "/api/control/missions/:id/telegram-channels",
