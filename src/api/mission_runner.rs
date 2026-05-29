@@ -2884,7 +2884,7 @@ async fn run_mission_turn(
         config.default_model = Some(resolve_gemini_default_model());
     } else if backend_id == "grok" && model_override.is_none() {
         // Pin Grok Build to its own default model. Without this the global
-        // DEFAULT_MODEL (typically `anthropic/claude-opus-4-6`) flows
+        // DEFAULT_MODEL (typically `anthropic/claude-opus-4-8`) flows
         // through to `--model` and the grok CLI rejects it as "unknown
         // model id" — the mission then fails on the first turn with a
         // confusing chdir error from the rejected-CLI path. See prod
@@ -12338,6 +12338,16 @@ pub async fn run_grok_turn(
                     .with_terminal_reason(TerminalReason::LlmError);
                 }
             }
+        } else if let Err(err) = crate::api::ai_providers::write_grok_oauth_auth_file(
+            &entry.refresh_token,
+            &entry.access_token,
+            entry.expires_at,
+        ) {
+            tracing::warn!(
+                mission_id = %mission_id,
+                error = %err,
+                "Failed to materialize fresh xAI OAuth token into Grok auth file"
+            );
         }
     }
 
@@ -12815,6 +12825,15 @@ fn codex_turn_requires_tool_activity(user_message: &str, assistant_message: &str
         .iter()
         .any(|action| contains_ascii_word(&user, action))
         && object_markers.iter().any(|object| user.contains(object))
+}
+
+fn codex_is_goal_request(user_message: &str) -> bool {
+    user_message.trim_start().starts_with("/goal ")
+}
+
+fn codex_missing_goal_final_response_message() -> String {
+    "Goal completed, but Codex did not emit a final assistant response. The last reasoning block was captured in the thinking panel, but it is not being promoted to the completion message."
+        .to_string()
 }
 
 /// Does the user message read as a question or request-for-explanation,
@@ -13493,10 +13512,14 @@ pub async fn run_codex_turn(
     } else if let Some(summary) = last_summary {
         summary
     } else if let Some(thinking_text) = thinking_for_fallback {
-        // Surface the model's reasoning as the assistant message so the
-        // dashboard's final-message slot matches what's already visible in
-        // the thinking panel.
-        thinking_text
+        if success && codex_is_goal_request(user_message) && !cancelled {
+            codex_missing_goal_final_response_message()
+        } else {
+            // Surface the model's reasoning as the assistant message so the
+            // dashboard's final-message slot matches what's already visible in
+            // the thinking panel.
+            thinking_text
+        }
     } else if let Some(marker) = cancel_marker.as_ref() {
         // Mid-turn cancellation with nothing accumulated — preserve the
         // historical "Mission cancelled" / shutdown text for the UI.
@@ -14385,7 +14408,8 @@ mod tests {
         claudecode_transport_failure_stage, claudecode_transport_failure_stage_for_incomplete_turn,
         claudecode_transport_recovery_strategy, codex_chatgpt_fallback_for_result,
         codex_chatgpt_fallback_model, codex_error_message_to_surface,
-        codex_final_message_looks_like_progress_update, codex_key_fingerprint,
+        codex_final_message_looks_like_progress_update, codex_is_goal_request,
+        codex_key_fingerprint, codex_missing_goal_final_response_message,
         codex_tool_stall_should_retry_with_default_model, codex_turn_requires_tool_activity,
         custom_opencode_provider_definition, ensure_opencode_provider_for_model,
         extract_model_from_message, extract_opencode_session_id, extract_part_text, extract_str,
@@ -14526,6 +14550,22 @@ mod tests {
             "Create directory codex_probe, write files, run ls -la, wc -c, and cat them.",
             "ALL_STEPS_DONE"
         ));
+    }
+
+    #[test]
+    fn codex_goal_request_detection_requires_slash_goal_command() {
+        assert!(codex_is_goal_request("/goal finish the task"));
+        assert!(codex_is_goal_request("   /goal finish the task"));
+        assert!(!codex_is_goal_request("/goal"));
+        assert!(!codex_is_goal_request("please run /goal literally"));
+    }
+
+    #[test]
+    fn codex_missing_goal_final_response_message_does_not_expose_reasoning() {
+        let message = codex_missing_goal_final_response_message();
+        assert!(message.contains("did not emit a final assistant response"));
+        assert!(!message.contains("Both PRs are open"));
+        assert!(!message.contains("final sanity check"));
     }
 
     #[test]

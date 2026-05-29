@@ -164,6 +164,50 @@ function getFileIcon(path: string) {
   return File;
 }
 
+// Sentinel class applied by `rehypeMarkStandaloneLinks` to links that are the
+// sole content of their paragraph/list-item. Only such "standalone" file links
+// render as the full download card; file links mentioned mid-prose render as a
+// compact inline chip so they don't break the surrounding text flow.
+const STANDALONE_LINK_CLASS = "__standalone-link";
+
+/* eslint-disable @typescript-eslint/no-explicit-any */
+function rehypeMarkStandaloneLinks() {
+  return (tree: any) => {
+    const walk = (node: any) => {
+      if (!node || !Array.isArray(node.children)) return;
+      for (const child of node.children) {
+        if (
+          child.type === "element" &&
+          (child.tagName === "p" || child.tagName === "li")
+        ) {
+          const meaningful = (child.children ?? []).filter(
+            (c: any) => !(c.type === "text" && String(c.value ?? "").trim() === "")
+          );
+          if (
+            meaningful.length === 1 &&
+            meaningful[0].type === "element" &&
+            meaningful[0].tagName === "a"
+          ) {
+            const link = meaningful[0];
+            link.properties = link.properties ?? {};
+            const existing = link.properties.className;
+            const classes = Array.isArray(existing)
+              ? existing.slice()
+              : typeof existing === "string"
+                ? [existing]
+                : [];
+            classes.push(STANDALONE_LINK_CLASS);
+            link.properties.className = classes;
+          }
+        }
+        walk(child);
+      }
+    };
+    walk(tree);
+  };
+}
+/* eslint-enable @typescript-eslint/no-explicit-any */
+
 function resolvePath(path: string, basePath?: string): string {
   if (path.startsWith("/") || /^[a-zA-Z]:/.test(path)) {
     if (basePath) {
@@ -935,6 +979,49 @@ function InlineFileCard({
   );
 }
 
+// Compact, text-flowing reference for a file linked mid-prose. Unlike
+// InlineFileCard this stays on the baseline and does no metadata fetch — it is
+// just a clickable filename that opens the preview modal.
+function InlineFileChip({
+  path,
+  displayName,
+  basePath,
+  workspaceId,
+  missionId,
+}: {
+  path: string;
+  displayName: string;
+  basePath?: string;
+  workspaceId?: string;
+  missionId?: string;
+}) {
+  const isAbsolute = path.startsWith("/") || /^[a-zA-Z]:/.test(path);
+  const canResolve = isAbsolute || !!basePath;
+  const resolvedPath = canResolve ? resolvePath(path, basePath) : path;
+  const FileIcon = getFileIcon(path);
+  return (
+    <button
+      type="button"
+      title="Click to preview"
+      onClick={(e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        showFilePreviewModal(path, resolvedPath, workspaceId, missionId);
+      }}
+      className={cn(
+        "inline-flex items-center gap-1 align-middle rounded px-1.5 py-0.5",
+        "bg-indigo-500/[0.12] text-indigo-300 hover:bg-indigo-500/20 hover:text-indigo-200",
+        "font-mono text-[0.85em] leading-none cursor-pointer transition-colors"
+      )}
+    >
+      {/* getFileIcon returns a stable module-level lucide component, not a new one. */}
+      {/* eslint-disable-next-line react-hooks/static-components */}
+      <FileIcon className="h-3 w-3 shrink-0 opacity-70" />
+      <span className="truncate max-w-[16rem]">{displayName}</span>
+    </button>
+  );
+}
+
 // P1-#10: messages larger than this render as plain <pre> with an opt-in
 // "Render markdown" button. The freeze trace on the verity missions
 // showed single assistant bubbles 200KB+ of repeated tokens that took
@@ -981,15 +1068,27 @@ export const MarkdownContent = memo(function MarkdownContent({
       // eslint-disable-next-line @next/next/no-img-element
       return <img src={srcStr} alt={alt} {...props} className="max-w-full rounded" />;
     },
-    a({ href, children, ...props }) {
+    a({ href, children, className, ...props }) {
       if (href && isRichFileLinkHref(href)) {
         const path = href.startsWith("sandboxed-file://")
           ? decodeURIComponent(href.replace("sandboxed-file://", ""))
           : decodeURIComponent(href.split(/[?#]/, 1)[0]);
         const childText = Array.isArray(children) ? children.join("") : String(children || "");
         const displayName = childText || path.split("/").pop() || "file";
-        return (
+        const standalone =
+          typeof className === "string" && className.includes(STANDALONE_LINK_CLASS);
+        // Standalone (own paragraph/list-item) → full download card; a file
+        // mentioned mid-prose → compact inline chip so text keeps flowing.
+        return standalone ? (
           <InlineFileCard
+            path={path}
+            displayName={displayName}
+            basePath={basePath}
+            workspaceId={workspaceId}
+            missionId={missionId}
+          />
+        ) : (
+          <InlineFileChip
             path={path}
             displayName={displayName}
             basePath={basePath}
@@ -1078,6 +1177,7 @@ export const MarkdownContent = memo(function MarkdownContent({
 
   // Memoize remarkPlugins array to prevent recreation
   const plugins = useMemo(() => [remarkGfm], []);
+  const rehypePlugins = useMemo(() => [rehypeMarkStandaloneLinks], []);
 
   // Allow our placeholder protocols through react-markdown's URL sanitizer.
   // Everything else should continue to use the default sanitizer behavior.
@@ -1114,7 +1214,7 @@ export const MarkdownContent = memo(function MarkdownContent({
 
   return (
     <div className={cn("prose-glass text-sm [&_p]:my-2", className)}>
-      <Markdown remarkPlugins={plugins} components={components} urlTransform={urlTransform}>
+      <Markdown remarkPlugins={plugins} rehypePlugins={rehypePlugins} components={components} urlTransform={urlTransform}>
         {processedContent}
       </Markdown>
     </div>

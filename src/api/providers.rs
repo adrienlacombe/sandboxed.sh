@@ -535,11 +535,18 @@ fn default_providers_config() -> ProvidersConfig {
                     // Check Anthropic's current model IDs here:
                     // https://docs.anthropic.com/en/docs/about-claude/models/overview
                     ProviderModel {
-                        id: "claude-opus-4-7".to_string(),
-                        name: "Claude Opus 4.7".to_string(),
+                        id: "claude-opus-4-8".to_string(),
+                        name: "Claude Opus 4.8".to_string(),
                         description: Some(
                             "Latest Opus model, recommended for hard coding and agentic tasks"
                                 .to_string(),
+                        ),
+                    },
+                    ProviderModel {
+                        id: "claude-opus-4-7".to_string(),
+                        name: "Claude Opus 4.7".to_string(),
+                        description: Some(
+                            "Most capable, recommended for complex tasks".to_string(),
                         ),
                     },
                     ProviderModel {

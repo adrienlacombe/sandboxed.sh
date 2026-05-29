@@ -3532,7 +3532,7 @@ fn sync_to_opencode_auth(
     Ok(())
 }
 
-fn write_grok_oauth_auth_file(
+pub(crate) fn write_grok_oauth_auth_file(
     refresh_token: &str,
     access_token: &str,
     expires_at: i64,

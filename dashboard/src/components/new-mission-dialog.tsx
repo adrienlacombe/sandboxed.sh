@@ -859,7 +859,7 @@ export function NewMissionDialog({
               <p className="text-xs text-white/30 mt-1.5">
                 {selectedBackend === 'opencode'
                     ? 'Use provider/model format (e.g., openai/gpt-5-codex).'
-                    : 'Use the raw model ID (e.g., gpt-5-codex or claude-opus-4-7).'}
+                    : 'Use the raw model ID (e.g., gpt-5-codex or claude-opus-4-8).'}
               </p>
             </div>
 
