@@ -345,7 +345,7 @@ async fn get_components(State(state): State<Arc<AppState>>) -> Json<SystemCompon
     components.push(assistant_mcp_info);
 
     // External Hermes assistant runtime/gateway service, if installed on this host.
-    let hermes_assistant_info = get_hermes_assistant_info().await;
+    let hermes_assistant_info = get_hermes_assistant_info(&state.config).await;
     components.push(hermes_assistant_info);
 
     // OpenCode
@@ -774,8 +774,15 @@ async fn get_assistant_mcp_info() -> ComponentInfo {
     }
 }
 
-async fn get_hermes_assistant_info() -> ComponentInfo {
-    for service_name in ["hermes-assistant-dev.service", "hermes-assistant.service"] {
+async fn get_hermes_assistant_info(config: &crate::config::Config) -> ComponentInfo {
+    let expected_service = format!("{}.service", assistant_runtime_name(config));
+    let fallback_service = if expected_service == "hermes-assistant-dev.service" {
+        "hermes-assistant.service"
+    } else {
+        "hermes-assistant-dev.service"
+    };
+
+    for service_name in [expected_service.as_str(), fallback_service] {
         if let Some(info) = get_systemd_service_component("hermes_assistant", service_name).await {
             return info;
         }
