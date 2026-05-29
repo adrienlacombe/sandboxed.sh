@@ -179,13 +179,13 @@ sandboxed.sh side of the service contract:
 - `docs/examples/hermes-config.yaml.example` points Hermes at the sandboxed.sh
   `/v1` model proxy and registers `assistant-mcp` as a stdio MCP.
 - `docs/examples/hermes-assistant-dev.service.example` shows a minimal systemd
-  shape for `hermes gateway`.
+  shape for `hermes gateway --accept-hooks run`.
 
 ## Dev Runtime Install Checklist
 
-This repository cannot install the external Hermes runtime by itself. After the
-Hermes runtime artifact is available on the dev host, use the example files as
-the sandboxed.sh-side contract:
+The dev host has been tested with Hermes `v0.15.1` installed at
+`/usr/local/bin/hermes`. Use the example files as the sandboxed.sh-side
+contract:
 
 ```bash
 install -d -m 0755 /etc/sandboxed-sh
@@ -206,6 +206,17 @@ systemctl daemon-reload
 systemctl enable --now hermes-assistant-dev.service
 systemctl status hermes-assistant-dev.service --no-pager
 ```
+
+On the current dev deployment, sandboxed.sh runtime state lives under:
+
+```text
+/var/lib/sandboxed-sh-dev/.sandboxed-sh/workspaces.json
+/var/lib/sandboxed-sh-dev/.sandboxed-sh/missions/missions-dev.db
+```
+
+The active legacy Telegram row can be used to seed `TELEGRAM_BOT_TOKEN`.
+If `allowed_chat_ids` is empty, configure `TELEGRAM_ALLOWED_USERS` before prod.
+`GATEWAY_ALLOW_ALL_USERS=true` is acceptable only for a temporary dev smoke.
 
 Then verify sandboxed.sh can see the runtime:
 

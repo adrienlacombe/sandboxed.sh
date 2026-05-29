@@ -9,11 +9,13 @@ EnvironmentFile=/etc/sandboxed-sh/hermes-assistant-dev.env
 WorkingDirectory=/var/lib/hermes-assistant-dev
 
 # Install Hermes on the host first. The gateway process owns Telegram and loads
-# ~/.hermes/config.yaml from HERMES_HOME.
-ExecStart=/usr/local/bin/hermes gateway
+# config.yaml/.env from HERMES_HOME. `run` keeps the gateway in the foreground
+# for systemd supervision.
+ExecStart=/usr/local/bin/hermes gateway --accept-hooks run
 
 Restart=always
 RestartSec=5
+TimeoutStopSec=240
 NoNewPrivileges=true
 PrivateTmp=true
 
