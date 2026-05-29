@@ -13,6 +13,7 @@ import {
   listAssistantGatewayMemory,
   searchAssistantGatewayMemory,
   adoptHermesAssistant,
+  getHermesAssistantStatus,
   listMissions,
   getSystemComponents,
   type Mission,
@@ -104,6 +105,11 @@ export default function AssistantPage() {
     revalidateOnFocus: false,
     dedupingInterval: 60000,
   });
+  const { data: hermesStatus, mutate: mutateHermesStatus } = useSWR(
+    'hermes-assistant-status',
+    getHermesAssistantStatus,
+    { revalidateOnFocus: false, dedupingInterval: 30000 }
+  );
 
   // Chat mappings keyed by bot ID
   const [chatsByBot, setChatsByBot] = useState<Record<string, AssistantGatewayChat[]>>({});
@@ -352,7 +358,7 @@ export default function AssistantPage() {
         model: assistantChain?.id || 'builtin/assistant',
         install_hermes_if_missing: true,
       });
-      await Promise.all([mutateBots(), mutateSystemComponents()]);
+      await Promise.all([mutateBots(), mutateSystemComponents(), mutateHermesStatus()]);
       toast.success(
         result.ok
           ? `${label} is now managed by ${result.service_name}`
@@ -360,7 +366,7 @@ export default function AssistantPage() {
       );
     } catch (err) {
       toast.error(err instanceof Error ? err.message : 'Failed to adopt gateway into Hermes');
-      await Promise.all([mutateBots(), mutateSystemComponents()]);
+      await Promise.all([mutateBots(), mutateSystemComponents(), mutateHermesStatus()]);
     } finally {
       setAdoptingGatewayId(null);
     }
@@ -512,10 +518,16 @@ export default function AssistantPage() {
               <Cable className="h-4 w-4 text-sky-300" />
             </div>
             <p className="mt-2 text-sm font-medium text-white">
-              {activeGatewayCount} active / {bots.length || 0} configured
+              {hermesStatus?.telegram_ok
+                ? `@${hermesStatus.telegram_bot_username || 'telegram'} via Hermes`
+                : `${activeGatewayCount} active / ${bots.length || 0} configured`}
             </p>
             <p className="mt-1 text-xs text-white/45">
-              {knownConversationCount} known conversation{knownConversationCount === 1 ? '' : 's'}.
+              {hermesStatus?.telegram_ok
+                ? hermesStatus.telegram_webhook_configured
+                  ? 'Telegram webhook is still configured; polling may be blocked.'
+                  : `Polling ready; ${hermesStatus.telegram_pending_update_count ?? 0} pending updates.`
+                : `${knownConversationCount} known conversation${knownConversationCount === 1 ? '' : 's'}.`}
             </p>
           </div>
           <div className={cn(
@@ -585,6 +597,18 @@ export default function AssistantPage() {
               >
                 Review gateways
               </a>
+            </div>
+          </div>
+        )}
+
+        {hermesStatus?.telegram_last_error && (
+          <div className="flex gap-3 rounded-lg border border-red-500/20 bg-red-500/[0.06] p-4">
+            <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-red-300" />
+            <div className="min-w-0">
+              <p className="text-sm font-medium text-white">Telegram gateway needs attention</p>
+              <p className="mt-1 text-xs leading-5 text-white/50">
+                {hermesStatus.telegram_last_error}
+              </p>
             </div>
           </div>
         )}

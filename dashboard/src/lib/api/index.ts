@@ -205,6 +205,7 @@ export {
   type UpdateAssistantGatewayInput,
   type AdoptHermesAssistantInput,
   type AdoptHermesAssistantResult,
+  type HermesAssistantStatus,
   listAssistantGateways,
   createAssistantGateway,
   updateAssistantGateway,
@@ -215,4 +216,5 @@ export {
   listAssistantGatewayMemory,
   searchAssistantGatewayMemory,
   adoptHermesAssistant,
+  getHermesAssistantStatus,
 } from "./assistant";

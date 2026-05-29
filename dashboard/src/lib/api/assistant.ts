@@ -51,6 +51,22 @@ export interface AdoptHermesAssistantResult {
   notes: string[];
 }
 
+export interface HermesAssistantStatus {
+  service_name: string;
+  service_active: boolean;
+  env_path: string;
+  config_path: string;
+  env_present: boolean;
+  config_present: boolean;
+  token_present: boolean;
+  telegram_ok: boolean | null;
+  telegram_bot_username: string | null;
+  telegram_webhook_configured: boolean | null;
+  telegram_pending_update_count: number | null;
+  telegram_last_error: string | null;
+  notes: string[];
+}
+
 const gatewayPath = "/api/control/assistant/gateways";
 
 export async function listAssistantGateways(): Promise<AssistantGateway[]> {
@@ -157,5 +173,12 @@ export async function adoptHermesAssistant(
     "/api/system/hermes-assistant/adopt",
     input,
     "Failed to adopt gateway into Hermes"
+  );
+}
+
+export async function getHermesAssistantStatus(): Promise<HermesAssistantStatus> {
+  return apiGet<HermesAssistantStatus>(
+    "/api/system/hermes-assistant/status",
+    "Failed to fetch Hermes assistant status"
   );
 }
