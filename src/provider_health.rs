@@ -835,13 +835,17 @@ impl ModelChainStore {
                 id: "builtin/smart".to_string(),
                 name: "Smart (Default)".to_string(),
                 entries: vec![
-                    ChainEntry {
-                        provider_id: "zai".to_string(),
-                        model_id: "glm-5.1".to_string(),
-                    },
+                    // MiniMax leads because it emits visible OpenAI-compatible
+                    // `message.content`. GLM-5.1 streams long `reasoning_content`
+                    // before visible text, which the Hermes gateway treats as an
+                    // empty provider response. GLM stays as the fallback.
                     ChainEntry {
                         provider_id: "minimax".to_string(),
                         model_id: "MiniMax-M2.7".to_string(),
+                    },
+                    ChainEntry {
+                        provider_id: "zai".to_string(),
+                        model_id: "glm-5.1".to_string(),
                     },
                 ],
                 is_default: true,
@@ -863,6 +867,19 @@ impl ModelChainStore {
                         entry.model_id = "MiniMax-M2.7".to_string();
                         migrated = true;
                     }
+                }
+                // One-time reorder: older builtin/smart was persisted GLM-first,
+                // which makes the Hermes gateway see empty `content` while GLM
+                // streams `reasoning_content`. Lead with MiniMax instead. Only
+                // touch the stock two-entry shape so operator-added fallbacks or
+                // custom orderings are left alone.
+                if chain.entries.len() == 2
+                    && chain.entries[0].provider_id == "zai"
+                    && chain.entries[1].provider_id == "minimax"
+                {
+                    chain.entries.swap(0, 1);
+                    migrated = true;
+                    tracing::info!("Reordered builtin/smart to lead with MiniMax");
                 }
                 if migrated {
                     chain.updated_at = now;
@@ -905,16 +922,51 @@ impl ModelChainStore {
         if !chains.iter().any(|c| c.id == "builtin/assistant") {
             chains.push(ModelChain {
                 id: "builtin/assistant".to_string(),
-                name: "Assistant (GLM-5.1)".to_string(),
-                entries: vec![ChainEntry {
-                    provider_id: "zai".to_string(),
-                    model_id: "glm-5.1".to_string(),
-                }],
+                name: "Assistant (Hermes)".to_string(),
+                // The Hermes Telegram gateway renders `message.content` and treats
+                // an empty response as a provider failure. GLM-5.1 streams its
+                // answer as `reasoning_content` with empty `content`, and the
+                // proxy only fails over on pre-stream errors, so a GLM entry here
+                // produces a dead "provider failed after retries" reply. Use
+                // providers that emit visible OpenAI-compatible content instead.
+                entries: vec![
+                    ChainEntry {
+                        provider_id: "minimax".to_string(),
+                        model_id: "MiniMax-M2.7".to_string(),
+                    },
+                    ChainEntry {
+                        provider_id: "cerebras".to_string(),
+                        model_id: "qwen-3-235b-a22b-instruct-2507".to_string(),
+                    },
+                ],
                 is_default: false,
                 created_at: now,
                 updated_at: now,
             });
             changed = true;
+        } else if let Some(chain) = chains.iter_mut().find(|c| c.id == "builtin/assistant") {
+            // Heal the stock GLM-only assistant chain that predates Hermes. Only
+            // touch the exact legacy shape so an operator-customized chain is left
+            // alone.
+            if chain.entries.len() == 1
+                && chain.entries[0].provider_id == "zai"
+                && chain.entries[0].model_id == "glm-5.1"
+            {
+                chain.name = "Assistant (Hermes)".to_string();
+                chain.entries = vec![
+                    ChainEntry {
+                        provider_id: "minimax".to_string(),
+                        model_id: "MiniMax-M2.7".to_string(),
+                    },
+                    ChainEntry {
+                        provider_id: "cerebras".to_string(),
+                        model_id: "qwen-3-235b-a22b-instruct-2507".to_string(),
+                    },
+                ];
+                chain.updated_at = now;
+                changed = true;
+                tracing::info!("Healed builtin/assistant chain to visible-content providers");
+            }
         }
 
         if changed {
