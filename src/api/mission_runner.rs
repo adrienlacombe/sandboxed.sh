@@ -2757,12 +2757,34 @@ fn is_claudecode_incomplete_turn_transport_error(result: &AgentResult) -> bool {
         || out.contains("Claude Code did not emit a terminal result event before the turn ended")
 }
 
+/// Detects Anthropic's "stale thinking block" rejection surfaced through the
+/// Claude Code turn output: a replayed `thinking`/`redacted_thinking` block in
+/// the session transcript no longer matches what the API issued (typically
+/// because it was produced under a different model). Resuming the same session
+/// just replays the same blocks, so this must escalate straight to a fresh
+/// session rather than a same-session retry.
+pub(crate) fn is_stale_thinking_error(result: &AgentResult) -> bool {
+    let output = result.output.to_lowercase();
+    output.contains("cannot be modified")
+        && (output.contains("thinking") || output.contains("redacted_thinking"))
+}
+
 pub(crate) fn claudecode_transport_recovery_strategy(
     result: &AgentResult,
     has_session_id: bool,
     attempted_same_session_resume: bool,
     attempted_session_reset: bool,
 ) -> ClaudeTransportRecoveryStrategy {
+    // A stale-thinking rejection lives in the replayed session transcript;
+    // resuming the same session would hit it again, so go straight to a fresh
+    // session (which rebuilds context as text and drops the signed thinking).
+    if is_stale_thinking_error(result) {
+        if attempted_session_reset {
+            return ClaudeTransportRecoveryStrategy::None;
+        }
+        return ClaudeTransportRecoveryStrategy::ResetSessionFresh;
+    }
+
     if !is_session_corruption_error(result) {
         return ClaudeTransportRecoveryStrategy::None;
     }
@@ -16086,6 +16108,29 @@ mod tests {
         assert_eq!(
             claudecode_transport_recovery_strategy(&result, true, false, false),
             ClaudeTransportRecoveryStrategy::ResumeCurrentSession
+        );
+    }
+
+    #[test]
+    fn claudecode_transport_recovery_strategy_resets_fresh_for_stale_thinking() {
+        // The stale-thinking 400 lives in the replayed transcript, so the
+        // strategy must go straight to a fresh session — even though a session
+        // id exists and no same-session resume was attempted yet (a resume
+        // would just replay the same rejected blocks).
+        let result = AgentResult::failure(
+            "API Error: 400 messages.7.content.17: `thinking` or `redacted_thinking` blocks in the latest assistant message cannot be modified. These blocks must remain as they were in the original response.",
+            0,
+        )
+        .with_terminal_reason(TerminalReason::LlmError);
+
+        assert_eq!(
+            claudecode_transport_recovery_strategy(&result, true, false, false),
+            ClaudeTransportRecoveryStrategy::ResetSessionFresh
+        );
+        // Once a reset has been attempted, give up rather than loop.
+        assert_eq!(
+            claudecode_transport_recovery_strategy(&result, true, true, true),
+            ClaudeTransportRecoveryStrategy::None
         );
     }
 

@@ -532,6 +532,7 @@ async fn upsert_grok_oauth_provider(
     state: &super::routes::AppState,
     entry: &serde_json::Value,
     use_for_backends: Option<Vec<String>>,
+    target_id: Option<uuid::Uuid>,
 ) -> Result<ProviderResponse, (StatusCode, String)> {
     let access_token = entry
         .get("key")
@@ -556,12 +557,13 @@ async fn upsert_grok_oauth_provider(
     let account_email = grok_auth_email(entry);
     let backends = use_for_backends.unwrap_or_else(|| vec!["grok".to_string()]);
 
-    let mut provider = state
-        .ai_providers
-        .get_all_by_type(ProviderType::Xai)
-        .await
-        .into_iter()
-        .find(|p| p.has_oauth())
+    // When reconnect targets a specific row (UUID), update *that* row so the
+    // health probe checks the same id the user clicked. Otherwise fall back to
+    // the first OAuth row, or create a new one.
+    let existing_xai = state.ai_providers.get_all_by_type(ProviderType::Xai).await;
+    let mut provider = target_id
+        .and_then(|tid| existing_xai.iter().find(|p| p.id == tid).cloned())
+        .or_else(|| existing_xai.iter().find(|p| p.has_oauth()).cloned())
         .unwrap_or_else(|| {
             crate::ai_providers::AIProvider::new(
                 ProviderType::Xai,
@@ -7714,14 +7716,33 @@ async fn oauth_callback(
     let provider_type_id = id.clone();
     match oauth_callback_inner(State(state.clone()), AxumPath(id), Json(req)).await {
         Ok(json) => {
-            if ProviderType::from_id(&provider_type_id) == Some(ProviderType::Xai) {
+            // Resolve the provider type. The add-provider flow passes a
+            // provider-type id ("anthropic", ...); the reconnect button passes
+            // the stored provider's *UUID*, which `ProviderType::from_id` does
+            // not recognize. Look the UUID up in the store so reconnect still
+            // mirrors the fresh OAuth into the row instead of leaving it with
+            // expired tokens.
+            let resolved_type_and_uuid = match ProviderType::from_id(&provider_type_id) {
+                Some(pt) => Some((pt, None)),
+                None => match uuid::Uuid::parse_str(&provider_type_id) {
+                    Ok(uuid) => state
+                        .ai_providers
+                        .get(uuid)
+                        .await
+                        .map(|existing| (existing.provider_type, Some(uuid))),
+                    Err(_) => None,
+                },
+            };
+
+            if resolved_type_and_uuid.map(|(pt, _)| pt) == Some(ProviderType::Xai) {
+                // xAI tracks creds in auth.json only; don't mirror to the store.
                 return json.into_response();
             }
 
             // After successful OAuth, upsert the provider in AIProviderStore.
             // The OAuth callback already synced creds to auth.json; now mirror that
             // into the store so multiple accounts of the same type are tracked.
-            if let Some(provider_type) = ProviderType::from_id(&provider_type_id) {
+            if let Some((provider_type, existing_uuid)) = resolved_type_and_uuid {
                 let backends = use_for_backends
                     .unwrap_or_else(|| default_backends_for_provider(provider_type));
 
@@ -7779,6 +7800,51 @@ async fn oauth_callback(
                     }
                 }
 
+                // If the caller referenced an existing provider by UUID (the
+                // reconnect button passes the stored provider's id), refresh
+                // that row in place. We must NEVER fall through to `add` here:
+                // inserting a second account for the same OAuth completion would
+                // leave the targeted row stale and duplicate the credential. Any
+                // failure path returns an explicit error instead.
+                if let Some(uuid) = existing_uuid {
+                    let Some(mut existing) = state.ai_providers.get(uuid).await else {
+                        // The OAuth creds are already synced to auth.json; the
+                        // targeted row just vanished. Report rather than insert
+                        // a duplicate.
+                        return (
+                            axum::http::StatusCode::NOT_FOUND,
+                            "Provider to reconnect no longer exists".to_string(),
+                        )
+                            .into_response();
+                    };
+                    // Only replace the stored credentials when the callback
+                    // actually produced fresh ones. If `read_opencode_auth`
+                    // returned nothing (e.g. a failed auth.json sync that still
+                    // reported success), keep the existing creds rather than
+                    // wiping a row the user just re-authorized.
+                    if provider.api_key.is_some() || provider.oauth.is_some() {
+                        existing.api_key = provider.api_key.clone();
+                        existing.oauth = provider.oauth.clone();
+                    }
+                    existing.use_for_backends = provider.use_for_backends.clone();
+                    existing.enabled = true;
+                    // Only overwrite the display name/email when the new
+                    // credentials carry an identity; otherwise keep what the
+                    // user already had.
+                    if provider.account_email.is_some() {
+                        existing.account_email = provider.account_email.clone();
+                        existing.name = provider.name.clone();
+                    }
+                    return match state.ai_providers.update(uuid, existing).await {
+                        Some(stored) => Json(build_response_from_store(&stored)).into_response(),
+                        None => (
+                            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                            "Failed to persist reconnected provider".to_string(),
+                        )
+                            .into_response(),
+                    };
+                }
+
                 let store_id = state.ai_providers.add(provider.clone()).await;
                 // Return a response with the store UUID so the frontend can reference it
                 let stored = state.ai_providers.get(store_id).await.unwrap_or(provider);
@@ -7825,8 +7891,12 @@ async fn oauth_callback_inner(
                     .to_string(),
             )
         })?;
+        // Reconnect passes the row's UUID as the path id; thread it through so
+        // we update that exact row instead of the first OAuth xAI account.
+        let target_id = uuid::Uuid::parse_str(&id).ok();
         let response =
-            upsert_grok_oauth_provider(&state, &entry, req.use_for_backends.clone()).await?;
+            upsert_grok_oauth_provider(&state, &entry, req.use_for_backends.clone(), target_id)
+                .await?;
         return Ok(Json(response));
     }
 

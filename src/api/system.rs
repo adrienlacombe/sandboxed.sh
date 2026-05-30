@@ -1368,9 +1368,12 @@ async fn adopt_hermes_assistant(
     )
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
-    write_private_file(&soul_path, &hermes_soul_markdown(&channel, home_channel.as_ref()))
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    write_private_file(
+        &soul_path,
+        &hermes_soul_markdown(&channel, home_channel.as_ref()),
+    )
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     let service_path = format!("/etc/systemd/system/{service_name}");
     let service_after = if runtime_name.ends_with("-dev") {
