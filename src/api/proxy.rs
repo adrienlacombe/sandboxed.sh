@@ -1738,13 +1738,61 @@ fn anthropic_model_omits_sampling_params(model_id: &str) -> bool {
     model_id.contains("claude-opus-4-8") || model_id.contains("claude-opus-4-7")
 }
 
+/// Drop `thinking`/`redacted_thinking` blocks from assistant messages.
+///
+/// Thinking blocks carry a signature that is cryptographically bound to the
+/// exact model that produced them. Replaying them under a *different* model
+/// makes Anthropic reject the whole request with
+/// "`thinking` or `redacted_thinking` blocks in the latest assistant message
+/// cannot be modified". We force `model` on every forwarded request (fallback
+/// chains, default-model changes), so when the conversation's model changes we
+/// must strip the now-stale thinking blocks before forwarding. This matches
+/// Anthropic's guidance for switching models mid-conversation.
+///
+/// An assistant turn that contained *only* thinking is left untouched (we never
+/// emit an empty `content` array, which Anthropic would also reject).
+fn strip_thinking_blocks(messages: &mut [serde_json::Value]) {
+    for message in messages.iter_mut() {
+        if message.get("role").and_then(|v| v.as_str()) != Some("assistant") {
+            continue;
+        }
+        let Some(content) = message.get_mut("content").and_then(|v| v.as_array_mut()) else {
+            continue;
+        };
+        let filtered: Vec<serde_json::Value> = content
+            .iter()
+            .filter(|block| {
+                !matches!(
+                    block.get("type").and_then(|v| v.as_str()),
+                    Some("thinking") | Some("redacted_thinking")
+                )
+            })
+            .cloned()
+            .collect();
+        if !filtered.is_empty() && filtered.len() != content.len() {
+            *content = filtered;
+        }
+    }
+}
+
 fn rewrite_model_for_anthropic_cli_proxy(
     body: &[u8],
     new_model: &str,
 ) -> Result<bytes::Bytes, String> {
     let mut value: serde_json::Value =
         serde_json::from_slice(body).map_err(|e| format!("Invalid JSON: {}", e))?;
+    let original_model = value
+        .get("model")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
     value["model"] = serde_json::Value::String(new_model.to_string());
+    // When we rewrite onto a different model, prior thinking blocks were signed
+    // by the original model and can no longer be replayed — strip them.
+    if matches!(&original_model, Some(m) if m != new_model) {
+        if let Some(messages) = value.get_mut("messages").and_then(|v| v.as_array_mut()) {
+            strip_thinking_blocks(messages);
+        }
+    }
     if anthropic_model_omits_sampling_params(new_model) {
         if let Some(obj) = value.as_object_mut() {
             for key in ["temperature", "top_p", "top_k"] {
@@ -2514,12 +2562,22 @@ fn build_anthropic_upstream_request(
         out.insert("stop_sequences".to_string(), stop_sequences);
     }
 
-    let (system, messages) = anthropic_messages_from_openai(
+    let (system, mut messages) = anthropic_messages_from_openai(
         req.get("messages")
             .and_then(|v| v.as_array())
             .map(|v| v.as_slice())
             .unwrap_or(&[]),
     );
+    // This adapter also forces `model` to `model_id`. If that differs from the
+    // model the request was authored under, prior thinking blocks were signed
+    // by a different model and must be stripped before replay.
+    let model_changed = req
+        .get("model")
+        .and_then(|v| v.as_str())
+        .is_some_and(|m| m != model_id);
+    if model_changed {
+        strip_thinking_blocks(&mut messages);
+    }
     if !system.is_empty() {
         out.insert("system".to_string(), serde_json::Value::String(system));
     }
@@ -2689,6 +2747,28 @@ fn anthropic_content_blocks_from_openai(
                         "source": { "type": "url", "url": url }
                     }));
                 }
+            }
+            "thinking" => {
+                // Preserve the block verbatim (text + signature). Dropping it
+                // corrupts the assistant turn so Anthropic rejects the replay;
+                // callers strip these explicitly on a model switch instead.
+                let mut block = serde_json::Map::new();
+                block.insert("type".to_string(), serde_json::json!("thinking"));
+                if let Some(text) = part.get("thinking").and_then(|v| v.as_str()) {
+                    block.insert("thinking".to_string(), serde_json::json!(text));
+                }
+                if let Some(sig) = part.get("signature").and_then(|v| v.as_str()) {
+                    block.insert("signature".to_string(), serde_json::json!(sig));
+                }
+                out.push(serde_json::Value::Object(block));
+            }
+            "redacted_thinking" => {
+                let mut block = serde_json::Map::new();
+                block.insert("type".to_string(), serde_json::json!("redacted_thinking"));
+                if let Some(data) = part.get("data").and_then(|v| v.as_str()) {
+                    block.insert("data".to_string(), serde_json::json!(data));
+                }
+                out.push(serde_json::Value::Object(block));
             }
             _ => {}
         }
@@ -4415,6 +4495,75 @@ mod tests {
         assert!(value.get("top_p").is_none());
         assert!(value.get("top_k").is_none());
         assert_eq!(value["thinking"], serde_json::json!({ "type": "disabled" }));
+    }
+
+    fn assistant_msg_with_thinking() -> serde_json::Value {
+        serde_json::json!({
+            "model": "claude-opus-4-7",
+            "max_tokens": 16,
+            "messages": [
+                { "role": "user", "content": "hi" },
+                { "role": "assistant", "content": [
+                    { "type": "thinking", "thinking": "ponder", "signature": "sig-abc" },
+                    { "type": "text", "text": "hello" }
+                ]}
+            ]
+        })
+    }
+
+    #[test]
+    fn anthropic_cli_proxy_strips_thinking_when_model_changes() {
+        // Conversation authored under opus-4-7, now forwarded under opus-4-8:
+        // the stale thinking block must be dropped, the text kept.
+        let payload = rewrite_model_for_anthropic_cli_proxy(
+            serde_json::to_vec(&assistant_msg_with_thinking())
+                .unwrap()
+                .as_slice(),
+            "claude-opus-4-8",
+        )
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(payload.as_ref()).unwrap();
+        let blocks = value["messages"][1]["content"].as_array().unwrap();
+        assert!(
+            blocks
+                .iter()
+                .all(|b| b["type"] != "thinking" && b["type"] != "redacted_thinking"),
+            "thinking blocks should be stripped on model change"
+        );
+        assert!(blocks.iter().any(|b| b["type"] == "text"));
+    }
+
+    #[test]
+    fn anthropic_cli_proxy_keeps_thinking_when_model_unchanged() {
+        let payload = rewrite_model_for_anthropic_cli_proxy(
+            serde_json::to_vec(&assistant_msg_with_thinking())
+                .unwrap()
+                .as_slice(),
+            "claude-opus-4-7",
+        )
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(payload.as_ref()).unwrap();
+        let blocks = value["messages"][1]["content"].as_array().unwrap();
+        assert!(
+            blocks.iter().any(|b| b["type"] == "thinking"),
+            "thinking must be preserved verbatim when the model is unchanged"
+        );
+    }
+
+    #[test]
+    fn anthropic_content_blocks_preserve_thinking() {
+        let content = serde_json::json!([
+            { "type": "thinking", "thinking": "deep", "signature": "sig-1" },
+            { "type": "redacted_thinking", "data": "enc" },
+            { "type": "text", "text": "answer" }
+        ]);
+        let blocks = anthropic_content_blocks_from_openai(Some(&content));
+        assert_eq!(blocks.len(), 3, "thinking blocks must not be dropped");
+        assert_eq!(blocks[0]["type"], "thinking");
+        assert_eq!(blocks[0]["signature"], "sig-1");
+        assert_eq!(blocks[1]["type"], "redacted_thinking");
+        assert_eq!(blocks[1]["data"], "enc");
+        assert_eq!(blocks[2]["type"], "text");
     }
 
     #[tokio::test(start_paused = true)]
