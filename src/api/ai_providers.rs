@@ -7779,6 +7779,30 @@ async fn oauth_callback(
                     }
                 }
 
+                // If the caller referenced an existing provider by UUID (the
+                // reconnect button passes the stored provider's id), refresh
+                // that row in place instead of inserting a duplicate. The
+                // add-provider flow passes a provider-type id (not a UUID) and
+                // falls through to `add`.
+                if let Ok(uuid) = uuid::Uuid::parse_str(&provider_type_id) {
+                    if let Some(mut existing) = state.ai_providers.get(uuid).await {
+                        existing.api_key = provider.api_key.clone();
+                        existing.oauth = provider.oauth.clone();
+                        existing.use_for_backends = provider.use_for_backends.clone();
+                        existing.enabled = true;
+                        // Only overwrite the display name/email when the new
+                        // credentials carry an identity; otherwise keep what
+                        // the user already had.
+                        if provider.account_email.is_some() {
+                            existing.account_email = provider.account_email.clone();
+                            existing.name = provider.name.clone();
+                        }
+                        if let Some(stored) = state.ai_providers.update(uuid, existing).await {
+                            return Json(build_response_from_store(&stored)).into_response();
+                        }
+                    }
+                }
+
                 let store_id = state.ai_providers.add(provider.clone()).await;
                 // Return a response with the store UUID so the frontend can reference it
                 let stored = state.ai_providers.get(store_id).await.unwrap_or(provider);
