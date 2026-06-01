@@ -8956,3 +8956,66 @@ pub async fn refresh_oauth_token_with_lock(
     Ok((new_access, new_refresh, expires_at))
     // _lock is dropped here, releasing the file lock
 }
+
+/// Refresh OAuth tokens for **store-backed** accounts (AIProviderStore) of
+/// `provider_type` that expire within `refresh_threshold_ms`, writing the new
+/// tokens back to the store (and credential tiers).
+///
+/// The file-based [`oauth_token_refresher_loop`] only sees tokens written to
+/// `auth.json`/`credentials.json`. Providers connected via the dashboard live
+/// in the store (e.g. xAI/Grok), so without this their short-lived access
+/// token silently expires and `resolve_chain` drops the provider until the
+/// user reconnects. Returns `(found, refreshed)`.
+pub async fn refresh_due_store_oauth(
+    ai_providers: &crate::ai_providers::AIProviderStore,
+    provider_type: ProviderType,
+    refresh_threshold_ms: i64,
+) -> (u32, u32) {
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let mut found = 0u32;
+    let mut refreshed = 0u32;
+    for account in ai_providers.get_all_by_type(provider_type).await {
+        let Some(oauth) = account.oauth.as_ref() else {
+            continue;
+        };
+        if oauth.refresh_token.trim().is_empty() {
+            continue;
+        }
+        found += 1;
+        if oauth.expires_at - now_ms > refresh_threshold_ms {
+            continue;
+        }
+        // Serialize with the file-based refresher to avoid racing a rotating
+        // refresh token (best-effort — proceed unlocked if contended).
+        let _lock = acquire_oauth_refresh_lock(provider_type).ok();
+        match refresh_oauth_token_internal(&provider_type, &oauth.refresh_token).await {
+            Ok((access, refresh, expires_at)) => {
+                let mut updated = account.clone();
+                updated.oauth = Some(crate::ai_providers::OAuthCredentials {
+                    access_token: access.clone(),
+                    refresh_token: refresh.clone(),
+                    expires_at,
+                });
+                ai_providers.update(account.id, updated).await;
+                // Keep the credential tiers consistent too (best-effort).
+                let _ = sync_oauth_to_all_tiers(provider_type, &refresh, &access, expires_at);
+                refreshed += 1;
+                tracing::info!(
+                    provider = ?provider_type,
+                    account_id = %account.id,
+                    new_expires_at = expires_at,
+                    "Refreshed store-backed OAuth token"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    provider = ?provider_type,
+                    account_id = %account.id,
+                    error = ?e,
+                    "Failed to refresh store-backed OAuth token (account may need reconnect)"
+                );
+            }
+        }
+    }
+    (found, refreshed)
+}

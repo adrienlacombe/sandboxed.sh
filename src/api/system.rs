@@ -1340,7 +1340,7 @@ async fn adopt_hermes_assistant(
             "TELEGRAM_HOME_CHANNEL",
             &home_channel_id.to_string(),
         ));
-        env.push_str(&env_line("TELEGRAM_HOME_CHANNEL_NAME", &home_channel_name));
+        env.push_str(&env_line("TELEGRAM_HOME_CHANNEL_NAME", home_channel_name));
     }
     if req.allow_all_users {
         env.push_str("GATEWAY_ALLOW_ALL_USERS=true\n");
