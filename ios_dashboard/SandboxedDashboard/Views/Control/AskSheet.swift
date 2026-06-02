@@ -18,6 +18,8 @@ struct AskSheet: View {
     @State private var input: String = ""
     @State private var isLoading = false
     @State private var errorText: String?
+    // Id of the assistant bubble currently being streamed into (nil between segments).
+    @State private var streamId: String?
 
     private let api = APIService.shared
     private let copilot = Color.cyan
@@ -198,33 +200,114 @@ struct AskSheet: View {
         input = ""
         errorText = nil
         isLoading = true
+        streamId = nil
 
-        // Optimistic user bubble.
-        let optimistic = AskMessage(
-            id: "temp-\(UUID().uuidString)",
-            threadId: threadId ?? "",
-            seq: messages.count + 1,
-            role: "user",
-            content: content,
-            toolName: nil,
-            toolCallId: nil,
-            createdAt: ISO8601DateFormatter().string(from: Date())
+        messages.append(
+            AskMessage(
+                id: "u-\(UUID().uuidString)",
+                threadId: threadId ?? "",
+                seq: messages.count + 1,
+                role: "user",
+                content: content,
+                toolName: nil,
+                toolCallId: nil,
+                createdAt: isoNow()
+            )
         )
-        messages.append(optimistic)
 
         do {
-            let response = try await api.postAsk(missionId: missionId, content: content, threadId: threadId)
-            threadId = response.threadId
-            messages = response.messages
-            if let refreshed = try? await api.listAskThreads(missionId: missionId) {
-                threads = refreshed
+            for try await ev in api.askStream(
+                missionId: missionId,
+                content: content,
+                threadId: threadId
+            ) {
+                handleStreamEvent(ev)
             }
         } catch {
             errorText = error.localizedDescription
-            messages.removeAll { $0.id == optimistic.id }
-            input = content
         }
         isLoading = false
+        streamId = nil
+    }
+
+    private func isoNow() -> String {
+        ISO8601DateFormatter().string(from: Date())
+    }
+
+    private func handleStreamEvent(_ ev: AskStreamEvent) {
+        switch ev.type {
+        case "delta":
+            guard let text = ev.content else { return }
+            if let id = streamId,
+                let idx = messages.firstIndex(where: { $0.id == id })
+            {
+                let m = messages[idx]
+                messages[idx] = AskMessage(
+                    id: m.id,
+                    threadId: m.threadId,
+                    seq: m.seq,
+                    role: m.role,
+                    content: m.content + text,
+                    toolName: nil,
+                    toolCallId: nil,
+                    createdAt: m.createdAt
+                )
+            } else {
+                let id = "a-\(UUID().uuidString)"
+                streamId = id
+                messages.append(
+                    AskMessage(
+                        id: id,
+                        threadId: threadId ?? "",
+                        seq: messages.count + 1,
+                        role: "assistant",
+                        content: text,
+                        toolName: nil,
+                        toolCallId: nil,
+                        createdAt: isoNow()
+                    )
+                )
+            }
+        case "tool_call":
+            streamId = nil
+            messages.append(
+                AskMessage(
+                    id: "tc-\(ev.toolCallId ?? UUID().uuidString)",
+                    threadId: threadId ?? "",
+                    seq: messages.count + 1,
+                    role: "tool_call",
+                    content: ev.args ?? "",
+                    toolName: ev.name,
+                    toolCallId: ev.toolCallId,
+                    createdAt: isoNow()
+                )
+            )
+        case "tool_result":
+            messages.append(
+                AskMessage(
+                    id: "tr-\(ev.toolCallId ?? UUID().uuidString)",
+                    threadId: threadId ?? "",
+                    seq: messages.count + 1,
+                    role: "tool_result",
+                    content: ev.result ?? "",
+                    toolName: ev.name,
+                    toolCallId: ev.toolCallId,
+                    createdAt: isoNow()
+                )
+            )
+        case "done":
+            streamId = nil
+            if let tid = ev.threadId { threadId = tid }
+            Task {
+                if let refreshed = try? await api.listAskThreads(missionId: missionId) {
+                    threads = refreshed
+                }
+            }
+        case "error":
+            errorText = ev.message ?? "Ask failed"
+        default:
+            break
+        }
     }
 
     private func clearThread() async {

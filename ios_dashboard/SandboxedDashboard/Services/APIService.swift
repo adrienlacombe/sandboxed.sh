@@ -549,6 +549,67 @@ final class APIService {
         )
     }
 
+    /// Streaming variant of `postAsk`: yields `AskStreamEvent`s parsed from the
+    /// SSE response as the assistant produces tokens and runs tools.
+    func askStream(
+        missionId: String,
+        content: String,
+        threadId: String? = nil
+    ) -> AsyncThrowingStream<AskStreamEvent, Error> {
+        AsyncThrowingStream { continuation in
+            let task = Task {
+                do {
+                    guard let url = makeURL("/api/control/missions/\(missionId)/ask/stream") else {
+                        throw APIError.invalidURL
+                    }
+                    var request = URLRequest(url: url)
+                    request.httpMethod = "POST"
+                    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+                    request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
+                    if let token = jwtToken {
+                        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+                    }
+                    struct Req: Encodable {
+                        let content: String
+                        let thread_id: String?
+                    }
+                    request.httpBody = try JSONEncoder().encode(
+                        Req(content: content, thread_id: threadId)
+                    )
+
+                    let (bytes, response) = try await Self.askSession.bytes(for: request)
+                    guard let http = response as? HTTPURLResponse else {
+                        throw APIError.invalidResponse
+                    }
+                    if http.statusCode == 401 {
+                        markSessionExpired()
+                        throw APIError.unauthorized
+                    }
+                    guard (200..<300).contains(http.statusCode) else {
+                        throw APIError.httpError(http.statusCode, nil)
+                    }
+
+                    let decoder = JSONDecoder()
+                    for try await line in bytes.lines {
+                        guard line.hasPrefix("data:") else { continue }
+                        let payload = line.dropFirst(5)
+                            .trimmingCharacters(in: .whitespaces)
+                        if payload.isEmpty { continue }
+                        if let data = payload.data(using: .utf8),
+                            let ev = try? decoder.decode(AskStreamEvent.self, from: data)
+                        {
+                            continuation.yield(ev)
+                        }
+                    }
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
+    }
+
     func listAskThreads(missionId: String) async throws -> [AskThread] {
         try await get("/api/control/missions/\(missionId)/ask/threads")
     }

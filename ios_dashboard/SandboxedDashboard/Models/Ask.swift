@@ -86,3 +86,23 @@ struct AskThreadDetail: Codable {
         case updatedAt = "updated_at"
     }
 }
+
+/// One Server-Sent Event from `POST /api/control/missions/:id/ask/stream`.
+/// A single shape covers every variant (`type` discriminates).
+struct AskStreamEvent: Decodable {
+    let type: String
+    let content: String?
+    let toolCallId: String?
+    let name: String?
+    let args: String?
+    let result: String?
+    let threadId: String?
+    let answer: String?
+    let message: String?
+
+    enum CodingKeys: String, CodingKey {
+        case type, content, name, args, result, answer, message
+        case toolCallId = "tool_call_id"
+        case threadId = "thread_id"
+    }
+}
