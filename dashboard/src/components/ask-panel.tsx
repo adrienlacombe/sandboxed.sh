@@ -68,6 +68,8 @@ export function AskPanel({
   // Bumped on every send / thread switch so an in-flight post-stream reconcile
   // fetch can detect it's stale and skip overwriting the current view.
   const genRef = useRef(0);
+  // Aborts the in-flight stream when a new send / thread switch supersedes it.
+  const abortRef = useRef<AbortController | null>(null);
 
   // Auto-grow the composer with input, capped (lighter than the main composer's
   // 10-line cap). Runs on every input change, including seed prefill and reset.
@@ -132,6 +134,9 @@ export function AskPanel({
   const selectThread = useCallback(
     async (id: string) => {
       genRef.current += 1;
+      abortRef.current?.abort();
+      setLoading(false);
+      streamIdRef.current = null;
       setShowThreadList(false);
       setThreadId(id);
       setMessages([]);
@@ -147,6 +152,9 @@ export function AskPanel({
 
   const newThread = useCallback(() => {
     genRef.current += 1;
+    abortRef.current?.abort();
+    setLoading(false);
+    streamIdRef.current = null;
     setShowThreadList(false);
     setThreadId(null);
     setMessages([]);
@@ -162,6 +170,9 @@ export function AskPanel({
     streamIdRef.current = null;
     genRef.current += 1;
     const myGen = genRef.current;
+    abortRef.current?.abort();
+    const ac = new AbortController();
+    abortRef.current = ac;
 
     // Ids of every bubble this turn added, so a failed turn can roll them back
     // (the backend may not have persisted these fragments).
@@ -285,14 +296,21 @@ export function AskPanel({
             setInput((cur) => cur || content);
           },
         },
+        ac.signal,
       );
     } catch (e) {
-      setError(e instanceof Error ? e.message : "Ask failed");
-      rollbackTurn();
-      setInput((cur) => cur || content);
+      // Superseded turns (thread switch / new send aborted this one) must not
+      // surface an error, roll back, or restore input for the new turn.
+      if (genRef.current === myGen) {
+        setError(e instanceof Error ? e.message : "Ask failed");
+        rollbackTurn();
+        setInput((cur) => cur || content);
+      }
     } finally {
-      setLoading(false);
-      streamIdRef.current = null;
+      if (genRef.current === myGen) {
+        setLoading(false);
+        streamIdRef.current = null;
+      }
     }
   }, [input, loading, missionId, threadId, sandbox, refreshThreads]);
 

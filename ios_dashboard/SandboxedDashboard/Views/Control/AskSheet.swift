@@ -181,6 +181,8 @@ struct AskSheet: View {
 
     private func selectThread(_ id: String) async {
         streamGen += 1
+        isLoading = false
+        streamId = nil
         threadId = id
         do {
             let detail = try await api.getAskThread(missionId: missionId, threadId: id)
@@ -192,6 +194,8 @@ struct AskSheet: View {
 
     private func newThread() {
         streamGen += 1
+        isLoading = false
+        streamId = nil
         threadId = nil
         messages = []
         input = ""
@@ -235,7 +239,11 @@ struct AskSheet: View {
                 handleStreamEvent(ev)
             }
         } catch {
-            errorText = error.localizedDescription
+            // Ignore errors from a superseded turn (the user switched threads
+            // or started a new send mid-stream).
+            if gen == streamGen {
+                errorText = error.localizedDescription
+            }
         }
         if errorText != nil, gen == streamGen {
             // Roll back this turn's optimistic + streamed bubbles, and restore
@@ -247,8 +255,11 @@ struct AskSheet: View {
                 input = content
             }
         }
-        isLoading = false
-        streamId = nil
+        // Only clear loading for the current turn — a newer send owns it now.
+        if gen == streamGen {
+            isLoading = false
+            streamId = nil
+        }
     }
 
     private func isoNow() -> String {
