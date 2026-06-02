@@ -25,6 +25,7 @@ use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::sync::{Arc, LazyLock, Mutex as StdMutex};
+use std::time::Instant;
 use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use tokio::process::Command as TokioCommand;
 use tokio::sync::{mpsc, Mutex as AsyncMutex};
@@ -256,6 +257,9 @@ const GOOGLE_SCOPES: &str =
     "https://www.googleapis.com/auth/cloud-platform https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/userinfo.profile";
 const GROK_OAUTH_CLIENT_KEY: &str = "https://auth.x.ai::b1a00492-073a-47ea-816f-4c329264a828";
 const GROK_OAUTH_CLIENT_ID: &str = "b1a00492-073a-47ea-816f-4c329264a828";
+const GROK_CLI_RECONCILE_INTERVAL: Duration = Duration::from_secs(30);
+static GROK_CLI_RECONCILE_LAST_CHECK: LazyLock<StdMutex<Option<Instant>>> =
+    LazyLock::new(|| StdMutex::new(None));
 
 fn google_client_id() -> &'static str {
     GOOGLE_CLIENT_ID
@@ -279,9 +283,21 @@ fn grok_auth_paths() -> Vec<PathBuf> {
 }
 
 fn read_grok_auth_entry() -> Option<serde_json::Value> {
-    let contents = std::fs::read_to_string(grok_auth_path()).ok()?;
-    let auth: serde_json::Value = serde_json::from_str(&contents).ok()?;
-    auth.get(GROK_OAUTH_CLIENT_KEY).cloned()
+    // Try every candidate path (home-based AND the service path
+    // `/var/lib/opencode/.grok/auth.json`) — `home_dir()` for the service
+    // process doesn't always resolve to where the Grok CLI wrote its auth.
+    for path in grok_auth_paths() {
+        let Ok(contents) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(auth) = serde_json::from_str::<serde_json::Value>(&contents) else {
+            continue;
+        };
+        if let Some(entry) = auth.get(GROK_OAUTH_CLIENT_KEY) {
+            return Some(entry.clone());
+        }
+    }
+    None
 }
 
 async fn wait_for_grok_auth_entry() -> Option<serde_json::Value> {
@@ -356,9 +372,11 @@ fn parse_grok_device_auth_line(line: &str) -> (Option<String>, Option<String>) {
 #[cfg(test)]
 mod grok_oauth_tests {
     use super::{
-        get_xai_api_key_for_grok, grok_auth_expires_at_millis, parse_grok_device_auth_line,
+        get_xai_api_key_for_grok, grok_auth_expires_at_millis, grok_cli_reconcile_due,
+        parse_grok_device_auth_line, GROK_CLI_RECONCILE_INTERVAL,
     };
     use crate::ai_providers::{AIProvider, OAuthCredentials, ProviderType};
+    use std::time::{Duration as StdDuration, Instant};
 
     #[test]
     fn parses_device_auth_url_and_user_code_from_stderr_line() {
@@ -396,6 +414,22 @@ mod grok_oauth_tests {
         });
 
         assert_eq!(grok_auth_expires_at_millis(&entry), 1779172231759);
+    }
+
+    #[test]
+    fn grok_cli_reconcile_throttles_recent_checks() {
+        let now = Instant::now();
+
+        assert!(grok_cli_reconcile_due(None, now));
+        assert!(!grok_cli_reconcile_due(Some(now), now));
+        assert!(!grok_cli_reconcile_due(
+            Some(now - GROK_CLI_RECONCILE_INTERVAL + StdDuration::from_millis(1)),
+            now,
+        ));
+        assert!(grok_cli_reconcile_due(
+            Some(now - GROK_CLI_RECONCILE_INTERVAL),
+            now,
+        ));
     }
 
     #[test]
@@ -5842,11 +5876,86 @@ async fn list_provider_types() -> Json<Vec<ProviderTypeInfo>> {
 }
 
 /// GET /api/ai/providers - List all providers.
+/// Reconcile the stored xAI OAuth token from the Grok CLI's own auth file.
+///
+/// The Grok Build CLI refreshes `~/.grok/auth.json` on its own schedule. When
+/// it does, sandboxed's stored copy goes stale and the dashboard wrongly shows
+/// the xAI provider as "needs reauth" (NeedsReauth keys off the stored
+/// `expires_at`) even though the CLI's token is still valid. Adopt the CLI's
+/// token whenever it is fresher so the dashboard reflects reality and later
+/// runs reuse the freshest credential.
+pub async fn reconcile_xai_store_from_grok_cli(
+    ai_providers: &crate::ai_providers::AIProviderStore,
+) {
+    let Some(entry) = read_grok_auth_entry() else {
+        return;
+    };
+    let access = entry
+        .get("key")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty());
+    let refresh = entry
+        .get("refresh_token")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty());
+    let (Some(access), Some(refresh)) = (access, refresh) else {
+        return;
+    };
+    let cli_expires_at = grok_auth_expires_at_millis(&entry);
+    for account in ai_providers.get_all_by_type(ProviderType::Xai).await {
+        if !account.has_oauth() {
+            continue;
+        }
+        let stored_expires = account.oauth.as_ref().map(|o| o.expires_at).unwrap_or(0);
+        if cli_expires_at > stored_expires {
+            let mut updated = account.clone();
+            updated.oauth = Some(crate::ai_providers::OAuthCredentials {
+                access_token: access.to_string(),
+                refresh_token: refresh.to_string(),
+                expires_at: cli_expires_at,
+            });
+            ai_providers.update(account.id, updated).await;
+            tracing::info!(
+                account_id = %account.id,
+                cli_expires_at,
+                "Reconciled xAI OAuth token from Grok CLI auth file"
+            );
+        }
+    }
+}
+
+fn grok_cli_reconcile_due(last_check: Option<Instant>, now: Instant) -> bool {
+    last_check
+        .map(|last| now.duration_since(last) >= GROK_CLI_RECONCILE_INTERVAL)
+        .unwrap_or(true)
+}
+
+async fn maybe_reconcile_xai_store_from_grok_cli(
+    ai_providers: &crate::ai_providers::AIProviderStore,
+) {
+    let now = Instant::now();
+    {
+        let mut last_check = GROK_CLI_RECONCILE_LAST_CHECK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !grok_cli_reconcile_due(*last_check, now) {
+            return;
+        }
+        *last_check = Some(now);
+    }
+
+    reconcile_xai_store_from_grok_cli(ai_providers).await;
+}
+
 async fn list_providers(
     State(state): State<Arc<super::routes::AppState>>,
 ) -> Result<Json<Vec<ProviderResponse>>, (StatusCode, String)> {
     // Migrate any standard providers from opencode.json to the store on first call
     migrate_opencode_providers_to_store(&state.ai_providers, &state.config.working_dir).await;
+
+    // Keep the xAI provider's stored token in sync with the Grok CLI's own
+    // refreshed auth file so it doesn't show a false "needs reauth".
+    maybe_reconcile_xai_store_from_grok_cli(&state.ai_providers).await;
 
     // All providers live in AIProviderStore now
     let store_providers = state.ai_providers.list().await;
