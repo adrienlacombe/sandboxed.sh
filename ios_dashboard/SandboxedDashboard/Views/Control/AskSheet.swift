@@ -20,6 +20,8 @@ struct AskSheet: View {
     @State private var errorText: String?
     // Id of the assistant bubble currently being streamed into (nil between segments).
     @State private var streamId: String?
+    // Bumped on send / thread switch so a stale post-stream sync can be skipped.
+    @State private var streamGen = 0
 
     private let api = APIService.shared
     private let copilot = Color.cyan
@@ -178,6 +180,7 @@ struct AskSheet: View {
     }
 
     private func selectThread(_ id: String) async {
+        streamGen += 1
         threadId = id
         do {
             let detail = try await api.getAskThread(missionId: missionId, threadId: id)
@@ -188,6 +191,7 @@ struct AskSheet: View {
     }
 
     private func newThread() {
+        streamGen += 1
         threadId = nil
         messages = []
         input = ""
@@ -201,6 +205,7 @@ struct AskSheet: View {
         errorText = nil
         isLoading = true
         streamId = nil
+        streamGen += 1
 
         messages.append(
             AskMessage(
@@ -302,10 +307,20 @@ struct AskSheet: View {
             )
         case "done":
             streamId = nil
-            if let tid = ev.threadId { threadId = tid }
+            let tid = ev.threadId
+            if let tid { threadId = tid }
+            let gen = streamGen
             Task {
                 if let refreshed = try? await api.listAskThreads(missionId: missionId) {
                     threads = refreshed
+                }
+                // Reconcile the streamed bubbles with the canonical persisted
+                // messages, unless a newer send / thread switch superseded this.
+                if let tid,
+                    let detail = try? await api.getAskThread(missionId: missionId, threadId: tid),
+                    gen == streamGen, threadId == tid
+                {
+                    messages = detail.messages
                 }
             }
         case "error":

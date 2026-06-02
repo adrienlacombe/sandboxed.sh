@@ -65,6 +65,9 @@ export function AskPanel({
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   // Id of the assistant bubble currently being streamed into (null between segments).
   const streamIdRef = useRef<string | null>(null);
+  // Bumped on every send / thread switch so an in-flight post-stream reconcile
+  // fetch can detect it's stale and skip overwriting the current view.
+  const genRef = useRef(0);
 
   // Auto-grow the composer with input, capped (lighter than the main composer's
   // 10-line cap). Runs on every input change, including seed prefill and reset.
@@ -128,6 +131,7 @@ export function AskPanel({
 
   const selectThread = useCallback(
     async (id: string) => {
+      genRef.current += 1;
       setShowThreadList(false);
       setThreadId(id);
       setMessages([]);
@@ -142,6 +146,7 @@ export function AskPanel({
   );
 
   const newThread = useCallback(() => {
+    genRef.current += 1;
     setShowThreadList(false);
     setThreadId(null);
     setMessages([]);
@@ -155,6 +160,8 @@ export function AskPanel({
     setError(null);
     setLoading(true);
     streamIdRef.current = null;
+    genRef.current += 1;
+    const myGen = genRef.current;
 
     const now = () => new Date().toISOString();
     setMessages((prev) => [
@@ -242,7 +249,8 @@ export function AskPanel({
             void (async () => {
               try {
                 const detail = await getAskThread(missionId, d.thread_id);
-                setMessages(detail.messages ?? []);
+                // Skip if a newer send / thread switch happened meanwhile.
+                if (genRef.current === myGen) setMessages(detail.messages ?? []);
               } catch {
                 /* keep the streamed bubbles on failure */
               }
