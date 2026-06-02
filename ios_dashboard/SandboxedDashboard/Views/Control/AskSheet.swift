@@ -181,14 +181,16 @@ struct AskSheet: View {
 
     private func selectThread(_ id: String) async {
         streamGen += 1
+        let gen = streamGen
         isLoading = false
         streamId = nil
         threadId = id
         do {
             let detail = try await api.getAskThread(missionId: missionId, threadId: id)
-            messages = detail.messages
+            // A later switch / send may have superseded this fetch.
+            if gen == streamGen { messages = detail.messages }
         } catch {
-            messages = []
+            if gen == streamGen { messages = [] }
         }
     }
 

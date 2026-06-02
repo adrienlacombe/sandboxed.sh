@@ -93,14 +93,16 @@ export function AskPanel({
   // On mission change: load threads and open the most recent (if any).
   useEffect(() => {
     let cancelled = false;
+    const myGen = genRef.current;
+    const live = () => !cancelled && genRef.current === myGen;
     (async () => {
       const t = await refreshThreads();
-      if (cancelled) return;
+      if (!live()) return;
       if (t.length > 0) {
         setThreadId(t[0].id);
         try {
           const detail = await getAskThread(missionId, t[0].id);
-          if (!cancelled) setMessages(detail.messages ?? []);
+          if (live()) setMessages(detail.messages ?? []);
         } catch {
           /* ignore */
         }
@@ -134,6 +136,7 @@ export function AskPanel({
   const selectThread = useCallback(
     async (id: string) => {
       genRef.current += 1;
+      const myGen = genRef.current;
       abortRef.current?.abort();
       setLoading(false);
       streamIdRef.current = null;
@@ -142,9 +145,10 @@ export function AskPanel({
       setMessages([]);
       try {
         const detail = await getAskThread(missionId, id);
-        setMessages(detail.messages ?? []);
+        // A later switch / send may have superseded this fetch.
+        if (genRef.current === myGen) setMessages(detail.messages ?? []);
       } catch {
-        setMessages([]);
+        if (genRef.current === myGen) setMessages([]);
       }
     },
     [missionId],
