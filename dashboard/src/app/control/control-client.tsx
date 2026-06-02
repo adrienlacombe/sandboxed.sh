@@ -27,6 +27,7 @@ import {
   type EnhancedInputHandle,
   type FilePasteContext,
 } from "@/components/enhanced-input";
+import { AskPanel } from "@/components/ask-panel";
 import { deriveAssistantTurnStatus } from "@/lib/assistant-turn-status";
 import { perfBus } from "@/lib/perf-bus";
 import {
@@ -46,6 +47,8 @@ import {
   useControlStreamingDiagnosticsStore,
   useControlThinkingStore,
   useControlViewingMissionStore,
+  useControlAskStore,
+  controlAskStore,
   type StreamDiagnosticsState,
 } from "./control-stores";
 import { NowTickProvider, useNow } from "@/lib/now-tick";
@@ -169,6 +172,7 @@ import {
   Flag,
   Pencil,
   MoreVertical,
+  Sparkles,
 } from "lucide-react";
 import { IMAGE_PATH_PATTERN } from "@/lib/file-extensions";
 import {
@@ -3919,7 +3923,19 @@ const ChatItemRow = memo(function ChatItemRow({
             </div>
           )}
         </div>
-        <CopyButton text={item.content} className="self-start mt-8" />
+        <div className="flex flex-col items-center gap-1 self-start mt-8">
+          <CopyButton text={item.content} />
+          <button
+            type="button"
+            onClick={() =>
+              controlAskStore.set({ open: true, seed: item.content })
+            }
+            title="Ask the co-pilot about this"
+            className="opacity-0 group-hover:opacity-100 transition-opacity text-[rgb(var(--foreground)/0.4)] hover:text-[rgb(var(--copilot))]"
+          >
+            <Sparkles className="h-3.5 w-3.5" />
+          </button>
+        </div>
       </div>
     );
   }
@@ -4466,6 +4482,27 @@ export default function ControlClient() {
   const [showWorkbenchPanel, setShowWorkbenchPanel] = useState(
     () => searchParams.get("workbench") === "1",
   );
+  const [askSlice, setAskSlice] = useControlAskStore();
+  const showAskPanel = askSlice.open;
+  const setShowAskPanel = useCallback(
+    (next: boolean | ((v: boolean) => boolean)) =>
+      setAskSlice((s) => ({
+        ...s,
+        open: typeof next === "function" ? next(s.open) : next,
+      })),
+    [setAskSlice],
+  );
+  // ⌘/ (or Ctrl+/) toggles the Ask co-pilot panel.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key === "/") {
+        e.preventDefault();
+        setShowAskPanel((v) => !v);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [setShowAskPanel]);
   const handleToggleThinkingPanel = useCallback(() => {
     setShowThinkingPanel((prev) => {
       const next = !prev;
@@ -10067,6 +10104,26 @@ export default function ControlClient() {
               <span className="hidden sm:inline">Workbench</span>
             </button>
 
+            {/* Ask co-pilot toggle */}
+            <button
+              type="button"
+              onClick={() => setShowAskPanel((prev) => !prev)}
+              className={cn(
+                "flex items-center gap-2 rounded-lg border px-3 py-2 text-sm transition-colors",
+                showAskPanel
+                  ? "border-[rgb(var(--copilot)/0.4)] bg-[rgb(var(--copilot)/0.12)] text-[rgb(var(--copilot))]"
+                  : "border-white/[0.06] bg-white/[0.02] text-[rgb(var(--foreground)/0.7)] hover:bg-white/[0.04]",
+              )}
+              title={
+                showAskPanel
+                  ? "Hide Ask co-pilot"
+                  : "Ask about this mission (non-interrupting)"
+              }
+            >
+              <Sparkles className="h-4 w-4" />
+              <span className="hidden sm:inline">Ask</span>
+            </button>
+
             {/* Thinking panel toggle */}
             <button
               onClick={handleToggleThinkingPanel}
@@ -11039,6 +11096,22 @@ export default function ControlClient() {
                 </div>
               )}
             </div>
+          )}
+
+          {/* Ask co-pilot panel (separate lane — never interrupts the agent) */}
+          {showAskPanel && viewingMissionId && (
+            <AskPanel
+              missionId={viewingMissionId}
+              seed={askSlice.seed}
+              onSeedConsumed={() =>
+                setAskSlice((s) => ({ ...s, seed: null }))
+              }
+              onClose={() => setShowAskPanel(false)}
+              onSendToAgent={(text) => {
+                setInput((prev) => (prev ? `${prev}\n\n${text}` : text));
+                setShowAskPanel(false);
+              }}
+            />
           )}
         </div>
       </div>
