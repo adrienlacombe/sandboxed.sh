@@ -9435,40 +9435,61 @@ export default function ControlClient() {
     [applyDesktopSessionState],
   );
 
-  // Auto-flush the unsent-message outbox whenever the control stream is
-  // connected (covers reconnect after a deploy/network drop, and a fresh
-  // mount with leftover undelivered messages). The in-flight guard prevents a
-  // re-render from double-firing the same entry; redelivery is idempotent
-  // anyway via client_message_id.
+  // Surface and auto-flush the unsent-message outbox. Pending messages are
+  // always re-surfaced into the chat (so they stay visible with a Retry even
+  // while the stream is down); redelivery itself runs once the stream is
+  // connected (reconnect after a deploy/network drop, or a fresh mount with
+  // leftover messages). The in-flight guard prevents a re-render from
+  // double-firing an entry; redelivery is idempotent via client_message_id.
   const flushingOutboxRef = useRef<Set<string>>(new Set());
   useEffect(() => {
-    if (connectionState !== "connected") return;
     if (!viewingMissionId) return;
     const pending = getOutboxForMission(viewingMissionId);
     if (pending.length === 0) return;
+    const connected = connectionState === "connected";
+
+    // Always surface undelivered outbox messages so the user keeps seeing them
+    // (with an inline Retry while the stream is down), instead of them only
+    // re-appearing once the SSE stream reconnects. After a refresh the bubbles
+    // may not be in `items` yet.
+    setItems((prev) => {
+      const present = new Set(prev.map((it) => it.id));
+      const missing = pending.filter((m) => !present.has(m.id));
+      if (missing.length === 0) return prev;
+      return [
+        ...prev,
+        ...missing.map((m) => ({
+          kind: "user" as const,
+          id: m.id,
+          content: m.content,
+          timestamp: m.timestamp,
+          agent: m.agent,
+          sendStatus: connected ? ("sending" as const) : ("failed" as const),
+          failedReason: connected ? undefined : ("network" as const),
+        })),
+      ];
+    });
+
+    // Redelivery only happens once the stream is connected.
+    if (!connected) return;
+
     let cancelled = false;
     (async () => {
       for (const msg of pending) {
         if (cancelled) break;
         if (flushingOutboxRef.current.has(msg.id)) continue;
         flushingOutboxRef.current.add(msg.id);
-        // After a refresh the bubble may not be in `items` yet — re-surface
-        // it (as "sending", since we're about to deliver) so the user sees
-        // their pending message instead of it silently vanishing.
+        // Flip the already-surfaced bubble to "sending" while we deliver it.
         setItems((prev) =>
-          prev.some((it) => it.id === msg.id)
-            ? prev
-            : [
-                ...prev,
-                {
-                  kind: "user" as const,
-                  id: msg.id,
-                  content: msg.content,
-                  timestamp: msg.timestamp,
-                  agent: msg.agent,
+          prev.map((it) =>
+            it.id === msg.id && it.kind === "user"
+              ? {
+                  ...it,
                   sendStatus: "sending" as const,
-                },
-              ],
+                  failedReason: undefined,
+                }
+              : it,
+          ),
         );
         try {
           // Bind to the mission this flush captured, not the live viewing ref,
