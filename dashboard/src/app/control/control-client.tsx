@@ -117,6 +117,7 @@ import {
   type SharedFile,
 } from "@/lib/api";
 import { QueueStrip, type QueueItem } from "@/components/queue-strip";
+import { GoalBar } from "@/components/goal-bar";
 import { AsyncButton } from "@/components/ui/async-button";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import {
@@ -278,9 +279,22 @@ export function appendUnpersistedLiveTail(
       return !historyHasAssistantAfterLastUser;
     });
 
-  return unpersistedTail.length > 0
-    ? [...historyItems, ...unpersistedTail]
-    : historyItems;
+  // A failed or still-sending user row never reached the server, so rebuilding
+  // from server history would drop the bubble (and its Retry affordance) while
+  // any outbox entry lingers. Carry it over. A "sent" row already appears in
+  // history by id, so this only re-surfaces genuinely unpersisted sends.
+  const lastLiveUser = liveItems[lastLiveUserIdx];
+  const carryUnpersistedUser =
+    lastLiveUser.kind === "user" &&
+    !existingIds.has(lastLiveUser.id) &&
+    (lastLiveUser.sendStatus === "failed" ||
+      lastLiveUser.sendStatus === "sending");
+
+  const tail = carryUnpersistedUser
+    ? [lastLiveUser, ...unpersistedTail]
+    : unpersistedTail;
+
+  return tail.length > 0 ? [...historyItems, ...tail] : historyItems;
 }
 
 async function postControlMessageWithRetry(
@@ -294,6 +308,68 @@ async function postControlMessageWithRetry(
     await new Promise((resolve) => setTimeout(resolve, 800));
     return postControlMessage(content, options);
   }
+}
+
+// ---- Unsent-message outbox (Phase 2) --------------------------------------
+// Messages that failed to reach the backend (network drop, deploy SIGTERM)
+// are persisted here, keyed by mission, and auto-flushed when the control
+// stream reconnects. `client_message_id` makes redelivery idempotent, so a
+// flush can never double-send. Without this a disconnect (e.g. a redeploy)
+// silently drops the message and the user thinks the agent ignored them.
+const CONTROL_OUTBOX_KEY = "control-outbox";
+
+type OutboxEntry = {
+  id: string;
+  content: string;
+  agent?: string;
+  timestamp: number;
+};
+
+function readOutbox(): Record<string, OutboxEntry[]> {
+  if (typeof window === "undefined") return {};
+  try {
+    const raw = window.localStorage.getItem(CONTROL_OUTBOX_KEY);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return {};
+    }
+    return parsed as Record<string, OutboxEntry[]>;
+  } catch {
+    return {};
+  }
+}
+
+function writeOutbox(map: Record<string, OutboxEntry[]>): void {
+  if (typeof window === "undefined") return;
+  try {
+    window.localStorage.setItem(CONTROL_OUTBOX_KEY, JSON.stringify(map));
+  } catch {
+    // Ignore quota / serialization failures — the in-memory bubble still
+    // carries the failed message and its Retry button.
+  }
+}
+
+function getOutboxForMission(missionId: string): OutboxEntry[] {
+  return readOutbox()[missionId] ?? [];
+}
+
+function addOutboxEntry(missionId: string, entry: OutboxEntry): void {
+  const map = readOutbox();
+  const list = map[missionId] ?? [];
+  // De-dupe by id so repeated failures of the same message don't stack.
+  map[missionId] = [...list.filter((e) => e.id !== entry.id), entry];
+  writeOutbox(map);
+}
+
+function removeOutboxEntry(missionId: string, id: string): void {
+  const map = readOutbox();
+  const list = map[missionId];
+  if (!list) return;
+  const next = list.filter((e) => e.id !== id);
+  if (next.length > 0) map[missionId] = next;
+  else delete map[missionId];
+  writeOutbox(map);
 }
 
 type StreamLogLevel = "debug" | "info" | "warn" | "error";
@@ -936,6 +1012,26 @@ type QuestionInfo = {
   /** True when the only meaningful option is "Other" (free-text input). */
   freeTextOnly?: boolean;
 };
+
+/**
+ * True when a goal `status` means the goal loop has stopped driving the
+ * mission, so the goal pill should be cleared.
+ *
+ * The two goal backends speak different dialects: Codex emits the exact tokens
+ * `complete` / `budgetLimited` / `cleared`, while the Grok native loop emits
+ * decorated forms like `aborted:cancelled`, `aborted:no_goal_sentinel`, and
+ * `budget_limited` (snake_case). Match tolerantly — by prefix and normalized
+ * separators — so a stopped Grok goal mission doesn't leave a stale pill.
+ */
+function isTerminalGoalStatus(status: string): boolean {
+  const normalized = status.toLowerCase().replace(/[_-]/g, "");
+  return (
+    normalized === "complete" ||
+    normalized === "cleared" ||
+    normalized === "budgetlimited" ||
+    normalized.startsWith("aborted")
+  );
+}
 
 function parseQuestionArgs(args: unknown): QuestionInfo[] {
   if (!isRecord(args)) return [];
@@ -3732,6 +3828,11 @@ type ChatItemRowProps = {
     result: unknown,
   ) => Promise<void>;
   onOptimisticToolResult: (toolCallId: string, result: unknown) => void;
+  onRetryUserMessage: (msg: {
+    id: string;
+    content: string;
+    agent?: string;
+  }) => void;
 };
 
 /**
@@ -3752,6 +3853,7 @@ const ChatItemRow = memo(function ChatItemRow({
   onResume,
   onToolResult,
   onOptimisticToolResult,
+  onRetryUserMessage,
 }: ChatItemRowProps) {
   const renderedContent =
     item.kind === "assistant" && item.sharedFiles?.length
@@ -3785,6 +3887,7 @@ const ChatItemRow = memo(function ChatItemRow({
   }
 
   if (item.kind === "user") {
+    const sendStatus = item.sendStatus;
     return (
       <div
         id={`chat-item-${item.id}`}
@@ -3798,10 +3901,14 @@ const ChatItemRow = memo(function ChatItemRow({
         <div className="max-w-[80%]">
           <div
             className={cn(
-              "user-message-bubble rounded-2xl rounded-tr-md px-4 py-3 selection-light",
+              "user-message-bubble rounded-2xl rounded-tr-md px-4 py-3 selection-light transition-opacity duration-200",
               item.queued
                 ? "user-message-bubble-queued border-2 border-dashed"
                 : "user-message-bubble-solid",
+              // In-flight sends read as tentative; failed sends keep a
+              // rose ring so an undelivered message is unmistakable.
+              sendStatus === "sending" && "opacity-60",
+              sendStatus === "failed" && "opacity-90 ring-1 ring-rose-500/40",
             )}
           >
             <p className="whitespace-pre-wrap text-sm break-words">
@@ -3809,7 +3916,36 @@ const ChatItemRow = memo(function ChatItemRow({
             </p>
           </div>
           <div className="mt-1 text-right flex items-center justify-end gap-2">
-            {item.queued === true && (
+            {sendStatus === "sending" && (
+              <span className="inline-flex items-center gap-1 text-[10px] text-white/40">
+                <Loader className="h-2.5 w-2.5 motion-safe:animate-spin" />
+                Sending…
+              </span>
+            )}
+            {sendStatus === "failed" && (
+              <>
+                <span className="text-[10px] text-rose-500">
+                  {item.failedReason === "rejected"
+                    ? "Not delivered"
+                    : "Not sent — offline"}
+                </span>
+                <button
+                  type="button"
+                  onClick={() =>
+                    onRetryUserMessage({
+                      id: item.id,
+                      content: item.content,
+                      agent: item.agent,
+                    })
+                  }
+                  className="inline-flex items-center gap-1 text-[10px] font-medium text-rose-500 hover:text-rose-400"
+                >
+                  <RotateCcw className="h-2.5 w-2.5" />
+                  Retry
+                </button>
+              </>
+            )}
+            {item.queued === true && sendStatus !== "failed" && (
               <span className="text-[10px] text-white/30">Queued</span>
             )}
             <span className="text-[10px] text-white/30">
@@ -5137,7 +5273,7 @@ export default function ControlClient() {
 
   // Goal-mode state, keyed by mission id. Updated from `goal_iteration` /
   // `goal_status` SSE events. Cleared when status reaches a terminal value
-  // (`complete`, `cleared`, `budgetLimited`) so finished goals stop showing
+  // (see `isTerminalGoalStatus`) so finished or stopped goals stop showing
   // a pill on subsequent renders.
   const [goalInfoByMission, setGoalInfoByMission] = useState<
     Record<string, { iteration: number; status: string; objective: string }>
@@ -6180,9 +6316,7 @@ export default function ControlClient() {
           }
           // Skip terminal statuses — those clear the pill, matching the live handler.
           const isTerminalStatus = latestStatus
-            ? ["complete", "cleared", "budgetLimited", "aborted"].includes(
-                latestStatus,
-              )
+            ? isTerminalGoalStatus(latestStatus)
             : false;
           if (
             (latestIteration !== undefined || latestStatus !== undefined) &&
@@ -7556,13 +7690,17 @@ export default function ControlClient() {
             }
           }
         } else {
-          // Event has NO mission_id (from main session)
-          // Only show if we're viewing the current/main mission OR if currentMission
-          // hasn't been loaded yet (to handle race condition during initial load)
-          if (currentMissionId && viewingId !== currentMissionId) {
-            // We're viewing a parallel mission, skip main session events
+          // Event has NO mission_id (a main-session event). Show it only when
+          // we positively know the viewed mission IS the main/current mission.
+          // If currentMissionId isn't known yet (a load/switch race), fail
+          // CLOSED and drop it — history catch-up backfills it on the next
+          // sync — rather than risk rendering a main-session message inside an
+          // unrelated parallel mission's view (cross-mission leak).
+          if (viewingId !== currentMissionId) {
             if (event.type !== "status") {
-              filterReason = "event has no mission_id for parallel mission";
+              filterReason = currentMissionId
+                ? "event has no mission_id for parallel mission"
+                : "event has no mission_id; current mission unknown (fail-closed)";
             }
           }
         }
@@ -7655,6 +7793,15 @@ export default function ControlClient() {
           "queued",
         );
         const queued = data["queued"] === true;
+        // The mission this echo belongs to (the SSE filter above already
+        // guarantees it matches the viewed mission). Used to stamp the new
+        // row and to stop content-based reconciliation from hijacking a
+        // same-content row that was created for a *different* mission.
+        const msgMissionId = eventMissionId ?? viewingId ?? undefined;
+        const sameMission = (item: ChatItem) =>
+          item.kind !== "user" ||
+          item.missionId == null ||
+          item.missionId === msgMissionId;
         setItems((prev) => {
           // Check if already added with this ID - if so, mark as not queued (being processed)
           const existingIndex = prev.findIndex((item) => item.id === msgId);
@@ -7677,7 +7824,8 @@ export default function ControlClient() {
             (item) =>
               item.kind === "user" &&
               item.id.startsWith("temp-") &&
-              item.content === msgContent,
+              item.content === msgContent &&
+              sameMission(item),
           );
 
           if (tempIndex !== -1) {
@@ -7704,7 +7852,9 @@ export default function ControlClient() {
               (item) =>
                 item.kind === "user" &&
                 item.content === msgContent &&
-                (item.id.startsWith("history-") || item.id.startsWith("temp-")),
+                (item.id.startsWith("history-") ||
+                  item.id.startsWith("temp-")) &&
+                sameMission(item),
             );
           if (contentIndex !== -1) {
             // Convert reversed index back to forward index
@@ -7730,6 +7880,7 @@ export default function ControlClient() {
               content: msgContent,
               timestamp: Date.now(),
               queued,
+              missionId: msgMissionId,
             },
           ];
         });
@@ -8628,12 +8779,7 @@ export default function ControlClient() {
         if (missionId && status) {
           // Clear pill on terminal statuses — keeps the UI uncluttered once
           // the goal is no longer driving the mission.
-          if (
-            status === "complete" ||
-            status === "cleared" ||
-            status === "budgetLimited" ||
-            status === "aborted"
-          ) {
+          if (isTerminalGoalStatus(status)) {
             setGoalInfoByMission((prev) => {
               if (!(missionId in prev)) return prev;
               const next = { ...prev };
@@ -9059,16 +9205,37 @@ export default function ControlClient() {
       );
       const willBeQueued = isBusy && hasExistingUserMessages;
 
-      const restoreFailedOptimisticSend = () => {
-        setItems((prev) => prev.filter((item) => item.id !== tempId));
-        enhancedInputRef.current?.restoreDraft(trimmedContent, agent ?? null);
-        setInput(trimmedContent);
-        saveControlDraftForMission(trimmedContent, targetMissionId);
+      // On failure we KEEP the optimistic row (instead of deleting it) and
+      // flip it to a persistent "failed" state with an inline Retry — a
+      // transient toast was too easy to miss, which is exactly how a message
+      // got silently dropped during a redeploy. Network failures are also
+      // queued to the outbox so they auto-redeliver on reconnect.
+      const markOptimisticSendFailed = (reason: "network" | "rejected") => {
+        setItems((prev) =>
+          prev.map((item) =>
+            item.id === tempId && item.kind === "user"
+              ? {
+                  ...item,
+                  sendStatus: "failed" as const,
+                  failedReason: reason,
+                  queued: false,
+                }
+              : item,
+          ),
+        );
+        if (reason === "network" && targetMissionId) {
+          addOutboxEntry(targetMissionId, {
+            id: tempId,
+            content: trimmedContent,
+            agent: agent || undefined,
+            timestamp,
+          });
+        }
       };
 
       // Acknowledge the user's send immediately, before any mission sync or
-      // network round-trip. If sync/post fails below, the optimistic row is
-      // removed and the draft is restored.
+      // network round-trip. The row starts in "sending" (dimmed, with a
+      // spinner); on ack it becomes "sent", on failure "failed" + Retry.
       setItems((prev) => [
         ...prev,
         {
@@ -9077,6 +9244,9 @@ export default function ControlClient() {
           content: trimmedContent,
           timestamp,
           queued: willBeQueued,
+          sendStatus: "sending" as const,
+          agent: agent || undefined,
+          missionId: targetMissionId ?? undefined,
         },
       ]);
       scrollToBottom("instant");
@@ -9092,7 +9262,7 @@ export default function ControlClient() {
           let mission = await loadMission(targetMissionId);
 
           if (!mission) {
-            restoreFailedOptimisticSend();
+            markOptimisticSendFailed("rejected");
             toast.error("Mission not found");
             submittingRef.current = false;
             return;
@@ -9116,7 +9286,9 @@ export default function ControlClient() {
         } catch (err) {
           const errMsg = err instanceof Error ? err.message : String(err);
           console.error("Failed to sync mission before sending:", err);
-          restoreFailedOptimisticSend();
+          markOptimisticSendFailed(
+            isRetriableSendError(err) ? "network" : "rejected",
+          );
           toast.error(
             `Failed to sync mission: ${errMsg}. Check API connection in Settings.`,
           );
@@ -9135,6 +9307,9 @@ export default function ControlClient() {
             client_message_id: tempId,
           },
         );
+        // The message reached the backend — drop it from the outbox so a
+        // later reconnect-flush can't redeliver it.
+        if (targetMissionId) removeOutboxEntry(targetMissionId, tempId);
         setItems((prev) => {
           // Check if SSE already added this message (race condition where SSE arrives before API response)
           // If so, just remove the temp message to avoid duplicates
@@ -9152,20 +9327,26 @@ export default function ControlClient() {
           const effectiveQueued = isFirstMessage ? false : queued;
           return prev.map((item) =>
             item.id === tempId
-              ? { ...item, id, queued: effectiveQueued }
+              ? {
+                  ...item,
+                  id,
+                  queued: effectiveQueued,
+                  sendStatus: "sent" as const,
+                  failedReason: undefined,
+                }
               : item,
           );
         });
       } catch (err) {
         console.error(err);
-        // Restore via the imperative handle so a locked-agent badge is
-        // reinstated instead of surfacing as a raw "@agent " prefix.
-        // Use `trimmedContent` — it's what the optimistic item and the
-        // failed API call carried, so the restored draft matches what
-        // the user actually sent. Leading/trailing whitespace in
-        // `content` is intentionally dropped here.
-        restoreFailedOptimisticSend();
-        toast.error("Failed to send message");
+        // Keep the bubble and flip it to "failed" with an inline Retry. A
+        // network failure also lands in the outbox to auto-redeliver on
+        // reconnect (idempotent via client_message_id), so a dropped
+        // connection no longer silently loses the message.
+        markOptimisticSendFailed(
+          isRetriableSendError(err) ? "network" : "rejected",
+        );
+        toast.error("Message not delivered — tap Retry on the message");
       } finally {
         submittingRef.current = false;
       }
@@ -9178,6 +9359,191 @@ export default function ControlClient() {
       scrollToBottom,
     ],
   );
+
+  // Re-send a message that failed to reach the backend, reusing its original
+  // client_message_id so redelivery is idempotent. Used by both the inline
+  // Retry button and the automatic reconnect-flush below.
+  const handleRetryUserMessage = useCallback(
+    async (
+      msg: { id: string; content: string; agent?: string },
+      explicitMissionId?: string | null,
+    ) => {
+      // Bind redelivery to an explicit mission for outbox flushes — the viewing
+      // mission can change mid-flight, and posting to viewingMissionIdRef at
+      // send time would misroute a queued message to the wrong mission. Inline
+      // Retry omits it and falls back to the active view.
+      const missionId =
+        explicitMissionId !== undefined
+          ? explicitMissionId
+          : viewingMissionIdRef.current;
+      const markFailed = (reason: "network" | "rejected") => {
+        setItems((prev) =>
+          prev.map((it) =>
+            it.id === msg.id && it.kind === "user"
+              ? { ...it, sendStatus: "failed" as const, failedReason: reason }
+              : it,
+          ),
+        );
+        if (reason === "network" && missionId) {
+          addOutboxEntry(missionId, {
+            id: msg.id,
+            content: msg.content,
+            agent: msg.agent,
+            timestamp: Date.now(),
+          });
+        }
+      };
+      setItems((prev) =>
+        prev.map((it) =>
+          it.id === msg.id && it.kind === "user"
+            ? { ...it, sendStatus: "sending" as const, failedReason: undefined }
+            : it,
+        ),
+      );
+      // Mirror the main send path: a mission in a resumable state must be
+      // resumed before it will accept the message, otherwise redelivery
+      // silently drops it. Only adopt the mission into the active view if the
+      // user is still looking at it, so a background flush doesn't yank them.
+      if (missionId) {
+        try {
+          let mission = await loadMission(missionId);
+          if (!mission) {
+            markFailed("rejected");
+            return;
+          }
+          if (["failed", "interrupted", "blocked"].includes(mission.status)) {
+            mission = await resumeMission(mission.id, { skipMessage: true });
+          }
+          if (viewingMissionIdRef.current === missionId) {
+            setCurrentMission(mission);
+            setViewingMission(mission);
+            setViewingMissionId(mission.id);
+            applyDesktopSessionState(mission);
+          }
+        } catch (err) {
+          markFailed(isRetriableSendError(err) ? "network" : "rejected");
+          return;
+        }
+      }
+      try {
+        const { id, queued } = await postControlMessageWithRetry(msg.content, {
+          agent: msg.agent || undefined,
+          mission_id: missionId || undefined,
+          client_message_id: msg.id,
+        });
+        if (missionId) removeOutboxEntry(missionId, msg.id);
+        setItems((prev) => {
+          const sseAlreadyAdded = prev.some(
+            (item) => item.id === id && item.id !== msg.id,
+          );
+          if (sseAlreadyAdded) {
+            return prev.filter((item) => item.id !== msg.id);
+          }
+          // Mirror the main send path: the mission's first user message is
+          // never queued, even if the agent is busy. Trusting the backend
+          // `queued` flag here would show "Queued" on a retried first message
+          // when the initial send would not have.
+          const otherUserMessages = prev.filter(
+            (item) => item.kind === "user" && item.id !== msg.id,
+          );
+          const isFirstMessage = otherUserMessages.length === 0;
+          const effectiveQueued = isFirstMessage ? false : queued;
+          return prev.map((item) =>
+            item.id === msg.id
+              ? {
+                  ...item,
+                  id,
+                  queued: effectiveQueued,
+                  sendStatus: "sent" as const,
+                  failedReason: undefined,
+                }
+              : item,
+          );
+        });
+      } catch (err) {
+        markFailed(isRetriableSendError(err) ? "network" : "rejected");
+      }
+    },
+    [applyDesktopSessionState],
+  );
+
+  // Surface and auto-flush the unsent-message outbox. Pending messages are
+  // always re-surfaced into the chat (so they stay visible with a Retry even
+  // while the stream is down); redelivery itself runs once the stream is
+  // connected (reconnect after a deploy/network drop, or a fresh mount with
+  // leftover messages). The in-flight guard prevents a re-render from
+  // double-firing an entry; redelivery is idempotent via client_message_id.
+  const flushingOutboxRef = useRef<Set<string>>(new Set());
+  useEffect(() => {
+    if (!viewingMissionId) return;
+    const pending = getOutboxForMission(viewingMissionId);
+    if (pending.length === 0) return;
+    const connected = connectionState === "connected";
+
+    // Always surface undelivered outbox messages so the user keeps seeing them
+    // (with an inline Retry while the stream is down), instead of them only
+    // re-appearing once the SSE stream reconnects. After a refresh the bubbles
+    // may not be in `items` yet.
+    setItems((prev) => {
+      const present = new Set(prev.map((it) => it.id));
+      const missing = pending.filter((m) => !present.has(m.id));
+      if (missing.length === 0) return prev;
+      return [
+        ...prev,
+        ...missing.map((m) => ({
+          kind: "user" as const,
+          id: m.id,
+          content: m.content,
+          timestamp: m.timestamp,
+          agent: m.agent,
+          sendStatus: connected ? ("sending" as const) : ("failed" as const),
+          failedReason: connected ? undefined : ("network" as const),
+          missionId: viewingMissionId,
+        })),
+      ];
+    });
+
+    // Redelivery only happens once the stream is connected.
+    if (!connected) return;
+
+    let cancelled = false;
+    (async () => {
+      for (const msg of pending) {
+        if (cancelled) break;
+        if (flushingOutboxRef.current.has(msg.id)) continue;
+        flushingOutboxRef.current.add(msg.id);
+        // Flip the already-surfaced bubble to "sending" while we deliver it.
+        setItems((prev) =>
+          prev.map((it) =>
+            it.id === msg.id && it.kind === "user"
+              ? {
+                  ...it,
+                  sendStatus: "sending" as const,
+                  failedReason: undefined,
+                }
+              : it,
+          ),
+        );
+        try {
+          // Bind to the mission this flush captured, not the live viewing ref,
+          // so a mid-flush mission switch can't misroute the message.
+          await handleRetryUserMessage(
+            {
+              id: msg.id,
+              content: msg.content,
+              agent: msg.agent,
+            },
+            viewingMissionId,
+          );
+        } finally {
+          flushingOutboxRef.current.delete(msg.id);
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [connectionState, viewingMissionId, handleRetryUserMessage]);
 
   const handleStop = async () => {
     const targetId = viewingMissionIdRef.current;
@@ -10411,7 +10777,7 @@ export default function ControlClient() {
             {connectionState !== "connected" && (
               <div
                 className={cn(
-                  "flex items-center gap-1.5 rounded-md border px-2 py-1 text-xs font-medium",
+                  "flex items-center gap-2 rounded-lg border px-3 py-2 text-sm transition-colors",
                   connectionState === "reconnecting"
                     ? "border-amber-500/30 bg-amber-500/10 text-amber-300"
                     : "border-red-500/30 bg-red-500/10 text-red-300",
@@ -10423,11 +10789,11 @@ export default function ControlClient() {
                 }
               >
                 {connectionState === "reconnecting" ? (
-                  <RefreshCw className="h-3 w-3 animate-spin" />
+                  <RefreshCw className="h-4 w-4 animate-spin" />
                 ) : (
-                  <WifiOff className="h-3 w-3" />
+                  <WifiOff className="h-4 w-4" />
                 )}
-                <span className="hidden md:inline">
+                <span className="hidden sm:inline">
                   {connectionState === "reconnecting"
                     ? "Reconnecting"
                     : "Disconnected"}
@@ -10640,6 +11006,7 @@ export default function ControlClient() {
                             onResume={stableResumeMission}
                             onToolResult={handleToolResultCommit}
                             onOptimisticToolResult={handleOptimisticToolResult}
+                            onRetryUserMessage={handleRetryUserMessage}
                           />
                         </div>
                       );
@@ -10913,11 +11280,11 @@ export default function ControlClient() {
                 />
 
                 {(() => {
-                  // Goal-mode pill — a flow row above the composer (not an
+                  // Goal-mode bar — a flow row above the composer (not an
                   // absolute overlay) so it never overlaps the streaming /
-                  // working indicators in the message list. indigo-300 text
-                  // (vs indigo-200) so the light-theme remap renders it dark
-                  // and readable. Cleared by the SSE handler at terminal status.
+                  // working indicators in the message list. Compact by default;
+                  // click to expand the full objective. Cleared by the SSE
+                  // handler at terminal status.
                   const activeMissionId =
                     viewingMission?.id ?? currentMission?.id;
                   const goal = activeMissionId
@@ -10931,22 +11298,10 @@ export default function ControlClient() {
                         ? "paused"
                         : goal.status;
                   return (
-                    <div
-                      className="mb-2 flex items-center gap-2 px-3 py-1.5 rounded-full bg-indigo-500/10 border border-indigo-500/30 text-xs text-indigo-300 max-w-fit"
-                      title={goal.objective}
-                    >
-                      <span className="font-semibold">Goal</span>
-                      <span className="text-indigo-300/60">·</span>
-                      <span>{statusLabel}</span>
-                      {goal.objective && (
-                        <>
-                          <span className="text-indigo-300/60">·</span>
-                          <span className="truncate max-w-[40ch] text-indigo-300/60">
-                            {goal.objective}
-                          </span>
-                        </>
-                      )}
-                    </div>
+                    <GoalBar
+                      objective={goal.objective}
+                      statusLabel={statusLabel}
+                    />
                   );
                 })()}
 

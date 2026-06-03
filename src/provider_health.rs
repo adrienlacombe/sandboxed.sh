@@ -841,7 +841,7 @@ impl ModelChainStore {
                     // empty provider response. GLM stays as the fallback.
                     ChainEntry {
                         provider_id: "minimax".to_string(),
-                        model_id: "MiniMax-M2.7".to_string(),
+                        model_id: "MiniMax-M3".to_string(),
                     },
                     ChainEntry {
                         provider_id: "zai".to_string(),
@@ -863,8 +863,10 @@ impl ModelChainStore {
                         entry.model_id = "glm-5.1".to_string();
                         migrated = true;
                     }
-                    if entry.provider_id == "minimax" && entry.model_id == "MiniMax-M2.5" {
-                        entry.model_id = "MiniMax-M2.7".to_string();
+                    if entry.provider_id == "minimax"
+                        && matches!(entry.model_id.as_str(), "MiniMax-M2.5" | "MiniMax-M2.7")
+                    {
+                        entry.model_id = "MiniMax-M3".to_string();
                         migrated = true;
                     }
                 }
@@ -932,7 +934,7 @@ impl ModelChainStore {
                 entries: vec![
                     ChainEntry {
                         provider_id: "minimax".to_string(),
-                        model_id: "MiniMax-M2.7".to_string(),
+                        model_id: "MiniMax-M3".to_string(),
                     },
                     ChainEntry {
                         provider_id: "cerebras".to_string(),
@@ -956,7 +958,7 @@ impl ModelChainStore {
                 chain.entries = vec![
                     ChainEntry {
                         provider_id: "minimax".to_string(),
-                        model_id: "MiniMax-M2.7".to_string(),
+                        model_id: "MiniMax-M3".to_string(),
                     },
                     ChainEntry {
                         provider_id: "cerebras".to_string(),
