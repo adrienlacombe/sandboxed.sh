@@ -1125,6 +1125,7 @@ async fn write_opencode_config(
             "$schema".to_string(),
             json!("https://opencode.ai/config.json"),
         );
+        ensure_opencode_goal_plugin(base_obj);
         base_obj.insert("mcp".to_string(), serde_json::Value::Object(mcp_map));
         base_obj.insert(
             "permission".to_string(),
@@ -1256,6 +1257,47 @@ async fn write_opencode_config(
     }
 
     Ok(())
+}
+
+fn ensure_opencode_goal_plugin(base_obj: &mut serde_json::Map<String, serde_json::Value>) {
+    const GOAL_PLUGIN: &str = "opencode-goal-plugin";
+
+    let plugin_entry = base_obj
+        .entry("plugin".to_string())
+        .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+    if !plugin_entry.is_array() {
+        *plugin_entry = serde_json::Value::Array(Vec::new());
+    }
+    if let Some(plugins) = plugin_entry.as_array_mut() {
+        let has_goal_plugin = plugins.iter().any(|entry| match entry {
+            serde_json::Value::String(spec) => spec == GOAL_PLUGIN,
+            serde_json::Value::Array(items) => items
+                .first()
+                .and_then(|value| value.as_str())
+                .map(|spec| spec == GOAL_PLUGIN)
+                .unwrap_or(false),
+            _ => false,
+        });
+        if !has_goal_plugin {
+            plugins.push(json!(GOAL_PLUGIN));
+        }
+    }
+
+    let command_entry = base_obj
+        .entry("command".to_string())
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    if !command_entry.is_object() {
+        *command_entry = serde_json::Value::Object(serde_json::Map::new());
+    }
+    if let Some(commands) = command_entry.as_object_mut() {
+        commands.entry("goal".to_string()).or_insert_with(|| {
+            json!({
+                "description": "Set a session-scoped goal and auto-continue until complete.",
+                "template": "$ARGUMENTS",
+                "agent": "build"
+            })
+        });
+    }
 }
 
 /// Write Claude Code `PreToolUse` hooks for workspace execution.

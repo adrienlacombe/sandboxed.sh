@@ -544,11 +544,15 @@ select:focus-visible {
     border-color: rgb(17 24 39 / 0.16);
   }
 
+  [class~="bg-black/10"],
   [class~="bg-black/20"],
+  [class~="bg-black/30"],
   [class~="bg-black/40"],
   [class~="bg-black/50"],
   [class~="bg-black/60"],
-  [class~="bg-black/80"] {
+  [class~="bg-black/70"],
+  [class~="bg-black/80"],
+  [class~="bg-black/85"] {
     background-color: rgb(255 255 255 / 0.82);
   }
 
@@ -557,6 +561,7 @@ select:focus-visible {
   [class~="bg-[#1a1a1f]"],
   [class~="bg-[#1a1a2e]"],
   [class~="bg-[#1c1c1e]/95"],
+  [class~="bg-[#161618]"],
   [class~="bg-[#121214]"],
   [class~="bg-[#111113]"],
   [class~="bg-[#0f0f11]"] {
@@ -580,6 +585,7 @@ select:focus-visible {
   [class*="bg-emerald-"][class*="text-white"],
   [class*="bg-green-"][class*="text-white"],
   [class*="bg-blue-"][class*="text-white"],
+  [class*="bg-sky-"][class*="text-white"],
   [class*="bg-cyan-"][class*="text-white"],
   [class*="bg-amber-"][class*="text-white"],
   [class*="bg-orange-"][class*="text-white"] {

@@ -297,6 +297,11 @@ const PRICING_ENTRIES: &[PricingEntry] = &[
         pricing: pricing(600, 2_200, None, Some(110)),
     },
     PricingEntry {
+        canonical: "minimax-m3",
+        aliases: &["minimax-m3"],
+        pricing: pricing(600, 2_400, Some(375), Some(60)),
+    },
+    PricingEntry {
         canonical: "minimax-m2.7-highspeed",
         aliases: &["minimax-m2.7-highspeed", "minimax-m2-7-highspeed"],
         pricing: pricing(600, 2_400, Some(375), Some(60)),
@@ -549,6 +554,7 @@ mod tests {
         assert!(pricing_for_model("zai/glm-5-turbo").is_some());
         assert!(pricing_for_model("zai/glm-4.7").is_some());
         assert!(pricing_for_model("zai/glm-4.5-air").is_some());
+        assert!(pricing_for_model("minimax/MiniMax-M3").is_some());
         assert!(pricing_for_model("minimax/MiniMax-M2.5-highspeed").is_some());
         assert!(pricing_for_model("minimax/MiniMax-M2.5").is_some());
     }
@@ -573,7 +579,7 @@ mod tests {
         assert_eq!(glm.input_nano_per_token, 1_400);
         assert_eq!(glm.output_nano_per_token, 4_400);
 
-        let minimax = pricing_for_model("minimax/MiniMax-M2.7-highspeed").expect("minimax pricing");
+        let minimax = pricing_for_model("minimax/MiniMax-M3").expect("minimax pricing");
         assert_eq!(minimax.input_nano_per_token, 600);
         assert_eq!(minimax.output_nano_per_token, 2_400);
     }
