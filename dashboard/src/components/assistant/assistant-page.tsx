@@ -28,7 +28,7 @@ import {
   type CreateAssistantGatewayInput,
 } from '@/lib/api';
 import { listBackends, listWorkspaces, listBackendModelOptions, listProviders, listConfigProfiles, type Backend, type BackendModelOption, type Provider, type Workspace, type ConfigProfileSummary } from '@/lib/api';
-import { listMissionAutomations, listLibrarySkills, type Automation, type CommandSource, type TriggerType, type SkillSummary, type SkillSource } from '@/lib/api';
+import { listMissionAutomations, listHermesAssistantSkills, type Automation, type CommandSource, type TriggerType, type HermesSkill, type HermesSkillsResponse } from '@/lib/api';
 import {
   MessageCircle,
   Plus,
@@ -153,12 +153,6 @@ function automationLabel(cs: CommandSource): string {
   }
 }
 
-function skillSourceLabel(s?: SkillSource): string {
-  if (!s || s.type === 'Local') return 'local';
-  if (s.type === 'SkillsRegistry') return s.identifier || 'registry';
-  return 'local';
-}
-
 // A small empty-state used for populated lists and genuinely-empty tabs.
 function EmptyHint({ icon: Icon, children }: { icon: typeof Sparkles; children: React.ReactNode }) {
   return (
@@ -211,11 +205,12 @@ export default function AssistantPage() {
     getHermesAssistantStatus,
     { revalidateOnFocus: false, dedupingInterval: 30000 }
   );
-  const { data: librarySkills = [], isLoading: skillsLoading } = useSWR<SkillSummary[]>(
-    'library-skills',
-    listLibrarySkills,
+  const { data: hermesSkillsData, isLoading: skillsLoading } = useSWR<HermesSkillsResponse>(
+    'hermes-skills',
+    listHermesAssistantSkills,
     { revalidateOnFocus: false, dedupingInterval: 60000 }
   );
+  const hermesSkills = hermesSkillsData?.skills ?? [];
 
   // Chat mappings keyed by bot ID
   const [chatsByBot, setChatsByBot] = useState<Record<string, AssistantGatewayChat[]>>({});
@@ -1015,7 +1010,7 @@ export default function AssistantPage() {
                     if (id === 'scheduled') return sched.length || null;
                     if (id === 'tasks') return autos.length || null;
                     if (id === 'memory') return mem.length || null;
-                    if (id === 'skills') return librarySkills.length || null;
+                    if (id === 'skills') return hermesSkills.length || null;
                     return null;
                   };
 
@@ -1373,27 +1368,32 @@ export default function AssistantPage() {
                           </div>
                         )}
 
-                        {/* SKILLS — library skills available to the assistant */}
+                        {/* SKILLS — skills the Hermes runtime installed for itself */}
                         {tab === 'skills' && (
                           skillsLoading ? (
                             <div className="flex items-center gap-2 px-1 py-3 text-xs text-white/40"><Loader className="h-3 w-3 animate-spin" /> Loading...</div>
-                          ) : librarySkills.length === 0 ? (
+                          ) : hermesSkillsData && !hermesSkillsData.available ? (
                             <EmptyHint icon={Sparkles}>
-                              No skills in the library yet. Skills available to this assistant appear here.
+                              Hermes skills directory not found. These are managed by the Hermes runtime and appear once it is installed.
+                            </EmptyHint>
+                          ) : hermesSkills.length === 0 ? (
+                            <EmptyHint icon={Sparkles}>
+                              The Hermes runtime has no skills installed yet.
                             </EmptyHint>
                           ) : (
                             <div>
-                              {librarySkills.map((skill: SkillSummary) => {
-                                const rk = `skill:${skill.name}`;
+                              {hermesSkills.map((skill: HermesSkill) => {
+                                const rk = `skill:${skill.path}`;
                                 const open = expandedRows.has(rk);
                                 return (
-                                  <div key={skill.name} className={ROW}>
+                                  <div key={skill.path} className={ROW}>
                                     <button type="button" onClick={() => toggleRow(rk)} className={cn(ROW_PAD, 'w-full text-left hover:bg-white/[0.02] rounded')}>
                                       <Sparkles className="mt-0.5 h-3.5 w-3.5 shrink-0 text-white/30" />
                                       <div className="flex-1 min-w-0">
                                         <p className="text-xs text-white/70 truncate">
                                           {skill.name}
-                                          <span className="text-white/30"> · {skillSourceLabel(skill.source)}</span>
+                                          {skill.category && <span className="text-white/30"> · {skill.category}</span>}
+                                          {skill.version && <span className="text-white/25"> · v{skill.version}</span>}
                                         </p>
                                         {skill.description && (
                                           <p className={cn('text-[11px] text-white/40', open ? 'whitespace-pre-wrap' : 'truncate')}>{skill.description}</p>

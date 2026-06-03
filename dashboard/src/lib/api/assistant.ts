@@ -195,3 +195,25 @@ export async function getHermesAssistantStatus(): Promise<HermesAssistantStatus>
     "Failed to fetch Hermes assistant status"
   );
 }
+
+export interface HermesSkill {
+  name: string;
+  description: string | null;
+  category: string | null;
+  version: string | null;
+  path: string;
+}
+
+export interface HermesSkillsResponse {
+  root: string;
+  available: boolean;
+  skills: HermesSkill[];
+}
+
+/** Skills the Hermes runtime installed for itself (agentskills.io / skills.sh). */
+export async function listHermesAssistantSkills(): Promise<HermesSkillsResponse> {
+  return apiGet<HermesSkillsResponse>(
+    "/api/system/hermes-assistant/skills",
+    "Failed to fetch Hermes assistant skills"
+  );
+}

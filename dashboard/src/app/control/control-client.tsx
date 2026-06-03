@@ -11209,7 +11209,7 @@ export default function ControlClient() {
                     >
                       <Target className="h-3.5 w-3.5 shrink-0" />
                       <span className="shrink-0 font-medium">Goal</span>
-                      <span className="shrink-0 text-indigo-300/70">
+                      <span className="shrink-0 rounded bg-indigo-500/15 px-1.5 py-0.5 font-mono text-[10px] text-indigo-300">
                         {statusLabel}
                       </span>
                       {goal.objective && (
