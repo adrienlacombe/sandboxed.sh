@@ -32,17 +32,30 @@ type ChipStatus = {
   icon: React.ReactNode;
   text: string;
   border: string;
+  /** Tinted fill that makes live workers "light up" against the flat
+   * neutral surface of idle/terminal ones — hierarchy via surface, not a
+   * blunt opacity dim that would also crush idle text contrast. */
+  surface: string;
   activity: string | null;
   isActive: boolean;
 };
+
+// Spinner that holds still under prefers-reduced-motion (the glyph alone
+// still reads as "working").
+const Spinner = (
+  <Loader2 className="h-3 w-3 animate-spin motion-reduce:animate-none" />
+);
+
+const FLAT_SURFACE = 'bg-white/[0.02]';
 
 function chipStatusFor(mission: Mission, info?: RunningMissionInfo): ChipStatus {
   if (info) {
     if (info.state === 'running') {
       return {
-        icon: <Loader2 className="h-3 w-3 animate-spin" />,
+        icon: Spinner,
         text: 'text-indigo-400',
         border: 'border-indigo-500/30',
+        surface: 'bg-indigo-500/[0.08]',
         activity: info.current_activity || null,
         isActive: true,
       };
@@ -52,6 +65,7 @@ function chipStatusFor(mission: Mission, info?: RunningMissionInfo): ChipStatus 
         icon: <Clock className="h-3 w-3" />,
         text: 'text-amber-400',
         border: 'border-amber-500/30',
+        surface: 'bg-amber-500/[0.08]',
         activity: info.current_activity || 'Waiting for tool',
         isActive: true,
       };
@@ -61,6 +75,7 @@ function chipStatusFor(mission: Mission, info?: RunningMissionInfo): ChipStatus 
         icon: <Clock className="h-3 w-3" />,
         text: 'text-white/60',
         border: 'border-white/10',
+        surface: FLAT_SURFACE,
         activity: 'Queued',
         isActive: false,
       };
@@ -73,6 +88,7 @@ function chipStatusFor(mission: Mission, info?: RunningMissionInfo): ChipStatus 
         icon: <CheckCircle className="h-3 w-3" />,
         text: 'text-emerald-400',
         border: 'border-emerald-500/25',
+        surface: FLAT_SURFACE,
         activity: null,
         isActive: false,
       };
@@ -81,6 +97,7 @@ function chipStatusFor(mission: Mission, info?: RunningMissionInfo): ChipStatus 
         icon: <XCircle className="h-3 w-3" />,
         text: 'text-red-400',
         border: 'border-red-500/25',
+        surface: FLAT_SURFACE,
         activity: null,
         isActive: false,
       };
@@ -89,6 +106,7 @@ function chipStatusFor(mission: Mission, info?: RunningMissionInfo): ChipStatus 
         icon: <AlertTriangle className="h-3 w-3" />,
         text: 'text-amber-400',
         border: 'border-amber-500/25',
+        surface: FLAT_SURFACE,
         activity: null,
         isActive: false,
       };
@@ -97,14 +115,16 @@ function chipStatusFor(mission: Mission, info?: RunningMissionInfo): ChipStatus 
         icon: <Ban className="h-3 w-3" />,
         text: 'text-rose-400',
         border: 'border-rose-500/25',
+        surface: FLAT_SURFACE,
         activity: null,
         isActive: false,
       };
     case 'active':
       return {
-        icon: <Loader2 className="h-3 w-3 animate-spin" />,
+        icon: Spinner,
         text: 'text-indigo-400',
         border: 'border-indigo-500/30',
+        surface: 'bg-indigo-500/[0.08]',
         activity: null,
         isActive: true,
       };
@@ -113,6 +133,7 @@ function chipStatusFor(mission: Mission, info?: RunningMissionInfo): ChipStatus 
         icon: <Clock className="h-3 w-3" />,
         text: 'text-white/50',
         border: 'border-white/[0.08]',
+        surface: FLAT_SURFACE,
         activity: null,
         isActive: false,
       };
@@ -182,7 +203,8 @@ export const WorkersStrip = memo(function WorkersStrip({
             className={cn(
               'shrink-0 inline-flex h-6 items-center gap-1 rounded-md border border-violet-500/30',
               'bg-violet-500/10 hover:bg-violet-500/20 text-violet-400',
-              'px-2 text-[11px] font-medium transition-colors max-w-[280px]'
+              'px-2 text-[11px] font-medium max-w-[280px]',
+              'transition-[background-color,transform] duration-150 active:translate-y-px'
             )}
             title={`Back to boss: ${parentTitle}`}
             aria-label={`Back to boss mission ${parentTitle}`}
@@ -202,8 +224,10 @@ export const WorkersStrip = memo(function WorkersStrip({
           title={`${activeCount} active of ${chips.length} ${onWorkerView ? 'siblings' : 'workers'}`}
         >
           <span>{onWorkerView ? 'Siblings' : 'Workers'}</span>
-          <span className="tabular-nums text-white/60">
-            {activeCount}
+          <span className="tabular-nums">
+            <span className={activeCount > 0 ? 'text-indigo-300' : 'text-white/55'}>
+              {activeCount}
+            </span>
             <span className="text-white/30">/{chips.length}</span>
           </span>
         </span>
@@ -224,13 +248,17 @@ export const WorkersStrip = memo(function WorkersStrip({
             )}
             <button
               onClick={() => onSelectWorker(mission.id)}
+              aria-current={isViewing ? 'true' : undefined}
               className={cn(
-                'shrink-0 inline-flex h-6 items-center gap-1.5 rounded-md border px-2 text-[11px] transition-colors max-w-[260px]',
-                'bg-white/[0.02] hover:bg-white/[0.05]',
+                'shrink-0 inline-flex h-6 items-center gap-1.5 rounded-md border px-2 text-[11px] max-w-[260px]',
+                'transition-[background-color,box-shadow,transform] duration-150 active:translate-y-px',
                 status.border,
-                !status.isActive && 'opacity-75 hover:opacity-100',
-                isViewing &&
-                  'bg-indigo-500/10 ring-1 ring-indigo-400/40 border-indigo-500/35 opacity-100'
+                status.surface,
+                'hover:bg-white/[0.06]',
+                // "Viewing" is a structural cue (you-are-here): a neutral inset
+                // ring, so it reads on top of the chip's semantic status hue
+                // instead of replacing it.
+                isViewing && 'ring-1 ring-inset ring-white/30'
               )}
               title={status.activity ? `${title}: ${status.activity}` : title}
             >
@@ -239,7 +267,7 @@ export const WorkersStrip = memo(function WorkersStrip({
                 {title}
               </span>
               {status.activity && (
-                <span className="hidden lg:inline truncate text-white/40 max-w-[120px]">
+                <span className="hidden lg:inline truncate text-white/45 max-w-[120px]">
                   {status.activity}
                 </span>
               )}

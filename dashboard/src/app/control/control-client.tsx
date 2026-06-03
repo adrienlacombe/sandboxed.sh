@@ -117,6 +117,7 @@ import {
   type SharedFile,
 } from "@/lib/api";
 import { QueueStrip, type QueueItem } from "@/components/queue-strip";
+import { GoalBar } from "@/components/goal-bar";
 import { AsyncButton } from "@/components/ui/async-button";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import {
@@ -1011,6 +1012,26 @@ type QuestionInfo = {
   /** True when the only meaningful option is "Other" (free-text input). */
   freeTextOnly?: boolean;
 };
+
+/**
+ * True when a goal `status` means the goal loop has stopped driving the
+ * mission, so the goal pill should be cleared.
+ *
+ * The two goal backends speak different dialects: Codex emits the exact tokens
+ * `complete` / `budgetLimited` / `cleared`, while the Grok native loop emits
+ * decorated forms like `aborted:cancelled`, `aborted:no_goal_sentinel`, and
+ * `budget_limited` (snake_case). Match tolerantly — by prefix and normalized
+ * separators — so a stopped Grok goal mission doesn't leave a stale pill.
+ */
+function isTerminalGoalStatus(status: string): boolean {
+  const normalized = status.toLowerCase().replace(/[_-]/g, "");
+  return (
+    normalized === "complete" ||
+    normalized === "cleared" ||
+    normalized === "budgetlimited" ||
+    normalized.startsWith("aborted")
+  );
+}
 
 function parseQuestionArgs(args: unknown): QuestionInfo[] {
   if (!isRecord(args)) return [];
@@ -5252,7 +5273,7 @@ export default function ControlClient() {
 
   // Goal-mode state, keyed by mission id. Updated from `goal_iteration` /
   // `goal_status` SSE events. Cleared when status reaches a terminal value
-  // (`complete`, `cleared`, `budgetLimited`) so finished goals stop showing
+  // (see `isTerminalGoalStatus`) so finished or stopped goals stop showing
   // a pill on subsequent renders.
   const [goalInfoByMission, setGoalInfoByMission] = useState<
     Record<string, { iteration: number; status: string; objective: string }>
@@ -6295,9 +6316,7 @@ export default function ControlClient() {
           }
           // Skip terminal statuses — those clear the pill, matching the live handler.
           const isTerminalStatus = latestStatus
-            ? ["complete", "cleared", "budgetLimited", "aborted"].includes(
-                latestStatus,
-              )
+            ? isTerminalGoalStatus(latestStatus)
             : false;
           if (
             (latestIteration !== undefined || latestStatus !== undefined) &&
@@ -8760,12 +8779,7 @@ export default function ControlClient() {
         if (missionId && status) {
           // Clear pill on terminal statuses — keeps the UI uncluttered once
           // the goal is no longer driving the mission.
-          if (
-            status === "complete" ||
-            status === "cleared" ||
-            status === "budgetLimited" ||
-            status === "aborted"
-          ) {
+          if (isTerminalGoalStatus(status)) {
             setGoalInfoByMission((prev) => {
               if (!(missionId in prev)) return prev;
               const next = { ...prev };
@@ -11266,11 +11280,11 @@ export default function ControlClient() {
                 />
 
                 {(() => {
-                  // Goal-mode pill — a flow row above the composer (not an
+                  // Goal-mode bar — a flow row above the composer (not an
                   // absolute overlay) so it never overlaps the streaming /
-                  // working indicators in the message list. indigo-300 text
-                  // (vs indigo-200) so the light-theme remap renders it dark
-                  // and readable. Cleared by the SSE handler at terminal status.
+                  // working indicators in the message list. Compact by default;
+                  // click to expand the full objective. Cleared by the SSE
+                  // handler at terminal status.
                   const activeMissionId =
                     viewingMission?.id ?? currentMission?.id;
                   const goal = activeMissionId
@@ -11284,22 +11298,10 @@ export default function ControlClient() {
                         ? "paused"
                         : goal.status;
                   return (
-                    <div
-                      className="flex w-full items-center gap-2 rounded-md border border-indigo-500/25 bg-indigo-500/10 px-2.5 py-1.5 text-xs text-indigo-300"
-                      role="status"
-                      title={goal.objective}
-                    >
-                      <Target className="h-3.5 w-3.5 shrink-0" />
-                      <span className="shrink-0 font-medium">Goal</span>
-                      <span className="shrink-0 rounded bg-indigo-500/15 px-1.5 py-0.5 font-mono text-[10px] text-indigo-300">
-                        {statusLabel}
-                      </span>
-                      {goal.objective && (
-                        <span className="min-w-0 truncate text-white/50">
-                          {goal.objective}
-                        </span>
-                      )}
-                    </div>
+                    <GoalBar
+                      objective={goal.objective}
+                      statusLabel={statusLabel}
+                    />
                   );
                 })()}
 
