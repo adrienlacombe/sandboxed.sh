@@ -20,6 +20,11 @@ fn model_is_reasoning(model: &str) -> bool {
         || m.contains("qwq")
         || m.contains("thinking")
         || m.contains("reasoning")
+        // Cerebras's GLM 4.7 (`zai-glm-4.7`) is a reasoning model: without an
+        // explicit effort it spends the budget on hidden reasoning and returns
+        // empty content.
+        || m.contains("glm")
+        || m.contains("zai")
 }
 
 /// A tool call requested by the model.

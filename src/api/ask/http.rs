@@ -65,6 +65,37 @@ pub struct AskThreadDetail {
     pub messages: Vec<AskMessage>,
 }
 
+/// Resolve the directory the Ask bash tool should run in — the same place the
+/// harness actually ran the mission. Precedence mirrors the mission runner:
+///   1. an explicit `working_directory` override (e.g. an orchestrated worker's
+///      git worktree), but only when it still exists;
+///   2. otherwise the per-mission workspace dir
+///      (`<workspace>/workspaces/mission-<short>`), which is where the backend
+///      ran — `working_directory` is left NULL for ordinary missions, so this
+///      is the common path;
+///   3. a last-resort fall back to the raw workspace root.
+///
+/// Without step 2 the bash tool started at the workspace *base*, forcing the
+/// model to burn its whole iteration budget just locating the project.
+fn resolve_base_work_dir(
+    working_directory: Option<&str>,
+    workspace_path: &std::path::Path,
+    mission_id: Uuid,
+) -> std::path::PathBuf {
+    if let Some(dir) = working_directory.map(std::path::PathBuf::from) {
+        if dir.exists() {
+            return dir;
+        }
+    }
+    let per_mission_dir =
+        crate::workspace::mission_workspace_dir_for_root(workspace_path, mission_id);
+    if per_mission_dir.exists() {
+        per_mission_dir
+    } else {
+        workspace_path.to_path_buf()
+    }
+}
+
 /// POST /api/control/missions/:id/ask — send a question to the Ask assistant.
 pub async fn ask_send(
     State(state): State<Arc<AppState>>,
@@ -127,11 +158,11 @@ pub async fn ask_send(
         Some(mission.workspace_id),
     )
     .await;
-    let base_work_dir = mission
-        .working_directory
-        .as_ref()
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| workspace.path.clone());
+    let base_work_dir = resolve_base_work_dir(
+        mission.working_directory.as_deref(),
+        &workspace.path,
+        mission_id,
+    );
 
     // Optional sandbox-copy isolation: writes go to a throwaway worktree/copy.
     let setup_exec = crate::workspace_exec::WorkspaceExec::new(workspace.clone());
@@ -244,11 +275,11 @@ pub async fn ask_send_stream(
         Some(mission.workspace_id),
     )
     .await;
-    let base_work_dir = mission
-        .working_directory
-        .as_ref()
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| workspace.path.clone());
+    let base_work_dir = resolve_base_work_dir(
+        mission.working_directory.as_deref(),
+        &workspace.path,
+        mission_id,
+    );
 
     // Optional sandbox-copy isolation (same as the synchronous path): set up a
     // throwaway worktree, run the streamed turn in it, tear it down after.

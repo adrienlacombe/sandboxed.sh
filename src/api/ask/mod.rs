@@ -33,7 +33,10 @@ pub use client::AskClient;
 pub use store::{AskMessage, AskStore, AskThread, OperatorNote};
 
 /// Hard cap on tool-calling iterations per turn — keeps cost/latency bounded.
-const MAX_ITERATIONS: usize = 6;
+/// When the cap is hit mid-investigation, a final tools-disabled pass still
+/// forces a synthesized answer (see the loops below), so this bounds *tool*
+/// rounds rather than guaranteeing a dead end.
+const MAX_ITERATIONS: usize = 10;
 /// Max bytes of any single tool result fed back to the model.
 const MAX_TOOL_RESULT_BYTES: usize = 8_000;
 /// Number of recent mission events seeded into the system prompt.
@@ -160,8 +163,21 @@ pub async fn run_ask_turn(turn: &AskTurn, user_content: &str) -> Result<String, 
     }
 
     if final_answer.is_empty() {
-        final_answer =
-            "(The assistant reached the tool-call limit without a final answer.)".to_string();
+        // The loop ended on a tool-calling turn — the model never volunteered a
+        // final answer. Give it one more pass with tools disabled so it must
+        // synthesize from the results it already gathered, rather than bailing
+        // with a canned "tool-call limit" message.
+        match turn.llm.complete(&messages, &[]).await {
+            Ok(c) => {
+                total_tokens += c.total_tokens.unwrap_or(0);
+                final_answer = c.content.unwrap_or_default();
+            }
+            Err(e) => tracing::warn!("[Ask] forced final-answer pass failed: {e}"),
+        }
+        if final_answer.is_empty() {
+            final_answer =
+                "(The assistant reached the tool-call limit without a final answer.)".to_string();
+        }
     }
 
     turn.ask_store
@@ -322,8 +338,28 @@ async fn run_ask_turn_streaming_inner(
     }
 
     if final_answer.is_empty() {
-        final_answer =
-            "(The assistant reached the tool-call limit without a final answer.)".to_string();
+        // Same forced synthesis as the non-streaming path: one more pass with
+        // tools disabled, streamed so the operator sees the answer arrive.
+        let txc = tx.clone();
+        match turn
+            .llm
+            .complete_stream(&messages, &[], |frag| {
+                let _ = txc.send(AskStreamEvent::Delta {
+                    content: frag.to_string(),
+                });
+            })
+            .await
+        {
+            Ok(c) => {
+                total_tokens += c.total_tokens.unwrap_or(0);
+                final_answer = c.content.unwrap_or_default();
+            }
+            Err(e) => tracing::warn!("[Ask] forced final-answer pass (stream) failed: {e}"),
+        }
+        if final_answer.is_empty() {
+            final_answer =
+                "(The assistant reached the tool-call limit without a final answer.)".to_string();
+        }
     }
 
     turn.ask_store
@@ -378,11 +414,16 @@ async fn build_system_prompt(turn: &AskTurn) -> String {
         }
     }
 
+    let cwd = turn.work_dir.display();
     format!(
         "You are the Ask co-pilot for an autonomous coding mission. A separate \
          \"working agent\" is doing the real work in this same workspace; you are a \
          read-mostly assistant helping the operator understand and occasionally nudge \
          what's happening.\n\n\
+         Your bash tool runs in `{cwd}` — this is the mission's workspace and the \
+         working agent's project root. Commands start there and relative paths \
+         resolve against it, so you can `ls`, `cat`, or `git log` directly without \
+         hunting for the project first.\n\n\
          Prefer reading (history, files, logs) over writing. You MAY write to the \
          workspace with the bash tool, but anything you change is reported to the \
          working agent, so keep writes minimal and intentional. The full mission \

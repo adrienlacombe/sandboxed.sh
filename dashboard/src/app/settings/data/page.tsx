@@ -382,7 +382,8 @@ export default function DataSettingsPage() {
                       Save
                     </button>
                     <span className="text-xs text-white/30">
-                      e.g. gpt-oss-120b, qwen-3-235b-a22b-instruct-2507
+                      e.g. gpt-oss-120b (fast default), zai-glm-4.7 (larger,
+                      slower)
                     </span>
                   </div>
                 </div>
