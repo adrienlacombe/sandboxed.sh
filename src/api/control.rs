@@ -4808,6 +4808,7 @@ fn conversation_profile_enabled(profile: Option<&str>) -> bool {
 fn project_conversation_events(
     events: Vec<mission_store::StoredEvent>,
     keep_full_tool_call_ids: &HashSet<String>,
+    tool_summaries: &HashMap<String, mission_store::ToolCallSummary>,
 ) -> Vec<mission_store::StoredEvent> {
     if events.is_empty() {
         return events;
@@ -4862,30 +4863,42 @@ fn project_conversation_events(
         }
 
         if let Some(pair) = pairs.get(&tool_call_id) {
+            let persisted = tool_summaries.get(&tool_call_id);
             event.event_type = "tool_stub".to_string();
             event.content.clear();
             let mut metadata = event.metadata.as_object().cloned().unwrap_or_default();
             metadata.insert("lazy".to_string(), serde_json::json!(true));
-            metadata.insert("has_result".to_string(), serde_json::json!(pair.has_result));
+            metadata.insert(
+                "has_result".to_string(),
+                serde_json::json!(persisted.map_or(pair.has_result, |summary| summary.has_result)),
+            );
             metadata.insert(
                 "call_sequence".to_string(),
                 serde_json::json!(event.sequence),
             );
             metadata.insert(
                 "result_sequence".to_string(),
-                serde_json::json!(pair.result_sequence),
+                serde_json::json!(persisted
+                    .and_then(|summary| summary.result_sequence)
+                    .or(pair.result_sequence)),
             );
             metadata.insert(
                 "result_timestamp".to_string(),
-                serde_json::json!(pair.result_timestamp),
+                serde_json::json!(persisted
+                    .and_then(|summary| summary.result_timestamp.clone())
+                    .or_else(|| pair.result_timestamp.clone())),
             );
             metadata.insert(
                 "call_content_bytes".to_string(),
-                serde_json::json!(pair.call_content_bytes),
+                serde_json::json!(persisted.map_or(pair.call_content_bytes, |summary| {
+                    summary.call_content_bytes
+                })),
             );
             metadata.insert(
                 "result_content_bytes".to_string(),
-                serde_json::json!(pair.result_content_bytes),
+                serde_json::json!(persisted.map_or(pair.result_content_bytes, |summary| {
+                    summary.result_content_bytes
+                })),
             );
             event.metadata = serde_json::Value::Object(metadata);
         }
@@ -4959,7 +4972,20 @@ pub async fn get_mission_events(
             .map_err(internal_error)?
             .into_iter()
             .collect();
-        summary.events = project_conversation_events(summary.events, &keep_full_tool_call_ids);
+        let tool_call_ids = summary
+            .events
+            .iter()
+            .filter_map(|event| event.tool_call_id.clone())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let tool_summaries = control
+            .mission_store
+            .get_tool_call_summaries(mission_id, &tool_call_ids)
+            .await
+            .map_err(internal_error)?;
+        summary.events =
+            project_conversation_events(summary.events, &keep_full_tool_call_ids, &tool_summaries);
         summary.summarized_count = summary.events.len();
     }
 
@@ -5246,7 +5272,20 @@ pub async fn get_mission_snapshot(
             .map_err(internal_error)?
             .into_iter()
             .collect();
-        summary.events = project_conversation_events(summary.events, &keep_full_tool_call_ids);
+        let tool_call_ids = summary
+            .events
+            .iter()
+            .filter_map(|event| event.tool_call_id.clone())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let tool_summaries = control
+            .mission_store
+            .get_tool_call_summaries(mission_id, &tool_call_ids)
+            .await
+            .map_err(internal_error)?;
+        summary.events =
+            project_conversation_events(summary.events, &keep_full_tool_call_ids, &tool_summaries);
         summary.summarized_count = summary.events.len();
     }
     let event_counts = control
@@ -15186,7 +15225,8 @@ mod tests {
         ];
 
         let keep_full_tool_call_ids = HashSet::from(["tool-2".to_string()]);
-        let projected = project_conversation_events(events, &keep_full_tool_call_ids);
+        let projected =
+            project_conversation_events(events, &keep_full_tool_call_ids, &HashMap::new());
 
         assert_eq!(
             projected
@@ -15230,7 +15270,7 @@ mod tests {
             ),
         ];
 
-        let projected = project_conversation_events(events, &HashSet::new());
+        let projected = project_conversation_events(events, &HashSet::new(), &HashMap::new());
 
         assert_eq!(projected.len(), 1);
         assert_eq!(projected[0].event_type, "tool_stub");
@@ -15238,6 +15278,41 @@ mod tests {
             projected[0].tool_call_id.as_deref(),
             Some("older-page-newest")
         );
+    }
+
+    #[test]
+    fn conversation_projection_uses_persisted_tool_summary_across_page_boundary() {
+        let mission_id = Uuid::new_v4();
+        let events = vec![stored_test_event(
+            mission_id,
+            10,
+            "tool_call",
+            Some("split-tool"),
+            "{}",
+        )];
+        let summaries = HashMap::from([(
+            "split-tool".to_string(),
+            mission_store::ToolCallSummary {
+                has_result: true,
+                result_sequence: Some(11),
+                result_timestamp: Some("2026-06-04T10:00:11Z".to_string()),
+                call_content_bytes: 2,
+                result_content_bytes: 14,
+            },
+        )]);
+
+        let projected = project_conversation_events(events, &HashSet::new(), &summaries);
+
+        assert_eq!(projected.len(), 1);
+        let stub = &projected[0];
+        assert_eq!(stub.event_type, "tool_stub");
+        assert_eq!(stub.metadata["has_result"], serde_json::json!(true));
+        assert_eq!(stub.metadata["result_sequence"], serde_json::json!(11));
+        assert_eq!(
+            stub.metadata["result_timestamp"],
+            serde_json::json!("2026-06-04T10:00:11Z")
+        );
+        assert_eq!(stub.metadata["result_content_bytes"], serde_json::json!(14));
     }
 
     fn test_automation_with_mode(

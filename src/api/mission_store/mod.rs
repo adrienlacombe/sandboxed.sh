@@ -144,6 +144,16 @@ pub struct StoredEvent {
     pub metadata: serde_json::Value,
 }
 
+/// Persisted summary for one tool call across all of its stored events.
+#[derive(Debug, Clone, Default)]
+pub struct ToolCallSummary {
+    pub has_result: bool,
+    pub result_sequence: Option<i64>,
+    pub result_timestamp: Option<String>,
+    pub call_content_bytes: usize,
+    pub result_content_bytes: usize,
+}
+
 /// Aggregated AI token/cost usage for a single (normalized) model.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelUsageStats {
@@ -1361,6 +1371,16 @@ pub trait MissionStore: Send + Sync {
     ) -> Result<Vec<String>, String> {
         let _ = (mission_id, limit);
         Ok(vec![])
+    }
+
+    /// Get persisted summaries for specific tool calls.
+    async fn get_tool_call_summaries(
+        &self,
+        mission_id: Uuid,
+        tool_call_ids: &[String],
+    ) -> Result<HashMap<String, ToolCallSummary>, String> {
+        let _ = (mission_id, tool_call_ids);
+        Ok(HashMap::new())
     }
 
     /// Count events for a mission, optionally filtered by type.

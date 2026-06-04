@@ -13,7 +13,7 @@ use super::{
     TelegramStructuredMemoryEntry, TelegramStructuredMemoryKind, TelegramStructuredMemoryScope,
     TelegramStructuredMemorySearchHit, TelegramUser, TelegramUserCursor, TelegramUserRole,
     TelegramWorkflow, TelegramWorkflowEvent, TelegramWorkflowKind, TelegramWorkflowStatus,
-    TriggerType, WebhookConfig,
+    ToolCallSummary, TriggerType, WebhookConfig,
 };
 use crate::api::control::{AgentEvent, AgentTreeNode, DesktopSessionInfo, TextOp};
 use async_trait::async_trait;
@@ -696,7 +696,7 @@ impl SqliteMissionStore {
             _ => {
                 return Err(rusqlite::Error::ToSqlConversionFailure(
                     format!("Unknown command source type: {}", command_source_type).into(),
-                ))
+                ));
             }
         };
 
@@ -734,7 +734,7 @@ impl SqliteMissionStore {
             _ => {
                 return Err(rusqlite::Error::ToSqlConversionFailure(
                     format!("Unknown trigger type: {}", trigger_type).into(),
-                ))
+                ));
             }
         };
 
@@ -4248,6 +4248,65 @@ impl MissionStore for SqliteMissionStore {
                 ids.push(row.map_err(|e| e.to_string())?);
             }
             Ok(ids)
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
+    async fn get_tool_call_summaries(
+        &self,
+        mission_id: Uuid,
+        tool_call_ids: &[String],
+    ) -> Result<HashMap<String, ToolCallSummary>, String> {
+        if tool_call_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let conn = self.conn.clone();
+        let mid = mission_id.to_string();
+        let ids = tool_call_ids.to_vec();
+
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let ids_json = serde_json::to_string(&ids).unwrap_or_else(|_| "[]".to_string());
+            let mut stmt = conn
+                .prepare(
+                    "SELECT tool_call_id, event_type, sequence, timestamp, content, content_file
+                     FROM mission_events
+                     WHERE mission_id = ?1
+                       AND tool_call_id IN (SELECT value FROM json_each(?2))
+                       AND event_type IN ('tool_call', 'tool_result')
+                     ORDER BY sequence ASC",
+                )
+                .map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map(params![&mid, &ids_json], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                    ))
+                })
+                .map_err(|e| e.to_string())?;
+            let mut summaries: HashMap<String, ToolCallSummary> = HashMap::new();
+            for row in rows {
+                let (tool_call_id, event_type, sequence, timestamp, content, content_file) =
+                    row.map_err(|e| e.to_string())?;
+                let full_content =
+                    SqliteMissionStore::load_content(content.as_deref(), content_file.as_deref());
+                let summary = summaries.entry(tool_call_id).or_default();
+                if event_type == "tool_call" {
+                    summary.call_content_bytes = full_content.len();
+                } else {
+                    summary.has_result = true;
+                    summary.result_sequence = Some(sequence);
+                    summary.result_timestamp = Some(timestamp);
+                    summary.result_content_bytes = full_content.len();
+                }
+            }
+            Ok(summaries)
         })
         .await
         .map_err(|e| e.to_string())?

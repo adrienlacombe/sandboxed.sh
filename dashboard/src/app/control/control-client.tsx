@@ -9925,7 +9925,8 @@ export default function ControlClient() {
                 if (
                   item.kind === "tool" &&
                   incoming?.kind === "tool" &&
-                  incoming.lazy === true
+                  incoming.lazy === true &&
+                  item.result === undefined
                 ) {
                   changed = true;
                   return {
