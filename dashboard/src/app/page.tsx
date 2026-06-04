@@ -670,16 +670,21 @@ function OverviewPageContent() {
         </div>
       </div>
 
-      {/* Right sidebar - no glass panel wrapper, just border */}
-      <div className="w-72 h-screen border-l border-white/[0.06] p-4 overflow-y-auto space-y-4">
-        <LastDaySummary
-          missions={missions}
-          runningMissionIds={runningLikeMissionIds}
-        />
-        <ActiveAutomations
-          missions={missions}
-          runningMissionIds={runningMissionIds}
-        />
+      {/* Right sidebar - no glass panel wrapper, just border. Flex column so
+          the automations panel stretches into the remaining vertical space. */}
+      <div className="flex h-screen w-72 flex-col gap-4 overflow-y-auto border-l border-white/[0.06] p-4">
+        <div className="flex-shrink-0">
+          <LastDaySummary
+            missions={missions}
+            runningMissionIds={runningLikeMissionIds}
+          />
+        </div>
+        <div className="min-h-0 flex-1">
+          <ActiveAutomations
+            missions={missions}
+            runningMissionIds={runningMissionIds}
+          />
+        </div>
       </div>
     </div>
   );
