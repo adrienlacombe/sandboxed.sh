@@ -1352,6 +1352,56 @@ async fn rollback_legacy_gateway(
     }
 }
 
+/// Name prefix for proxy keys provisioned for the Hermes gateway.
+const HERMES_PROXY_KEY_PREFIX: &str = "Hermes Assistant";
+
+/// Get the proxy API key for the Hermes gateway, reusing the key already
+/// wired into the gateway env when it is still registered; otherwise mint a
+/// fresh one. Either way, revoke any other "Hermes Assistant" keys so
+/// repeated adopt runs don't leak one key per invocation.
+async fn ensure_hermes_proxy_key(
+    state: &AppState,
+    env_path: &str,
+    runtime_name: &str,
+) -> Result<String, String> {
+    let existing = tokio::fs::read_to_string(env_path)
+        .await
+        .ok()
+        .and_then(|contents| parse_env_value(&contents, "OPENAI_API_KEY"))
+        .filter(|v| !v.is_empty());
+
+    let mut reuse = None;
+    if let Some(raw) = existing {
+        if let Some(summary) = state.proxy_api_keys.find_by_token(&raw).await {
+            reuse = Some((raw, summary.id));
+        }
+    }
+    let (raw_key, keep_id) = match reuse {
+        Some(pair) => pair,
+        None => {
+            let created = state
+                .proxy_api_keys
+                .create(format!("{HERMES_PROXY_KEY_PREFIX} ({runtime_name})"))
+                .await?;
+            (created.key, created.id)
+        }
+    };
+    match state
+        .proxy_api_keys
+        .delete_named_except(HERMES_PROXY_KEY_PREFIX, Some(keep_id))
+        .await
+    {
+        Ok(removed) if !removed.is_empty() => tracing::info!(
+            "Revoked {} stale \"{HERMES_PROXY_KEY_PREFIX}\" proxy key(s) during adopt",
+            removed.len()
+        ),
+        Ok(_) => {}
+        // Losing the garbage collection is not worth failing the adopt over.
+        Err(e) => tracing::warn!("Failed to revoke stale Hermes proxy keys: {}", e),
+    }
+    Ok(raw_key)
+}
+
 /// Adopt an existing Assistant/Telegram gateway into the host Hermes runtime.
 ///
 /// The token is read from the existing encrypted/local mission store and written
@@ -1406,15 +1456,9 @@ async fn adopt_hermes_assistant(
     } else {
         req.model.trim().to_string()
     };
-    let proxy_key = state
-        .proxy_api_keys
-        .create(format!(
-            "Hermes Assistant {}",
-            chrono::Utc::now().to_rfc3339()
-        ))
+    let proxy_key = ensure_hermes_proxy_key(&state, &env_path, runtime_name)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
-        .key;
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
     let jwt_secret = std::env::var("JWT_SECRET").unwrap_or_default();
     let user_id = user.id.clone();
     let default_workspace_id = channel

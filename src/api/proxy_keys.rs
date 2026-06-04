@@ -228,6 +228,47 @@ impl ProxyApiKeyStore {
         true
     }
 
+    /// Find the stored key matching a raw token, without recording usage.
+    ///
+    /// Used by infrastructure that re-reads its own provisioned key (e.g. the
+    /// Hermes gateway env) to check it is still valid before reusing it.
+    pub async fn find_by_token(&self, token: &str) -> Option<KeySummary> {
+        let token_hash = hex_sha256(token);
+        let keys = self.keys.read().await;
+        let mut found = None;
+        for key in keys.iter() {
+            if super::auth::constant_time_eq(&token_hash, &key.key_hash) {
+                found = Some(KeySummary::from(key));
+            }
+        }
+        found
+    }
+
+    /// Delete every key whose name starts with `prefix`, except `keep`.
+    /// Returns the deleted keys. Used to garbage-collect keys leaked by
+    /// repeated provisioning runs (e.g. one "Hermes Assistant …" key per
+    /// adopt invocation).
+    pub async fn delete_named_except(
+        &self,
+        prefix: &str,
+        keep: Option<Uuid>,
+    ) -> Result<Vec<KeySummary>, String> {
+        let doomed = |k: &ProxyApiKey| k.name.starts_with(prefix) && keep != Some(k.id);
+        let mut keys = self.keys.write().await;
+        let deleted: Vec<KeySummary> = keys
+            .iter()
+            .filter(|k| doomed(k))
+            .map(KeySummary::from)
+            .collect();
+        if deleted.is_empty() {
+            return Ok(deleted);
+        }
+        keys.retain(|k| !doomed(k));
+        self.save_to_disk(&keys)
+            .map_err(|e| format!("Failed to persist proxy API key cleanup: {}", e))?;
+        Ok(deleted)
+    }
+
     /// Record usage for the given keys. Always updates in-memory; persists to
     /// disk at most once per minute per key so the hot proxy path doesn't pay
     /// a disk write on every request.
@@ -400,6 +441,53 @@ mod tests {
         assert!(store.list().await[0].last_used_at.is_some());
         // The first touch persists to disk.
         assert!(store.load_from_disk().unwrap()[0].last_used_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn find_by_token_does_not_record_usage() {
+        let (store, _tmp) = store_with(vec![ProxyApiKey {
+            id: Uuid::new_v4(),
+            name: "k".to_string(),
+            key_hash: hex_sha256("sk-proxy-raw"),
+            key_prefix: "sk-proxy-raw00000".to_string(),
+            created_at: chrono::Utc::now(),
+            last_used_at: None,
+        }])
+        .await;
+
+        assert!(store.find_by_token("nope").await.is_none());
+        let found = store.find_by_token("sk-proxy-raw").await.unwrap();
+        assert_eq!(found.name, "k");
+        assert!(store.list().await[0].last_used_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn delete_named_except_keeps_the_kept_key_and_other_names() {
+        let keep = key("Hermes Assistant (prod)", 1, None);
+        let keep_id = keep.id;
+        let (store, _tmp) = store_with(vec![
+            key("Hermes Assistant 2026-05-29T13:02:50+00:00", 6, None),
+            key("Hermes Assistant 2026-05-30T08:15:23+00:00", 5, None),
+            keep,
+            // Different prefix — must survive.
+            key("Hermes debug smoke", 6, None),
+            key("Cursor", 90, None),
+        ])
+        .await;
+
+        let deleted = store
+            .delete_named_except("Hermes Assistant", Some(keep_id))
+            .await
+            .unwrap();
+        assert_eq!(deleted.len(), 2);
+
+        let remaining: Vec<_> = store.list().await.into_iter().map(|k| k.name).collect();
+        assert_eq!(
+            remaining,
+            vec!["Hermes Assistant (prod)", "Hermes debug smoke", "Cursor"]
+        );
+        // Persisted.
+        assert_eq!(store.load_from_disk().unwrap().len(), 3);
     }
 }
 
