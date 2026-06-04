@@ -746,6 +746,10 @@ function InlineImagePreview({
   const [imageUrl, setImageUrl] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  // Bumped in `onLoad` after recording the image's dimensions so the
+  // render below re-reads `imageDimsCache` and swaps the pre-decode
+  // reservation for the exact final box.
+  const [, setDimsVersion] = useState(0);
 
   // Layout effect (not useEffect): the cached-URL path is synchronous, so
   // running before paint means a remounted preview (virtualized row
@@ -865,12 +869,28 @@ function InlineImagePreview({
         // Pin the box to the remembered size so the row's height is stable
         // from the very first commit, even before the blob is decoded
         // (an `<img>` has no intrinsic size until decode completes, which
-        // is async even for cached blob URLs).
-        style={knownDims ? { width: knownDims.width, height: knownDims.height, maxWidth: "100%" } : undefined}
+        // is async even for cached blob URLs). Without remembered dims —
+        // e.g. the URL is cached but the row unmounted before `onLoad`
+        // ever fired — reserve the 300px fallback height instead of
+        // letting the box collapse to its (zero) pre-decode size; `onLoad`
+        // then records the real dims and re-renders with the exact box.
+        style={
+          knownDims
+            ? { width: knownDims.width, height: knownDims.height, maxWidth: "100%" }
+            : { height: 300, maxWidth: "100%" }
+        }
         onLoad={(e) => {
           const img = e.currentTarget;
-          if (resolvedPath && img.offsetWidth > 0 && img.offsetHeight > 0) {
-            imageDimsCache.set(resolvedPath, { width: img.offsetWidth, height: img.offsetHeight });
+          // Derive the final box from the intrinsic size and the
+          // max-h-[300px] rule rather than offsetWidth/offsetHeight: the
+          // pre-decode `height: 300` pin is still applied at this point,
+          // so the laid-out box of a shorter image would read as
+          // (stretched) 300px and get cached wrong.
+          if (resolvedPath && img.naturalWidth > 0 && img.naturalHeight > 0) {
+            const height = Math.min(300, img.naturalHeight);
+            const width = Math.round((img.naturalWidth / img.naturalHeight) * height);
+            imageDimsCache.set(resolvedPath, { width, height });
+            setDimsVersion((v) => v + 1);
           }
         }}
         onClick={() => showFilePreviewModal(path, resolvedPath ?? path, workspaceId, missionId)}
