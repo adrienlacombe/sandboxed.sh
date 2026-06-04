@@ -713,15 +713,18 @@ fn default_providers_config() -> ProvidersConfig {
                 billing: "pay-per-token".to_string(),
                 description: "Ultra-fast inference via Cerebras".to_string(),
                 models: vec![
+                    // Keep aligned with the live catalog: GET /v1/models only
+                    // serves these two IDs now (Qwen and the `-cs` aliases are
+                    // retired).
                     ProviderModel {
-                        id: "gpt-oss-120b-cs".to_string(),
-                        name: "GPT-OSS 120B".to_string(),
-                        description: Some("Most capable Cerebras model".to_string()),
+                        id: "zai-glm-4.7".to_string(),
+                        name: "GLM-4.7 (Cerebras)".to_string(),
+                        description: Some("Most capable Cerebras-hosted model".to_string()),
                     },
                     ProviderModel {
-                        id: "zai-glm-4.6-cs".to_string(),
-                        name: "GLM-4.6 (Cerebras)".to_string(),
-                        description: Some("GLM-4.6 via Cerebras inference".to_string()),
+                        id: "gpt-oss-120b".to_string(),
+                        name: "GPT-OSS 120B".to_string(),
+                        description: Some("Open-weight reasoning model, ultra-fast".to_string()),
                     },
                 ],
             },
