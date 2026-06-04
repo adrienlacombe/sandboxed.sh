@@ -340,6 +340,7 @@ select:focus-visible {
   [class~="text-indigo-400/70"],
   [class~="text-indigo-400/60"],
   [class~="text-indigo-400/50"],
+  [class~="text-indigo-300/80"],
   [class~="text-indigo-300/60"] {
     color: rgb(79 70 229 / 0.86);
   }
@@ -360,7 +361,8 @@ select:focus-visible {
   }
 
   [class~="text-emerald-400/80"],
-  [class~="text-emerald-400/60"] {
+  [class~="text-emerald-400/60"],
+  [class~="text-emerald-500/70"] {
     color: rgb(4 120 87 / 0.88);
   }
 
@@ -368,6 +370,16 @@ select:focus-visible {
   [class~="text-amber-300"],
   [class~="text-amber-200"] {
     color: rgb(180 83 9);
+  }
+
+  [class~="text-amber-400/80"],
+  [class~="text-amber-400/70"],
+  [class~="text-amber-400/60"],
+  [class~="text-amber-300/80"],
+  [class~="text-amber-200/80"],
+  [class~="text-amber-500/70"],
+  [class~="text-amber-500/50"] {
+    color: rgb(180 83 9 / 0.9);
   }
 
   [class~="text-orange-400"],
@@ -379,13 +391,18 @@ select:focus-visible {
     color: rgb(185 28 28);
   }
 
-  [class~="text-red-400/70"] {
+  [class~="text-red-400/80"],
+  [class~="text-red-400/70"],
+  [class~="text-red-400/60"],
+  [class~="text-red-400/50"] {
     color: rgb(185 28 28 / 0.85);
   }
 
   [class~="text-red-300"],
   [class~="text-red-200"],
-  [class~="text-red-300/80"] {
+  [class~="text-red-300/80"],
+  [class~="text-red-300/70"],
+  [class~="text-red-300/50"] {
     color: rgb(185 28 28 / 0.9);
   }
 
@@ -402,6 +419,46 @@ select:focus-visible {
   [class~="text-violet-300"],
   [class~="text-violet-400"] {
     color: rgb(109 40 217);
+  }
+
+  [class~="text-sky-300"],
+  [class~="text-sky-400"] {
+    color: rgb(3 105 161);
+  }
+
+  [class~="text-sky-400/60"] {
+    color: rgb(3 105 161 / 0.85);
+  }
+
+  [class~="text-blue-400"] {
+    color: rgb(29 78 216);
+  }
+
+  [class~="text-blue-400/80"],
+  [class~="text-blue-400/60"],
+  [class~="text-blue-400/50"] {
+    color: rgb(29 78 216 / 0.85);
+  }
+
+  [class~="text-purple-300"],
+  [class~="text-purple-400"] {
+    color: rgb(126 34 206);
+  }
+
+  [class~="text-purple-400/60"] {
+    color: rgb(126 34 206 / 0.85);
+  }
+
+  [class~="text-yellow-400"] {
+    color: rgb(161 98 7);
+  }
+
+  [class~="text-teal-400"] {
+    color: rgb(15 118 110);
+  }
+
+  [class~="text-pink-400"] {
+    color: rgb(190 24 93);
   }
 
   /* Tinted surfaces beyond indigo — let the soft fills render with light-theme
