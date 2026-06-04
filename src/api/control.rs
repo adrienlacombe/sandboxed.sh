@@ -4864,14 +4864,16 @@ fn project_conversation_events(
 
         if let Some(pair) = pairs.get(&tool_call_id) {
             let persisted = tool_summaries.get(&tool_call_id);
+            let has_result = persisted.map_or(pair.has_result, |summary| summary.has_result);
+            if !has_result {
+                projected.push(event);
+                continue;
+            }
             event.event_type = "tool_stub".to_string();
             event.content.clear();
             let mut metadata = event.metadata.as_object().cloned().unwrap_or_default();
             metadata.insert("lazy".to_string(), serde_json::json!(true));
-            metadata.insert(
-                "has_result".to_string(),
-                serde_json::json!(persisted.map_or(pair.has_result, |summary| summary.has_result)),
-            );
+            metadata.insert("has_result".to_string(), serde_json::json!(has_result));
             metadata.insert(
                 "call_sequence".to_string(),
                 serde_json::json!(event.sequence),
@@ -15313,6 +15315,34 @@ mod tests {
             serde_json::json!("2026-06-04T10:00:11Z")
         );
         assert_eq!(stub.metadata["result_content_bytes"], serde_json::json!(14));
+    }
+
+    #[test]
+    fn conversation_projection_keeps_inflight_tools_full() {
+        let mission_id = Uuid::new_v4();
+        let events = vec![stored_test_event(
+            mission_id,
+            10,
+            "tool_call",
+            Some("inflight-tool"),
+            "{\"cmd\":\"long\"}",
+        )];
+        let summaries = HashMap::from([(
+            "inflight-tool".to_string(),
+            mission_store::ToolCallSummary {
+                has_result: false,
+                result_sequence: None,
+                result_timestamp: None,
+                call_content_bytes: "{\"cmd\":\"long\"}".len(),
+                result_content_bytes: 0,
+            },
+        )]);
+
+        let projected = project_conversation_events(events, &HashSet::new(), &summaries);
+
+        assert_eq!(projected.len(), 1);
+        assert_eq!(projected[0].event_type, "tool_call");
+        assert_eq!(projected[0].content, "{\"cmd\":\"long\"}");
     }
 
     fn test_automation_with_mode(
