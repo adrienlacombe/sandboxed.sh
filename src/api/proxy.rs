@@ -3167,6 +3167,7 @@ fn transform_anthropic_sse_to_openai(
             0u32,
             false,
             false,
+            0u64,
         ),
         |(
             mut stream,
@@ -3179,6 +3180,7 @@ fn transform_anthropic_sse_to_openai(
             mut next_tool_idx,
             mut stream_ended,
             mut done_emitted,
+            mut input_tokens,
         )| async move {
             if stream_ended {
                 return None;
@@ -3212,6 +3214,19 @@ fn transform_anthropic_sse_to_openai(
                         sent_role = true;
                     }
                     match event_type {
+                        "message_start" => {
+                            // Capture input tokens so the finish chunk can
+                            // surface OpenAI-style usage (Anthropic reports
+                            // them here, not on message_delta).
+                            if let Some(n) = parsed
+                                .get("message")
+                                .and_then(|m| m.get("usage"))
+                                .and_then(|u| u.get("input_tokens"))
+                                .and_then(|v| v.as_u64())
+                            {
+                                input_tokens = n;
+                            }
+                        }
                         "content_block_start" => {
                             let block_index =
                                 parsed.get("index").and_then(|v| v.as_u64()).unwrap_or(0);
@@ -3316,13 +3331,28 @@ fn transform_anthropic_sse_to_openai(
                                     .and_then(|d| d.get("stop_reason"))
                                     .and_then(|v| v.as_str()),
                             );
-                            let chunk = serde_json::json!({
+                            let mut chunk = serde_json::json!({
                                 "id": stream_id,
                                 "object": "chat.completion.chunk",
                                 "created": created,
                                 "model": model_id,
                                 "choices": [{ "index": 0, "delta": {}, "finish_reason": finish_reason }],
                             });
+                            // Anthropic reports cumulative output tokens here;
+                            // attach OpenAI-style usage to the finish chunk so
+                            // track_stream_health's scanner (and downstream
+                            // clients) see token counts for adapter streams.
+                            if let Some(out) = parsed
+                                .get("usage")
+                                .and_then(|u| u.get("output_tokens"))
+                                .and_then(|v| v.as_u64())
+                            {
+                                chunk["usage"] = serde_json::json!({
+                                    "prompt_tokens": input_tokens,
+                                    "completion_tokens": out,
+                                    "total_tokens": input_tokens + out,
+                                });
+                            }
                             chunks.push(format!("data: {}\n\n", chunk));
                         }
                         "message_stop" if !done_emitted => {
@@ -3370,6 +3400,7 @@ fn transform_anthropic_sse_to_openai(
                             next_tool_idx,
                             stream_ended,
                             done_emitted,
+                            input_tokens,
                         ),
                     ));
                 }
@@ -3390,6 +3421,7 @@ fn transform_anthropic_sse_to_openai(
                                 next_tool_idx,
                                 stream_ended,
                                 done_emitted,
+                                input_tokens,
                             ),
                         ));
                     }
@@ -3423,6 +3455,7 @@ fn transform_anthropic_sse_to_openai(
                                 next_tool_idx,
                                 stream_ended,
                                 done_emitted,
+                                input_tokens,
                             ),
                         ));
                     }
@@ -3918,6 +3951,7 @@ fn transform_google_sse_to_openai(
             stream_id,
             model_id,
             created,
+            None::<(u64, u64)>, // last seen usageMetadata (prompt, completion)
         ),
         |(
             mut stream,
@@ -3928,6 +3962,7 @@ fn transform_google_sse_to_openai(
             stream_id,
             model_id,
             created,
+            mut usage_seen,
         )| async move {
             loop {
                 if let Some(pos) = buf.iter().position(|&b| b == b'\n') {
@@ -3954,6 +3989,7 @@ fn transform_google_sse_to_openai(
                                     stream_id,
                                     model_id,
                                     created,
+                                    usage_seen,
                                 ),
                             ));
                         }
@@ -3964,6 +4000,27 @@ fn transform_google_sse_to_openai(
                         Err(_) => continue,
                     };
                     let resp = parsed.get("response").unwrap_or(&parsed);
+                    // Gemini reports usageMetadata on (at least) the final
+                    // chunk; remember the latest so the finish chunk can carry
+                    // OpenAI-style usage for the proxy usage scanner.
+                    if let Some(meta) = resp.get("usageMetadata") {
+                        let prompt = meta
+                            .get("promptTokenCount")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0);
+                        let candidates = meta
+                            .get("candidatesTokenCount")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0);
+                        let thoughts = meta
+                            .get("thoughtsTokenCount")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0);
+                        if prompt > 0 || candidates > 0 || thoughts > 0 {
+                            // Thinking tokens bill as output.
+                            usage_seen = Some((prompt, candidates + thoughts));
+                        }
+                    }
                     let candidate = resp
                         .get("candidates")
                         .and_then(|v| v.as_array())
@@ -4038,7 +4095,7 @@ fn transform_google_sse_to_openai(
                         if emitted_tool_call && finish_reason == "stop" {
                             finish_reason = "tool_calls".to_string();
                         }
-                        let finish_chunk = serde_json::json!({
+                        let mut finish_chunk = serde_json::json!({
                             "id": stream_id,
                             "object": "chat.completion.chunk",
                             "created": created,
@@ -4049,6 +4106,13 @@ fn transform_google_sse_to_openai(
                                 "finish_reason": finish_reason,
                             }],
                         });
+                        if let Some((prompt, completion)) = usage_seen {
+                            finish_chunk["usage"] = serde_json::json!({
+                                "prompt_tokens": prompt,
+                                "completion_tokens": completion,
+                                "total_tokens": prompt + completion,
+                            });
+                        }
                         chunks.push(format!("data: {}\n\n", finish_chunk));
                         if !emitted_done {
                             chunks.push("data: [DONE]\n\n".to_string());
@@ -4069,6 +4133,7 @@ fn transform_google_sse_to_openai(
                             stream_id,
                             model_id,
                             created,
+                            usage_seen,
                         ),
                     ));
                 }
@@ -4087,6 +4152,7 @@ fn transform_google_sse_to_openai(
                                 stream_id,
                                 model_id,
                                 created,
+                                usage_seen,
                             ),
                         ));
                     }
@@ -4105,6 +4171,7 @@ fn transform_google_sse_to_openai(
                                 stream_id,
                                 model_id,
                                 created,
+                                usage_seen,
                             ),
                         ));
                     }
@@ -4536,6 +4603,85 @@ mod tests {
             .collect::<String>();
 
         assert!(text.contains("\"finish_reason\":\"tool_calls\""));
+    }
+
+    #[test]
+    fn anthropic_stream_surfaces_usage_on_finish_chunk() {
+        // message_start carries input tokens; message_delta carries cumulative
+        // output tokens. The finish chunk must surface OpenAI-style usage so
+        // track_stream_health's scanner records /v1 usage for adapter streams.
+        let events = [
+            r#"{"type":"message_start","message":{"id":"msg_1","usage":{"input_tokens":100,"output_tokens":1}}}"#,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}"#,
+            r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":42}}"#,
+            r#"{"type":"message_stop"}"#,
+        ];
+        let sse = events
+            .iter()
+            .map(|e| format!("data: {}\n\n", e))
+            .collect::<String>();
+        let input = futures::stream::iter(vec![Ok(Bytes::from(sse))]);
+
+        let out = futures::executor::block_on(async move {
+            transform_anthropic_sse_to_openai(
+                input,
+                "chatcmpl-test".to_string(),
+                1,
+                "claude-opus-4-8".to_string(),
+            )
+            .collect::<Vec<_>>()
+            .await
+        });
+
+        let text = out
+            .into_iter()
+            .map(|item| String::from_utf8(item.unwrap().to_vec()).unwrap())
+            .collect::<String>();
+
+        assert!(text.contains("\"prompt_tokens\":100"), "{text}");
+        assert!(text.contains("\"completion_tokens\":42"), "{text}");
+        assert!(text.contains("\"total_tokens\":142"), "{text}");
+    }
+
+    #[test]
+    fn google_stream_surfaces_usage_on_finish_chunk() {
+        // usageMetadata must be folded into OpenAI-style usage on the finish
+        // chunk (thinking tokens bill as output).
+        let sse_payload = serde_json::json!({
+            "response": {
+                "candidates": [{
+                    "content": { "parts": [{ "text": "hi" }] },
+                    "finishReason": "STOP"
+                }],
+                "usageMetadata": {
+                    "promptTokenCount": 10,
+                    "candidatesTokenCount": 5,
+                    "thoughtsTokenCount": 3
+                }
+            }
+        });
+        let sse_bytes = Bytes::from(format!("data: {}\n\n", sse_payload));
+        let input = futures::stream::iter(vec![Ok(sse_bytes)]);
+
+        let out = futures::executor::block_on(async move {
+            transform_google_sse_to_openai(
+                input,
+                "chatcmpl-test".to_string(),
+                1,
+                "gemini-2.5-pro".to_string(),
+            )
+            .collect::<Vec<_>>()
+            .await
+        });
+
+        let text = out
+            .into_iter()
+            .map(|item| String::from_utf8(item.unwrap().to_vec()).unwrap())
+            .collect::<String>();
+
+        assert!(text.contains("\"prompt_tokens\":10"), "{text}");
+        assert!(text.contains("\"completion_tokens\":8"), "{text}");
+        assert!(text.contains("\"total_tokens\":18"), "{text}");
     }
 
     #[test]

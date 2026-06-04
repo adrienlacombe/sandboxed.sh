@@ -1217,11 +1217,16 @@ async fn exec_workspace_command(
         None => workspace.path.clone(),
     };
 
-    // `timeout(1)` enforces the limit inside the workspace (TERM-killing the
-    // bash child there); the outer tokio timeout is a belt-and-braces guard
-    // for exec-layer hangs (e.g. a wedged container boot).
+    // `timeout(1)` enforces the limit inside the workspace: TERM at expiry,
+    // escalating to KILL 5s later (`-k`) so TERM-ignoring commands still die
+    // in the right place — on outer-timeout the dropped future only kills the
+    // direct child (the timeout/nsenter wrapper), which would orphan the
+    // command itself. The outer tokio timeout is a belt-and-braces guard for
+    // exec-layer hangs (e.g. a wedged container boot).
     let exec = crate::workspace_exec::WorkspaceExec::new(workspace);
     let args = vec![
+        "-k".to_string(),
+        "5".to_string(),
         timeout_secs.to_string(),
         "/bin/bash".to_string(),
         "-lc".to_string(),
