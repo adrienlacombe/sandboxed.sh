@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import {
   Sparkles,
   X,
@@ -564,15 +564,41 @@ function AskToolRun({ messages }: { messages: AskMessage[] }) {
   const [collapsed, setCollapsed] = useState(false);
   const callCount = messages.filter((m) => m.role === "tool_call").length;
 
+  // Keep the toggle pinned under the cursor across fold/unfold (mirrors the
+  // main chat's previous-tools fold): steps reveal *upward* into history and
+  // the content below the toggle never moves. The toggle's viewport position
+  // is captured on click and the scroller re-aligned pre-paint.
+  const toggleRef = useRef<HTMLButtonElement | null>(null);
+  const anchorTopRef = useRef<number | null>(null);
+
+  const setFolded = (next: boolean) => {
+    anchorTopRef.current =
+      toggleRef.current?.getBoundingClientRect().top ?? null;
+    setCollapsed(next);
+  };
+
+  useLayoutEffect(() => {
+    const anchorTop = anchorTopRef.current;
+    if (anchorTop == null) return;
+    anchorTopRef.current = null;
+    const el = toggleRef.current;
+    if (!el) return;
+    const scroller = el.closest(".overflow-y-auto");
+    if (!scroller) return;
+    const delta = el.getBoundingClientRect().top - anchorTop;
+    if (Math.abs(delta) > 0.5) scroller.scrollTop += delta;
+  }, [collapsed]);
+
   if (collapsed) {
     return (
       <button
+        ref={toggleRef}
         type="button"
-        onClick={() => setCollapsed(false)}
+        onClick={() => setFolded(false)}
         className="ml-8 flex items-center gap-1 text-[11px] text-[rgb(var(--foreground)/0.35)] transition-colors hover:text-[rgb(var(--foreground)/0.6)]"
-        title="Show tool steps"
+        title="Show tool steps (they reveal above)"
       >
-        <ChevronRight className="h-3 w-3" />
+        <ChevronUp className="h-3 w-3" />
         {callCount} tool step{callCount === 1 ? "" : "s"} hidden
       </button>
     );
@@ -584,12 +610,13 @@ function AskToolRun({ messages }: { messages: AskMessage[] }) {
         <AskBubble key={m.id} message={m} />
       ))}
       <button
+        ref={toggleRef}
         type="button"
-        onClick={() => setCollapsed(true)}
+        onClick={() => setFolded(true)}
         className="ml-8 flex items-center gap-1 text-[10px] text-[rgb(var(--foreground)/0.3)] transition-colors hover:text-[rgb(var(--foreground)/0.55)]"
         title="Hide tool steps"
       >
-        <ChevronUp className="h-3 w-3" />
+        <ChevronRight className="h-3 w-3" />
         Hide tool steps
       </button>
     </div>
