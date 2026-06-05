@@ -834,6 +834,21 @@ struct LeasedCodexAccount {
     _permit: OwnedSemaphorePermit,
 }
 
+/// Longest prefix of `s` that is at most `max_bytes` long without splitting
+/// a UTF-8 code point. A plain `&s[..n]` panics when byte `n` lands inside a
+/// multi-byte char (a user message with an em-dash at the boundary once took
+/// down the whole mission runner task before the turn started).
+fn utf8_safe_prefix(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
 fn codex_key_fingerprint(key: &str) -> String {
     let suffix: String = key
         .chars()
@@ -2634,9 +2649,24 @@ impl MissionRunner {
                     Some(result)
                 }
                 Err(e) => {
+                    // A panicked turn used to vanish here (mission left
+                    // "active" forever with no event). Synthesize a failed
+                    // result so the normal finalization path marks the
+                    // mission failed and the UI surfaces the error.
                     tracing::error!("Mission runner task failed: {}", e);
                     self.state = MissionRunState::Finished;
-                    None
+                    Some((
+                        self.mission_id,
+                        String::new(),
+                        AgentResult::failure(
+                            format!(
+                                "Internal error: the agent turn crashed before completing ({e}). \
+                                 This is a bug in sandboxed.sh, not in your request — retry the \
+                                 message and report if it persists."
+                            ),
+                            0,
+                        ),
+                    ))
                 }
             }
         } else {
@@ -3150,7 +3180,7 @@ async fn run_mission_turn(
     } else {
         tracing::debug!(
             mission_id = %mission_id,
-            user_message_prefix = &user_message[..user_message.len().min(100)],
+            user_message_prefix = utf8_safe_prefix(&user_message, 100),
             "Not a Telegram message, skipping CLAUDE.md injection"
         );
     }
@@ -14791,11 +14821,11 @@ mod tests {
         replace_filepath_artifact_with_tool_output, resolve_cost_cents_and_source, running_health,
         sanitized_opencode_stdout, set_codex_account_cooldown, stall_severity, strip_ansi_codes,
         strip_opencode_banner_lines, strip_think_tags, summarize_recent_opencode_stderr,
-        thinking_overlaps_visible_answer, use_thinking_only_fallback, ClaudeIncompleteTurnContext,
-        ClaudeTransportFailureStage, ClaudeTransportRecoveryStrategy, ClaudeTurnWaitState,
-        MissionHealth, MissionRunState, MissionStallSeverity, OpencodeSseState,
-        CODEX_AUTH_ERROR_COOLDOWN, CODEX_CAPACITY_COOLDOWN, CODEX_RATE_LIMIT_COOLDOWN,
-        STALL_SEVERE_SECS, STALL_WARN_SECS,
+        thinking_overlaps_visible_answer, use_thinking_only_fallback, utf8_safe_prefix,
+        ClaudeIncompleteTurnContext, ClaudeTransportFailureStage, ClaudeTransportRecoveryStrategy,
+        ClaudeTurnWaitState, MissionHealth, MissionRunState, MissionStallSeverity,
+        OpencodeSseState, CODEX_AUTH_ERROR_COOLDOWN, CODEX_CAPACITY_COOLDOWN,
+        CODEX_RATE_LIMIT_COOLDOWN, STALL_SEVERE_SECS, STALL_WARN_SECS,
     };
     use super::{
         extract_telegram_instructions, grok_event_reasoning, grok_event_text, grok_event_usage,
@@ -15205,6 +15235,19 @@ mod tests {
         // A zero-duration cooldown is immediately lapsed.
         assert!(codex_account_cooldown_remaining(fp).is_none());
         clear_codex_account_cooldown(fp);
+    }
+
+    #[test]
+    fn utf8_safe_prefix_respects_char_boundaries() {
+        // The exact production crash: em-dash (3 bytes) straddling byte 100.
+        let msg = format!("{}\u{2014}maybe using a few workflows", "a".repeat(98));
+        let prefix = utf8_safe_prefix(&msg, 100);
+        assert_eq!(prefix.len(), 98); // backs off to before the em-dash
+        assert!(prefix.chars().all(|c| c == 'a'));
+        // Boundary-exact and short inputs pass through untouched.
+        assert_eq!(utf8_safe_prefix("abc", 100), "abc");
+        assert_eq!(utf8_safe_prefix("abcd", 4), "abcd");
+        assert_eq!(utf8_safe_prefix("ab\u{2014}", 3), "ab");
     }
 
     #[test]
