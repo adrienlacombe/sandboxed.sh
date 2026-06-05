@@ -13127,8 +13127,6 @@ fn contains_ascii_word(haystack: &str, needle: &str) -> bool {
     false
 }
 
-#[allow(clippy::too_many_arguments)]
-
 /// Run a codex turn through the unified credential pool with rotation and
 /// account-level cooldown handling. Shared by the initial mission dispatch
 /// and the control-channel follow-up path so a usage-capped ChatGPT account
@@ -13394,6 +13392,7 @@ pub(crate) async fn run_codex_turn_with_rotation(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run_codex_turn(
     workspace: &Workspace,
     mission_work_dir: &std::path::Path,

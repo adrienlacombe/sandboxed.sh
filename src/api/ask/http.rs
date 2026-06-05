@@ -245,7 +245,7 @@ pub async fn ask_send_stream(
     let cfg = crate::api::metadata_llm::build_assistant_llm_config(
         &state.ai_providers,
         &state.chain_store,
-        { state.settings.get().await.ask_assistant_model },
+        state.settings.get().await.ask_assistant_model,
     )
     .await
     .ok_or((
