@@ -4709,6 +4709,14 @@ pub struct GetEventsQuery {
     /// `X-Max-Sequence`; skipping counts avoids an extra indexed DB scan.
     #[serde(default = "default_include_event_counts")]
     pub include_counts: bool,
+    /// Optional response profile. `conversation` keeps the recent transcript
+    /// hydrated while collapsing older tool payloads into lazy stubs.
+    #[serde(default)]
+    pub profile: Option<String>,
+    /// Number of recent tool call/result pairs to keep fully hydrated for
+    /// `profile=conversation`.
+    #[serde(default)]
+    pub trace_tail: Option<usize>,
 }
 
 fn default_include_event_counts() -> bool {
@@ -4716,6 +4724,7 @@ fn default_include_event_counts() -> bool {
 }
 
 const INACTIVE_EVENT_SUMMARY_AFTER: chrono::Duration = chrono::Duration::minutes(5);
+const CONVERSATION_PROFILE_TRACE_TAIL: usize = 10;
 
 #[derive(Debug, Clone)]
 struct EventSummary {
@@ -4792,6 +4801,115 @@ fn summarize_inactive_stream_events(events: Vec<mission_store::StoredEvent>) -> 
     }
 }
 
+fn conversation_profile_enabled(profile: Option<&str>) -> bool {
+    matches!(profile, Some("conversation"))
+}
+
+fn project_conversation_events(
+    events: Vec<mission_store::StoredEvent>,
+    keep_full_tool_call_ids: &HashSet<String>,
+    tool_summaries: &HashMap<String, mission_store::ToolCallSummary>,
+) -> Vec<mission_store::StoredEvent> {
+    if events.is_empty() {
+        return events;
+    }
+
+    #[derive(Default)]
+    struct ToolPair {
+        latest_sequence: i64,
+        has_result: bool,
+        result_sequence: Option<i64>,
+        result_timestamp: Option<String>,
+        call_content_bytes: usize,
+        result_content_bytes: usize,
+    }
+
+    let mut pairs: HashMap<String, ToolPair> = HashMap::new();
+    for event in &events {
+        if !matches!(event.event_type.as_str(), "tool_call" | "tool_result") {
+            continue;
+        }
+        let Some(tool_call_id) = event.tool_call_id.as_ref() else {
+            continue;
+        };
+        let pair = pairs.entry(tool_call_id.clone()).or_default();
+        pair.latest_sequence = pair.latest_sequence.max(event.sequence);
+        if event.event_type == "tool_call" {
+            pair.call_content_bytes = event.content.len();
+        } else {
+            pair.has_result = true;
+            pair.result_sequence = Some(event.sequence);
+            pair.result_timestamp = Some(event.timestamp.clone());
+            pair.result_content_bytes = event.content.len();
+        }
+    }
+
+    let mut projected = Vec::with_capacity(events.len());
+    for mut event in events {
+        if !matches!(event.event_type.as_str(), "tool_call" | "tool_result") {
+            projected.push(event);
+            continue;
+        }
+        let Some(tool_call_id) = event.tool_call_id.clone() else {
+            projected.push(event);
+            continue;
+        };
+        if keep_full_tool_call_ids.contains(&tool_call_id) {
+            projected.push(event);
+            continue;
+        }
+        if event.event_type == "tool_result" {
+            continue;
+        }
+
+        if let Some(pair) = pairs.get(&tool_call_id) {
+            let persisted = tool_summaries.get(&tool_call_id);
+            let has_result = persisted.map_or(pair.has_result, |summary| summary.has_result);
+            if !has_result {
+                projected.push(event);
+                continue;
+            }
+            event.event_type = "tool_stub".to_string();
+            event.content.clear();
+            let mut metadata = event.metadata.as_object().cloned().unwrap_or_default();
+            metadata.insert("lazy".to_string(), serde_json::json!(true));
+            metadata.insert("has_result".to_string(), serde_json::json!(has_result));
+            metadata.insert(
+                "call_sequence".to_string(),
+                serde_json::json!(event.sequence),
+            );
+            metadata.insert(
+                "result_sequence".to_string(),
+                serde_json::json!(persisted
+                    .and_then(|summary| summary.result_sequence)
+                    .or(pair.result_sequence)),
+            );
+            metadata.insert(
+                "result_timestamp".to_string(),
+                serde_json::json!(persisted
+                    .and_then(|summary| summary.result_timestamp.clone())
+                    .or_else(|| pair.result_timestamp.clone())),
+            );
+            metadata.insert(
+                "call_content_bytes".to_string(),
+                serde_json::json!(persisted.map_or(pair.call_content_bytes, |summary| {
+                    summary.call_content_bytes
+                })),
+            );
+            metadata.insert(
+                "result_content_bytes".to_string(),
+                serde_json::json!(persisted.map_or(pair.result_content_bytes, |summary| {
+                    summary.result_content_bytes
+                })),
+            );
+            event.metadata = serde_json::Value::Object(metadata);
+        }
+        projected.push(event);
+    }
+
+    projected
+}
+
 /// Get events for a mission (for debugging/replay).
 ///
 /// Response includes `X-Total-Events` (total count matching the type
@@ -4840,11 +4958,38 @@ pub async fn get_mission_events(
             .await
             .map_err(internal_error)?
     };
-    let summary = if should_summarize_events(&mission) {
+    let mut summary = if should_summarize_events(&mission) {
         summarize_inactive_stream_events(events)
     } else {
         EventSummary::unchanged(events)
     };
+    if conversation_profile_enabled(query.profile.as_deref()) {
+        let keep_full_tool_call_ids: HashSet<String> = control
+            .mission_store
+            .get_recent_tool_call_ids(
+                mission_id,
+                query.trace_tail.unwrap_or(CONVERSATION_PROFILE_TRACE_TAIL),
+            )
+            .await
+            .map_err(internal_error)?
+            .into_iter()
+            .collect();
+        let tool_call_ids = summary
+            .events
+            .iter()
+            .filter_map(|event| event.tool_call_id.clone())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let tool_summaries = control
+            .mission_store
+            .get_tool_call_summaries(mission_id, &tool_call_ids)
+            .await
+            .map_err(internal_error)?;
+        summary.events =
+            project_conversation_events(summary.events, &keep_full_tool_call_ids, &tool_summaries);
+        summary.summarized_count = summary.events.len();
+    }
 
     // Metadata headers let the client decide whether it's caught up
     // without a second round-trip. Failures here are non-fatal — we just
@@ -4903,6 +5048,32 @@ pub async fn get_mission_events(
     );
 
     Ok(response)
+}
+
+pub async fn get_mission_tool_call_events(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    Path((mission_id, tool_call_id)): Path<(Uuid, String)>,
+) -> Result<Json<Vec<mission_store::StoredEvent>>, (StatusCode, String)> {
+    let control = control_for_user(&state, &user).await;
+    let mission_exists = control
+        .mission_store
+        .get_mission(mission_id)
+        .await
+        .map_err(internal_error)?;
+    if mission_exists.is_none() {
+        return Err((StatusCode::NOT_FOUND, "Mission not found".to_string()));
+    }
+
+    let events = control
+        .mission_store
+        .get_events_for_tool_call(mission_id, &tool_call_id)
+        .await
+        .map_err(internal_error)?;
+    if events.is_empty() {
+        return Err((StatusCode::NOT_FOUND, "Tool call not found".to_string()));
+    }
+    Ok(Json(events))
 }
 
 const TRANSCRIPT_EVENT_TYPES: &[&str] = &[
@@ -4999,12 +5170,21 @@ pub struct MissionSnapshotResponse {
     pub running: Option<super::mission_runner::RunningMissionInfo>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct SnapshotQuery {
+    #[serde(default)]
+    pub profile: Option<String>,
+    #[serde(default)]
+    pub trace_tail: Option<usize>,
+}
+
 /// Single first-paint payload for clients. It returns the latest visible event
 /// tail plus metadata needed to avoid the old transcript-then-trace redraw.
 pub async fn get_mission_snapshot(
     State(state): State<Arc<AppState>>,
     Extension(user): Extension<AuthUser>,
     Path(mission_id): Path<Uuid>,
+    axum::extract::Query(query): axum::extract::Query<SnapshotQuery>,
 ) -> Result<Json<MissionSnapshotResponse>, (StatusCode, String)> {
     let control = control_for_user(&state, &user).await;
     let mut mission = control
@@ -5078,11 +5258,38 @@ pub async fn get_mission_snapshot(
             .await
             .map_err(internal_error)?,
     };
-    let summary = if should_summarize_events(&mission) {
+    let mut summary = if should_summarize_events(&mission) {
         summarize_inactive_stream_events(events)
     } else {
         EventSummary::unchanged(events)
     };
+    if conversation_profile_enabled(query.profile.as_deref()) {
+        let keep_full_tool_call_ids: HashSet<String> = control
+            .mission_store
+            .get_recent_tool_call_ids(
+                mission_id,
+                query.trace_tail.unwrap_or(CONVERSATION_PROFILE_TRACE_TAIL),
+            )
+            .await
+            .map_err(internal_error)?
+            .into_iter()
+            .collect();
+        let tool_call_ids = summary
+            .events
+            .iter()
+            .filter_map(|event| event.tool_call_id.clone())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let tool_summaries = control
+            .mission_store
+            .get_tool_call_summaries(mission_id, &tool_call_ids)
+            .await
+            .map_err(internal_error)?;
+        summary.events =
+            project_conversation_events(summary.events, &keep_full_tool_call_ids, &tool_summaries);
+        summary.summarized_count = summary.events.len();
+    }
     let event_counts = control
         .mission_store
         .count_events_by_type(mission_id, Some(HISTORY_EVENT_TYPES))
@@ -14960,6 +15167,182 @@ mod tests {
             .lock()
             .expect("metadata refresh baseline lock poisoned");
         baselines.clear();
+    }
+
+    fn stored_test_event(
+        mission_id: Uuid,
+        sequence: i64,
+        event_type: &str,
+        tool_call_id: Option<&str>,
+        content: &str,
+    ) -> mission_store::StoredEvent {
+        mission_store::StoredEvent {
+            id: sequence,
+            mission_id,
+            sequence,
+            event_type: event_type.to_string(),
+            timestamp: format!("2026-06-04T10:00:{sequence:02}Z"),
+            event_id: Some(format!("event-{sequence}")),
+            tool_call_id: tool_call_id.map(ToString::to_string),
+            tool_name: tool_call_id.map(|_| "bash".to_string()),
+            content: content.to_string(),
+            metadata: serde_json::json!({}),
+        }
+    }
+
+    #[test]
+    fn conversation_projection_stubs_older_tool_pairs() {
+        let mission_id = Uuid::new_v4();
+        let events = vec![
+            stored_test_event(mission_id, 1, "user_message", None, "start"),
+            stored_test_event(
+                mission_id,
+                2,
+                "tool_call",
+                Some("tool-1"),
+                "{\"cmd\":\"old\"}",
+            ),
+            stored_test_event(
+                mission_id,
+                3,
+                "tool_result",
+                Some("tool-1"),
+                "{\"ok\":true}",
+            ),
+            stored_test_event(
+                mission_id,
+                4,
+                "tool_call",
+                Some("tool-2"),
+                "{\"cmd\":\"new\"}",
+            ),
+            stored_test_event(
+                mission_id,
+                5,
+                "tool_result",
+                Some("tool-2"),
+                "{\"ok\":true}",
+            ),
+            stored_test_event(mission_id, 6, "assistant_message", None, "done"),
+        ];
+
+        let keep_full_tool_call_ids = HashSet::from(["tool-2".to_string()]);
+        let projected =
+            project_conversation_events(events, &keep_full_tool_call_ids, &HashMap::new());
+
+        assert_eq!(
+            projected
+                .iter()
+                .map(|event| event.event_type.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "user_message",
+                "tool_stub",
+                "tool_call",
+                "tool_result",
+                "assistant_message"
+            ]
+        );
+        let stub = projected
+            .iter()
+            .find(|event| event.event_type == "tool_stub")
+            .expect("older tool call should be stubbed");
+        assert_eq!(stub.tool_call_id.as_deref(), Some("tool-1"));
+        assert!(stub.content.is_empty());
+        assert_eq!(stub.metadata["lazy"], serde_json::json!(true));
+        assert_eq!(stub.metadata["has_result"], serde_json::json!(true));
+        assert_eq!(stub.metadata["result_sequence"], serde_json::json!(3));
+        assert_eq!(
+            stub.metadata["call_content_bytes"],
+            serde_json::json!("{\"cmd\":\"old\"}".len())
+        );
+    }
+
+    #[test]
+    fn conversation_projection_uses_global_keep_full_set() {
+        let mission_id = Uuid::new_v4();
+        let events = vec![
+            stored_test_event(mission_id, 20, "tool_call", Some("older-page-newest"), "{}"),
+            stored_test_event(
+                mission_id,
+                21,
+                "tool_result",
+                Some("older-page-newest"),
+                "{\"ok\":true}",
+            ),
+        ];
+
+        let projected = project_conversation_events(events, &HashSet::new(), &HashMap::new());
+
+        assert_eq!(projected.len(), 1);
+        assert_eq!(projected[0].event_type, "tool_stub");
+        assert_eq!(
+            projected[0].tool_call_id.as_deref(),
+            Some("older-page-newest")
+        );
+    }
+
+    #[test]
+    fn conversation_projection_uses_persisted_tool_summary_across_page_boundary() {
+        let mission_id = Uuid::new_v4();
+        let events = vec![stored_test_event(
+            mission_id,
+            10,
+            "tool_call",
+            Some("split-tool"),
+            "{}",
+        )];
+        let summaries = HashMap::from([(
+            "split-tool".to_string(),
+            mission_store::ToolCallSummary {
+                has_result: true,
+                result_sequence: Some(11),
+                result_timestamp: Some("2026-06-04T10:00:11Z".to_string()),
+                call_content_bytes: 2,
+                result_content_bytes: 14,
+            },
+        )]);
+
+        let projected = project_conversation_events(events, &HashSet::new(), &summaries);
+
+        assert_eq!(projected.len(), 1);
+        let stub = &projected[0];
+        assert_eq!(stub.event_type, "tool_stub");
+        assert_eq!(stub.metadata["has_result"], serde_json::json!(true));
+        assert_eq!(stub.metadata["result_sequence"], serde_json::json!(11));
+        assert_eq!(
+            stub.metadata["result_timestamp"],
+            serde_json::json!("2026-06-04T10:00:11Z")
+        );
+        assert_eq!(stub.metadata["result_content_bytes"], serde_json::json!(14));
+    }
+
+    #[test]
+    fn conversation_projection_keeps_inflight_tools_full() {
+        let mission_id = Uuid::new_v4();
+        let events = vec![stored_test_event(
+            mission_id,
+            10,
+            "tool_call",
+            Some("inflight-tool"),
+            "{\"cmd\":\"long\"}",
+        )];
+        let summaries = HashMap::from([(
+            "inflight-tool".to_string(),
+            mission_store::ToolCallSummary {
+                has_result: false,
+                result_sequence: None,
+                result_timestamp: None,
+                call_content_bytes: "{\"cmd\":\"long\"}".len(),
+                result_content_bytes: 0,
+            },
+        )]);
+
+        let projected = project_conversation_events(events, &HashSet::new(), &summaries);
+
+        assert_eq!(projected.len(), 1);
+        assert_eq!(projected[0].event_type, "tool_call");
+        assert_eq!(projected[0].content, "{\"cmd\":\"long\"}");
     }
 
     fn test_automation_with_mode(

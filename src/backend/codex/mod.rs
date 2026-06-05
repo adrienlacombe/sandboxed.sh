@@ -370,6 +370,7 @@ async fn send_message_streaming_app_server(
         // Mutable so we can swap in a fresh session after a reconnect.
         let mut session_arc = session_arc;
         let mut inbound = inbound;
+        let cancel_token = cfg.cancel_token.clone();
 
         // Cap the number of automatic reconnects per mission so a
         // systemic codex crash doesn't loop forever. One retry covers
@@ -380,9 +381,47 @@ async fn send_message_streaming_app_server(
 
         'outer: loop {
             loop {
-                let msg = match inbound.recv().await {
-                    Some(m) => m,
-                    None => break, // inner loop → check whether to reconnect
+                let msg = tokio::select! {
+                    _ = async {
+                        if let Some(token) = cancel_token.as_ref() {
+                            token.cancelled().await;
+                        } else {
+                            std::future::pending::<()>().await;
+                        }
+                    } => {
+                        tracing::info!(
+                            thread_id = %thread_id,
+                            is_goal_mission,
+                            "codex app-server cancellation requested"
+                        );
+                        if is_goal_mission {
+                            if let Err(e) = session_arc.goal_clear(&thread_id).await {
+                                tracing::warn!(
+                                    thread_id = %thread_id,
+                                    "codex thread/goal/clear failed during cancellation: {}",
+                                    e
+                                );
+                            }
+                            let _ = tx
+                                .send(ExecutionEvent::GoalStatus {
+                                    status: "cleared".to_string(),
+                                    objective: translator.goal_objective.clone(),
+                                })
+                                .await;
+                        } else if let Err(e) = session_arc.turn_interrupt(&thread_id, None).await {
+                            tracing::debug!(
+                                thread_id = %thread_id,
+                                "codex turn/interrupt failed during cancellation: {}",
+                                e
+                            );
+                        }
+                        let _ = tx.send(ExecutionEvent::Cancelled).await;
+                        break 'outer;
+                    }
+                    msg = inbound.recv() => match msg {
+                        Some(m) => m,
+                        None => break, // inner loop → check whether to reconnect
+                    },
                 };
 
                 match msg {

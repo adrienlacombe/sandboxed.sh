@@ -403,6 +403,87 @@ pub async fn build_assistant_llm_config(
     Some(cfg)
 }
 
+/// Sanitized view of a resolved LLM role config for the dashboard settings
+/// page. Never includes the API key.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct LlmRoleStatus {
+    /// Whether a usable provider/model pair was resolved for this role.
+    pub available: bool,
+    /// Human-readable provider label (derived from the base URL).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    /// Resolved model ID.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Resolved base URL.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+}
+
+impl LlmRoleStatus {
+    fn from_config(config: Option<&MetadataLlmConfig>) -> Self {
+        match config {
+            Some(cfg) => Self {
+                available: true,
+                provider: Some(provider_label_for_base_url(&cfg.base_url)),
+                model: Some(cfg.model.clone()),
+                base_url: Some(cfg.base_url.clone()),
+            },
+            None => Self {
+                available: false,
+                provider: None,
+                model: None,
+                base_url: None,
+            },
+        }
+    }
+}
+
+/// Map a base URL to a human-readable provider label for display purposes.
+fn provider_label_for_base_url(base_url: &str) -> String {
+    let labels: &[(&str, &str)] = &[
+        ("cerebras.ai", "Cerebras"),
+        ("openrouter.ai", "OpenRouter"),
+        ("groq.com", "Groq"),
+        ("api.openai.com", "OpenAI"),
+        ("anthropic.com", "Anthropic"),
+        ("googleapis.com", "Google Gemini"),
+        ("bigmodel.cn", "Z.AI"),
+    ];
+    for (needle, label) in labels {
+        if base_url.contains(needle) {
+            return (*label).to_string();
+        }
+    }
+    // Fall back to the URL host so custom endpoints stay identifiable.
+    base_url
+        .trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .split('/')
+        .next()
+        .unwrap_or(base_url)
+        .to_string()
+}
+
+/// Sanitized status of the **Assistant** role (the Ask sidecar) for the
+/// dashboard. Mirrors `build_assistant_llm_config` without exposing the key.
+pub async fn assistant_role_status(
+    ai_providers: &crate::ai_providers::AIProviderStore,
+    model_override: Option<String>,
+) -> LlmRoleStatus {
+    let config = build_assistant_llm_config(ai_providers, model_override).await;
+    LlmRoleStatus::from_config(config.as_ref())
+}
+
+/// Sanitized status of the **Metadata** role (mission titles & status lines)
+/// for the dashboard. Mirrors the provider ladder used at summarize time.
+pub async fn metadata_role_status(
+    ai_providers: &crate::ai_providers::AIProviderStore,
+) -> LlmRoleStatus {
+    let config = try_build_config_from_providers(ai_providers).await;
+    LlmRoleStatus::from_config(config.as_ref())
+}
+
 async fn try_build_config_from_providers(
     ai_providers: &crate::ai_providers::AIProviderStore,
 ) -> Option<MetadataLlmConfig> {

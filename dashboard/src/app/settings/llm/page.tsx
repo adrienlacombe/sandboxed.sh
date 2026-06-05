@@ -1,137 +1,108 @@
 'use client';
 
-import { useState, useEffect } from 'react';
+import { useState } from 'react';
+import Link from 'next/link';
+import useSWR from 'swr';
 import { toast } from '@/components/toast';
 import {
-  readLLMConfig,
-  writeLLMConfig,
-  LLM_PROVIDERS,
-  fetchLiveCerebrasModels,
-  type LLMConfig,
-} from '@/lib/llm-settings';
-import { generateMissionTitle, testLLMConnection } from '@/lib/llm';
+  getLlmRoles,
+  getSettings,
+  updateSettings,
+  type LlmRoleStatus,
+} from '@/lib/api';
 import {
-  Sparkles,
-  Eye,
-  EyeOff,
+  ArrowUpRight,
   Check,
+  Key,
   Loader,
+  RotateCcw,
+  Sparkles,
   Type,
-  Zap,
 } from 'lucide-react';
-import { cn } from '@/lib/utils';
+
+const SOURCE_LABELS: Record<string, string> = {
+  settings: 'Custom',
+  env: 'Env override',
+  auto: 'Auto',
+};
+
+/** Compact resolved provider/model chip with a real availability state. */
+function RoleStatusChip({
+  role,
+  loading,
+}: {
+  role: LlmRoleStatus | undefined;
+  loading: boolean;
+}) {
+  if (loading) {
+    return (
+      <div className="inline-flex items-center gap-2 rounded-lg border border-white/[0.06] bg-white/[0.02] px-2.5 py-1.5">
+        <Loader className="h-3 w-3 animate-spin text-white/40" />
+        <span className="text-xs text-white/40">Resolving...</span>
+      </div>
+    );
+  }
+  if (!role?.available) {
+    return (
+      <div className="inline-flex items-center gap-2 rounded-lg border border-amber-500/20 bg-amber-500/5 px-2.5 py-1.5">
+        <span className="h-1.5 w-1.5 rounded-full bg-amber-400" />
+        <span className="text-xs text-amber-400/90">No provider available</span>
+      </div>
+    );
+  }
+  return (
+    <div className="inline-flex items-center gap-2 rounded-lg border border-white/[0.06] bg-white/[0.02] px-2.5 py-1.5">
+      <span className="h-1.5 w-1.5 rounded-full bg-emerald-400" />
+      <span className="text-xs text-white/70">{role.provider}</span>
+      <span className="text-white/20">/</span>
+      <span className="font-mono text-xs text-white/70">{role.model}</span>
+    </div>
+  );
+}
 
 export default function LLMSettingsPage() {
-  const [config, setConfig] = useState<LLMConfig | null>(null);
-  const [providerModels, setProviderModels] = useState<Record<string, string[]>>(
-    () =>
-      Object.fromEntries(
-        Object.entries(LLM_PROVIDERS).map(([id, provider]) => [id, provider.models])
-      )
-  );
-  const [showApiKey, setShowApiKey] = useState(false);
-  const [testing, setTesting] = useState(false);
-  const [testResult, setTestResult] = useState<string | null>(null);
+  const {
+    data: serverSettings,
+    isLoading: settingsLoading,
+    mutate: mutateSettings,
+  } = useSWR('settings', getSettings, { revalidateOnFocus: false });
+  const {
+    data: roles,
+    isLoading: rolesLoading,
+    mutate: mutateRoles,
+  } = useSWR('llm-roles', getLlmRoles, { revalidateOnFocus: false });
 
-  useEffect(() => {
-    setConfig(readLLMConfig());
-  }, []);
+  const [askModelValue, setAskModelValue] = useState<string | null>(null);
+  const [savingAskModel, setSavingAskModel] = useState(false);
 
-  useEffect(() => {
-    let cancelled = false;
-    const loadLiveCerebrasModels = async () => {
-      try {
-        const models = await fetchLiveCerebrasModels();
-        if (!cancelled) {
-          setProviderModels((prev) => ({ ...prev, cerebras: models }));
-        }
-      } catch {
-        // Keep static fallback list when live fetch fails.
-      }
-    };
+  const savedModel = serverSettings?.ask_assistant_model ?? '';
+  const effectiveValue = askModelValue ?? savedModel;
+  const dirty = askModelValue !== null && askModelValue.trim() !== savedModel;
 
-    void loadLiveCerebrasModels();
-    return () => {
-      cancelled = true;
-    };
-  }, []);
-
-  useEffect(() => {
-    if (!config) return;
-    const options = providerModels[config.provider];
-    if (!options || options.length === 0) return;
-    if (options.includes(config.model)) return;
-    const next = { ...config, model: options[0] };
-    setConfig(next);
-    writeLLMConfig(next);
-  }, [config, providerModels]);
-
-  if (!config) return null;
-
-  const save = (patch: Partial<LLMConfig>) => {
-    const next = { ...config, ...patch };
-    setConfig(next);
-    writeLLMConfig(next);
-  };
-
-  const handleProviderChange = (provider: string) => {
-    const preset = LLM_PROVIDERS[provider];
-    if (preset) {
-      const liveModels = providerModels[provider] ?? preset.models;
-      save({
-        provider,
-        baseUrl: preset.baseUrl,
-        model: liveModels[0] ?? preset.defaultModel,
-      });
-    } else {
-      save({ provider });
-    }
-  };
-
-  const handleTest = async () => {
-    setTesting(true);
-    setTestResult(null);
-    // Temporarily enable so generateMissionTitle reads an enabled config.
-    // Only toggle the `enabled` flag — don't snapshot/restore the full config
-    // to avoid clobbering edits the user makes while the async call is in flight.
-    const wasEnabled = config.enabled;
-    if (!wasEnabled) writeLLMConfig({ ...config, enabled: true });
+  const saveAskModel = async (value: string) => {
+    setSavingAskModel(true);
     try {
-      const probe = await testLLMConnection();
-      if (!probe.ok) {
-        toast.error(`Connection failed: ${probe.error ?? 'Unknown error'}`);
-        return;
-      }
-
-      const title = await generateMissionTitle(
-        'Fix the authentication bug in the login page',
-        'I\'ll investigate the login flow and fix the session handling issue.'
+      const trimmed = value.trim();
+      // Send "" (not null) to clear: a present empty string is normalized to
+      // None server-side, whereas JSON null is treated as "no change".
+      await updateSettings({ ask_assistant_model: trimmed });
+      setAskModelValue(null);
+      mutateSettings();
+      mutateRoles();
+      toast.success(
+        trimmed ? 'Assistant model updated' : 'Assistant model reset to default'
       );
-      const sample = title || probe.content || 'OK';
-      if (sample) {
-        setTestResult(sample);
-        toast.success('LLM connection working');
-      } else {
-        toast.error('No response from LLM. Check your API key and base URL');
-      }
     } catch (err) {
       toast.error(
-        `LLM request failed: ${err instanceof Error ? err.message : 'Unknown error'}`
+        `Failed to save: ${err instanceof Error ? err.message : 'Unknown error'}`
       );
     } finally {
-      // Restore only the enabled flag we toggled, using the *current* config
-      // so any other edits the user made during the test are preserved.
-      if (!wasEnabled) {
-        const current = readLLMConfig();
-        writeLLMConfig({ ...current, enabled: wasEnabled });
-      }
-      setTesting(false);
+      setSavingAskModel(false);
     }
   };
 
-  const providerInfo = LLM_PROVIDERS[config.provider];
-  const modelOptions =
-    providerModels[config.provider] ?? providerInfo?.models ?? [];
+  const anyUnavailable =
+    !rolesLoading && roles && (!roles.assistant.available || !roles.metadata.available);
 
   return (
     <div className="flex-1 flex flex-col items-center p-6 overflow-auto">
@@ -139,239 +110,156 @@ export default function LLMSettingsPage() {
         <header>
           <h1 className="text-xl font-semibold text-white">LLM</h1>
           <p className="mt-1 text-sm text-white/50">
-            Fast model used for dashboard features like mission titles
+            Server-side models powering the Ask assistant and mission metadata
           </p>
         </header>
 
         <div className="space-y-5">
           <div className="grid gap-5 md:grid-cols-2">
-          {/* Enable toggle */}
-          <div className="rounded-xl bg-white/[0.02] border border-white/[0.04] p-5">
-            <div className="flex items-center justify-between">
-              <div className="flex items-center gap-3">
-                <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-amber-500/10 flex-shrink-0">
-                  <Sparkles className="h-5 w-5 text-amber-400" />
+            {/* Ask Assistant */}
+            <div className="rounded-xl bg-white/[0.02] border border-white/[0.04] p-5 flex flex-col">
+              <div className="flex items-start justify-between gap-3 mb-4">
+                <div className="flex items-center gap-3 min-w-0">
+                  <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-sky-500/10 flex-shrink-0">
+                    <Sparkles className="h-5 w-5 text-sky-400" />
+                  </div>
+                  <div className="min-w-0">
+                    <h2 className="text-sm font-medium text-white">
+                      Ask Assistant
+                    </h2>
+                    <p className="text-xs text-white/40">
+                      Sidecar co-pilot for missions
+                    </p>
+                  </div>
                 </div>
-                <div>
+                {!rolesLoading && roles && (
+                  <span className="rounded-md bg-white/[0.04] px-2 py-0.5 text-[10px] font-medium uppercase tracking-wide text-white/40 flex-shrink-0">
+                    {SOURCE_LABELS[roles.assistant_source] ?? roles.assistant_source}
+                  </span>
+                )}
+              </div>
+
+              <div className="mb-4">
+                <RoleStatusChip role={roles?.assistant} loading={rolesLoading} />
+              </div>
+
+              <div className="mt-auto">
+                <label className="block text-xs font-medium text-white/60 mb-1.5">
+                  Model ID
+                </label>
+                {settingsLoading ? (
+                  <div className="flex items-center gap-2 py-2.5">
+                    <Loader className="h-4 w-4 animate-spin text-white/40" />
+                    <span className="text-sm text-white/40">Loading...</span>
+                  </div>
+                ) : (
+                  <div className="space-y-2">
+                    <input
+                      type="text"
+                      value={effectiveValue}
+                      onChange={(e) => setAskModelValue(e.target.value)}
+                      placeholder="gpt-oss-120b"
+                      className="w-full rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2 text-sm text-white font-mono placeholder:text-white/20 focus:outline-none focus:border-sky-500/50"
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter') saveAskModel(effectiveValue);
+                      }}
+                    />
+                    <div className="flex items-center gap-2">
+                      <button
+                        onClick={() => saveAskModel(effectiveValue)}
+                        disabled={savingAskModel || !dirty}
+                        className="flex items-center gap-1.5 rounded-lg bg-indigo-500 px-3 py-1.5 text-xs text-white hover:bg-indigo-600 transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
+                      >
+                        {savingAskModel ? (
+                          <Loader className="h-3 w-3 animate-spin" />
+                        ) : (
+                          <Check className="h-3 w-3" />
+                        )}
+                        Save
+                      </button>
+                      {savedModel && (
+                        <button
+                          onClick={() => saveAskModel('')}
+                          disabled={savingAskModel}
+                          className="flex items-center gap-1.5 rounded-lg border border-white/[0.06] px-3 py-1.5 text-xs text-white/60 hover:bg-white/[0.04] transition-colors cursor-pointer disabled:opacity-50"
+                        >
+                          <RotateCcw className="h-3 w-3" />
+                          Reset to default
+                        </button>
+                      )}
+                    </div>
+                    <p className="text-xs text-white/30">
+                      Leave blank for the default (gpt-oss-120b). Served via
+                      Cerebras when configured, e.g. zai-glm-4.7 for a larger,
+                      slower model.
+                    </p>
+                  </div>
+                )}
+              </div>
+            </div>
+
+            {/* Mission metadata */}
+            <div className="rounded-xl bg-white/[0.02] border border-white/[0.04] p-5 flex flex-col">
+              <div className="flex items-center gap-3 mb-4">
+                <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-amber-500/10 flex-shrink-0">
+                  <Type className="h-5 w-5 text-amber-400" />
+                </div>
+                <div className="min-w-0">
                   <h2 className="text-sm font-medium text-white">
-                    LLM Integration
+                    Mission Titles & Status
                   </h2>
                   <p className="text-xs text-white/40">
-                    Powers mission titles and other dashboard AI features
+                    Summarizes missions after each turn
                   </p>
                 </div>
               </div>
-              <button
-                onClick={() => save({ enabled: !config.enabled })}
-                className={cn(
-                  'relative inline-flex h-6 w-11 items-center rounded-full transition-colors',
-                  config.enabled ? 'bg-emerald-500' : 'bg-white/10'
-                )}
-              >
-                <span
-                  className={cn(
-                    'inline-block h-4 w-4 rounded-full bg-white transition-transform',
-                    config.enabled ? 'translate-x-6' : 'translate-x-1'
-                  )}
-                />
-              </button>
+
+              <div className="mb-4">
+                <RoleStatusChip role={roles?.metadata} loading={rolesLoading} />
+              </div>
+
+              <p className="text-xs text-white/40 leading-relaxed">
+                Generated server-side from conversation history. The model is
+                picked automatically from your configured providers, fastest
+                first, and follows provider changes without a restart.
+              </p>
             </div>
           </div>
 
-          {/* Features */}
-          <div
-            className={cn(
-              'rounded-xl bg-white/[0.02] border border-white/[0.04] p-5 transition-opacity',
-              !config.enabled && 'opacity-60 dark:opacity-40 pointer-events-none'
+          {/* Providers */}
+          <div className="rounded-xl bg-white/[0.02] border border-white/[0.04] p-5">
+            <div className="flex flex-wrap items-center justify-between gap-4">
+              <div className="flex items-center gap-3 min-w-0">
+                <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-indigo-500/10 flex-shrink-0">
+                  <Key className="h-5 w-5 text-indigo-400" />
+                </div>
+                <div className="min-w-0">
+                  <h2 className="text-sm font-medium text-white">Providers</h2>
+                  <p className="text-xs text-white/40">
+                    Both roles need an OpenAI-compatible provider: Cerebras is
+                    preferred, then OpenRouter, Groq, OpenAI, or Gemini.
+                  </p>
+                </div>
+              </div>
+              <Link
+                href="/settings/providers"
+                className="flex items-center gap-1.5 rounded-lg border border-white/[0.08] bg-white/[0.02] px-3 py-1.5 text-xs text-white/70 hover:bg-white/[0.04] transition-colors flex-shrink-0"
+              >
+                Manage providers
+                <ArrowUpRight className="h-3 w-3" />
+              </Link>
+            </div>
+
+            {anyUnavailable && (
+              <p className="mt-3 rounded-lg border border-amber-500/20 bg-amber-500/5 px-3 py-2 text-xs text-amber-400/90">
+                {!roles?.assistant.available && !roles?.metadata.available
+                  ? 'No usable provider found: the Ask assistant and title generation are disabled until one is configured.'
+                  : !roles?.assistant.available
+                    ? 'No usable provider found for the Ask assistant; it is disabled until one is configured.'
+                    : 'No usable provider found for mission titles; they fall back to raw text until one is configured.'}
+              </p>
             )}
-          >
-            <div className="flex items-center gap-3 mb-4">
-              <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-sky-500/10 flex-shrink-0">
-                <Type className="h-5 w-5 text-sky-400" />
-              </div>
-              <div>
-                <h2 className="text-sm font-medium text-white">Features</h2>
-                <p className="text-xs text-white/40">
-                  What the dashboard uses this model for
-                </p>
-              </div>
-            </div>
-
-            <div className="flex items-center justify-between">
-              <div>
-                <p className="text-sm text-white/80">
-                  Auto-generate mission titles
-                </p>
-                <p className="text-xs text-white/40">
-                  Use the LLM to create meaningful titles from mission content
-                </p>
-              </div>
-              <button
-                onClick={() => save({ autoTitle: !config.autoTitle })}
-                className={cn(
-                  'relative inline-flex h-6 w-11 items-center rounded-full transition-colors',
-                  config.autoTitle ? 'bg-emerald-500' : 'bg-white/10'
-                )}
-              >
-                <span
-                  className={cn(
-                    'inline-block h-4 w-4 rounded-full bg-white transition-transform',
-                    config.autoTitle ? 'translate-x-6' : 'translate-x-1'
-                  )}
-                />
-              </button>
-            </div>
           </div>
-          </div>
-
-          {/* Provider config */}
-          <div
-            className={cn(
-              'rounded-xl bg-white/[0.02] border border-white/[0.04] p-5 space-y-4 transition-opacity',
-              !config.enabled && 'opacity-60 dark:opacity-40 pointer-events-none'
-            )}
-          >
-            <div className="flex items-center gap-3 mb-4">
-              <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-indigo-500/10">
-                <Zap className="h-5 w-5 text-indigo-400" />
-              </div>
-              <div>
-                <h2 className="text-sm font-medium text-white">Provider</h2>
-                <p className="text-xs text-white/40">
-                  Cerebras is the fastest option
-                </p>
-              </div>
-            </div>
-
-            {/* Provider selector */}
-            <div>
-              <label className="block text-xs font-medium text-white/60 mb-1.5">
-                Provider
-              </label>
-              <div className="flex flex-wrap gap-2">
-                {Object.entries(LLM_PROVIDERS).map(([id, p]) => (
-                  <button
-                    key={id}
-                    onClick={() => handleProviderChange(id)}
-                    className={cn(
-                      'px-3 py-1.5 rounded-lg text-xs font-medium transition-colors',
-                      config.provider === id
-                        ? 'bg-indigo-500/20 text-indigo-300 border border-indigo-500/30'
-                        : 'bg-white/[0.04] text-white/50 border border-transparent hover:bg-white/[0.06]'
-                    )}
-                  >
-                    {p.name}
-                  </button>
-                ))}
-                <button
-                  onClick={() => handleProviderChange('custom')}
-                  className={cn(
-                    'px-3 py-1.5 rounded-lg text-xs font-medium transition-colors',
-                    !LLM_PROVIDERS[config.provider]
-                      ? 'bg-indigo-500/20 text-indigo-300 border border-indigo-500/30'
-                      : 'bg-white/[0.04] text-white/50 border border-transparent hover:bg-white/[0.06]'
-                  )}
-                >
-                  Custom
-                </button>
-              </div>
-            </div>
-
-            {/* API Key */}
-            <div>
-              <label className="block text-xs font-medium text-white/60 mb-1.5">
-                API Key
-              </label>
-              <div className="relative">
-                <input
-                  type={showApiKey ? 'text' : 'password'}
-                  value={config.apiKey}
-                  onChange={(e) => save({ apiKey: e.target.value })}
-                  placeholder="sk-..."
-                  className="w-full rounded-lg bg-white/[0.04] border border-white/[0.06] px-3 py-2 pr-10 text-sm text-white placeholder:text-white/20 focus:border-indigo-500/40 focus:outline-none"
-                />
-                <button
-                  onClick={() => setShowApiKey(!showApiKey)}
-                  className="absolute right-2 top-1/2 -translate-y-1/2 text-white/30 hover:text-white/60"
-                >
-                  {showApiKey ? (
-                    <EyeOff className="h-4 w-4" />
-                  ) : (
-                    <Eye className="h-4 w-4" />
-                  )}
-                </button>
-              </div>
-            </div>
-
-            {/* Base URL (shown for custom, or editable) */}
-            <div>
-              <label className="block text-xs font-medium text-white/60 mb-1.5">
-                Base URL
-              </label>
-              <input
-                type="text"
-                value={config.baseUrl}
-                onChange={(e) => save({ baseUrl: e.target.value })}
-                placeholder="https://api.cerebras.ai/v1"
-                className="w-full rounded-lg bg-white/[0.04] border border-white/[0.06] px-3 py-2 text-sm text-white placeholder:text-white/20 focus:border-indigo-500/40 focus:outline-none"
-              />
-            </div>
-
-            {/* Model */}
-            <div>
-              <label className="block text-xs font-medium text-white/60 mb-1.5">
-                Model
-              </label>
-              {modelOptions.length > 0 ? (
-                <select
-                  value={config.model}
-                  onChange={(e) => save({ model: e.target.value })}
-                  className="w-full rounded-lg bg-white/[0.04] border border-white/[0.06] px-3 py-2 text-sm text-white focus:border-indigo-500/40 focus:outline-none appearance-none"
-                >
-                  {modelOptions.map((m) => (
-                    <option key={m} value={m} className="bg-[#1a1a2e]">
-                      {m}
-                    </option>
-                  ))}
-                </select>
-              ) : (
-                <input
-                  type="text"
-                  value={config.model}
-                  onChange={(e) => save({ model: e.target.value })}
-                  placeholder="model-name"
-                  className="w-full rounded-lg bg-white/[0.04] border border-white/[0.06] px-3 py-2 text-sm text-white placeholder:text-white/20 focus:border-indigo-500/40 focus:outline-none"
-                />
-              )}
-            </div>
-
-            {/* Test button */}
-            <div className="pt-2">
-              <button
-                onClick={handleTest}
-                disabled={!config.apiKey || testing}
-                className={cn(
-                  'flex items-center gap-2 rounded-lg px-4 py-2 text-sm font-medium transition-colors',
-                  config.apiKey && !testing
-                    ? 'bg-indigo-500/20 text-indigo-300 hover:bg-indigo-500/30'
-                    : 'bg-white/[0.04] text-white/30 cursor-not-allowed'
-                )}
-              >
-                {testing ? (
-                  <Loader className="h-4 w-4 animate-spin" />
-                ) : (
-                  <Check className="h-4 w-4" />
-                )}
-                Test Connection
-              </button>
-              {testResult && (
-                <p className="mt-2 text-xs text-emerald-400">
-                  Generated title: &ldquo;{testResult}&rdquo;
-                </p>
-              )}
-            </div>
-          </div>
-
         </div>
       </div>
     </div>

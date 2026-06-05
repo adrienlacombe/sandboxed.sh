@@ -99,3 +99,68 @@ describe("eventsToItemsImpl text_delta replay", () => {
     expect(items.filter((item) => item.kind === "stream")).toHaveLength(0);
   });
 });
+
+describe("eventsToItemsImpl lazy tool stubs", () => {
+  it("renders a tool_stub as a lazy tool row", () => {
+    const items = eventsToItemsImpl([
+      {
+        ...storedEvent(1, "tool_stub", "", "2026-05-28T10:00:01Z", {
+          lazy: true,
+          has_result: true,
+          result_timestamp: "2026-05-28T10:00:03Z",
+          call_content_bytes: 15,
+          result_content_bytes: 25,
+        }),
+        tool_call_id: "tool-1",
+        tool_name: "bash",
+      },
+    ]);
+
+    expect(items).toEqual([
+      expect.objectContaining({
+        kind: "tool",
+        toolCallId: "tool-1",
+        name: "bash",
+        lazy: true,
+        hasResult: true,
+        contentBytes: 15,
+        resultBytes: 25,
+        endTime: new Date("2026-05-28T10:00:03Z").getTime(),
+      }),
+    ]);
+  });
+
+  it("hydrates a lazy tool row when a full tool_result is replayed", () => {
+    const items = eventsToItemsImpl([
+      {
+        ...storedEvent(1, "tool_stub", "", "2026-05-28T10:00:01Z", {
+          lazy: true,
+          has_result: true,
+        }),
+        tool_call_id: "tool-1",
+        tool_name: "bash",
+      },
+      {
+        ...storedEvent(
+          2,
+          "tool_result",
+          '{"success":false,"error":"boom"}',
+          "2026-05-28T10:00:02Z",
+        ),
+        tool_call_id: "tool-1",
+        tool_name: "bash",
+      },
+    ]);
+
+    expect(items).toEqual([
+      expect.objectContaining({
+        kind: "tool",
+        toolCallId: "tool-1",
+        lazy: false,
+        loading: false,
+        hasResult: true,
+        result: { success: false, error: "boom" },
+      }),
+    ]);
+  });
+});

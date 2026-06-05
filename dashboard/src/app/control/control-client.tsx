@@ -76,6 +76,7 @@ import {
   markMissionOpened,
   getMission,
   getMissionEventsWithMeta,
+  getMissionToolCallEvents,
   getMissionSnapshot,
   searchMissionMoments,
   createMission,
@@ -92,8 +93,9 @@ import {
   getRunningMissions,
   isNetworkError,
   cancelMission,
+  listMissionAutomations,
+  updateAutomation,
   deleteMission,
-  autoGenerateMissionTitle,
   listWorkspaces,
   getHealth,
   listDesktopSessions,
@@ -118,6 +120,7 @@ import {
 } from "@/lib/api";
 import { QueueStrip, type QueueItem } from "@/components/queue-strip";
 import { GoalBar } from "@/components/goal-bar";
+import { StallBar } from "@/components/stall-bar";
 import { AsyncButton } from "@/components/ui/async-button";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import {
@@ -1662,16 +1665,18 @@ function SharedFilePreviewModal({
 
   return (
     <div
-      className="fixed inset-0 z-50 flex items-center justify-center p-4"
+      className="fixed inset-0 z-50 flex items-center justify-center p-4 md:p-8"
       onClick={(e) => {
         if (e.target === e.currentTarget) onClose();
       }}
     >
-      <div className="absolute inset-0 bg-black/60 backdrop-blur-sm pointer-events-none" />
+      <div className="absolute inset-0 bg-black/70 backdrop-blur-sm pointer-events-none" />
       <div
         onClick={(e) => e.stopPropagation()}
         className={cn(
-          "relative rounded-2xl bg-[#1a1a1a] border border-white/[0.06] shadow-xl w-full max-w-4xl",
+          // Full-page reader (viewport minus padding) so the document clearly
+          // sits over the page instead of reading as a chat-width expansion.
+          "relative flex h-full w-full max-w-6xl flex-col rounded-2xl bg-[#1a1a1a] border border-white/[0.06] shadow-xl",
           "animate-in fade-in zoom-in-95 duration-200",
         )}
       >
@@ -1718,7 +1723,7 @@ function SharedFilePreviewModal({
           </div>
         </div>
 
-        <div className="max-h-[70vh] overflow-auto">
+        <div className="min-h-0 flex-1 overflow-auto">
           {loading ? (
             <div className="p-5">
               <Shimmer />
@@ -1973,15 +1978,22 @@ function SharedFileCard({ file }: { file: SharedFile }) {
         </button>
       </div>
 
-      {previewOpen && canPreview && (
-        <SharedFilePreviewModal
-          file={file}
-          resolvedUrl={resolvedUrl}
-          isApiUrl={isApiUrl}
-          onClose={() => setPreviewOpen(false)}
-          onDownload={() => void handleDownload()}
-        />
-      )}
+      {/* Portal to body: the card lives inside a virtualized row positioned
+          with transform:translateY, which would otherwise trap the modal's
+          position:fixed and render it inside the conversation. */}
+      {previewOpen &&
+        canPreview &&
+        typeof document !== "undefined" &&
+        createPortal(
+          <SharedFilePreviewModal
+            file={file}
+            resolvedUrl={resolvedUrl}
+            isApiUrl={isApiUrl}
+            onClose={() => setPreviewOpen(false)}
+            onDownload={() => void handleDownload()}
+          />,
+          document.body,
+        )}
     </>
   );
 }
@@ -2045,30 +2057,17 @@ function ThinkingGroupItem({
   );
 
   const hasActiveItem = items.some((item) => !item.done);
-  const [expanded, setExpanded] = useState(hasActiveItem);
-  const hasAutoCollapsedRef = useRef(false);
+  // Collapsed by default, including while active: the transcript shows one
+  // compact pill ("Thinking for 12s") that matches the tool-call rows'
+  // height, instead of auto-expanding into a tall content card. Live
+  // reasoning is one click away here or in the Thinking side panel.
+  const [expanded, setExpanded] = useState(false);
 
   // Get the earliest start time and latest end time
   const startTime = Math.min(...items.map((item) => item.startTime));
   const endTime = items.every((item) => item.done && item.endTime)
     ? Math.max(...items.map((item) => item.endTime || item.startTime))
     : undefined;
-
-  // Auto-collapse when all thinking is done
-  useEffect(() => {
-    if (!hasActiveItem && expanded && !hasAutoCollapsedRef.current) {
-      const duration = Math.floor((Date.now() - startTime) / 1000);
-      if (duration > 30) {
-        hasAutoCollapsedRef.current = true;
-        return;
-      }
-      const timer = setTimeout(() => {
-        setExpanded(false);
-        hasAutoCollapsedRef.current = true;
-      }, 1500);
-      return () => clearTimeout(timer);
-    }
-  }, [hasActiveItem, expanded, startTime]);
 
   // Only the active branch ticks once per second via `<LiveDuration>`.
   // When the group is fully done, we render a fixed string and never
@@ -2078,8 +2077,11 @@ function ThinkingGroupItem({
       ? formatDuration(Math.floor((endTime - startTime) / 1000))
       : null;
 
-  // If no non-empty items, don't render anything
-  if (nonEmptyItems.length === 0) {
+  // Nothing to show only when there is no content AND nothing in flight.
+  // An active group with still-empty content keeps its liveness pill —
+  // previously it rendered nothing, which also suppressed the "Agent is
+  // working" pill and left a dead gap in the transcript.
+  if (nonEmptyItems.length === 0 && !hasActiveItem) {
     return null;
   }
 
@@ -3480,14 +3482,17 @@ const ToolCallItem = memo(function ToolCallItem({
   highlighted = false,
   workspaceId,
   missionId,
+  onLoadDetails,
 }: {
   item: Extract<ChatItem, { kind: "tool" }>;
   highlighted?: boolean;
   workspaceId?: string;
   missionId?: string;
+  onLoadDetails?: (toolCallId: string) => Promise<void>;
 }) {
   const [expanded, setExpanded] = useState(false);
-  const isDone = item.result !== undefined;
+  const isLazy = item.lazy === true;
+  const isDone = !isLazy && item.result !== undefined;
 
   // Only running tools live-tick (via `<LiveDuration>` below). Done rows
   // freeze on a fixed string; previously every visible done tool subscribed
@@ -3509,6 +3514,13 @@ const ToolCallItem = memo(function ToolCallItem({
   );
   const resultStr = resultPreview?.preview ?? null;
   const [resultExpanded, setResultExpanded] = useState(false);
+  const handleToggleExpanded = useCallback(() => {
+    const nextExpanded = !expanded;
+    setExpanded(nextExpanded);
+    if (nextExpanded && isLazy && !item.loading) {
+      void onLoadDetails?.(item.toolCallId);
+    }
+  }, [expanded, isLazy, item.loading, item.toolCallId, onLoadDetails]);
 
   // Memoize cancelled detection - check if tool was cancelled due to mission ending
   const isCancelled = useMemo(() => {
@@ -3570,13 +3582,14 @@ const ToolCallItem = memo(function ToolCallItem({
     >
       {/* Compact header */}
       <button
-        onClick={() => setExpanded(!expanded)}
+        onClick={handleToggleExpanded}
         className={cn(
           "flex items-center gap-1.5 px-2.5 py-1 rounded-full",
           "bg-white/[0.04] border border-white/[0.06]",
           "text-white/40 hover:text-white/60 hover:bg-white/[0.06]",
           "transition-all duration-200",
-          !isDone && "border-amber-500/20",
+          !isDone && !isLazy && "border-amber-500/20",
+          isLazy && "border-white/[0.06]",
           isDone && isCancelled && "border-amber-500/20",
           isDone && !isError && !isCancelled && "border-emerald-500/20",
           isDone && isError && "border-red-500/20",
@@ -3586,7 +3599,8 @@ const ToolCallItem = memo(function ToolCallItem({
           toolName={item.name}
           className={cn(
             "h-3 w-3",
-            !isDone && "animate-pulse text-amber-400",
+            !isDone && !isLazy && "animate-pulse text-amber-400",
+            isLazy && "text-white/40",
             isDone && isCancelled && "text-amber-400",
             isDone && !isError && !isCancelled && "text-emerald-400",
             isDone && isError && "text-red-400",
@@ -3599,7 +3613,13 @@ const ToolCallItem = memo(function ToolCallItem({
           </span>
         )}
         <span className="text-xs text-white/30 ml-1">
-          {isDone ? (
+          {isLazy ? (
+            item.loading ? (
+              "loading"
+            ) : (
+              "hidden"
+            )
+          ) : isDone ? (
             isCancelled ? (
               "cancelled"
             ) : (
@@ -3612,14 +3632,21 @@ const ToolCallItem = memo(function ToolCallItem({
             </>
           )}
         </span>
-        {isDone && !isError && !isCancelled && (
+        {!isLazy && isDone && !isError && !isCancelled && (
           <CheckCircle className="h-3 w-3 text-emerald-400" />
         )}
-        {isDone && isCancelled && (
+        {!isLazy && isDone && isCancelled && (
           <XCircle className="h-3 w-3 text-amber-400" />
         )}
-        {isDone && isError && <XCircle className="h-3 w-3 text-red-400" />}
-        {!isDone && <Loader className="h-3 w-3 animate-spin text-amber-400" />}
+        {!isLazy && isDone && isError && (
+          <XCircle className="h-3 w-3 text-red-400" />
+        )}
+        {!isDone && !isLazy && (
+          <Loader className="h-3 w-3 animate-spin text-amber-400" />
+        )}
+        {isLazy && item.loading && (
+          <Loader className="h-3 w-3 animate-spin text-white/40" />
+        )}
         <ChevronDown
           className={cn(
             "h-3 w-3 transition-transform duration-200 ml-1",
@@ -3633,6 +3660,27 @@ const ToolCallItem = memo(function ToolCallItem({
       {expanded && (
         <div className="mt-2">
           <div className="rounded-lg border border-white/[0.06] bg-white/[0.02] p-3 space-y-3">
+            {/* Arguments */}
+            {isLazy && (
+              <div className="flex items-center justify-between gap-3 rounded border border-white/[0.06] bg-white/[0.03] px-3 py-2 text-xs text-white/45">
+                <span>
+                  Details hidden
+                  {typeof item.contentBytes === "number" ||
+                  typeof item.resultBytes === "number"
+                    ? ` (${formatBytes((item.contentBytes ?? 0) + (item.resultBytes ?? 0))})`
+                    : ""}
+                </span>
+                <button
+                  type="button"
+                  onClick={() => void onLoadDetails?.(item.toolCallId)}
+                  disabled={item.loading}
+                  className="rounded bg-white/[0.06] px-2 py-1 text-[10px] font-medium text-white/70 hover:bg-white/[0.1] disabled:opacity-50"
+                >
+                  {item.loading ? "Loading" : "Load details"}
+                </button>
+              </div>
+            )}
+
             {/* Arguments */}
             {argsStr && (
               <div>
@@ -3741,17 +3789,64 @@ function CollapsedToolGroup({
   tools,
   isExpanded,
   onToggleExpand,
+  measureRow,
   workspaceId,
   missionId,
+  onLoadToolDetails,
 }: {
   tools: Extract<ChatItem, { kind: "tool" }>[];
   isExpanded: boolean;
   onToggleExpand: () => void;
+  /** Synchronously re-measure this group's virtualizer row — part of the
+      anti-flash fix: lets the layout effect below update row offsets in the
+      same pre-paint pass as the scroll adjustment. */
+  measureRow?: (el: HTMLElement) => void;
   workspaceId?: string;
   missionId?: string;
+  onLoadToolDetails?: (toolCallId: string) => Promise<void>;
 }) {
   const hiddenCount = tools.length - 1;
   const lastTool = tools[tools.length - 1];
+
+  // Keep the toggle pinned under the cursor across expand/collapse: revealed
+  // tools render *above* the toggle, so without compensation the toggle (and
+  // everything below) is pushed down and the user has to chase it. Record the
+  // toggle's viewport position before flipping, then re-align the scroller
+  // after layout (plus two rAF passes so the virtualizer's async re-measure
+  // doesn't undo the adjustment).
+  const toggleRef = useRef<HTMLButtonElement | null>(null);
+  const anchorTopRef = useRef<number | null>(null);
+
+  const handleToggle = () => {
+    anchorTopRef.current =
+      toggleRef.current?.getBoundingClientRect().top ?? null;
+    onToggleExpand();
+  };
+
+  useLayoutEffect(() => {
+    const anchorTop = anchorTopRef.current;
+    if (anchorTop == null) return;
+    anchorTopRef.current = null;
+    // Re-measure the virtualizer row *synchronously* so subsequent rows'
+    // offsets and the scroll adjustment land in the same pre-paint pass —
+    // without this the virtualizer re-measures via ResizeObserver after
+    // paint, and the intermediate frame flashes stale row offsets.
+    const rowEl = toggleRef.current?.closest("[data-index]");
+    if (rowEl instanceof HTMLElement) measureRow?.(rowEl);
+    const align = () => {
+      const el = toggleRef.current;
+      if (!el) return;
+      const scroller = el.closest(".overflow-y-auto");
+      if (!scroller) return;
+      const delta = el.getBoundingClientRect().top - anchorTop;
+      if (Math.abs(delta) > 0.5) scroller.scrollTop += delta;
+    };
+    align();
+    // Single post-paint safety pass; a no-op (read-only) when the
+    // synchronous path above already settled everything.
+    const raf = requestAnimationFrame(align);
+    return () => cancelAnimationFrame(raf);
+  }, [isExpanded, measureRow]);
 
   // Helper to render appropriate tool component
   const renderTool = (tool: Extract<ChatItem, { kind: "tool" }>) => {
@@ -3764,16 +3859,24 @@ function CollapsedToolGroup({
         item={tool}
         workspaceId={workspaceId}
         missionId={missionId}
+        onLoadDetails={onLoadToolDetails}
       />
     );
   };
 
+  // The group expands *upward*: revealed tools render above the toggle, so
+  // the toggle row and the last tool keep their position relative to the
+  // conversation below and auto-scroll isn't disturbed by content growing
+  // toward the bottom. Chevrons follow: collapsed points up (reveal above),
+  // expanded points right (neutral "fold away", not a direction the
+  // content grows in).
   if (isExpanded) {
-    // Show all tools with a collapse button at the top
     return (
       <div className="space-y-2">
+        {tools.slice(0, -1).map((tool) => renderTool(tool))}
         <button
-          onClick={onToggleExpand}
+          ref={toggleRef}
+          onClick={handleToggle}
           className={cn(
             "flex items-center gap-1.5 px-2.5 py-1 rounded-full",
             "bg-white/[0.02] border border-white/[0.04]",
@@ -3781,12 +3884,12 @@ function CollapsedToolGroup({
             "transition-all duration-200 text-xs",
           )}
         >
-          <ChevronUp className="h-3 w-3" />
+          <ChevronRight className="h-3 w-3" />
           <span>
             Hide {hiddenCount} previous tool{hiddenCount > 1 ? "s" : ""}
           </span>
         </button>
-        {tools.map((tool) => renderTool(tool))}
+        {renderTool(lastTool)}
       </div>
     );
   }
@@ -3795,7 +3898,8 @@ function CollapsedToolGroup({
   return (
     <div className="space-y-2">
       <button
-        onClick={onToggleExpand}
+        ref={toggleRef}
+        onClick={handleToggle}
         className={cn(
           "flex items-center gap-1.5 px-2.5 py-1 rounded-full",
           "bg-white/[0.02] border border-white/[0.04]",
@@ -3803,7 +3907,7 @@ function CollapsedToolGroup({
           "transition-all duration-200 text-xs",
         )}
       >
-        <ChevronDown className="h-3 w-3" />
+        <ChevronUp className="h-3 w-3" />
         <span>
           Show {hiddenCount} previous tool{hiddenCount > 1 ? "s" : ""}
         </span>
@@ -3821,6 +3925,7 @@ type ChatItemRowProps = {
   basePath: string | undefined;
   isToolGroupExpanded: boolean;
   onToggleToolGroup: (groupId: string) => void;
+  measureRow?: (el: HTMLElement) => void;
   onResume: () => void;
   onToolResult: (
     toolCallId: string,
@@ -3833,6 +3938,7 @@ type ChatItemRowProps = {
     content: string;
     agent?: string;
   }) => void;
+  onLoadToolDetails?: (toolCallId: string) => Promise<void>;
 };
 
 /**
@@ -3850,10 +3956,12 @@ const ChatItemRow = memo(function ChatItemRow({
   basePath,
   isToolGroupExpanded,
   onToggleToolGroup,
+  measureRow,
   onResume,
   onToolResult,
   onOptimisticToolResult,
   onRetryUserMessage,
+  onLoadToolDetails,
 }: ChatItemRowProps) {
   const renderedContent =
     item.kind === "assistant" && item.sharedFiles?.length
@@ -3879,8 +3987,10 @@ const ChatItemRow = memo(function ChatItemRow({
           tools={item.tools}
           isExpanded={isToolGroupExpanded}
           onToggleExpand={() => onToggleToolGroup(item.groupId)}
+          measureRow={measureRow}
           workspaceId={workspaceId}
           missionId={missionId}
+          onLoadToolDetails={onLoadToolDetails}
         />
       </div>
     );
@@ -4223,6 +4333,7 @@ const ChatItemRow = memo(function ChatItemRow({
           highlighted={highlighted}
           workspaceId={workspaceId}
           missionId={missionId}
+          onLoadDetails={onLoadToolDetails}
         />
       );
     }
@@ -4237,6 +4348,7 @@ const ChatItemRow = memo(function ChatItemRow({
         highlighted={highlighted}
         workspaceId={workspaceId}
         missionId={missionId}
+        onLoadDetails={onLoadToolDetails}
       />
     );
   }
@@ -4730,6 +4842,8 @@ export default function ControlClient() {
    * compare is enough.
    */
   const missionMaxSeqRef = useRef<Map<string, number>>(new Map());
+  const lazyToolDetailsRef = useRef<Map<string, StoredEvent[]>>(new Map());
+  const lazyToolDetailsLoadingRef = useRef<Set<string>>(new Set());
 
   // Page size for each backwards-paginate-older fetch (the explicit
   // "Load older messages" button / scroll-up). Tuned for memory headroom on
@@ -4737,6 +4851,7 @@ export default function ControlClient() {
   const HISTORY_PAGE_SIZE = 5000;
   const HISTORY_DELTA_PAGE_SIZE = 1000;
   const HISTORY_FALLBACK_PAGE_SIZE = 1000;
+  const HISTORY_TRACE_TAIL = 10;
 
   const loadHistoryEvents = useCallback(
     async (id: string, opts?: { sinceSeq?: number }) => {
@@ -4750,6 +4865,8 @@ export default function ControlClient() {
           sinceSeq: opts.sinceSeq,
           limit: HISTORY_DELTA_PAGE_SIZE,
           includeCounts: false,
+          profile: "conversation",
+          traceTail: HISTORY_TRACE_TAIL,
         });
         const maxSequence = meta.maxSequence ?? opts.sinceSeq;
         // If the page was capped by `limit`, advance the cursor to the
@@ -4786,6 +4903,8 @@ export default function ControlClient() {
             sinceSeq: cachedTailMaxSequence,
             limit: HISTORY_DELTA_PAGE_SIZE,
             includeCounts: false,
+            profile: "conversation",
+            traceTail: HISTORY_TRACE_TAIL,
           });
           // If the server's max sequence is *behind* what we cached, the
           // mission was reset or replaced server-side and our cache is
@@ -4849,7 +4968,10 @@ export default function ControlClient() {
 
       if (!sorted) {
         try {
-          const snapshot = await getMissionSnapshot(id);
+          const snapshot = await getMissionSnapshot(id, {
+            profile: "conversation",
+            traceTail: HISTORY_TRACE_TAIL,
+          });
           sorted = snapshot.events.sort((a, b) => a.sequence - b.sequence);
           metaMaxSeq = snapshot.latest_sequence;
           metaTotal = snapshot.total_events;
@@ -4858,6 +4980,8 @@ export default function ControlClient() {
           const fallback = await getMissionEventsWithMeta(id, {
             types: HISTORY_EVENT_TYPES,
             limit: HISTORY_FALLBACK_PAGE_SIZE,
+            profile: "conversation",
+            traceTail: HISTORY_TRACE_TAIL,
           });
           sorted = fallback.events.sort((a, b) => a.sequence - b.sequence);
           metaMaxSeq = fallback.meta.maxSequence;
@@ -5072,6 +5196,19 @@ export default function ControlClient() {
   // This is an instance field on the Virtualizer, not part of
   // `useVirtualizer`'s typed options — hence the direct assignment.
   chatVirtualizer.shouldAdjustScrollPositionOnItemSizeChange = () => false;
+  // Anti-flash path for tool-group expansion: measure the row synchronously
+  // AND grow the sizer div in the same pre-paint pass. Without the sizer
+  // bump, scrollTop adjustments larger than the stale scrollHeight allows
+  // get clamped, painting one mis-anchored frame until the virtualizer's
+  // state flush catches up.
+  const measureRowSync = useCallback(
+    (el: HTMLElement) => {
+      chatVirtualizer.measureElement(el);
+      const sizer = el.parentElement;
+      if (sizer) sizer.style.height = `${chatVirtualizer.getTotalSize()}px`;
+    },
+    [chatVirtualizer],
+  );
   const chatAnchorKey = useMemo(
     () =>
       groupedItems
@@ -5281,6 +5418,9 @@ export default function ControlClient() {
 
   // Treat "waiting_for_tool" as not busy for message input (user should respond immediately)
   const isBusy = viewingRunState === "running";
+  // …but a tool-wait turn is still in flight: goal exit must take the
+  // cancelMission path so the blocked turn gets interrupted too.
+  const isTurnInFlight = viewingRunState !== "idle";
   const canSubmitComposer = canSubmitInput || input.trim().length > 0;
 
   // Goal-mode state, keyed by mission id. Updated from `goal_iteration` /
@@ -5309,7 +5449,6 @@ export default function ControlClient() {
   const currentMissionRef = useRef<Mission | null>(null);
   const viewingMissionRef = useRef<Mission | null>(null);
   const submittingRef = useRef(false); // Guard against double-submission
-  const autoTitleAttemptedRef = useRef<Set<string>>(new Set()); // Track missions we've tried to auto-title
   const inputRef = useRef(input);
   const draftMissionIdRef = useRef<string | null>(viewingMissionId);
 
@@ -5931,6 +6070,83 @@ export default function ControlClient() {
     },
     [],
   );
+
+  const handleLoadToolDetails = useCallback(
+    async (toolCallId: string) => {
+      const missionId =
+        viewingMissionRef.current?.id ?? currentMissionRef.current?.id;
+      if (!missionId) return;
+      const cacheKey = `${missionId}::${toolCallId}`;
+
+      const applyToolEvents = (toolEvents: StoredEvent[]) => {
+        const mission = viewingMissionRef.current ?? currentMissionRef.current;
+        const hydrated = eventsToItems(toolEvents, mission).find(
+          (item): item is Extract<ChatItem, { kind: "tool" }> =>
+            item.kind === "tool" && item.toolCallId === toolCallId,
+        );
+        if (!hydrated) return false;
+
+        const replaceTool = (list: ChatItem[]) =>
+          list.map((item) =>
+            item.kind === "tool" && item.toolCallId === toolCallId
+              ? { ...hydrated, lazy: false, loading: false }
+              : item,
+          );
+
+        setItems((prev) => replaceTool(prev));
+        setMissionItems((prev) => {
+          const cached = prev[missionId];
+          if (!cached) return prev;
+          return { ...prev, [missionId]: replaceTool(cached) };
+        });
+        return true;
+      };
+
+      const cached = lazyToolDetailsRef.current.get(cacheKey);
+      if (cached) {
+        if (!applyToolEvents(cached)) {
+          toast.error("Failed to load tool details");
+        }
+        return;
+      }
+      if (lazyToolDetailsLoadingRef.current.has(cacheKey)) {
+        return;
+      }
+      lazyToolDetailsLoadingRef.current.add(cacheKey);
+
+      const markLoading = (loading: boolean) => {
+        const patch = (list: ChatItem[]) =>
+          list.map((item) =>
+            item.kind === "tool" && item.toolCallId === toolCallId
+              ? { ...item, loading }
+              : item,
+          );
+        setItems((prev) => patch(prev));
+        setMissionItems((prev) => {
+          const cachedItems = prev[missionId];
+          if (!cachedItems) return prev;
+          return { ...prev, [missionId]: patch(cachedItems) };
+        });
+      };
+
+      markLoading(true);
+      try {
+        const toolEvents = await getMissionToolCallEvents(missionId, toolCallId);
+        lazyToolDetailsRef.current.set(cacheKey, toolEvents);
+        if (!applyToolEvents(toolEvents)) {
+          markLoading(false);
+          toast.error("Failed to load tool details");
+        }
+      } catch {
+        markLoading(false);
+        toast.error("Failed to load tool details");
+      } finally {
+        lazyToolDetailsLoadingRef.current.delete(cacheKey);
+      }
+    },
+    [eventsToItems, setItems, setMissionItems],
+  );
+
   const eventsWorkerRef = useRef<Worker | null | false>(null);
   const eventsWorkerSeqRef = useRef(0);
   const eventsWorkerPendingRef = useRef(
@@ -6083,6 +6299,8 @@ export default function ControlClient() {
             types: HISTORY_EVENT_TYPES,
             beforeSeq,
             limit: opts?.limit ?? HISTORY_PAGE_SIZE,
+            profile: "conversation",
+            traceTail: HISTORY_TRACE_TAIL,
           });
           if (olderEvents.length === 0) {
             // Same per-mission gate as below — see comment on
@@ -6852,6 +7070,63 @@ export default function ControlClient() {
         console.error("Failed to fetch health:", err);
       });
   }, []);
+
+  // Exit a /goal loop from the GoalBar: mirrors the automations dialog's
+  // stop-native-loop path — cancellation lets native harnesses clear their
+  // goal state first (Codex: thread/goal/clear), then we flip any goal-loop
+  // automation row inactive and clear the local goal info so the bar
+  // disappears immediately.
+  const handleExitGoal = useCallback(
+    async (missionId: string, running: boolean) => {
+      try {
+        const automations = await listMissionAutomations(missionId).catch(
+          () => [],
+        );
+        const goalRow = automations.find(
+          (a) => a.active && a.command_source?.type === "native_loop",
+        );
+        if (running) {
+          // Mid-turn: cancellation lets native harnesses clear their goal
+          // state first (Codex: thread/goal/clear), then interrupts the turn.
+          await cancelMission(missionId);
+        }
+        // Idle (or belt-and-braces while running): deactivate the loop row so
+        // the next agent_finished hook doesn't re-fire the continuation. No
+        // cancelMission here when idle — an idle mission shouldn't get marked
+        // interrupted just because the user ended its goal loop.
+        if (goalRow) {
+          try {
+            await updateAutomation(goalRow.id, { active: false });
+          } catch (err) {
+            // While running, the observer flips it inactive when the harness
+            // emits the aborted GoalStatus, so a local failure is non-fatal.
+            // While idle there is no turn in flight to emit that status: the
+            // loop would stay live, so keep the bar and surface the error.
+            if (!running) {
+              throw err instanceof Error
+                ? err
+                : new Error("Failed to deactivate the goal loop");
+            }
+          }
+        }
+        setGoalInfoByMission((prev) => {
+          const next = { ...prev };
+          delete next[missionId];
+          return next;
+        });
+        toast.success(
+          running
+            ? "Goal loop stopped; current turn interrupted"
+            : "Goal loop ended",
+        );
+      } catch (err) {
+        toast.error(
+          err instanceof Error ? err.message : "Failed to exit goal loop",
+        );
+      }
+    },
+    [],
+  );
 
   // Handle cancelling a parallel mission
   const handleCancelMission = async (missionId: string) => {
@@ -8060,40 +8335,6 @@ export default function ControlClient() {
           phase: "idle",
         }));
 
-        // Auto-generate mission title on first successful assistant response (LLM-powered, best-effort).
-        // Use viewingMissionIdRef (not currentMissionRef) to target the correct mission —
-        // events are already filtered by viewingId, so this matches the event's mission.
-        const targetMissionId = viewingMissionIdRef.current;
-        const targetMission = viewingMissionRef.current;
-        if (
-          targetMissionId &&
-          !isFailure &&
-          !targetMission?.title &&
-          !autoTitleAttemptedRef.current.has(targetMissionId)
-        ) {
-          autoTitleAttemptedRef.current.add(targetMissionId);
-          const assistantContent = String(data["content"] ?? "");
-          // Use itemsRef for synchronous read — avoids side effects in state updaters
-          // and prevents double-firing in React StrictMode.
-          const firstUser = itemsRef.current.find((it) => it.kind === "user");
-          if (firstUser && firstUser.kind === "user") {
-            autoGenerateMissionTitle(
-              targetMissionId,
-              firstUser.content,
-              assistantContent,
-            ).then((title) => {
-              if (title) {
-                // Update local mission state so the UI reflects the new title immediately
-                setCurrentMission((m) =>
-                  m?.id === targetMissionId ? { ...m, title } : m,
-                );
-                setViewingMission((m) =>
-                  m?.id === targetMissionId ? { ...m, title } : m,
-                );
-              }
-            });
-          }
-        }
         return;
       }
 
@@ -8593,7 +8834,15 @@ export default function ControlClient() {
         setItems((prev) =>
           prev.map((it) =>
             it.kind === "tool" && it.toolCallId === toolCallId
-              ? { ...it, result: data["result"], endTime }
+              ? // The live result fully hydrates the row, so a conversation
+                // stub must drop its lazy/loading UI state here too.
+                {
+                  ...it,
+                  result: data["result"],
+                  endTime,
+                  lazy: false,
+                  loading: false,
+                }
               : it,
           ),
         );
@@ -9701,11 +9950,36 @@ export default function ControlClient() {
             const deltaItems = eventsToItems(deltaEvents, mission);
             setItems((prev) => {
               const existingIds = new Set(prev.map((it) => it.id));
+              const deltaItemsById = new Map(
+                deltaItems.map((item) => [item.id, item]),
+              );
+              let changed = false;
+              const updated = prev.map((item) => {
+                const incoming = deltaItemsById.get(item.id);
+                if (
+                  item.kind === "tool" &&
+                  incoming?.kind === "tool" &&
+                  incoming.lazy === true &&
+                  item.result === undefined
+                ) {
+                  changed = true;
+                  return {
+                    ...item,
+                    lazy: true,
+                    loading: false,
+                    hasResult: incoming.hasResult,
+                    contentBytes: incoming.contentBytes,
+                    resultBytes: incoming.resultBytes,
+                    endTime: incoming.endTime ?? item.endTime,
+                  };
+                }
+                return item;
+              });
               const additions = deltaItems.filter(
                 (it) => !existingIds.has(it.id),
               );
-              if (additions.length === 0) return prev;
-              const merged = [...prev, ...additions];
+              if (!changed && additions.length === 0) return prev;
+              const merged = [...updated, ...additions];
               adjustVisibleItemsLimit(merged);
               updateMissionItems(missionId, merged);
               return merged;
@@ -10877,7 +11151,7 @@ export default function ControlClient() {
             <div
               ref={containerRef}
               data-testid="chat-scroll-container"
-              className="flex-1 overflow-y-auto px-6 pt-6 pb-2"
+              className="flex-1 overflow-y-auto px-6 pt-6 pb-2 [overflow-anchor:none]"
             >
               {/* Backwards pagination — only when there's actually more older
               history to fetch and the chat isn't empty. Click prepends the
@@ -11045,10 +11319,12 @@ export default function ControlClient() {
                             basePath={missionWorkingDirectory}
                             isToolGroupExpanded={isToolGroupExpanded}
                             onToggleToolGroup={handleToggleToolGroup}
+                            measureRow={measureRowSync}
                             onResume={stableResumeMission}
                             onToolResult={handleToolResultCommit}
                             onOptimisticToolResult={handleOptimisticToolResult}
                             onRetryUserMessage={handleRetryUserMessage}
+                            onLoadToolDetails={handleLoadToolDetails}
                           />
                         </div>
                       );
@@ -11103,53 +11379,6 @@ export default function ControlClient() {
                       </div>
                     </div>
                   )}
-
-                  {/* Stall warning banner when agent hasn't reported activity for 60+ seconds */}
-                  {isViewingMissionStalled &&
-                    viewingMissionId &&
-                    !hasPendingUserInput && (
-                      <div className="flex justify-center py-2 animate-fade-in">
-                        <div
-                          className={cn(
-                            "inline-flex items-center gap-2 rounded-md border px-2.5 py-1 text-xs",
-                            isViewingMissionSeverelyStalled
-                              ? "bg-red-500/10 border-red-500/30 text-red-400"
-                              : "bg-amber-500/10 border-amber-500/30 text-amber-400",
-                          )}
-                          title={
-                            isViewingMissionSeverelyStalled
-                              ? "The agent appears to be stuck on a long-running operation. Consider stopping it."
-                              : "A tool or external operation may be taking longer than expected."
-                          }
-                        >
-                          <AlertTriangle className="h-3 w-3 shrink-0" />
-                          <span className="font-medium">
-                            {isViewingMissionSeverelyStalled
-                              ? "Likely stuck"
-                              : "Idle"}
-                          </span>
-                          <span className="text-white/50 tabular-nums">
-                            {Math.floor(viewingMissionStallSeconds)}s
-                          </span>
-                          <button
-                            onClick={() =>
-                              handleCancelMission(viewingMissionId)
-                            }
-                            className={cn(
-                              "ml-1 inline-flex items-center gap-1 rounded border px-1.5 py-0.5 text-[11px] font-medium transition-colors",
-                              isViewingMissionSeverelyStalled
-                                ? "border-red-500/30 bg-red-500/15 text-red-400 hover:bg-red-500/25"
-                                : "border-amber-500/30 bg-amber-500/15 text-amber-400 hover:bg-amber-500/25",
-                            )}
-                          >
-                            <Square className="h-3 w-3" />
-                            {isViewingMissionSeverelyStalled
-                              ? "Force stop"
-                              : "Stop"}
-                          </button>
-                        </div>
-                      </div>
-                    )}
 
                   {/* Continue banner for blocked missions */}
                   {activeMission?.status === "blocked" && items.length > 0 && (
@@ -11343,9 +11572,29 @@ export default function ControlClient() {
                     <GoalBar
                       objective={goal.objective}
                       statusLabel={statusLabel}
+                      running={isTurnInFlight}
+                      onExit={
+                        activeMissionId
+                          ? (running) => handleExitGoal(activeMissionId, running)
+                          : undefined
+                      }
                     />
                   );
                 })()}
+
+                {/* Stall warning bar when the agent hasn't reported activity
+                    for 60+ seconds. Lives in the composer stack with the
+                    GoalBar (same row grammar) instead of floating mid-list. */}
+                {isViewingMissionStalled &&
+                  viewingMissionId &&
+                  !hasPendingUserInput && (
+                    <StallBar
+                      seconds={viewingMissionStallSeconds}
+                      severe={isViewingMissionSeverelyStalled}
+                      onStop={() => handleCancelMission(viewingMissionId)}
+                      className="animate-fade-in"
+                    />
+                  )}
 
                 <form
                   onSubmit={(e) => e.preventDefault()}

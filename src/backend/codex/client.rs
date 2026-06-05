@@ -27,6 +27,10 @@ pub struct CodexConfig {
     /// ChatGPT OAuth account supplied by the host app. When set, the app-server
     /// uses external `chatgptAuthTokens` mode and asks the host to refresh.
     pub external_chatgpt_auth: Option<CodexExternalChatgptAuth>,
+    /// Optional cancellation signal from mission_runner. The app-server task
+    /// observes it directly so goal-mode cancellation can call
+    /// `thread/goal/clear` against the live thread before shutdown.
+    pub cancel_token: Option<tokio_util::sync::CancellationToken>,
     /// Deprecated. App-server is the only path now. Setting this to
     /// `false` does nothing — the legacy exec branch is gone. Kept on
     /// the struct so existing call sites that set the field still
@@ -50,6 +54,7 @@ impl Default for CodexConfig {
             default_model: None,
             model_effort: None,
             external_chatgpt_auth: None,
+            cancel_token: None,
             use_app_server: true,
         }
     }

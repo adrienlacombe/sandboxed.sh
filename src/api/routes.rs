@@ -615,6 +615,14 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         )
         // WebSocket system monitoring uses subprotocol-based auth
         .route("/api/monitoring/ws", get(monitoring::monitoring_ws))
+        // Hermes remote access: pass-through to the host Hermes API server so
+        // a desktop Hermes can connect via GATEWAY_PROXY_URL/GATEWAY_PROXY_KEY.
+        // Auth is the API_SERVER_KEY bearer token enforced by Hermes itself.
+        .route(
+            "/hermes-remote/*path",
+            axum::routing::any(system_api::hermes_remote_proxy)
+                .layer(DefaultBodyLimit::max(50 * 1024 * 1024)),
+        )
         // OpenAI-compatible proxy endpoint (bearer token auth via SANDBOXED_PROXY_SECRET).
         // LLM payloads with tool outputs and long contexts can exceed the default 2MB
         // body limit, so set a generous 50MB limit for proxy routes.
@@ -681,6 +689,10 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         .route(
             "/api/control/missions/:id/events",
             get(control::get_mission_events),
+        )
+        .route(
+            "/api/control/missions/:id/tool-calls/:tool_call_id",
+            get(control::get_mission_tool_call_events),
         )
         .route(
             "/api/control/missions/:id/snapshot",
@@ -1530,6 +1542,78 @@ async fn get_ai_usage_summary(
     } else {
         Vec::new()
     };
+
+    // Merge in OpenAI-compatible /v1 router usage (external clients: assistant
+    // gateways, IDEs with proxy keys). It lives in a dedicated table because
+    // those requests have no mission to attach events to.
+    let mut rows = rows;
+    {
+        let proxy_rows = control_state
+            .mission_store
+            .get_proxy_usage_by_model(since.as_deref())
+            .await
+            .unwrap_or_default();
+        for p in proxy_rows {
+            if let Some(existing) = rows.iter_mut().find(|r| r.model == p.model) {
+                existing.requests = existing.requests.saturating_add(p.requests);
+                existing.input_tokens = existing.input_tokens.saturating_add(p.input_tokens);
+                existing.output_tokens = existing.output_tokens.saturating_add(p.output_tokens);
+                existing.cache_creation_tokens = existing
+                    .cache_creation_tokens
+                    .saturating_add(p.cache_creation_tokens);
+                existing.cache_read_tokens = existing
+                    .cache_read_tokens
+                    .saturating_add(p.cache_read_tokens);
+                existing.cost_cents = existing.cost_cents.saturating_add(p.cost_cents);
+            } else {
+                rows.push(p);
+            }
+        }
+    }
+    let mut daily = daily;
+    {
+        let proxy_daily = control_state
+            .mission_store
+            .get_proxy_usage_by_day(since.as_deref())
+            .await
+            .unwrap_or_default();
+        for p in proxy_daily {
+            if let Some(existing) = daily.iter_mut().find(|d| d.day == p.day) {
+                existing.requests = existing.requests.saturating_add(p.requests);
+                existing.input_tokens = existing.input_tokens.saturating_add(p.input_tokens);
+                existing.output_tokens = existing.output_tokens.saturating_add(p.output_tokens);
+                existing.cache_read_tokens = existing
+                    .cache_read_tokens
+                    .saturating_add(p.cache_read_tokens);
+                existing.cost_cents = existing.cost_cents.saturating_add(p.cost_cents);
+            } else {
+                daily.push(p);
+            }
+        }
+        daily.sort_by(|a, b| a.day.cmp(&b.day));
+    }
+    let mut hourly = hourly;
+    if matches!(window, "24h" | "7d") {
+        let proxy_hourly = control_state
+            .mission_store
+            .get_proxy_usage_by_hour(since.as_deref())
+            .await
+            .unwrap_or_default();
+        for p in proxy_hourly {
+            if let Some(existing) = hourly.iter_mut().find(|h| h.hour == p.hour) {
+                existing.requests = existing.requests.saturating_add(p.requests);
+                existing.input_tokens = existing.input_tokens.saturating_add(p.input_tokens);
+                existing.output_tokens = existing.output_tokens.saturating_add(p.output_tokens);
+                existing.cache_read_tokens = existing
+                    .cache_read_tokens
+                    .saturating_add(p.cache_read_tokens);
+                existing.cost_cents = existing.cost_cents.saturating_add(p.cost_cents);
+            } else {
+                hourly.push(p);
+            }
+        }
+        hourly.sort_by(|a, b| a.hour.cmp(&b.hour));
+    }
 
     let mut totals = UsageSummaryTotals {
         requests: 0,

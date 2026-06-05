@@ -13,8 +13,8 @@ use chrono::Utc;
 use jsonwebtoken::{EncodingKey, Header};
 use sandboxed_sh::ai_providers::ProviderType;
 use sandboxed_sh::api::ai_providers::{
-    default_backends_for_provider, get_openai_api_key_for_codex_default, provider_targets_backend,
-    read_oauth_token_entry,
+    default_backends_for_provider, get_all_openai_oauth_accounts,
+    get_openai_api_key_for_codex_default, provider_targets_backend, read_oauth_token_entry,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -1075,7 +1075,6 @@ impl OrchestratorMcp {
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|| data_dir.clone());
         let auth_json_path = opencode_auth_json_path();
-        let codex_auth_path = codex_auth_json_path();
 
         let statuses: Vec<Value> = backends
             .into_iter()
@@ -1090,10 +1089,7 @@ impl OrchestratorMcp {
                     None,
                 ),
                 "codex" => {
-                    let has_oauth = read_oauth_token_entry(ProviderType::OpenAI).is_some();
-                    let has_api_key =
-                        get_openai_api_key_for_codex_default(&workspace_root).is_some();
-                    let has_host_auth = looks_like_json_file(&codex_auth_path);
+                    let codex_auth = codex_auth_status(&workspace_root);
                     let targeted =
                         provider_targets_backend(&workspace_root, ProviderType::OpenAI, "codex");
                     backend_auth_entry(
@@ -1101,12 +1097,16 @@ impl OrchestratorMcp {
                         ProviderType::OpenAI,
                         &workspace_root,
                         targeted,
-                        has_oauth || has_api_key || has_host_auth,
-                        has_host_auth,
+                        codex_auth.has_credentials(),
+                        codex_auth.has_valid_auth_json,
                         Some(json!({
-                            "has_api_key": has_api_key,
-                            "has_oauth": has_oauth,
-                            "has_host_auth_json": has_host_auth,
+                            "has_api_key": codex_auth.has_api_key,
+                            "has_oauth": codex_auth.has_oauth,
+                            "has_oauth_account": codex_auth.has_oauth_account,
+                            "has_host_auth_json": codex_auth.has_valid_auth_json,
+                            "auth_json_path": codex_auth.auth_json_path,
+                            "auth_json_mode": codex_auth.auth_json_mode,
+                            "auth_json_candidates": codex_auth.auth_json_candidates,
                         })),
                     )
                 }
@@ -2289,11 +2289,117 @@ fn codex_auth_json_path() -> std::path::PathBuf {
     std::path::PathBuf::from("/var/lib/opencode/.codex/auth.json")
 }
 
-fn looks_like_json_file(path: &std::path::Path) -> bool {
-    std::fs::read_to_string(path)
-        .ok()
-        .and_then(|contents| serde_json::from_str::<serde_json::Value>(&contents).ok())
-        .is_some()
+#[derive(Debug, Clone)]
+struct CodexAuthStatus {
+    has_api_key: bool,
+    has_oauth: bool,
+    has_oauth_account: bool,
+    has_valid_auth_json: bool,
+    auth_json_path: Option<String>,
+    auth_json_mode: Option<String>,
+    auth_json_candidates: Vec<String>,
+}
+
+impl CodexAuthStatus {
+    fn has_credentials(&self) -> bool {
+        self.has_api_key || self.has_oauth || self.has_oauth_account || self.has_valid_auth_json
+    }
+}
+
+fn codex_auth_status(workspace_root: &std::path::Path) -> CodexAuthStatus {
+    let has_api_key = get_openai_api_key_for_codex_default(workspace_root).is_some();
+    let has_oauth = read_oauth_token_entry(ProviderType::OpenAI).is_some();
+    let has_oauth_account = !get_all_openai_oauth_accounts(workspace_root).is_empty();
+
+    let auth_json_candidates = codex_auth_json_candidates(workspace_root);
+    let auth_json_candidates_display = auth_json_candidates
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>();
+    let valid_auth_json = auth_json_candidates
+        .iter()
+        .filter_map(|path| codex_auth_json_status(path).map(|mode| (path, mode)))
+        .next();
+
+    let (auth_json_path, auth_json_mode) = valid_auth_json
+        .map(|(path, mode)| (Some(path.display().to_string()), Some(mode)))
+        .unwrap_or((None, None));
+
+    CodexAuthStatus {
+        has_api_key,
+        has_oauth,
+        has_oauth_account,
+        has_valid_auth_json: auth_json_path.is_some(),
+        auth_json_path,
+        auth_json_mode,
+        auth_json_candidates: auth_json_candidates_display,
+    }
+}
+
+fn codex_auth_json_candidates(workspace_root: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut candidates = Vec::new();
+
+    if let Ok(home) = std::env::var("HOME") {
+        candidates.push(std::path::PathBuf::from(home).join(".codex/auth.json"));
+    }
+
+    // In container workspaces Codex runs as root and reads /root/.codex/auth.json.
+    candidates.push(std::path::PathBuf::from("/root/.codex/auth.json"));
+
+    // Host-side view of a container workspace: write_codex_credentials_for_workspace
+    // writes <workspace_root>/root/.codex/auth.json.
+    candidates.push(workspace_root.join("root/.codex/auth.json"));
+
+    // Legacy isolated OpenCode home fallback.
+    candidates.push(std::path::PathBuf::from(
+        "/var/lib/opencode/.codex/auth.json",
+    ));
+
+    let legacy = codex_auth_json_path();
+    candidates.push(legacy);
+
+    let mut deduped = Vec::new();
+    for candidate in candidates {
+        if !deduped.iter().any(|existing| existing == &candidate) {
+            deduped.push(candidate);
+        }
+    }
+    deduped
+}
+
+fn codex_auth_json_status(path: &std::path::Path) -> Option<String> {
+    let contents = std::fs::read_to_string(path).ok()?;
+    let value = serde_json::from_str::<serde_json::Value>(&contents).ok()?;
+    codex_auth_json_mode(&value)
+}
+
+fn codex_auth_json_mode(value: &serde_json::Value) -> Option<String> {
+    let mode = value.get("auth_mode").and_then(|v| v.as_str())?;
+    match mode {
+        "apikey" => {
+            let has_key = value
+                .get("tokens")
+                .and_then(|v| v.get("api_key"))
+                .or_else(|| value.get("api_key"))
+                .or_else(|| value.get("OPENAI_API_KEY"))
+                .and_then(|v| v.as_str())
+                .is_some_and(|token| !token.trim().is_empty());
+            has_key.then(|| mode.to_string())
+        }
+        "chatgpt" => {
+            let tokens = value.get("tokens")?;
+            let has_access = tokens
+                .get("access_token")
+                .and_then(|v| v.as_str())
+                .is_some_and(|token| !token.trim().is_empty());
+            let has_refresh = tokens
+                .get("refresh_token")
+                .and_then(|v| v.as_str())
+                .is_some_and(|token| !token.trim().is_empty());
+            (has_access && has_refresh).then(|| mode.to_string())
+        }
+        _ => None,
+    }
 }
 
 fn opencode_auth_has_provider(path: &std::path::Path, provider: &str) -> bool {
@@ -2522,6 +2628,66 @@ mod working_directory_tests {
                 .expect_err("sibling path with prefix match should be rejected");
             assert!(err.contains("not be visible to the worker"));
         });
+    }
+}
+
+#[cfg(test)]
+mod codex_auth_status_tests {
+    use super::{codex_auth_json_mode, CodexAuthStatus};
+    use serde_json::json;
+
+    #[test]
+    fn codex_auth_json_mode_accepts_apikey_payload() {
+        let value = json!({
+            "auth_mode": "apikey",
+            "OPENAI_API_KEY": "sk-test",
+        });
+
+        assert_eq!(codex_auth_json_mode(&value), Some("apikey".to_string()));
+    }
+
+    #[test]
+    fn codex_auth_json_mode_accepts_chatgpt_payload_with_refresh() {
+        let value = json!({
+            "auth_mode": "chatgpt",
+            "OPENAI_API_KEY": null,
+            "tokens": {
+                "access_token": "access",
+                "refresh_token": "refresh",
+                "id_token": "access",
+                "account_id": "acct"
+            },
+            "last_refresh": "2026-06-04T16:01:00Z",
+        });
+
+        assert_eq!(codex_auth_json_mode(&value), Some("chatgpt".to_string()));
+    }
+
+    #[test]
+    fn codex_auth_json_mode_rejects_chatgpt_payload_without_refresh() {
+        let value = json!({
+            "auth_mode": "chatgpt",
+            "tokens": {
+                "access_token": "access"
+            }
+        });
+
+        assert_eq!(codex_auth_json_mode(&value), None);
+    }
+
+    #[test]
+    fn codex_auth_status_counts_oauth_account_as_credentials() {
+        let status = CodexAuthStatus {
+            has_api_key: false,
+            has_oauth: false,
+            has_oauth_account: true,
+            has_valid_auth_json: false,
+            auth_json_path: None,
+            auth_json_mode: None,
+            auth_json_candidates: Vec::new(),
+        };
+
+        assert!(status.has_credentials());
     }
 }
 

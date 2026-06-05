@@ -13402,6 +13402,7 @@ pub async fn run_codex_turn(
     let codex_config = crate::backend::codex::client::CodexConfig {
         cli_path,
         model_effort: model_effort.map(|s| s.to_string()),
+        cancel_token: Some(cancel.clone()),
         external_chatgpt_auth: prepared_oauth_account.as_ref().map(|account| {
             crate::backend::codex::client::CodexExternalChatgptAuth {
                 access_token: account.access_token.clone(),
@@ -13480,12 +13481,22 @@ pub async fn run_codex_turn(
     // closing audit lives in `thinking_accumulated`), we break out of the
     // loop and let the post-loop finalization recover whatever it can.
     let mut cancelled = false;
+    let mut codex_goal_cancel_deferred = false;
 
     loop {
         tokio::select! {
-            _ = cancel.cancelled() => {
+            _ = cancel.cancelled(), if !codex_goal_cancel_deferred => {
                 tracing::info!("Codex turn cancelled for mission {}", mission_id);
-                // Note: Codex process will be cleaned up automatically when the event stream task ends
+                if codex_is_goal_request(user_message) && !codex_goal_cancel_deferred {
+                    // Goal-mode cancellation must be handled by the app-server
+                    // task because it owns the live thread id needed for
+                    // `thread/goal/clear`. Keep draining events until it emits
+                    // `ExecutionEvent::Cancelled` (or the channel closes).
+                    codex_goal_cancel_deferred = true;
+                    continue;
+                }
+                // Note: Codex process will be cleaned up automatically when
+                // the event stream task ends.
                 cancelled = true;
                 break;
             }
@@ -13618,6 +13629,10 @@ pub async fn run_codex_turn(
                             objective,
                             mission_id: Some(mission_id),
                         });
+                    }
+                    ExecutionEvent::Cancelled => {
+                        cancelled = true;
+                        break;
                     }
                     ExecutionEvent::Error { message } => {
                         // Codex CLI emits two kinds of post-response errors we
@@ -14190,6 +14205,10 @@ pub async fn run_gemini_turn(
                             objective,
                             mission_id: Some(mission_id),
                         });
+                    }
+                    ExecutionEvent::Cancelled => {
+                        cancelled = true;
+                        break;
                     }
                     ExecutionEvent::Error { message } => {
                         error_message = Some(message.clone());

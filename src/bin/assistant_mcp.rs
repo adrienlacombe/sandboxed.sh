@@ -120,6 +120,17 @@ struct SendMessageParams {
     content: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct WorkspaceBashParams {
+    command: String,
+    #[serde(default)]
+    workspace_id: Option<String>,
+    #[serde(default)]
+    cwd: Option<String>,
+    #[serde(default)]
+    timeout_secs: Option<u64>,
+}
+
 #[derive(Debug, Serialize)]
 struct JwtClaims {
     sub: String,
@@ -318,6 +329,20 @@ impl AssistantMcp {
                 description: "List sandboxed.sh workspaces so new missions can target the right environment.".to_string(),
                 input_schema: json!({"type": "object", "properties": {}}),
             },
+            ToolDefinition {
+                name: "workspace_bash".to_string(),
+                description: "Run a bash command inside a sandboxed.sh workspace with the workspace's configured environment variables (GH_TOKEN, SSH keys, ...) — the same context missions run in. Prefer this over local bash for git/gh operations and anything needing workspace secrets.".to_string(),
+                input_schema: json!({
+                    "type": "object",
+                    "required": ["command"],
+                    "properties": {
+                        "command": {"type": "string", "description": "Shell command to run in the workspace."},
+                        "workspace_id": {"type": "string", "description": "Workspace UUID. Defaults to the assistant's default workspace."},
+                        "cwd": {"type": "string", "description": "Working directory relative to the workspace root."},
+                        "timeout_secs": {"type": "integer", "description": "Timeout in seconds, default 300, max 600."}
+                    }
+                }),
+            },
         ]
     }
 
@@ -447,6 +472,42 @@ impl AssistantMcp {
         Ok(json!({ "mission": mission }))
     }
 
+    /// Run a bash command through `POST /api/workspaces/:id/exec`, which
+    /// executes in the workspace context with its configured `env_vars`
+    /// merged in (host: process env; container: --setenv). This gives the
+    /// assistant mission-equivalent access to workspace secrets without
+    /// copying them into the gateway's own service environment.
+    async fn workspace_bash(&self, params: WorkspaceBashParams) -> Result<Value, String> {
+        if params.command.trim().is_empty() {
+            return Err("Command is empty".to_string());
+        }
+        let workspace_id = resolve_default_workspace_id(params.workspace_id).ok_or_else(|| {
+            "No workspace_id given and no default workspace configured \
+             (HERMES_DEFAULT_WORKSPACE_ID / ASSISTANT_DEFAULT_WORKSPACE_ID)"
+                .to_string()
+        })?;
+        let id = parse_uuid(&workspace_id)?;
+        let response = self
+            .api_post(
+                &format!("/api/workspaces/{id}/exec"),
+                json!({
+                    "command": params.command,
+                    "cwd": params.cwd,
+                    "timeout_secs": params.timeout_secs,
+                }),
+            )
+            .await?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let text = response.text().await.unwrap_or_default();
+            return Err(format!("Workspace exec failed ({status}): {text}"));
+        }
+        response
+            .json()
+            .await
+            .map_err(|error| format!("Failed to parse exec result: {error}"))
+    }
+
     async fn send_message(&self, params: SendMessageParams) -> Result<Value, String> {
         let id = parse_uuid(&params.mission_id)?;
         let response = self
@@ -530,6 +591,11 @@ impl AssistantMcp {
                 self.cancel_mission(params).await
             }
             "list_workspaces" => self.list_workspaces().await,
+            "workspace_bash" => {
+                let params: WorkspaceBashParams = serde_json::from_value(arguments)
+                    .map_err(|error| format!("Invalid params: {error}"))?;
+                self.workspace_bash(params).await
+            }
             other => Err(format!("Unknown tool: {other}")),
         }
     }
