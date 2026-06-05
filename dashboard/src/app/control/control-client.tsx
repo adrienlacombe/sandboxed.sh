@@ -117,6 +117,8 @@ import {
   type DesktopSessionDetail,
   type StoredEvent,
   type SharedFile,
+  type QueuedMessage,
+  isHttpStatusError,
 } from "@/lib/api";
 import { QueueStrip, type QueueItem } from "@/components/queue-strip";
 import { GoalBar } from "@/components/goal-bar";
@@ -570,6 +572,52 @@ const PerfOverlay = dynamic(() =>
 
 type ToolItem = Extract<ChatItem, { kind: "tool" }>;
 type SidePanelItem = Extract<ChatItem, { kind: "thinking" | "stream" }>;
+
+/**
+ * Merge a `getQueue()` snapshot into history items for one mission: mark
+ * existing user rows as queued and append rows for queue entries missing
+ * from history.
+ *
+ * `snapshotIsFresh` must be false when a local queue mutation (remove /
+ * clear) happened while the snapshot was in flight — such a snapshot may
+ * still contain a just-deleted message, and merging it would resurrect the
+ * message as a ghost row that the server can no longer delete (404). Stale
+ * snapshots are ignored entirely; the post-mutation queue sync reconciles
+ * flags with a fresh fetch.
+ */
+function mergeQueuedMessagesIntoItems(
+  historyItems: ChatItem[],
+  queuedMessages: QueuedMessage[],
+  missionId: string,
+  snapshotIsFresh: boolean,
+): ChatItem[] {
+  if (!snapshotIsFresh) return historyItems;
+  const missionQueuedMessages = queuedMessages.filter(
+    (qm) => qm.mission_id === missionId,
+  );
+  if (missionQueuedMessages.length === 0) return historyItems;
+  const queuedIds = new Set(missionQueuedMessages.map((qm) => qm.id));
+  // Mark existing items as queued
+  let next = historyItems.map((item) =>
+    item.kind === "user" && queuedIds.has(item.id)
+      ? { ...item, queued: true }
+      : item,
+  );
+  // Add any queued messages not already in history
+  const existingIds = new Set(next.map((item) => item.id));
+  const newQueuedItems: ChatItem[] = missionQueuedMessages
+    .filter((qm) => !existingIds.has(qm.id))
+    .map((qm) => ({
+      kind: "user" as const,
+      id: qm.id,
+      content: qm.content,
+      timestamp: Date.now(),
+      agent: qm.agent ?? undefined,
+      queued: true,
+    }));
+  if (newQueuedItems.length > 0) next = [...next, ...newQueuedItems];
+  return next;
+}
 
 // Mirror of the server's conversation-anchored snapshot (see
 // `get_mission_snapshot` in src/api/control.rs). Keep these in sync.
@@ -4486,6 +4534,12 @@ export default function ControlClient() {
   const [queueLen, setQueueLen] = useControlQueueStore();
   const lastQueueLenRef = useRef<number | null>(null);
   const syncingQueueRef = useRef(false);
+  // Bumped whenever the user locally mutates the queue (remove / clear all).
+  // getQueue() snapshots capture the generation *before* the fetch and compare
+  // it when applying — a snapshot taken while a deletion was in flight may
+  // still contain the deleted message, and merging it would resurrect the
+  // message as a ghost row (visible in the queue strip, 404 on re-delete).
+  const queueMutationGenRef = useRef(0);
 
   // Backwards-pagination state. Long missions can have 20k+ history events
   // and the initial load is capped at HISTORY_PAGE_SIZE for memory + render
@@ -6488,6 +6542,7 @@ export default function ControlClient() {
       fetchingMissionIdRef.current = id; // Track which mission we're loading
       try {
         // Load mission, events, and queue in parallel for faster load
+        const queueGenAtFetch = queueMutationGenRef.current;
         const [mission, events, queuedMessages] = await Promise.all([
           loadMission(id),
           loadHistoryEvents(id).catch(() => null), // Don't fail if events unavailable
@@ -6574,31 +6629,12 @@ export default function ControlClient() {
         // correctly (see `seedPaginationStateAfterInitialLoad`).
         const historicEventsLen = historyItems.length;
         // Merge queued messages that belong to this mission
-        const missionQueuedMessages = queuedMessages.filter(
-          (qm) => qm.mission_id === id,
+        historyItems = mergeQueuedMessagesIntoItems(
+          historyItems,
+          queuedMessages,
+          id,
+          queueGenAtFetch === queueMutationGenRef.current,
         );
-        if (missionQueuedMessages.length > 0) {
-          const queuedIds = new Set(missionQueuedMessages.map((qm) => qm.id));
-          // Mark existing items as queued
-          historyItems = historyItems.map((item) =>
-            item.kind === "user" && queuedIds.has(item.id)
-              ? { ...item, queued: true }
-              : item,
-          );
-          // Add any queued messages not already in history
-          const existingIds = new Set(historyItems.map((item) => item.id));
-          const newQueuedItems: ChatItem[] = missionQueuedMessages
-            .filter((qm) => !existingIds.has(qm.id))
-            .map((qm) => ({
-              kind: "user" as const,
-              id: qm.id,
-              content: qm.content,
-              timestamp: Date.now(),
-              agent: qm.agent ?? undefined,
-              queued: true,
-            }));
-          historyItems = [...historyItems, ...newQueuedItems];
-        }
         setItems(historyItems);
         adjustVisibleItemsLimit(historyItems);
         seedPaginationStateAfterInitialLoad(id, historicEventsLen);
@@ -6655,6 +6691,7 @@ export default function ControlClient() {
           applyDesktopSessionState(mission);
           router.replace(`/control?mission=${mission.id}`, { scroll: false });
           // Load full events and queue in background (including tool calls)
+          const queueGenAtFetch = queueMutationGenRef.current;
           Promise.all([
             loadHistoryEvents(mission.id),
             getQueue().catch(() => []),
@@ -6669,33 +6706,12 @@ export default function ControlClient() {
               // queued items (see `seedPaginationStateAfterInitialLoad`).
               const historicEventsLen = historyItems.length;
               // Merge queued messages that belong to this mission
-              const missionQueuedMessages = queuedMessages.filter(
-                (qm) => qm.mission_id === mission.id,
+              historyItems = mergeQueuedMessagesIntoItems(
+                historyItems,
+                queuedMessages,
+                mission.id,
+                queueGenAtFetch === queueMutationGenRef.current,
               );
-              if (missionQueuedMessages.length > 0) {
-                const queuedIds = new Set(
-                  missionQueuedMessages.map((qm) => qm.id),
-                );
-                historyItems = historyItems.map((item) =>
-                  item.kind === "user" && queuedIds.has(item.id)
-                    ? { ...item, queued: true }
-                    : item,
-                );
-                const existingIds = new Set(
-                  historyItems.map((item) => item.id),
-                );
-                const newQueuedItems: ChatItem[] = missionQueuedMessages
-                  .filter((qm) => !existingIds.has(qm.id))
-                  .map((qm) => ({
-                    kind: "user" as const,
-                    id: qm.id,
-                    content: qm.content,
-                    timestamp: Date.now(),
-                    agent: qm.agent ?? undefined,
-                    queued: true,
-                  }));
-                historyItems = [...historyItems, ...newQueuedItems];
-              }
               setItems(historyItems);
               adjustVisibleItemsLimit(historyItems);
               seedPaginationStateAfterInitialLoad(
@@ -7177,6 +7193,7 @@ export default function ControlClient() {
       // This ensures we don't show stale cached events
       try {
         // Load mission, events, and queue in parallel for faster load
+        const queueGenAtFetch = queueMutationGenRef.current;
         const [mission, events, queuedMessages] = await Promise.all([
           getMission(missionId),
           loadHistoryEvents(missionId).catch(() => null), // Don't fail if events unavailable
@@ -7200,29 +7217,12 @@ export default function ControlClient() {
         // (see `seedPaginationStateAfterInitialLoad`).
         const historicEventsLen = historyItems.length;
         // Merge queued messages that belong to this mission
-        const missionQueuedMessages = queuedMessages.filter(
-          (qm) => qm.mission_id === missionId,
+        historyItems = mergeQueuedMessagesIntoItems(
+          historyItems,
+          queuedMessages,
+          missionId,
+          queueGenAtFetch === queueMutationGenRef.current,
         );
-        if (missionQueuedMessages.length > 0) {
-          const queuedIds = new Set(missionQueuedMessages.map((qm) => qm.id));
-          historyItems = historyItems.map((item) =>
-            item.kind === "user" && queuedIds.has(item.id)
-              ? { ...item, queued: true }
-              : item,
-          );
-          const existingIds = new Set(historyItems.map((item) => item.id));
-          const newQueuedItems: ChatItem[] = missionQueuedMessages
-            .filter((qm) => !existingIds.has(qm.id))
-            .map((qm) => ({
-              kind: "user" as const,
-              id: qm.id,
-              content: qm.content,
-              timestamp: Date.now(),
-              agent: qm.agent ?? undefined,
-              queued: true,
-            }));
-          historyItems = [...historyItems, ...newQueuedItems];
-        }
 
         setItems(historyItems);
         adjustVisibleItemsLimit(historyItems);
@@ -8046,7 +8046,12 @@ export default function ControlClient() {
         }
 
         const nextQueueLen = typeof q === "number" ? q : 0;
-        setQueueLen(nextQueueLen);
+        // Only adopt the queue length when the status concerns the viewed
+        // mission — parallel missions emit their own per-mission Status
+        // events and must not clobber the viewed mission's badge.
+        if (shouldApplyStatus) {
+          setQueueLen(nextQueueLen);
+        }
         setRunStateMissionId(effectiveMissionId);
 
         if (shouldApplyStatus && effectiveMissionId) {
@@ -9834,7 +9839,12 @@ export default function ControlClient() {
       if (!missionId || syncingQueueRef.current) return;
       syncingQueueRef.current = true;
       try {
+        const queueGenAtFetch = queueMutationGenRef.current;
         const queuedMessages = await getQueue();
+        // A local remove/clear landed while this snapshot was in flight —
+        // it may still contain the deleted message. Discard it; the
+        // mutation handler triggers its own (fresh) sync.
+        if (queueGenAtFetch !== queueMutationGenRef.current) return;
         const queuedForMission = queuedMessages.filter(
           (qm) => qm.mission_id === missionId,
         );
@@ -9873,6 +9883,7 @@ export default function ControlClient() {
     async (missionId: string) => {
       try {
         const knownSeq = missionMaxSeqRef.current.get(missionId) ?? 0;
+        const queueGenAtFetch = queueMutationGenRef.current;
 
         if (knownSeq > 0) {
           const [mission, deltaEvents, queuedMessages] = await Promise.all([
@@ -9989,36 +10000,43 @@ export default function ControlClient() {
 
           // Queue reconciliation still needs every tick — a message
           // could move from "queued" to "processing" with no new events.
-          const missionQueuedMessages = queuedMessages.filter(
-            (qm) => qm.mission_id === missionId,
-          );
-          const queuedIds = new Set(missionQueuedMessages.map((qm) => qm.id));
-          setItems((prev) => {
-            let changed = false;
-            const next = prev.map((item) => {
-              if (item.kind !== "user") return item;
-              const shouldBeQueued = queuedIds.has(item.id);
-              if (!!item.queued === shouldBeQueued) return item;
-              changed = true;
-              return { ...item, queued: shouldBeQueued };
+          // Skip when a local remove/clear landed while the snapshot was
+          // in flight: the snapshot may still contain the deleted message
+          // and re-adding it would resurrect a ghost row.
+          if (queueGenAtFetch === queueMutationGenRef.current) {
+            const missionQueuedMessages = queuedMessages.filter(
+              (qm) => qm.mission_id === missionId,
+            );
+            const queuedIds = new Set(
+              missionQueuedMessages.map((qm) => qm.id),
+            );
+            setItems((prev) => {
+              let changed = false;
+              const next = prev.map((item) => {
+                if (item.kind !== "user") return item;
+                const shouldBeQueued = queuedIds.has(item.id);
+                if (!!item.queued === shouldBeQueued) return item;
+                changed = true;
+                return { ...item, queued: shouldBeQueued };
+              });
+              const existingIds = new Set(prev.map((it) => it.id));
+              const newQueued: ChatItem[] = missionQueuedMessages
+                .filter((qm) => !existingIds.has(qm.id))
+                .map((qm) => ({
+                  kind: "user" as const,
+                  id: qm.id,
+                  content: qm.content,
+                  timestamp: Date.now(),
+                  agent: qm.agent ?? undefined,
+                  queued: true,
+                }));
+              if (newQueued.length === 0 && !changed) return prev;
+              const merged =
+                newQueued.length > 0 ? [...next, ...newQueued] : next;
+              updateMissionItems(missionId, merged);
+              return merged;
             });
-            const existingIds = new Set(prev.map((it) => it.id));
-            const newQueued: ChatItem[] = missionQueuedMessages
-              .filter((qm) => !existingIds.has(qm.id))
-              .map((qm) => ({
-                kind: "user" as const,
-                id: qm.id,
-                content: qm.content,
-                timestamp: Date.now(),
-                agent: qm.agent ?? undefined,
-                queued: true,
-              }));
-            if (newQueued.length === 0 && !changed) return prev;
-            const merged =
-              newQueued.length > 0 ? [...next, ...newQueued] : next;
-            updateMissionItems(missionId, merged);
-            return merged;
-          });
+          }
           if (!needsFullReload) return;
           // Orphan delta — clear the cursor and fall through to the
           // full reload below so state reconstructs with full context.
@@ -10026,6 +10044,7 @@ export default function ControlClient() {
         }
 
         // Full reload fallback (first load or counter reset).
+        const fullQueueGenAtFetch = queueMutationGenRef.current;
         const [mission, events, queuedMessages] = await Promise.all([
           getMission(missionId),
           loadHistoryEvents(missionId).catch(() => null),
@@ -10047,29 +10066,12 @@ export default function ControlClient() {
         // Pre-queue length: pagination uses this to find the live tail
         // without clipping queued items (see `seedPaginationStateAfterInitialLoad`).
         const historicEventsLen = historyItems.length;
-        const missionQueuedMessages = queuedMessages.filter(
-          (qm) => qm.mission_id === missionId,
+        historyItems = mergeQueuedMessagesIntoItems(
+          historyItems,
+          queuedMessages,
+          missionId,
+          fullQueueGenAtFetch === queueMutationGenRef.current,
         );
-        if (missionQueuedMessages.length > 0) {
-          const queuedIds = new Set(missionQueuedMessages.map((qm) => qm.id));
-          historyItems = historyItems.map((item) =>
-            item.kind === "user" && queuedIds.has(item.id)
-              ? { ...item, queued: true }
-              : item,
-          );
-          const existingIds = new Set(historyItems.map((item) => item.id));
-          const newQueuedItems: ChatItem[] = missionQueuedMessages
-            .filter((qm) => !existingIds.has(qm.id))
-            .map((qm) => ({
-              kind: "user" as const,
-              id: qm.id,
-              content: qm.content,
-              timestamp: Date.now(),
-              agent: qm.agent ?? undefined,
-              queued: true,
-            }));
-          historyItems = [...historyItems, ...newQueuedItems];
-        }
 
         setItems(historyItems);
         adjustVisibleItemsLimit(historyItems);
@@ -10139,31 +10141,68 @@ export default function ControlClient() {
       .map((item) => ({
         id: item.id,
         content: item.content,
-        agent: null, // Agent info not stored in current item structure
+        agent: item.agent ?? null,
       }));
   }, [items]);
+
+  // Drop a message from the local timeline (and the viewed mission's cache,
+  // so the row doesn't come back from a cache restore).
+  const dropQueuedItemLocally = useCallback(
+    (messageId: string) => {
+      setItems((prev) => {
+        const next = prev.filter((item) => item.id !== messageId);
+        if (next.length === prev.length) return prev;
+        const missionId = viewingMissionIdRef.current;
+        if (missionId) updateMissionItems(missionId, next);
+        return next;
+      });
+    },
+    [setItems, updateMissionItems],
+  );
 
   // Handle removing a message from the queue
   const handleRemoveFromQueue = async (messageId: string) => {
     try {
       await removeFromQueue(messageId);
-      // Optimistically remove from local state
-      setItems((prev) => prev.filter((item) => item.id !== messageId));
+      // Invalidate in-flight getQueue() snapshots (they may predate the
+      // deletion and would resurrect the message), then drop it locally.
+      queueMutationGenRef.current += 1;
+      dropQueuedItemLocally(messageId);
       toast.success("Removed from queue");
+      // Belt-and-braces: reconcile against a fresh post-delete snapshot.
+      const missionId = viewingMissionIdRef.current;
+      if (missionId) void syncQueueForMission(missionId);
     } catch (err) {
+      if (isHttpStatusError(err, 404)) {
+        // The server no longer has this message (e.g. a stale snapshot
+        // resurrected an already-deleted row) — self-heal by dropping it.
+        queueMutationGenRef.current += 1;
+        dropQueuedItemLocally(messageId);
+        toast.success("Message already removed from queue");
+        return;
+      }
       console.error(err);
       toast.error("Failed to remove from queue");
     }
   };
 
-  // Handle clearing all queued messages
+  // Handle clearing all queued messages for the viewed mission
   const handleClearQueue = async () => {
     try {
-      const { cleared } = await clearQueue();
+      // Scope to the viewed mission so clearing here doesn't wipe other
+      // missions' queues.
+      const missionId = viewingMissionIdRef.current;
+      const { cleared } = await clearQueue(missionId ?? undefined);
+      queueMutationGenRef.current += 1;
       // Optimistically remove all queued items from local state
-      setItems((prev) =>
-        prev.filter((item) => !(item.kind === "user" && item.queued === true)),
-      );
+      setItems((prev) => {
+        const next = prev.filter(
+          (item) => !(item.kind === "user" && item.queued === true),
+        );
+        if (next.length === prev.length) return prev;
+        if (missionId) updateMissionItems(missionId, next);
+        return next;
+      });
       toast.success(
         `Cleared ${cleared} message${cleared !== 1 ? "s" : ""} from queue`,
       );

@@ -33,6 +33,7 @@ import {
   libPut,
   libDel,
   ensureLibraryResponse,
+  HttpStatusError,
 } from "./api/core";
 
 // Types that remain in this file (not yet migrated to modules)
@@ -482,14 +483,26 @@ export async function getQueue(): Promise<QueuedMessage[]> {
 }
 
 export async function removeFromQueue(messageId: string): Promise<void> {
-  return apiDel(
-    `/api/control/queue/${messageId}`,
-    "Failed to remove from queue",
-  );
+  const res = await apiFetch(`/api/control/queue/${messageId}`, {
+    method: "DELETE",
+  });
+  if (!res.ok) {
+    // Carry the status so callers can treat 404 ("message not in queue")
+    // as already-removed instead of a hard failure.
+    throw new HttpStatusError("Failed to remove from queue", res.status);
+  }
 }
 
-export async function clearQueue(): Promise<{ cleared: number }> {
-  return apiDel("/api/control/queue", "Failed to clear queue");
+/** Clear queued messages. When `missionId` is given, only messages targeting
+ * that mission are cleared — without it the backend wipes every mission's
+ * queue. */
+export async function clearQueue(
+  missionId?: string,
+): Promise<{ cleared: number }> {
+  const path = missionId
+    ? `/api/control/queue?mission_id=${encodeURIComponent(missionId)}`
+    : "/api/control/queue";
+  return apiDel(path, "Failed to clear queue");
 }
 
 // ── Ask assistant (non-interrupting sidecar co-pilot) ──────────────────────

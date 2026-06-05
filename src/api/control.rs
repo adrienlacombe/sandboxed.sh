@@ -3118,8 +3118,11 @@ pub enum ControlCommand {
         message_id: Uuid,
         respond: oneshot::Sender<bool>, // true if removed, false if not found
     },
-    /// Clear all messages from the queue
+    /// Clear queued messages. When `mission_id` is set, only messages
+    /// targeting that mission are cleared (main queue entries targeting it +
+    /// that mission's parallel-runner queue); otherwise every queue is wiped.
     ClearQueue {
+        mission_id: Option<Uuid>,
         respond: oneshot::Sender<usize>, // number of messages cleared
     },
 }
@@ -3653,16 +3656,30 @@ pub async fn remove_from_queue(
     }
 }
 
-/// Clear all messages from the queue.
+/// Query parameters for `clear_queue`.
+#[derive(Debug, Default, Deserialize)]
+pub struct ClearQueueQuery {
+    /// When set, only clear messages targeting this mission instead of
+    /// wiping every mission's queue.
+    #[serde(default)]
+    pub mission_id: Option<Uuid>,
+}
+
+/// Clear queued messages (optionally scoped to a single mission via
+/// `?mission_id=`).
 pub async fn clear_queue(
     State(state): State<Arc<AppState>>,
     Extension(user): Extension<AuthUser>,
+    Query(query): Query<ClearQueueQuery>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let control = control_for_user(&state, &user).await;
     let (tx, rx) = oneshot::channel();
     control
         .cmd_tx
-        .send(ControlCommand::ClearQueue { respond: tx })
+        .send(ControlCommand::ClearQueue {
+            mission_id: query.mission_id,
+            respond: tx,
+        })
         .await
         .map_err(session_unavailable)?;
     let cleared = rx.await.map_err(|_| {
@@ -9080,6 +9097,18 @@ async fn control_actor_loop(
                                         queued: was_running,
                                         mission_id: Some(tid),
                                     });
+                                    // Surface the parallel queue growth to all
+                                    // clients (Status events otherwise only
+                                    // carry the main queue length). Only when
+                                    // the message actually stays queued —
+                                    // otherwise start_next pops it right away.
+                                    if was_running {
+                                        let _ = events_tx.send(AgentEvent::Status {
+                                            state: ControlRunState::Running,
+                                            queue_len: runner.queue.len(),
+                                            mission_id: Some(tid),
+                                        });
+                                    }
                                     // Try to start if not already running
                                     if !runner.is_running() {
                                         runner.start_next(
@@ -10505,41 +10534,137 @@ async fn control_actor_loop(
                             });
                         }
 
-                        // Also try to remove from parallel runner queues
+                        // Also try to remove from parallel runner queues.
+                        // Emit a Status event for each affected mission so
+                        // every client (other tabs, iOS) learns the queue
+                        // changed — without this, only the deleting client
+                        // ever updates its UI.
                         for (mid, runner) in parallel_runners.iter_mut() {
                             if runner.remove_from_queue(message_id) {
                                 removed = true;
                                 tracing::info!("Removed message {} from parallel mission {}", message_id, mid);
+                                let _ = events_tx.send(AgentEvent::Status {
+                                    state: if runner.is_running() {
+                                        ControlRunState::Running
+                                    } else {
+                                        ControlRunState::Idle
+                                    },
+                                    queue_len: runner.queue.len(),
+                                    mission_id: Some(*mid),
+                                });
                             }
                         }
 
                         let _ = respond.send(removed);
                     }
-                    ControlCommand::ClearQueue { respond } => {
-                        let mut cleared = queue.len();
-                        queue.clear();
+                    ControlCommand::ClearQueue { mission_id, respond } => {
+                        let main_mission_id = if running.is_some() {
+                            running_mission_id
+                        } else {
+                            *current_mission.read().await
+                        };
 
-                        // Also clear parallel runner queues
-                        for (_mid, runner) in parallel_runners.iter_mut() {
-                            cleared += runner.clear_queue();
+                        let mut cleared = 0usize;
+                        match mission_id {
+                            Some(target) => {
+                                // Scoped clear: only drop messages targeting
+                                // this mission (main queue entries + that
+                                // mission's parallel-runner queue). Clearing
+                                // from one mission's view must not wipe other
+                                // missions' queues.
+                                let before_len = queue.len();
+                                queue.retain(|(_, _, _, target_mid)| *target_mid != Some(target));
+                                let main_removed = before_len - queue.len();
+                                cleared += main_removed;
+                                if main_removed > 0 {
+                                    let _ = events_tx.send(AgentEvent::Status {
+                                        state: if running.is_some() {
+                                            ControlRunState::Running
+                                        } else {
+                                            ControlRunState::Idle
+                                        },
+                                        queue_len: queue.len(),
+                                        mission_id: main_mission_id,
+                                    });
+                                }
+                                // Clients filter Status events by the mission
+                                // they are viewing, so the main-queue event
+                                // above is invisible to a client focused on
+                                // `target` (unless target IS the main
+                                // mission). Emit a target-scoped Status
+                                // whenever anything was cleared for it.
+                                let mut target_status_sent = false;
+                                if let Some(runner) = parallel_runners.get_mut(&target) {
+                                    let runner_cleared = runner.clear_queue();
+                                    cleared += runner_cleared;
+                                    if runner_cleared > 0 || main_removed > 0 {
+                                        let _ = events_tx.send(AgentEvent::Status {
+                                            state: if runner.is_running() {
+                                                ControlRunState::Running
+                                            } else {
+                                                ControlRunState::Idle
+                                            },
+                                            queue_len: runner.queue.len(),
+                                            mission_id: Some(target),
+                                        });
+                                        target_status_sent = true;
+                                    }
+                                }
+                                if main_removed > 0
+                                    && !target_status_sent
+                                    && main_mission_id != Some(target)
+                                {
+                                    // No parallel runner for `target` and it
+                                    // is not the main mission: it cannot be
+                                    // running, but its viewers still need a
+                                    // scoped event to refresh their queue.
+                                    let _ = events_tx.send(AgentEvent::Status {
+                                        state: ControlRunState::Idle,
+                                        queue_len: 0,
+                                        mission_id: Some(target),
+                                    });
+                                }
+                                tracing::info!(
+                                    "Cleared {} queued messages for mission {}",
+                                    cleared, target
+                                );
+                            }
+                            None => {
+                                cleared = queue.len();
+                                queue.clear();
+
+                                // Also clear parallel runner queues, notifying
+                                // each affected mission's viewers.
+                                for (mid, runner) in parallel_runners.iter_mut() {
+                                    let runner_cleared = runner.clear_queue();
+                                    if runner_cleared > 0 {
+                                        cleared += runner_cleared;
+                                        let _ = events_tx.send(AgentEvent::Status {
+                                            state: if runner.is_running() {
+                                                ControlRunState::Running
+                                            } else {
+                                                ControlRunState::Idle
+                                            },
+                                            queue_len: 0,
+                                            mission_id: Some(*mid),
+                                        });
+                                    }
+                                }
+
+                                // Emit event to notify frontend (main queue)
+                                let _ = events_tx.send(AgentEvent::Status {
+                                    state: if running.is_some() {
+                                        ControlRunState::Running
+                                    } else {
+                                        ControlRunState::Idle
+                                    },
+                                    queue_len: 0,
+                                    mission_id: main_mission_id,
+                                });
+
+                                tracing::info!("Cleared {} total queued messages (main + parallel)", cleared);
+                            }
                         }
-
-                        // Emit event to notify frontend (main queue only)
-                        let _ = events_tx.send(AgentEvent::Status {
-                            state: if running.is_some() {
-                                ControlRunState::Running
-                            } else {
-                                ControlRunState::Idle
-                            },
-                            queue_len: 0,
-                            mission_id: if running.is_some() {
-                                running_mission_id
-                            } else {
-                                *current_mission.read().await
-                            },
-                        });
-
-                        tracing::info!("Cleared {} total queued messages (main + parallel)", cleared);
                         let _ = respond.send(cleared);
                     }
                 }
