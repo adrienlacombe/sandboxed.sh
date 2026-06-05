@@ -320,6 +320,7 @@ pub(crate) fn resolve_provider_api_key(
 /// independent of the metadata config's reasoning fields.
 pub async fn build_assistant_llm_config(
     ai_providers: &crate::ai_providers::AIProviderStore,
+    chain_store: &crate::provider_health::SharedModelChainStore,
     model_override: Option<String>,
 ) -> Option<MetadataLlmConfig> {
     use crate::ai_providers::ProviderType;
@@ -331,6 +332,38 @@ pub async fn build_assistant_llm_config(
             .ok()
             .filter(|m| !m.trim().is_empty())
     });
+
+    // A routable override — an existing Routing chain id ("builtin/assistant")
+    // or a provider/model passthrough ("xai/grok-code-fast-1",
+    // "cerebras/zai-glm-4.7") — goes through the local /v1 proxy: fallbacks,
+    // health tracking, and usage accounting come for free, and anything
+    // configured under Routing becomes usable for the assistant.
+    if let Some(model) = explicit_model.as_deref() {
+        let model = model.trim();
+        let is_chain = chain_store.get(model).await.is_some();
+        let is_passthrough = model
+            .split_once('/')
+            .map(|(prefix, rest)| !rest.is_empty() && ProviderType::from_id(prefix).is_some())
+            .unwrap_or(false);
+        if is_chain || is_passthrough {
+            match local_proxy_llm_config(model) {
+                Some(config) => {
+                    tracing::info!(
+                        "[AskLLM] Routing assistant model {} via the local /v1 proxy",
+                        model
+                    );
+                    return Some(config);
+                }
+                None => tracing::warn!(
+                    "[AskLLM] Assistant model {} is proxy-routable but the local \
+                     /v1 proxy is unavailable (missing PORT or proxy secret); \
+                     falling back to the direct provider ladder",
+                    model
+                ),
+            }
+        }
+    }
+
     let assistant_model = explicit_model
         .clone()
         .unwrap_or_else(|| "gpt-oss-120b".to_string());
@@ -439,9 +472,27 @@ impl LlmRoleStatus {
     }
 }
 
+/// Config pointing at the local /v1 router (chains + provider passthrough).
+fn local_proxy_llm_config(model: &str) -> Option<MetadataLlmConfig> {
+    let base = crate::api::mission_runner::localhost_api_base_url_from_env()?;
+    let secret = std::env::var("SANDBOXED_PROXY_SECRET")
+        .ok()
+        .filter(|s| !s.trim().is_empty())?;
+    Some(MetadataLlmConfig {
+        base_url: format!("{}/v1", base.trim_end_matches('/')),
+        api_key: secret,
+        model: model.to_string(),
+        api_format: ApiFormat::OpenAI,
+        // AskClient derives reasoning_effort from the model name itself.
+        reasoning_effort: None,
+    })
+}
+
 /// Map a base URL to a human-readable provider label for display purposes.
 fn provider_label_for_base_url(base_url: &str) -> String {
     let labels: &[(&str, &str)] = &[
+        ("127.0.0.1", "Routing"),
+        ("localhost", "Routing"),
         ("cerebras.ai", "Cerebras"),
         ("openrouter.ai", "OpenRouter"),
         ("groq.com", "Groq"),
@@ -469,9 +520,10 @@ fn provider_label_for_base_url(base_url: &str) -> String {
 /// dashboard. Mirrors `build_assistant_llm_config` without exposing the key.
 pub async fn assistant_role_status(
     ai_providers: &crate::ai_providers::AIProviderStore,
+    chain_store: &crate::provider_health::SharedModelChainStore,
     model_override: Option<String>,
 ) -> LlmRoleStatus {
-    let config = build_assistant_llm_config(ai_providers, model_override).await;
+    let config = build_assistant_llm_config(ai_providers, chain_store, model_override).await;
     LlmRoleStatus::from_config(config.as_ref())
 }
 

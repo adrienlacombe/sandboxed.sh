@@ -718,6 +718,58 @@ const CODEX_ACCOUNT_LEASE_WAIT_TIMEOUT: Duration = Duration::from_secs(15);
 static CODEX_ACCOUNT_POOL: LazyLock<StdMutex<HashMap<String, Arc<Semaphore>>>> =
     LazyLock::new(|| StdMutex::new(HashMap::new()));
 
+/// Account-level cooldown memory: fingerprints of credentials that recently
+/// hit a usage/rate cap, mapped to when they may be tried again. Lets every
+/// codex path (initial dispatch, control-channel follow-ups) skip known-capped
+/// accounts instead of burning the first attempt on them. In-memory only —
+/// resets on restart, which is fine: the worst case is one wasted probe.
+static CODEX_ACCOUNT_COOLDOWNS: LazyLock<StdMutex<HashMap<String, std::time::Instant>>> =
+    LazyLock::new(|| StdMutex::new(HashMap::new()));
+
+/// OpenAI usage caps reset on long windows (often hours); 15 minutes keeps a
+/// capped account out of the hot path while re-probing often enough to catch
+/// an early reset.
+const CODEX_RATE_LIMIT_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+/// Capacity blips clear quickly; re-probe after 2 minutes.
+const CODEX_CAPACITY_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(2 * 60);
+/// Auth failures (refresh-token reuse) usually need a background token
+/// refresh to land; give it 10 minutes.
+const CODEX_AUTH_ERROR_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+fn codex_account_cooldown_remaining(fingerprint: &str) -> Option<std::time::Duration> {
+    let map = CODEX_ACCOUNT_COOLDOWNS
+        .lock()
+        .expect("Codex account cooldown mutex poisoned");
+    map.get(fingerprint)
+        .and_then(|until| until.checked_duration_since(std::time::Instant::now()))
+}
+
+fn set_codex_account_cooldown(fingerprint: &str, duration: std::time::Duration) {
+    let mut map = CODEX_ACCOUNT_COOLDOWNS
+        .lock()
+        .expect("Codex account cooldown mutex poisoned");
+    map.insert(
+        fingerprint.to_string(),
+        std::time::Instant::now() + duration,
+    );
+}
+
+fn clear_codex_account_cooldown(fingerprint: &str) {
+    let mut map = CODEX_ACCOUNT_COOLDOWNS
+        .lock()
+        .expect("Codex account cooldown mutex poisoned");
+    map.remove(fingerprint);
+}
+
+fn codex_cooldown_for_reason(reason: &TerminalReason) -> Option<std::time::Duration> {
+    match reason {
+        TerminalReason::RateLimited => Some(CODEX_RATE_LIMIT_COOLDOWN),
+        TerminalReason::CapacityLimited => Some(CODEX_CAPACITY_COOLDOWN),
+        TerminalReason::AuthError => Some(CODEX_AUTH_ERROR_COOLDOWN),
+        _ => None,
+    }
+}
+
 /// A codex auth credential — either a raw OpenAI API key (rotation slot keyed
 /// on the secret string) or a ChatGPT OAuth identity (rotation slot keyed on
 /// `chatgpt_account_id`, since that's what OpenAI's usage cap is keyed on).
@@ -780,6 +832,21 @@ impl CodexCredential {
 struct LeasedCodexAccount {
     credential: CodexCredential,
     _permit: OwnedSemaphorePermit,
+}
+
+/// Longest prefix of `s` that is at most `max_bytes` long without splitting
+/// a UTF-8 code point. A plain `&s[..n]` panics when byte `n` lands inside a
+/// multi-byte char (a user message with an em-dash at the boundary once took
+/// down the whole mission runner task before the turn started).
+fn utf8_safe_prefix(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
 }
 
 fn codex_key_fingerprint(key: &str) -> String {
@@ -1207,7 +1274,7 @@ async fn lease_codex_account(
         return None;
     }
 
-    let mut candidates: Vec<(CodexCredential, Arc<Semaphore>, usize)> = creds
+    let candidates: Vec<(CodexCredential, Arc<Semaphore>, usize)> = creds
         .into_iter()
         .filter(|cred| !tried_fingerprints.contains(&cred.fingerprint()))
         .map(|cred| {
@@ -1221,8 +1288,23 @@ async fn lease_codex_account(
         return None;
     }
 
-    // Prefer the currently least-loaded credential (highest available permits).
-    candidates.sort_by_key(|candidate| Reverse(candidate.2));
+    // Prefer credentials that aren't on a usage-cap cooldown; cooled ones stay
+    // in the list as a last resort so a single-account setup still retries
+    // instead of hard-failing. Within each group, prefer the least-loaded
+    // credential (highest available permits).
+    let (mut fresh, mut cooled): (Vec<_>, Vec<_>) = candidates.into_iter().partition(|candidate| {
+        codex_account_cooldown_remaining(&candidate.0.fingerprint()).is_none()
+    });
+    fresh.sort_by_key(|candidate| Reverse(candidate.2));
+    cooled.sort_by_key(|candidate| Reverse(candidate.2));
+    for candidate in &cooled {
+        tracing::debug!(
+            credential = %candidate.0.label_for_logs(),
+            "Codex credential on usage-cap cooldown; deprioritized for lease"
+        );
+    }
+    let candidates: Vec<(CodexCredential, Arc<Semaphore>, usize)> =
+        fresh.into_iter().chain(cooled).collect();
 
     for (cred, sem, available) in &candidates {
         if let Ok(permit) = sem.clone().try_acquire_owned() {
@@ -2567,9 +2649,24 @@ impl MissionRunner {
                     Some(result)
                 }
                 Err(e) => {
+                    // A panicked turn used to vanish here (mission left
+                    // "active" forever with no event). Synthesize a failed
+                    // result so the normal finalization path marks the
+                    // mission failed and the UI surfaces the error.
                     tracing::error!("Mission runner task failed: {}", e);
                     self.state = MissionRunState::Finished;
-                    None
+                    Some((
+                        self.mission_id,
+                        String::new(),
+                        AgentResult::failure(
+                            format!(
+                                "Internal error: the agent turn crashed before completing ({e}). \
+                                 This is a bug in sandboxed.sh, not in your request — retry the \
+                                 message and report if it persists."
+                            ),
+                            0,
+                        ),
+                    ))
                 }
             }
         } else {
@@ -3083,7 +3180,7 @@ async fn run_mission_turn(
     } else {
         tracing::debug!(
             mission_id = %mission_id,
-            user_message_prefix = &user_message[..user_message.len().min(100)],
+            user_message_prefix = utf8_safe_prefix(&user_message, 100),
             "Not a Telegram message, skipping CLAUDE.md injection"
         );
     }
@@ -3534,258 +3631,23 @@ async fn run_mission_turn(
                 convo.clone()
             };
             let codex_message: &str = codex_message_owned.as_str();
-            // Unified credential pool: API keys + ChatGPT-OAuth identities,
-            // de-duplicated by chatgpt_account_id. Empty only when neither
-            // an OpenAI API key nor a connected ChatGPT account is available.
-            //
-            // Defensive: if the pool was empty and the turn hits a rate
-            // limit, re-query once and rerun via rotation if credentials are
-            // now visible. The May 2026 incident showed the empty branch can
-            // be taken transiently even when accounts exist on disk, leaving
-            // the user with no rotation. The recheck guards against that
-            // without changing the happy-path behaviour.
-            'codex_arm: {
-                let mut all_creds = collect_codex_credentials(&config.working_dir);
-                let mut prior_empty_result: Option<AgentResult> = None;
-                if all_creds.is_empty() {
-                    let mut result = run_codex_turn(
-                        &workspace,
-                        &mission_work_dir,
-                        codex_message,
-                        requested_model,
-                        model_effort.as_deref(),
-                        effective_agent.as_deref(),
-                        mission_id,
-                        events_tx.clone(),
-                        cancel.clone(),
-                        &config.working_dir,
-                        session_id.as_deref(),
-                        None,
-                    )
-                    .await;
-
-                    if let Some(fallback_model) =
-                        codex_chatgpt_fallback_for_result(requested_model, &result)
-                    {
-                        tracing::warn!(
-                            mission_id = %mission_id,
-                            requested_model = ?requested_model,
-                            fallback_model,
-                            "Retrying Codex turn with fallback model for ChatGPT account compatibility"
-                        );
-                        result = run_codex_turn(
-                            &workspace,
-                            &mission_work_dir,
-                            codex_message,
-                            Some(fallback_model),
-                            model_effort.as_deref(),
-                            effective_agent.as_deref(),
-                            mission_id,
-                            events_tx.clone(),
-                            cancel.clone(),
-                            &config.working_dir,
-                            session_id.as_deref(),
-                            None,
-                        )
-                        .await;
-                    } else if codex_tool_stall_should_retry_with_default_model(
-                        requested_model,
-                        &result,
-                    ) {
-                        tracing::warn!(
-                            mission_id = %mission_id,
-                            requested_model = ?requested_model,
-                            "Retrying Codex turn on the requested model (not the stale Codex CLI default) after it stopped before tool use"
-                        );
-                        result = run_codex_turn(
-                            &workspace,
-                            &mission_work_dir,
-                            codex_message,
-                            // Was `None`, which made the Codex CLI fall back to
-                            // its built-in default — currently the retired
-                            // `gpt-5.3-codex`, rejected by ChatGPT-account auth
-                            // with a 400. Retry on the requested (latest) model.
-                            requested_model,
-                            model_effort.as_deref(),
-                            effective_agent.as_deref(),
-                            mission_id,
-                            events_tx.clone(),
-                            cancel.clone(),
-                            &config.working_dir,
-                            session_id.as_deref(),
-                            None,
-                        )
-                        .await;
-                    }
-
-                    // Defensive re-query: if this turn was rate/capacity limited
-                    // and a fresh enumeration now returns accounts, fall through
-                    // to the rotation loop instead of surfacing the failure.
-                    let constrained = matches!(
-                        result.terminal_reason,
-                        Some(TerminalReason::RateLimited | TerminalReason::CapacityLimited)
-                    );
-                    if constrained {
-                        let recheck = collect_codex_credentials(&config.working_dir);
-                        if !recheck.is_empty() {
-                            tracing::warn!(
-                                mission_id = %mission_id,
-                                recovered_credentials = recheck.len(),
-                                "Codex credential pool was empty on first attempt but re-query found accounts after a rate-limited turn; retrying with rotation"
-                            );
-                            all_creds = recheck;
-                            prior_empty_result = Some(result);
-                            // fall through to rotation loop below
-                        } else {
-                            break 'codex_arm result;
-                        }
-                    } else {
-                        break 'codex_arm result;
-                    }
-                }
-                {
-                    let mut attempted_credentials: HashSet<String> = HashSet::new();
-                    let mut attempt_idx = 0usize;
-                    let mut last_constrained_result: Option<AgentResult> = prior_empty_result;
-
-                    loop {
-                        if cancel.is_cancelled() {
-                            break last_constrained_result
-                                .unwrap_or_else(cancel_or_shutdown_failure);
-                        }
-
-                        let lease = lease_codex_account(
-                            &config.working_dir,
-                            &attempted_credentials,
-                            &cancel,
-                        )
-                        .await;
-                        let Some(lease) = lease else {
-                            if let Some(prev) = last_constrained_result {
-                                break prev;
-                            }
-                            break AgentResult::failure(
-                            "All configured Codex accounts are currently at capacity. Try again shortly."
-                                .to_string(),
-                            0,
-                        )
-                        .with_terminal_reason(TerminalReason::CapacityLimited);
-                        };
-
-                        attempt_idx += 1;
-                        let credential_label = lease.credential.label_for_logs();
-                        attempted_credentials.insert(lease.credential.fingerprint());
-                        let credential_override = lease.credential.as_override();
-
-                        tracing::info!(
-                            mission_id = %mission_id,
-                            attempt = attempt_idx,
-                            credential = %credential_label,
-                            total_credentials = all_creds.len(),
-                            "Running Codex turn with leased account slot"
-                        );
-
-                        let mut result = run_codex_turn(
-                            &workspace,
-                            &mission_work_dir,
-                            codex_message,
-                            requested_model,
-                            model_effort.as_deref(),
-                            effective_agent.as_deref(),
-                            mission_id,
-                            events_tx.clone(),
-                            cancel.clone(),
-                            &config.working_dir,
-                            session_id.as_deref(),
-                            Some(&credential_override),
-                        )
-                        .await;
-
-                        if let Some(fallback_model) =
-                            codex_chatgpt_fallback_for_result(requested_model, &result)
-                        {
-                            tracing::warn!(
-                                mission_id = %mission_id,
-                                attempt = attempt_idx,
-                                requested_model = ?requested_model,
-                                fallback_model,
-                                credential = %credential_label,
-                                "Retrying Codex turn with fallback model for ChatGPT account compatibility"
-                            );
-                            result = run_codex_turn(
-                                &workspace,
-                                &mission_work_dir,
-                                codex_message,
-                                Some(fallback_model),
-                                model_effort.as_deref(),
-                                effective_agent.as_deref(),
-                                mission_id,
-                                events_tx.clone(),
-                                cancel.clone(),
-                                &config.working_dir,
-                                session_id.as_deref(),
-                                Some(&credential_override),
-                            )
-                            .await;
-                        } else if codex_tool_stall_should_retry_with_default_model(
-                            requested_model,
-                            &result,
-                        ) {
-                            tracing::warn!(
-                                mission_id = %mission_id,
-                                attempt = attempt_idx,
-                                requested_model = ?requested_model,
-                                credential = %credential_label,
-                                "Retrying Codex turn on the requested model (not the stale Codex CLI default) after it stopped before tool use"
-                            );
-                            result = run_codex_turn(
-                                &workspace,
-                                &mission_work_dir,
-                                codex_message,
-                                // Was `None` (stale CLI default gpt-5.3-codex,
-                                // 400 on ChatGPT auth). Retry on the requested
-                                // (latest) model instead.
-                                requested_model,
-                                model_effort.as_deref(),
-                                effective_agent.as_deref(),
-                                mission_id,
-                                events_tx.clone(),
-                                cancel.clone(),
-                                &config.working_dir,
-                                session_id.as_deref(),
-                                Some(&credential_override),
-                            )
-                            .await;
-                        }
-
-                        drop(lease);
-
-                        match result.terminal_reason {
-                            Some(
-                                TerminalReason::RateLimited
-                                | TerminalReason::CapacityLimited
-                                | TerminalReason::AuthError,
-                            ) if attempted_credentials.len() < all_creds.len() => {
-                                let reason = match result.terminal_reason {
-                                    Some(TerminalReason::CapacityLimited) => "capacity limited",
-                                    Some(TerminalReason::AuthError) => {
-                                        "auth failed (likely refresh-token reuse)"
-                                    }
-                                    _ => "rate limited",
-                                };
-                                tracing::info!(
-                                    mission_id = %mission_id,
-                                    attempt = attempt_idx,
-                                    reason,
-                                    "Codex account constrained; leasing next account"
-                                );
-                                last_constrained_result = Some(result);
-                            }
-                            _ => break result,
-                        }
-                    }
-                }
-            }
+            // Unified credential pool + rotation + cooldown handling lives in
+            // run_codex_turn_with_rotation so the control-channel follow-up
+            // path gets identical account-rotation behaviour.
+            run_codex_turn_with_rotation(
+                &workspace,
+                &mission_work_dir,
+                codex_message,
+                requested_model,
+                model_effort.as_deref(),
+                effective_agent.as_deref(),
+                mission_id,
+                events_tx.clone(),
+                cancel.clone(),
+                &config.working_dir,
+                session_id.as_deref(),
+            )
+            .await
         }
         "gemini" => {
             run_gemini_turn(
@@ -13265,6 +13127,271 @@ fn contains_ascii_word(haystack: &str, needle: &str) -> bool {
     false
 }
 
+/// Run a codex turn through the unified credential pool with rotation and
+/// account-level cooldown handling. Shared by the initial mission dispatch
+/// and the control-channel follow-up path so a usage-capped ChatGPT account
+/// rotates to the next credential everywhere.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_codex_turn_with_rotation(
+    workspace: &Workspace,
+    mission_work_dir: &std::path::Path,
+    codex_message: &str,
+    requested_model: Option<&str>,
+    model_effort: Option<&str>,
+    agent: Option<&str>,
+    mission_id: Uuid,
+    events_tx: broadcast::Sender<AgentEvent>,
+    cancel: CancellationToken,
+    app_working_dir: &std::path::Path,
+    session_id: Option<&str>,
+) -> AgentResult {
+    'codex_arm: {
+        let mut all_creds = collect_codex_credentials(app_working_dir);
+        let mut prior_empty_result: Option<AgentResult> = None;
+        if all_creds.is_empty() {
+            let mut result = run_codex_turn(
+                workspace,
+                mission_work_dir,
+                codex_message,
+                requested_model,
+                model_effort,
+                agent,
+                mission_id,
+                events_tx.clone(),
+                cancel.clone(),
+                app_working_dir,
+                session_id,
+                None,
+            )
+            .await;
+
+            if let Some(fallback_model) =
+                codex_chatgpt_fallback_for_result(requested_model, &result)
+            {
+                tracing::warn!(
+                    mission_id = %mission_id,
+                    requested_model = ?requested_model,
+                    fallback_model,
+                    "Retrying Codex turn with fallback model for ChatGPT account compatibility"
+                );
+                result = run_codex_turn(
+                    workspace,
+                    mission_work_dir,
+                    codex_message,
+                    Some(fallback_model),
+                    model_effort,
+                    agent,
+                    mission_id,
+                    events_tx.clone(),
+                    cancel.clone(),
+                    app_working_dir,
+                    session_id,
+                    None,
+                )
+                .await;
+            } else if codex_tool_stall_should_retry_with_default_model(requested_model, &result) {
+                tracing::warn!(
+                    mission_id = %mission_id,
+                    requested_model = ?requested_model,
+                    "Retrying Codex turn on the requested model (not the stale Codex CLI default) after it stopped before tool use"
+                );
+                result = run_codex_turn(
+                    workspace,
+                    mission_work_dir,
+                    codex_message,
+                    // Was `None`, which made the Codex CLI fall back to
+                    // its built-in default — currently the retired
+                    // `gpt-5.3-codex`, rejected by ChatGPT-account auth
+                    // with a 400. Retry on the requested (latest) model.
+                    requested_model,
+                    model_effort,
+                    agent,
+                    mission_id,
+                    events_tx.clone(),
+                    cancel.clone(),
+                    app_working_dir,
+                    session_id,
+                    None,
+                )
+                .await;
+            }
+
+            // Defensive re-query: if this turn was rate/capacity limited
+            // and a fresh enumeration now returns accounts, fall through
+            // to the rotation loop instead of surfacing the failure.
+            let constrained = matches!(
+                result.terminal_reason,
+                Some(TerminalReason::RateLimited | TerminalReason::CapacityLimited)
+            );
+            if constrained {
+                let recheck = collect_codex_credentials(app_working_dir);
+                if !recheck.is_empty() {
+                    tracing::warn!(
+                        mission_id = %mission_id,
+                        recovered_credentials = recheck.len(),
+                        "Codex credential pool was empty on first attempt but re-query found accounts after a rate-limited turn; retrying with rotation"
+                    );
+                    all_creds = recheck;
+                    prior_empty_result = Some(result);
+                    // fall through to rotation loop below
+                } else {
+                    break 'codex_arm result;
+                }
+            } else {
+                break 'codex_arm result;
+            }
+        }
+        {
+            let mut attempted_credentials: HashSet<String> = HashSet::new();
+            let mut attempt_idx = 0usize;
+            let mut last_constrained_result: Option<AgentResult> = prior_empty_result;
+
+            loop {
+                if cancel.is_cancelled() {
+                    break last_constrained_result.unwrap_or_else(cancel_or_shutdown_failure);
+                }
+
+                let lease =
+                    lease_codex_account(app_working_dir, &attempted_credentials, &cancel).await;
+                let Some(lease) = lease else {
+                    if let Some(prev) = last_constrained_result {
+                        break prev;
+                    }
+                    break AgentResult::failure(
+                    "All configured Codex accounts are currently at capacity. Try again shortly."
+                        .to_string(),
+                    0,
+                )
+                .with_terminal_reason(TerminalReason::CapacityLimited);
+                };
+
+                attempt_idx += 1;
+                let credential_label = lease.credential.label_for_logs();
+                let credential_fingerprint = lease.credential.fingerprint();
+                attempted_credentials.insert(credential_fingerprint.clone());
+                let credential_override = lease.credential.as_override();
+
+                tracing::info!(
+                    mission_id = %mission_id,
+                    attempt = attempt_idx,
+                    credential = %credential_label,
+                    total_credentials = all_creds.len(),
+                    "Running Codex turn with leased account slot"
+                );
+
+                let mut result = run_codex_turn(
+                    workspace,
+                    mission_work_dir,
+                    codex_message,
+                    requested_model,
+                    model_effort,
+                    agent,
+                    mission_id,
+                    events_tx.clone(),
+                    cancel.clone(),
+                    app_working_dir,
+                    session_id,
+                    Some(&credential_override),
+                )
+                .await;
+
+                if let Some(fallback_model) =
+                    codex_chatgpt_fallback_for_result(requested_model, &result)
+                {
+                    tracing::warn!(
+                        mission_id = %mission_id,
+                        attempt = attempt_idx,
+                        requested_model = ?requested_model,
+                        fallback_model,
+                        credential = %credential_label,
+                        "Retrying Codex turn with fallback model for ChatGPT account compatibility"
+                    );
+                    result = run_codex_turn(
+                        workspace,
+                        mission_work_dir,
+                        codex_message,
+                        Some(fallback_model),
+                        model_effort,
+                        agent,
+                        mission_id,
+                        events_tx.clone(),
+                        cancel.clone(),
+                        app_working_dir,
+                        session_id,
+                        Some(&credential_override),
+                    )
+                    .await;
+                } else if codex_tool_stall_should_retry_with_default_model(requested_model, &result)
+                {
+                    tracing::warn!(
+                        mission_id = %mission_id,
+                        attempt = attempt_idx,
+                        requested_model = ?requested_model,
+                        credential = %credential_label,
+                        "Retrying Codex turn on the requested model (not the stale Codex CLI default) after it stopped before tool use"
+                    );
+                    result = run_codex_turn(
+                        workspace,
+                        mission_work_dir,
+                        codex_message,
+                        // Was `None` (stale CLI default gpt-5.3-codex,
+                        // 400 on ChatGPT auth). Retry on the requested
+                        // (latest) model instead.
+                        requested_model,
+                        model_effort,
+                        agent,
+                        mission_id,
+                        events_tx.clone(),
+                        cancel.clone(),
+                        app_working_dir,
+                        session_id,
+                        Some(&credential_override),
+                    )
+                    .await;
+                }
+
+                // Cooldown bookkeeping: a capped/constrained account is
+                // skipped by every future lease (this turn or any later
+                // path) until its cooldown lapses; a healthy turn clears
+                // any stale cooldown.
+                match result
+                    .terminal_reason
+                    .as_ref()
+                    .and_then(codex_cooldown_for_reason)
+                {
+                    Some(cooldown) => set_codex_account_cooldown(&credential_fingerprint, cooldown),
+                    None => clear_codex_account_cooldown(&credential_fingerprint),
+                }
+                drop(lease);
+
+                match result.terminal_reason {
+                    Some(
+                        TerminalReason::RateLimited
+                        | TerminalReason::CapacityLimited
+                        | TerminalReason::AuthError,
+                    ) if attempted_credentials.len() < all_creds.len() => {
+                        let reason = match result.terminal_reason {
+                            Some(TerminalReason::CapacityLimited) => "capacity limited",
+                            Some(TerminalReason::AuthError) => {
+                                "auth failed (likely refresh-token reuse)"
+                            }
+                            _ => "rate limited",
+                        };
+                        tracing::info!(
+                            mission_id = %mission_id,
+                            attempt = attempt_idx,
+                            reason,
+                            "Codex account constrained; leasing next account"
+                        );
+                        last_constrained_result = Some(result);
+                    }
+                    _ => break result,
+                }
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn run_codex_turn(
     workspace: &Workspace,
@@ -14674,8 +14801,9 @@ mod tests {
         claudecode_malformed_startup_message, claudecode_pre_turn_transport_message,
         claudecode_resume_current_session_message, claudecode_transport_failure_data,
         claudecode_transport_failure_stage, claudecode_transport_failure_stage_for_incomplete_turn,
-        claudecode_transport_recovery_strategy, codex_chatgpt_fallback_for_result,
-        codex_chatgpt_fallback_model, codex_error_message_to_surface,
+        claudecode_transport_recovery_strategy, clear_codex_account_cooldown,
+        codex_account_cooldown_remaining, codex_chatgpt_fallback_for_result,
+        codex_chatgpt_fallback_model, codex_cooldown_for_reason, codex_error_message_to_surface,
         codex_final_message_looks_like_progress_update, codex_is_goal_request,
         codex_key_fingerprint, codex_missing_goal_final_response_message,
         codex_tool_stall_should_retry_with_default_model, codex_turn_requires_tool_activity,
@@ -14690,11 +14818,13 @@ mod tests {
         parse_opencode_goal_objective, parse_opencode_session_token, parse_opencode_sse_event,
         parse_opencode_stderr_text_part, preferred_model_for_cost, record_codex_error_message,
         replace_filepath_artifact_with_tool_output, resolve_cost_cents_and_source, running_health,
-        sanitized_opencode_stdout, stall_severity, strip_ansi_codes, strip_opencode_banner_lines,
-        strip_think_tags, summarize_recent_opencode_stderr, thinking_overlaps_visible_answer,
-        use_thinking_only_fallback, ClaudeIncompleteTurnContext, ClaudeTransportFailureStage,
-        ClaudeTransportRecoveryStrategy, ClaudeTurnWaitState, MissionHealth, MissionRunState,
-        MissionStallSeverity, OpencodeSseState, STALL_SEVERE_SECS, STALL_WARN_SECS,
+        sanitized_opencode_stdout, set_codex_account_cooldown, stall_severity, strip_ansi_codes,
+        strip_opencode_banner_lines, strip_think_tags, summarize_recent_opencode_stderr,
+        thinking_overlaps_visible_answer, use_thinking_only_fallback, utf8_safe_prefix,
+        ClaudeIncompleteTurnContext, ClaudeTransportFailureStage, ClaudeTransportRecoveryStrategy,
+        ClaudeTurnWaitState, MissionHealth, MissionRunState, MissionStallSeverity,
+        OpencodeSseState, CODEX_AUTH_ERROR_COOLDOWN, CODEX_CAPACITY_COOLDOWN,
+        CODEX_RATE_LIMIT_COOLDOWN, STALL_SEVERE_SECS, STALL_WARN_SECS,
     };
     use super::{
         extract_telegram_instructions, grok_event_reasoning, grok_event_text, grok_event_usage,
@@ -15083,6 +15213,57 @@ mod tests {
         assert!(is_rate_limited_error(
             "see chatgpt.com/codex/settings/usage for details"
         ));
+    }
+
+    #[test]
+    fn codex_account_cooldown_set_query_clear() {
+        let fp = "test:cooldown-roundtrip";
+        assert!(codex_account_cooldown_remaining(fp).is_none());
+        set_codex_account_cooldown(fp, std::time::Duration::from_secs(60));
+        let remaining = codex_account_cooldown_remaining(fp).expect("cooldown set");
+        assert!(remaining <= std::time::Duration::from_secs(60));
+        assert!(remaining > std::time::Duration::from_secs(50));
+        clear_codex_account_cooldown(fp);
+        assert!(codex_account_cooldown_remaining(fp).is_none());
+    }
+
+    #[test]
+    fn codex_account_cooldown_expires() {
+        let fp = "test:cooldown-expiry";
+        set_codex_account_cooldown(fp, std::time::Duration::from_millis(0));
+        // A zero-duration cooldown is immediately lapsed.
+        assert!(codex_account_cooldown_remaining(fp).is_none());
+        clear_codex_account_cooldown(fp);
+    }
+
+    #[test]
+    fn utf8_safe_prefix_respects_char_boundaries() {
+        // The exact production crash: em-dash (3 bytes) straddling byte 100.
+        let msg = format!("{}\u{2014}maybe using a few workflows", "a".repeat(98));
+        let prefix = utf8_safe_prefix(&msg, 100);
+        assert_eq!(prefix.len(), 98); // backs off to before the em-dash
+        assert!(prefix.chars().all(|c| c == 'a'));
+        // Boundary-exact and short inputs pass through untouched.
+        assert_eq!(utf8_safe_prefix("abc", 100), "abc");
+        assert_eq!(utf8_safe_prefix("abcd", 4), "abcd");
+        assert_eq!(utf8_safe_prefix("ab\u{2014}", 3), "ab");
+    }
+
+    #[test]
+    fn codex_cooldown_reason_mapping() {
+        assert_eq!(
+            codex_cooldown_for_reason(&TerminalReason::RateLimited),
+            Some(CODEX_RATE_LIMIT_COOLDOWN)
+        );
+        assert_eq!(
+            codex_cooldown_for_reason(&TerminalReason::CapacityLimited),
+            Some(CODEX_CAPACITY_COOLDOWN)
+        );
+        assert_eq!(
+            codex_cooldown_for_reason(&TerminalReason::AuthError),
+            Some(CODEX_AUTH_ERROR_COOLDOWN)
+        );
+        assert_eq!(codex_cooldown_for_reason(&TerminalReason::Cancelled), None);
     }
 
     #[test]

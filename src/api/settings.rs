@@ -126,9 +126,12 @@ struct LlmRolesResponse {
 async fn get_llm_roles(State(state): State<Arc<AppState>>) -> Json<LlmRolesResponse> {
     let model_override = state.settings.get().await.ask_assistant_model;
 
-    let assistant =
-        super::metadata_llm::assistant_role_status(&state.ai_providers, model_override.clone())
-            .await;
+    let assistant = super::metadata_llm::assistant_role_status(
+        &state.ai_providers,
+        &state.chain_store,
+        model_override.clone(),
+    )
+    .await;
     let metadata = super::metadata_llm::metadata_role_status(&state.ai_providers).await;
 
     // The override is honored only when the resolved model actually matches it

@@ -12294,7 +12294,14 @@ async fn run_single_control_turn(
                 convo.clone()
             };
             let codex_message: &str = codex_message_owned.as_str();
-            let mut result = Box::pin(super::mission_runner::run_codex_turn(
+            // Shared rotation wrapper: identical account rotation + usage-cap
+            // cooldown behaviour to the initial mission dispatch. Previously
+            // this path ran a single bare run_codex_turn with no credential
+            // override, so a follow-up/retry on a usage-capped ChatGPT
+            // account kept re-hitting the same cap instead of rotating to
+            // the next account. Fallback-model and tool-stall retries are
+            // handled inside the wrapper per attempted credential.
+            Box::pin(super::mission_runner::run_codex_turn_with_rotation(
                 exec_workspace,
                 &ctx.working_dir,
                 codex_message,
@@ -12306,62 +12313,8 @@ async fn run_single_control_turn(
                 cancel.clone(),
                 &config.working_dir,
                 session_id.as_deref(),
-                None,
             ))
-            .await;
-
-            if let Some(fallback_model) = super::mission_runner::codex_chatgpt_fallback_for_result(
-                requested_codex_model,
-                &result,
-            ) {
-                tracing::warn!(
-                    mission_id = %mid,
-                    requested_model = ?requested_codex_model,
-                    fallback_model,
-                    "Retrying Codex turn with fallback model for ChatGPT account compatibility (control path)"
-                );
-                result = Box::pin(super::mission_runner::run_codex_turn(
-                    exec_workspace,
-                    &ctx.working_dir,
-                    codex_message,
-                    Some(fallback_model),
-                    requested_model_effort.as_deref(),
-                    config.opencode_agent.as_deref(),
-                    mid,
-                    events_tx.clone(),
-                    cancel,
-                    &config.working_dir,
-                    session_id.as_deref(),
-                    None,
-                ))
-                .await;
-            } else if super::mission_runner::codex_tool_stall_should_retry_with_default_model(
-                requested_codex_model,
-                &result,
-            ) {
-                tracing::warn!(
-                    mission_id = %mid,
-                    requested_model = ?requested_codex_model,
-                    "Retrying Codex turn with CLI default model after generic GPT model stopped before tool use (control path)"
-                );
-                result = Box::pin(super::mission_runner::run_codex_turn(
-                    exec_workspace,
-                    &ctx.working_dir,
-                    codex_message,
-                    None,
-                    requested_model_effort.as_deref(),
-                    config.opencode_agent.as_deref(),
-                    mid,
-                    events_tx.clone(),
-                    cancel,
-                    &config.working_dir,
-                    session_id.as_deref(),
-                    None,
-                ))
-                .await;
-            }
-
-            result
+            .await
         }
         Some("gemini") => {
             let mid = match require_mission_id(mission_id, "Gemini CLI", &events_tx) {
