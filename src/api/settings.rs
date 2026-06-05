@@ -23,6 +23,7 @@ use super::routes::AppState;
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/", get(get_settings).put(update_settings))
+        .route("/llm-roles", get(get_llm_roles))
         .route("/library-remote", put(update_library_remote))
         .route("/backup", get(download_backup))
         .route("/restore", post(restore_backup))
@@ -97,6 +98,60 @@ pub struct UpdateLibraryRemoteResponse {
 async fn get_settings(State(state): State<Arc<AppState>>) -> Json<SettingsResponse> {
     let settings = state.settings.get().await;
     Json(settings.into())
+}
+
+/// Where the assistant model came from: an explicit Settings override, the
+/// `ASK_ASSISTANT_MODEL` env var, or automatic resolution (built-in default
+/// or provider-ladder fallback).
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum AssistantModelSource {
+    Settings,
+    Env,
+    Auto,
+}
+
+/// Response for the LLM roles status endpoint.
+#[derive(Debug, Serialize)]
+struct LlmRolesResponse {
+    /// The Ask sidecar co-pilot.
+    assistant: super::metadata_llm::LlmRoleStatus,
+    assistant_source: AssistantModelSource,
+    /// Mission titles & status lines.
+    metadata: super::metadata_llm::LlmRoleStatus,
+}
+
+/// GET /api/settings/llm-roles
+/// Sanitized view of which provider/model each backend LLM role resolves to.
+async fn get_llm_roles(State(state): State<Arc<AppState>>) -> Json<LlmRolesResponse> {
+    let model_override = state.settings.get().await.ask_assistant_model;
+
+    let assistant =
+        super::metadata_llm::assistant_role_status(&state.ai_providers, model_override.clone())
+            .await;
+    let metadata = super::metadata_llm::metadata_role_status(&state.ai_providers).await;
+
+    // The override is honored only when the resolved model actually matches it
+    // (a non-Cerebras ladder fallback serves its own model namespace).
+    let explicit = model_override
+        .filter(|m| !m.trim().is_empty())
+        .map(|m| (AssistantModelSource::Settings, m))
+        .or_else(|| {
+            std::env::var("ASK_ASSISTANT_MODEL")
+                .ok()
+                .filter(|m| !m.trim().is_empty())
+                .map(|m| (AssistantModelSource::Env, m))
+        });
+    let assistant_source = match explicit {
+        Some((source, model)) if assistant.model.as_deref() == Some(model.trim()) => source,
+        _ => AssistantModelSource::Auto,
+    };
+
+    Json(LlmRolesResponse {
+        assistant,
+        assistant_source,
+        metadata,
+    })
 }
 
 /// PUT /api/settings

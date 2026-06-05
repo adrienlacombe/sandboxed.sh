@@ -3046,6 +3046,28 @@ export async function getSettings(): Promise<SettingsResponse> {
   return apiGet("/api/settings", "Failed to get settings");
 }
 
+/** Sanitized resolved config for one backend LLM role (no API key). */
+export interface LlmRoleStatus {
+  available: boolean;
+  provider?: string;
+  model?: string;
+  base_url?: string;
+}
+
+export interface LlmRolesResponse {
+  /** The Ask sidecar co-pilot. */
+  assistant: LlmRoleStatus;
+  /** Where the assistant model came from. */
+  assistant_source: "settings" | "env" | "auto";
+  /** Mission titles & status lines. */
+  metadata: LlmRoleStatus;
+}
+
+// Get the resolved provider/model for each backend LLM role
+export async function getLlmRoles(): Promise<LlmRolesResponse> {
+  return apiGet("/api/settings/llm-roles", "Failed to get LLM roles");
+}
+
 export async function updateSettings(
   settings: Partial<SettingsResponse>,
 ): Promise<SettingsResponse> {

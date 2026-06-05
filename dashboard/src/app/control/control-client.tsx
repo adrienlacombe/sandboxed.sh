@@ -96,7 +96,6 @@ import {
   listMissionAutomations,
   updateAutomation,
   deleteMission,
-  autoGenerateMissionTitle,
   listWorkspaces,
   getHealth,
   listDesktopSessions,
@@ -5447,7 +5446,6 @@ export default function ControlClient() {
   const currentMissionRef = useRef<Mission | null>(null);
   const viewingMissionRef = useRef<Mission | null>(null);
   const submittingRef = useRef(false); // Guard against double-submission
-  const autoTitleAttemptedRef = useRef<Set<string>>(new Set()); // Track missions we've tried to auto-title
   const inputRef = useRef(input);
   const draftMissionIdRef = useRef<string | null>(viewingMissionId);
 
@@ -8327,40 +8325,6 @@ export default function ControlClient() {
           phase: "idle",
         }));
 
-        // Auto-generate mission title on first successful assistant response (LLM-powered, best-effort).
-        // Use viewingMissionIdRef (not currentMissionRef) to target the correct mission —
-        // events are already filtered by viewingId, so this matches the event's mission.
-        const targetMissionId = viewingMissionIdRef.current;
-        const targetMission = viewingMissionRef.current;
-        if (
-          targetMissionId &&
-          !isFailure &&
-          !targetMission?.title &&
-          !autoTitleAttemptedRef.current.has(targetMissionId)
-        ) {
-          autoTitleAttemptedRef.current.add(targetMissionId);
-          const assistantContent = String(data["content"] ?? "");
-          // Use itemsRef for synchronous read — avoids side effects in state updaters
-          // and prevents double-firing in React StrictMode.
-          const firstUser = itemsRef.current.find((it) => it.kind === "user");
-          if (firstUser && firstUser.kind === "user") {
-            autoGenerateMissionTitle(
-              targetMissionId,
-              firstUser.content,
-              assistantContent,
-            ).then((title) => {
-              if (title) {
-                // Update local mission state so the UI reflects the new title immediately
-                setCurrentMission((m) =>
-                  m?.id === targetMissionId ? { ...m, title } : m,
-                );
-                setViewingMission((m) =>
-                  m?.id === targetMissionId ? { ...m, title } : m,
-                );
-              }
-            });
-          }
-        }
         return;
       }
 
