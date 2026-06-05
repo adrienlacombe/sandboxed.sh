@@ -868,7 +868,7 @@ fn sanitize_env_vars(env_vars: HashMap<String, String>) -> HashMap<String, Strin
         .collect()
 }
 
-fn is_valid_env_name(key: &str) -> bool {
+pub(crate) fn is_valid_env_name(key: &str) -> bool {
     let mut chars = key.chars();
     match chars.next() {
         Some(c) if c.is_ascii_alphabetic() || c == '_' => {}

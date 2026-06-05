@@ -181,6 +181,7 @@ pub async fn ask_send(
     let used_sandbox = sandbox_dir.is_some();
     let work_dir = sandbox_dir.clone().unwrap_or_else(|| base_work_dir.clone());
 
+    let workspace_id = workspace.id;
     let turn = AskTurn {
         ask_store: Arc::clone(&ask_store),
         mission_store: Arc::clone(&control.mission_store),
@@ -190,6 +191,9 @@ pub async fn ask_send(
         mission_id,
         thread_id: thread.id,
         sandbox: used_sandbox,
+        workspaces: Arc::clone(&state.workspaces),
+        workspace_id,
+        proxy_keys: Arc::clone(&state.proxy_api_keys),
     };
 
     let answer_result = run_ask_turn(&turn, &req.content).await;
@@ -299,6 +303,7 @@ pub async fn ask_send_stream(
     let used_sandbox = sandbox_dir.is_some();
     let work_dir = sandbox_dir.clone().unwrap_or_else(|| base_work_dir.clone());
 
+    let workspace_id = workspace.id;
     let turn = AskTurn {
         ask_store: Arc::clone(&ask_store),
         mission_store: Arc::clone(&control.mission_store),
@@ -308,6 +313,9 @@ pub async fn ask_send_stream(
         mission_id,
         thread_id: thread.id,
         sandbox: used_sandbox,
+        workspaces: Arc::clone(&state.workspaces),
+        workspace_id,
+        proxy_keys: Arc::clone(&state.proxy_api_keys),
     };
 
     let content = req.content.clone();
