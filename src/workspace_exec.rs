@@ -800,7 +800,38 @@ impl WorkspaceExec {
             let env_ref = if env.is_empty() { None } else { Some(&env) };
             Self::build_shell_command_with_env(&rel_cwd, program, args, env_ref)
         };
-        let mut cmd = Command::new(nsenter);
+        // Per-mission isolation, nsenter edition. `nsenter` only enters the
+        // container's *namespaces* — the spawned process stays in the
+        // caller's cgroup (the API service's), so without this wrapper a
+        // runaway build attached to an already-running container bypasses
+        // the boot-path mission scope entirely (observed live: a 47 GiB
+        // Lean build throttling the whole service cgroup while the
+        // container's own scope sat at 24G/2MB). Wrap each attach in its
+        // own capped transient scope when `MISSION_MEMORY_MAX` is set.
+        let mission_mem_max = std::env::var("MISSION_MEMORY_MAX")
+            .ok()
+            .filter(|s| !s.trim().is_empty());
+        let mut cmd = if let Some(mem_max) = &mission_mem_max {
+            let mut c = Command::new("systemd-run");
+            c.arg("--scope")
+                .arg("--quiet")
+                .arg("--collect")
+                .arg(format!(
+                    "--unit=sandboxed-exec-{}",
+                    uuid::Uuid::new_v4().simple()
+                ))
+                .arg(format!("--property=MemoryMax={mem_max}"));
+            if let Some(mem_high) = std::env::var("MISSION_MEMORY_HIGH")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+            {
+                c.arg(format!("--property=MemoryHigh={mem_high}"));
+            }
+            c.arg(nsenter);
+            c
+        } else {
+            Command::new(nsenter)
+        };
         cmd.args([
             "--target", leader, "--mount", "--uts", "--ipc", "--net", "--pid",
         ]);
