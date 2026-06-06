@@ -11300,17 +11300,14 @@ pub async fn run_opencode_turn(
                                 }
                             }
 
-                            // Track tool depth for plain opencode JSON mode so that
-                            // the text-output idle timeout doesn't kill the process
-                            // while MCP tools (web fetch, etc.) are actively running.
+                            // Reset tool depth at step boundaries for plain opencode
+                            // JSON mode.  Per-tool increments/decrements happen below
+                            // on the ToolCall/ToolResult events emitted by the shared
+                            // parser (which also covers message.part.updated tool
+                            // parts), so the resets here are a safety net against a
+                            // missed ToolResult pinning depth above zero forever.
                             if let Some(ref tx) = json_tool_depth_tx {
-                                if event_type == "tool_use" {
-                                    tx.send_modify(|v| *v = v.saturating_add(1));
-                                } else if event_type == "step_finish" {
-                                    // All tools for this step completed — reset depth.
-                                    tx.send_modify(|v| *v = 0);
-                                } else if event_type == "step_start" {
-                                    // New step starting — ensure depth is clean.
+                                if event_type == "step_finish" || event_type == "step_start" {
                                     tx.send_modify(|v| *v = 0);
                                 }
                             }
@@ -11466,10 +11463,35 @@ pub async fn run_opencode_turn(
                                         let _ = text_output_tx.send(true);
                                         sse_emitted_text.store(true, std::sync::atomic::Ordering::SeqCst);
                                     }
+                                    // Track active tool depth so inactivity timeouts
+                                    // don't kill the process mid-tool-run (builds,
+                                    // web fetches, etc.).
+                                    if let Some(ref tx) = json_tool_depth_tx {
+                                        match event {
+                                            AgentEvent::ToolCall { .. } => {
+                                                tx.send_modify(|v| *v = v.saturating_add(1));
+                                            }
+                                            AgentEvent::ToolResult { .. } => {
+                                                tx.send_modify(|v| *v = v.saturating_sub(1));
+                                            }
+                                            _ => {}
+                                        }
+                                    }
                                     remember_tool_result_text(&event, &latest_tool_result_text);
                                     let _ = events_tx.send(event);
                                 }
                                 for event in parsed.extra_events {
+                                    if let Some(ref tx) = json_tool_depth_tx {
+                                        match event {
+                                            AgentEvent::ToolCall { .. } => {
+                                                tx.send_modify(|v| *v = v.saturating_add(1));
+                                            }
+                                            AgentEvent::ToolResult { .. } => {
+                                                tx.send_modify(|v| *v = v.saturating_sub(1));
+                                            }
+                                            _ => {}
+                                        }
+                                    }
                                     remember_tool_result_text(&event, &latest_tool_result_text);
                                     let _ = events_tx.send(event);
                                 }

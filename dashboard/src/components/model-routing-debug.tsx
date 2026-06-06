@@ -87,8 +87,19 @@ function ChainRow({ chain }: { chain: ModelChain }) {
           const r = resolved?.find(
             (x) => x.provider_id === entry.provider_id && x.model_id === entry.model_id
           );
-          const h = r ? healthByAccount.get(r.account_id) : undefined;
-          const skipped = !r;
+          // /resolve omits accounts in cooldown, so fall back to matching
+          // health by provider — otherwise cooled-down entries read as
+          // "unresolved" with no way to clear the cooldown.
+          const cooledFallback = !r
+            ? (health ?? []).find(
+                (x) =>
+                  x.provider_id === entry.provider_id &&
+                  x.cooldown_remaining_secs != null
+              )
+            : undefined;
+          const h = r ? healthByAccount.get(r.account_id) : cooledFallback;
+          const accountId = r?.account_id ?? cooledFallback?.account_id;
+          const skipped = !r && !cooledFallback;
           const inCooldown = h?.cooldown_remaining_secs != null;
           const noCredentials = r != null && !r.has_credentials;
           const degraded = h?.is_degraded === true;
@@ -123,7 +134,7 @@ function ChainRow({ chain }: { chain: ModelChain }) {
                     degraded
                   </span>
                 )}
-                {inCooldown && (
+                {inCooldown && accountId && (
                   <>
                     <span className="text-red-400">
                       cooldown {Math.round(h!.cooldown_remaining_secs!)}s
@@ -131,7 +142,7 @@ function ChainRow({ chain }: { chain: ModelChain }) {
                     <button
                       onClick={async () => {
                         try {
-                          await clearAccountCooldown(r!.account_id);
+                          await clearAccountCooldown(accountId);
                           await mutateHealth();
                           toast.success('Cooldown cleared');
                         } catch (e) {
