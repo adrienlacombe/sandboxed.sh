@@ -9211,27 +9211,36 @@ fn resolve_codex_native_binary_search_paths(
     let mut paths = Vec::new();
     let npm_pkg = codex_npm_package_name(triple);
 
+    // Layout changed across codex releases: ≤0.128 ships the native binary
+    // at `vendor/<triple>/codex/<bin>`, ≥0.137 at `vendor/<triple>/bin/<bin>`.
+    // Probe both for every base so host upgrades don't strand the resolver.
     let binary_path = |base: &std::path::Path| {
-        base.join("vendor")
-            .join(triple)
-            .join("codex")
-            .join(binary_name)
+        [
+            base.join("vendor")
+                .join(triple)
+                .join("codex")
+                .join(binary_name),
+            base.join("vendor")
+                .join(triple)
+                .join("bin")
+                .join(binary_name),
+        ]
     };
 
     if let Some(bin_dir) = wrapper_path.parent() {
         if let Some(package_root) = bin_dir.parent() {
-            paths.push(binary_path(package_root));
+            paths.extend(binary_path(package_root));
 
             let nested_optional = package_root
                 .join("node_modules")
                 .join("@openai")
                 .join(npm_pkg);
-            paths.push(binary_path(&nested_optional));
+            paths.extend(binary_path(&nested_optional));
         }
 
         if let Some(node_modules) = bin_dir.parent() {
             let sibling_optional = node_modules.join("@openai").join(npm_pkg);
-            paths.push(binary_path(&sibling_optional));
+            paths.extend(binary_path(&sibling_optional));
         }
     }
 
@@ -9241,10 +9250,10 @@ fn resolve_codex_native_binary_search_paths(
             .join("node_modules")
             .join("@openai")
             .join("codex");
-        paths.push(binary_path(&npm_root));
+        paths.extend(binary_path(&npm_root));
 
         let npm_optional = npm_root.join("node_modules").join("@openai").join(npm_pkg);
-        paths.push(binary_path(&npm_optional));
+        paths.extend(binary_path(&npm_optional));
     }
 
     for prefix in ["/usr/local", "/usr"] {
@@ -9253,10 +9262,10 @@ fn resolve_codex_native_binary_search_paths(
             .join("node_modules")
             .join("@openai")
             .join("codex");
-        paths.push(binary_path(&npm_root));
+        paths.extend(binary_path(&npm_root));
 
         let npm_optional = npm_root.join("node_modules").join("@openai").join(npm_pkg);
-        paths.push(binary_path(&npm_optional));
+        paths.extend(binary_path(&npm_optional));
     }
 
     if let Ok(home) = std::env::var("HOME") {
@@ -9267,7 +9276,7 @@ fn resolve_codex_native_binary_search_paths(
             .join("node_modules")
             .join("@openai")
             .join(npm_pkg);
-        paths.push(binary_path(&bun_optional));
+        paths.extend(binary_path(&bun_optional));
 
         let bun_cache_optional = std::path::PathBuf::from(&home)
             .join(".cache")
@@ -9277,7 +9286,7 @@ fn resolve_codex_native_binary_search_paths(
             .join("node_modules")
             .join("@openai")
             .join(npm_pkg);
-        paths.push(binary_path(&bun_cache_optional));
+        paths.extend(binary_path(&bun_cache_optional));
     }
 
     paths
