@@ -12094,10 +12094,11 @@ async fn run_single_control_turn(
     let history_context =
         build_history_context(history_for_prompt, config.context.max_history_total_chars);
     let mut convo = String::new();
-    convo.push_str(&history_context);
-    convo.push_str("User:\n");
-    convo.push_str(&user_message);
-    convo.push_str("\n\nInstructions:\n- Continue the conversation helpfully.\n- Use available tools as needed.\n- For large data processing tasks (>10KB), prefer executing scripts rather than inline processing.\n");
+    convo.push_str(&crate::util::frame_turn_prompt(
+        &history_context,
+        &user_message,
+    ));
+    convo.push_str("\n\nInstructions:\n- Respond to the CURRENT user request. The conversation history is context only: do not resume or continue earlier tasks from it unless the current request asks you to.\n- Use available tools as needed.\n- For large data processing tasks (>10KB), prefer executing scripts rather than inline processing.\n");
     let _task = match crate::task::Task::new(convo.clone(), Some(1000)) {
         Ok(t) => t,
         Err(e) => {
