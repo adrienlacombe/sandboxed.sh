@@ -17,6 +17,7 @@ export * from "./api/workspaces";
 export * from "./api/providers";
 export * from "./api/automations";
 export * from "./api/telegram";
+export * from "./api/assistant";
 
 // Import core utilities for use in this file (remaining APIs not yet split)
 import {
@@ -32,6 +33,7 @@ import {
   libPut,
   libDel,
   ensureLibraryResponse,
+  HttpStatusError,
 } from "./api/core";
 
 // Types that remain in this file (not yet migrated to modules)
@@ -481,37 +483,205 @@ export async function getQueue(): Promise<QueuedMessage[]> {
 }
 
 export async function removeFromQueue(messageId: string): Promise<void> {
-  return apiDel(
-    `/api/control/queue/${messageId}`,
-    "Failed to remove from queue",
+  const res = await apiFetch(`/api/control/queue/${messageId}`, {
+    method: "DELETE",
+  });
+  if (!res.ok) {
+    // Carry the status so callers can treat 404 ("message not in queue")
+    // as already-removed instead of a hard failure.
+    throw new HttpStatusError("Failed to remove from queue", res.status);
+  }
+}
+
+/** Clear queued messages. When `missionId` is given, only messages targeting
+ * that mission are cleared — without it the backend wipes every mission's
+ * queue. */
+export async function clearQueue(
+  missionId?: string,
+): Promise<{ cleared: number }> {
+  const path = missionId
+    ? `/api/control/queue?mission_id=${encodeURIComponent(missionId)}`
+    : "/api/control/queue";
+  return apiDel(path, "Failed to clear queue");
+}
+
+// ── Ask assistant (non-interrupting sidecar co-pilot) ──────────────────────
+
+export interface AskThread {
+  id: string;
+  mission_id: string;
+  title: string | null;
+  model: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface AskMessage {
+  id: string;
+  thread_id: string;
+  seq: number;
+  /** "user" | "assistant" | "tool_call" | "tool_result" */
+  role: string;
+  content: string;
+  tool_name?: string | null;
+  tool_call_id?: string | null;
+  metadata?: Record<string, unknown> | null;
+  created_at: string;
+}
+
+export interface AskSendResponse {
+  thread_id: string;
+  answer: string;
+  messages: AskMessage[];
+}
+
+/** Send a question to the Ask assistant for a mission (creates a thread if none).
+ * When `sandbox` is true, the Ask bash tool runs in an isolated git worktree so
+ * its writes never touch the live workspace. */
+export async function askSend(
+  missionId: string,
+  content: string,
+  threadId?: string,
+  sandbox?: boolean,
+): Promise<AskSendResponse> {
+  const body: { content: string; thread_id?: string; sandbox?: boolean } = {
+    content,
+  };
+  if (threadId) body.thread_id = threadId;
+  if (sandbox) body.sandbox = true;
+  return apiPost<AskSendResponse>(
+    `/api/control/missions/${missionId}/ask`,
+    body,
+    "Failed to ask the assistant",
   );
 }
 
-export async function clearQueue(): Promise<{ cleared: number }> {
-  return apiDel("/api/control/queue", "Failed to clear queue");
+export interface AskStreamHandlers {
+  onDelta: (text: string) => void;
+  onToolCall: (t: { tool_call_id: string; name: string; args: string }) => void;
+  onToolResult: (t: {
+    tool_call_id: string;
+    name: string;
+    result: string;
+  }) => void;
+  onDone: (d: { thread_id: string; answer: string }) => void;
+  onError: (message: string) => void;
 }
 
-// Agent tree snapshot (for refresh resilience)
-export interface AgentTreeNode {
-  id: string;
-  node_type: string;
-  name: string;
-  description: string;
-  status: string;
-  budget_allocated: number;
-  budget_spent: number;
-  complexity?: number;
-  selected_model?: string;
-  children: AgentTreeNode[];
-}
-
-// Get tree for a specific mission (either live from memory or saved from database)
-export async function getMissionTree(
+/** Streaming variant of {@link askSend}: POSTs to the SSE endpoint and invokes
+ * handlers as token/tool events arrive. */
+export async function askSendStream(
   missionId: string,
-): Promise<AgentTreeNode | null> {
+  content: string,
+  opts: { threadId?: string; sandbox?: boolean },
+  handlers: AskStreamHandlers,
+  signal?: AbortSignal,
+): Promise<void> {
+  const body: { content: string; thread_id?: string; sandbox?: boolean } = {
+    content,
+  };
+  if (opts.threadId) body.thread_id = opts.threadId;
+  if (opts.sandbox) body.sandbox = true;
+
+  const res = await apiFetch(`/api/control/missions/${missionId}/ask/stream`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+    signal,
+  });
+  if (res.status === 404) {
+    const fallback = await askSend(missionId, content, opts.threadId, opts.sandbox);
+    handlers.onDelta(fallback.answer);
+    handlers.onDone({ thread_id: fallback.thread_id, answer: fallback.answer });
+    return;
+  }
+  if (!res.ok || !res.body) {
+    handlers.onError(res.ok ? "No response stream" : `Ask failed (${res.status})`);
+    return;
+  }
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = "";
+  let sawTerminal = false;
+
+  const handleFrame = (frame: string) => {
+    const dataLine = frame.split("\n").find((l) => l.startsWith("data:"));
+    if (!dataLine) return;
+    const payload = dataLine.slice(5).trim();
+    if (!payload) return;
+    try {
+      const ev = JSON.parse(payload);
+      switch (ev.type) {
+        case "delta":
+          // Guard against a malformed frame missing `content` (avoid appending
+          // the string "undefined").
+          if (typeof ev.content === "string") handlers.onDelta(ev.content);
+          break;
+        case "tool_call":
+          handlers.onToolCall(ev);
+          break;
+        case "tool_result":
+          handlers.onToolResult(ev);
+          break;
+        case "done":
+          sawTerminal = true;
+          handlers.onDone(ev);
+          break;
+        case "error":
+          sawTerminal = true;
+          handlers.onError(ev.message);
+          break;
+      }
+    } catch {
+      /* ignore malformed frame */
+    }
+  };
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    let sep: number;
+    // SSE frames are separated by a blank line.
+    while ((sep = buf.indexOf("\n\n")) >= 0) {
+      handleFrame(buf.slice(0, sep));
+      buf = buf.slice(sep + 2);
+    }
+  }
+  // Flush any trailing frame the server didn't terminate with a blank line
+  // (e.g. a final `done`), then validate that the stream actually completed.
+  buf += decoder.decode();
+  if (buf.trim()) handleFrame(buf);
+  if (!sawTerminal) {
+    handlers.onError("Stream ended before completion");
+  }
+}
+
+export async function listAskThreads(missionId: string): Promise<AskThread[]> {
+  return apiGet<AskThread[]>(
+    `/api/control/missions/${missionId}/ask/threads`,
+    "Failed to list Ask threads",
+  );
+}
+
+export async function getAskThread(
+  missionId: string,
+  threadId: string,
+): Promise<{ messages: AskMessage[] } & AskThread> {
   return apiGet(
-    `/api/control/missions/${missionId}/tree`,
-    "Failed to fetch mission tree",
+    `/api/control/missions/${missionId}/ask/threads/${threadId}`,
+    "Failed to load Ask thread",
+  );
+}
+
+export async function deleteAskThread(
+  missionId: string,
+  threadId: string,
+): Promise<void> {
+  return apiDel(
+    `/api/control/missions/${missionId}/ask/threads/${threadId}`,
+    "Failed to delete Ask thread",
   );
 }
 
@@ -1613,6 +1783,8 @@ export async function listLibraryCommands(): Promise<CommandSummary[]> {
 export interface BuiltinCommandsResponse {
   opencode: CommandSummary[];
   claudecode: CommandSummary[];
+  /** Grok builtin commands (sandboxed.sh-driven /goal). */
+  grok?: CommandSummary[];
   /** Codex builtin commands (codex 0.128.0+ — empty on older binaries). */
   codex?: CommandSummary[];
 }
@@ -1622,12 +1794,13 @@ export async function getBuiltinCommands(): Promise<BuiltinCommandsResponse> {
   const res = await apiFetch("/api/library/builtin-commands");
   if (!res.ok) {
     // Fallback to empty if endpoint not available
-    return { opencode: [], claudecode: [], codex: [] };
+    return { opencode: [], claudecode: [], codex: [], grok: [] };
   }
   const json = await res.json();
   return {
     opencode: json.opencode ?? [],
     claudecode: json.claudecode ?? [],
+    grok: json.grok ?? [],
     codex: json.codex ?? [],
   };
 }
@@ -2005,26 +2178,6 @@ export async function setDefaultOpenCodeConnection(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// OpenCode Settings API (oh-my-opencode.json)
-// ─────────────────────────────────────────────────────────────────────────────
-
-// Get OpenCode settings (oh-my-opencode.json)
-export async function getOpenCodeSettings(): Promise<Record<string, unknown>> {
-  return apiGet("/api/opencode/settings", "Failed to get OpenCode settings");
-}
-
-// Update OpenCode settings (oh-my-opencode.json)
-export async function updateOpenCodeSettings(
-  settings: Record<string, unknown>,
-): Promise<Record<string, unknown>> {
-  return apiPut(
-    "/api/opencode/settings",
-    settings,
-    "Failed to update OpenCode settings",
-  );
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
 // OpenCode Config API (opencode.json)
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -2076,31 +2229,6 @@ export async function restartOpenCodeService(): Promise<{
     "/api/opencode/restart",
     undefined,
     "Failed to restart OpenCode service",
-  );
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Library-backed OpenCode Settings API
-// ─────────────────────────────────────────────────────────────────────────────
-
-// Get OpenCode settings from Library (oh-my-opencode.json)
-export async function getLibraryOpenCodeSettings(): Promise<
-  Record<string, unknown>
-> {
-  return apiGet(
-    "/api/library/opencode/settings",
-    "Failed to get Library OpenCode settings",
-  );
-}
-
-// Save OpenCode settings to Library and sync to system
-export async function saveLibraryOpenCodeSettings(
-  settings: Record<string, unknown>,
-): Promise<void> {
-  return apiPut(
-    "/api/library/opencode/settings",
-    settings,
-    "Failed to save Library OpenCode settings",
   );
 }
 
@@ -2246,28 +2374,6 @@ export async function deleteConfigProfile(name: string): Promise<void> {
   return apiDel(
     `/api/library/config-profile/${encodeURIComponent(name)}`,
     "Failed to delete config profile",
-  );
-}
-
-// Get OpenCode settings for a specific profile
-export async function getLibraryOpenCodeSettingsForProfile(
-  profile: string,
-): Promise<Record<string, unknown>> {
-  return apiGet(
-    `/api/library/config-profile/${encodeURIComponent(profile)}/opencode/settings`,
-    "Failed to get OpenCode settings for profile",
-  );
-}
-
-// Save OpenCode settings for a specific profile
-export async function saveLibraryOpenCodeSettingsForProfile(
-  profile: string,
-  settings: Record<string, unknown>,
-): Promise<void> {
-  return apiPut(
-    `/api/library/config-profile/${encodeURIComponent(profile)}/opencode/settings`,
-    settings,
-    "Failed to save OpenCode settings for profile",
   );
 }
 
@@ -2670,6 +2776,8 @@ export type DesktopSessionStatus =
 
 export interface DesktopSessionDetail {
   display: string;
+  display_server?: "wayland" | "x11" | string;
+  compositor?: string;
   status: DesktopSessionStatus;
   mission_id?: string;
   mission_title?: string;
@@ -2933,11 +3041,12 @@ export async function uninstallSystemComponent(
 export interface SettingsResponse {
   library_remote: string | null;
   sandboxed_repo_path: string | null;
-  rtk_enabled: boolean | null;
   max_parallel_missions: number | null;
   max_concurrent_tasks: number | null;
   auto_cleanup_enabled: boolean | null;
   auto_cleanup_days: number | null;
+  ask_assistant_model: string | null;
+  metadata_model: string | null;
 }
 
 export interface UpdateLibraryRemoteResponse {
@@ -2949,6 +3058,30 @@ export interface UpdateLibraryRemoteResponse {
 // Get all settings
 export async function getSettings(): Promise<SettingsResponse> {
   return apiGet("/api/settings", "Failed to get settings");
+}
+
+/** Sanitized resolved config for one backend LLM role (no API key). */
+export interface LlmRoleStatus {
+  available: boolean;
+  provider?: string;
+  model?: string;
+  base_url?: string;
+}
+
+export interface LlmRolesResponse {
+  /** The Ask sidecar co-pilot. */
+  assistant: LlmRoleStatus;
+  /** Where the assistant model came from. */
+  assistant_source: "settings" | "env" | "auto";
+  /** Mission titles & status lines. */
+  metadata: LlmRoleStatus;
+  /** Where the metadata model came from. */
+  metadata_source: "settings" | "env" | "auto";
+}
+
+// Get the resolved provider/model for each backend LLM role
+export async function getLlmRoles(): Promise<LlmRolesResponse> {
+  return apiGet("/api/settings/llm-roles", "Failed to get LLM roles");
 }
 
 export async function updateSettings(
@@ -2978,22 +3111,6 @@ export async function updateLibraryRemote(
   if (!res.ok) {
     const text = await res.text();
     throw new Error(text || "Failed to update library remote");
-  }
-  return res.json();
-}
-
-// Update the RTK enabled setting
-export async function updateRtkEnabled(
-  rtkEnabled: boolean,
-): Promise<{ rtk_enabled: boolean; previous_value: boolean | null }> {
-  const res = await apiFetch("/api/settings/rtk-enabled", {
-    method: "PUT",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ rtk_enabled: rtkEnabled }),
-  });
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(text || "Failed to update RTK setting");
   }
   return res.json();
 }
@@ -3039,9 +3156,11 @@ export async function getBackend(id: string): Promise<Backend> {
 // List agents for a specific backend
 export async function listBackendAgents(
   backendId: string,
+  profile?: string | null,
 ): Promise<BackendAgent[]> {
+  const query = profile ? `?profile=${encodeURIComponent(profile)}` : "";
   return apiGet(
-    `/api/backends/${encodeURIComponent(backendId)}/agents`,
+    `/api/backends/${encodeURIComponent(backendId)}/agents${query}`,
     "Failed to list backend agents",
   );
 }

@@ -3,8 +3,6 @@
  */
 
 import { apiGet, apiPost, apiFetch } from "./core";
-import { isAutoTitleEnabled } from "../llm-settings";
-import { generateMissionTitle } from "../llm";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -31,6 +29,8 @@ export interface MissionHistoryEntry {
 export interface DesktopSessionInfo {
   display: string;
   resolution?: string;
+  display_server?: "wayland" | "x11" | string;
+  compositor?: string;
   started_at: string;
   stopped_at?: string;
   screenshots_dir?: string;
@@ -86,6 +86,8 @@ export interface StoredEvent {
   content: string;
   metadata: Record<string, unknown>;
 }
+
+export type MissionEventsProfile = "conversation";
 
 export interface MissionSnapshot {
   mission: Mission;
@@ -206,6 +208,8 @@ export async function getMissionEvents(
     /** When set, request only events with `sequence < beforeSeq`,
      * returned ASC. Used for backwards pagination. */
     beforeSeq?: number;
+    profile?: MissionEventsProfile;
+    traceTail?: number;
   },
 ): Promise<StoredEvent[]> {
   const { events } = await getMissionEventsWithMeta(id, options);
@@ -237,6 +241,9 @@ export async function getMissionEventsWithMeta(
     limit?: number;
     sinceSeq?: number;
     beforeSeq?: number;
+    includeCounts?: boolean;
+    profile?: MissionEventsProfile;
+    traceTail?: number;
   },
 ): Promise<{ events: StoredEvent[]; meta: MissionEventsMeta }> {
   const params = new URLSearchParams();
@@ -247,6 +254,10 @@ export async function getMissionEventsWithMeta(
     params.set("since_seq", String(options.sinceSeq));
   if (options?.beforeSeq !== undefined)
     params.set("before_seq", String(options.beforeSeq));
+  if (options?.includeCounts === false) params.set("include_counts", "false");
+  if (options?.profile) params.set("profile", options.profile);
+  if (options?.traceTail !== undefined)
+    params.set("trace_tail", String(options.traceTail));
   const query = params.toString();
   const res = await apiFetch(
     `/api/control/missions/${id}/events${query ? `?${query}` : ""}`,
@@ -271,9 +282,20 @@ export async function getMissionEventsWithMeta(
   return { events, meta: { totalEvents, maxSequence } };
 }
 
-export async function getMissionSnapshot(id: string): Promise<MissionSnapshot> {
+export async function getMissionSnapshot(
+  id: string,
+  options?: {
+    profile?: MissionEventsProfile;
+    traceTail?: number;
+  },
+): Promise<MissionSnapshot> {
+  const params = new URLSearchParams();
+  if (options?.profile) params.set("profile", options.profile);
+  if (options?.traceTail !== undefined)
+    params.set("trace_tail", String(options.traceTail));
+  const query = params.toString();
   const snapshot = await apiGet<MissionSnapshot>(
-    `/api/control/missions/${id}/snapshot`,
+    `/api/control/missions/${id}/snapshot${query ? `?${query}` : ""}`,
     "Failed to fetch mission snapshot",
   );
   return {
@@ -297,6 +319,16 @@ export async function getMissionSnapshot(id: string): Promise<MissionSnapshot> {
       ? snapshot.child_missions
       : [],
   };
+}
+
+export async function getMissionToolCallEvents(
+  id: string,
+  toolCallId: string,
+): Promise<StoredEvent[]> {
+  return apiGet(
+    `/api/control/missions/${id}/tool-calls/${encodeURIComponent(toolCallId)}`,
+    "Failed to fetch tool call events",
+  );
 }
 
 export async function getCurrentMission(): Promise<Mission | null> {
@@ -433,7 +465,14 @@ export async function updateMissionSettings(
 
 export async function deleteMission(
   id: string,
-): Promise<{ ok: boolean; deleted: string }> {
+): Promise<{
+  ok: boolean;
+  deleted: string;
+  deleted_ids?: string[];
+  deleted_count?: number;
+  deleted_workspace_dirs?: string[];
+  deleted_workspace_dir_count?: number;
+}> {
   const res = await apiFetch(`/api/control/missions/${id}`, {
     method: "DELETE",
   });
@@ -490,27 +529,4 @@ export async function updateMissionTitle(
     { title },
     "Failed to update mission title",
   );
-}
-
-/**
- * Auto-generate a mission title using the configured LLM provider.
- * Fires-and-forgets: errors are silently ignored so it never disrupts the UI.
- * Returns the generated title if successful, null otherwise.
- */
-export async function autoGenerateMissionTitle(
-  missionId: string,
-  userMessage: string,
-  assistantReply: string,
-): Promise<string | null> {
-  if (!isAutoTitleEnabled()) return null;
-  try {
-    const title = await generateMissionTitle(userMessage, assistantReply);
-    if (title) {
-      await updateMissionTitle(missionId, title);
-      return title;
-    }
-  } catch (err) {
-    console.warn("[AutoTitle] Failed to generate mission title:", err);
-  }
-  return null;
 }

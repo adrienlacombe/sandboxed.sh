@@ -2,7 +2,6 @@
 
 import type React from "react";
 import {
-  useDeferredValue,
   useEffect,
   useLayoutEffect,
   useMemo,
@@ -12,7 +11,9 @@ import {
   memo,
   startTransition,
 } from "react";
+import { createPortal } from "react-dom";
 import { useVirtualizer } from "@tanstack/react-virtual";
+import dynamic from "next/dynamic";
 import { useSearchParams, useRouter } from "next/navigation";
 import { toast } from "@/components/toast";
 import {
@@ -26,11 +27,13 @@ import {
   type EnhancedInputHandle,
   type FilePasteContext,
 } from "@/components/enhanced-input";
-import { MissionAutomationsDialog } from "@/components/mission-automations-dialog";
-import { PerfOverlay } from "@/components/perf-overlay";
+import { AskPanel } from "@/components/ask-panel";
 import { deriveAssistantTurnStatus } from "@/lib/assistant-turn-status";
 import { perfBus } from "@/lib/perf-bus";
-import { isStreamContinuation } from "@/lib/stream-continuation";
+import {
+  isStreamContinuation,
+  mergeStreamFragment,
+} from "@/lib/stream-continuation";
 import {
   eventsToItemsImpl,
   isRecord,
@@ -44,17 +47,22 @@ import {
   useControlStreamingDiagnosticsStore,
   useControlThinkingStore,
   useControlViewingMissionStore,
+  useControlAskStore,
+  controlAskStore,
   type StreamDiagnosticsState,
 } from "./control-stores";
 import { NowTickProvider, useNow } from "@/lib/now-tick";
 import { startHealthBudgetWatcher } from "@/lib/health-budget";
-import { MissionDebugStats } from "./MissionDebugStats";
 import { LazyCodeBlock } from "@/components/lazy-code-block";
 import { LazyJsonHighlighter } from "@/components/lazy-json-highlighter";
 import { cn } from "@/lib/utils";
 import { getMissionShortName } from "@/lib/mission-display";
 import { inferMissionRole } from "@/lib/mission-role";
-import { getMissionDotColor, isFinishedStatus } from "@/lib/mission-status";
+import {
+  getMissionDotColor,
+  getMissionTitle,
+  isFinishedStatus,
+} from "@/lib/mission-status";
 import { getRuntimeApiBase } from "@/lib/settings";
 import { authHeader } from "@/lib/auth";
 import { stripRichFileTagsByName } from "@/lib/rich-tags";
@@ -68,6 +76,7 @@ import {
   markMissionOpened,
   getMission,
   getMissionEventsWithMeta,
+  getMissionToolCallEvents,
   getMissionSnapshot,
   searchMissionMoments,
   createMission,
@@ -76,6 +85,7 @@ import {
   setMissionStatus,
   resumeMission,
   getCurrentMission,
+  updateMissionTitle,
   uploadFile,
   uploadFileChunked,
   formatBytes,
@@ -83,7 +93,9 @@ import {
   getRunningMissions,
   isNetworkError,
   cancelMission,
-  autoGenerateMissionTitle,
+  listMissionAutomations,
+  updateAutomation,
+  deleteMission,
   listWorkspaces,
   getHealth,
   listDesktopSessions,
@@ -105,9 +117,14 @@ import {
   type DesktopSessionDetail,
   type StoredEvent,
   type SharedFile,
+  type QueuedMessage,
+  isHttpStatusError,
 } from "@/lib/api";
 import { QueueStrip, type QueueItem } from "@/components/queue-strip";
+import { GoalBar } from "@/components/goal-bar";
+import { StallBar } from "@/components/stall-bar";
 import { AsyncButton } from "@/components/ui/async-button";
+import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import {
   Send,
   Square,
@@ -143,7 +160,7 @@ import {
   Code,
   FolderOpen,
   Trash2,
-  Monitor,
+  AppWindow,
   HelpCircle,
   PanelRightClose,
   PanelRight,
@@ -155,10 +172,13 @@ import {
   File,
   ExternalLink,
   MessageSquare,
-  Users,
+  Clipboard,
   BriefcaseBusiness,
   Inbox,
   Flag,
+  Pencil,
+  MoreVertical,
+  Sparkles,
 } from "lucide-react";
 import { IMAGE_PATH_PATTERN } from "@/lib/file-extensions";
 import {
@@ -180,6 +200,8 @@ const LEGACY_CONTROL_DRAFT_KEY = "control-draft";
 const MISSION_DRAFT_CACHE_KEY = "control-mission-drafts-v1";
 const MAX_MISSION_DRAFT_CACHE_BYTES = 64 * 1024;
 const MAX_MISSION_DRAFT_CACHE_ENTRIES = 50;
+const DEFAULT_DOCUMENT_TITLE = "Sandboxed.sh";
+const MAX_DOCUMENT_MISSION_TITLE_LENGTH = 80;
 
 type EventsWorkerRequest = {
   id: number;
@@ -218,6 +240,68 @@ function isRetriableSendError(error: unknown): boolean {
   );
 }
 
+export function appendUnpersistedLiveTail(
+  historyItems: ChatItem[],
+  liveItems: ChatItem[],
+): ChatItem[] {
+  if (liveItems.length === 0) return historyItems;
+
+  const lastLiveUserIdx = liveItems.findLastIndex(
+    (item) => item.kind === "user",
+  );
+  if (lastLiveUserIdx === -1) return historyItems;
+
+  const existingIds = new Set(historyItems.map((item) => item.id));
+  const existingAssistantContent = new Set(
+    historyItems
+      .filter((item): item is Extract<ChatItem, { kind: "assistant" }> => {
+        return item.kind === "assistant";
+      })
+      .map((item) => item.content.trim())
+      .filter(Boolean),
+  );
+  const lastHistoryUserIdx = historyItems.findLastIndex(
+    (item) => item.kind === "user",
+  );
+  const historyHasAssistantAfterLastUser =
+    lastHistoryUserIdx !== -1 &&
+    historyItems
+      .slice(lastHistoryUserIdx + 1)
+      .some((item) => item.kind === "assistant");
+
+  const unpersistedTail = liveItems
+    .slice(lastLiveUserIdx + 1)
+    .filter((item) => {
+      if (existingIds.has(item.id)) return false;
+      if (item.kind === "assistant") {
+        const content = item.content.trim();
+        return content.length > 0 && !existingAssistantContent.has(content);
+      }
+      if (item.kind !== "stream" || item.done) return false;
+      const content = item.content.trim();
+      if (!content) return false;
+      if (existingAssistantContent.has(content)) return false;
+      return !historyHasAssistantAfterLastUser;
+    });
+
+  // A failed or still-sending user row never reached the server, so rebuilding
+  // from server history would drop the bubble (and its Retry affordance) while
+  // any outbox entry lingers. Carry it over. A "sent" row already appears in
+  // history by id, so this only re-surfaces genuinely unpersisted sends.
+  const lastLiveUser = liveItems[lastLiveUserIdx];
+  const carryUnpersistedUser =
+    lastLiveUser.kind === "user" &&
+    !existingIds.has(lastLiveUser.id) &&
+    (lastLiveUser.sendStatus === "failed" ||
+      lastLiveUser.sendStatus === "sending");
+
+  const tail = carryUnpersistedUser
+    ? [lastLiveUser, ...unpersistedTail]
+    : unpersistedTail;
+
+  return tail.length > 0 ? [...historyItems, ...tail] : historyItems;
+}
+
 async function postControlMessageWithRetry(
   content: string,
   options: { agent?: string; mission_id?: string; client_message_id: string },
@@ -229,6 +313,68 @@ async function postControlMessageWithRetry(
     await new Promise((resolve) => setTimeout(resolve, 800));
     return postControlMessage(content, options);
   }
+}
+
+// ---- Unsent-message outbox (Phase 2) --------------------------------------
+// Messages that failed to reach the backend (network drop, deploy SIGTERM)
+// are persisted here, keyed by mission, and auto-flushed when the control
+// stream reconnects. `client_message_id` makes redelivery idempotent, so a
+// flush can never double-send. Without this a disconnect (e.g. a redeploy)
+// silently drops the message and the user thinks the agent ignored them.
+const CONTROL_OUTBOX_KEY = "control-outbox";
+
+type OutboxEntry = {
+  id: string;
+  content: string;
+  agent?: string;
+  timestamp: number;
+};
+
+function readOutbox(): Record<string, OutboxEntry[]> {
+  if (typeof window === "undefined") return {};
+  try {
+    const raw = window.localStorage.getItem(CONTROL_OUTBOX_KEY);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return {};
+    }
+    return parsed as Record<string, OutboxEntry[]>;
+  } catch {
+    return {};
+  }
+}
+
+function writeOutbox(map: Record<string, OutboxEntry[]>): void {
+  if (typeof window === "undefined") return;
+  try {
+    window.localStorage.setItem(CONTROL_OUTBOX_KEY, JSON.stringify(map));
+  } catch {
+    // Ignore quota / serialization failures — the in-memory bubble still
+    // carries the failed message and its Retry button.
+  }
+}
+
+function getOutboxForMission(missionId: string): OutboxEntry[] {
+  return readOutbox()[missionId] ?? [];
+}
+
+function addOutboxEntry(missionId: string, entry: OutboxEntry): void {
+  const map = readOutbox();
+  const list = map[missionId] ?? [];
+  // De-dupe by id so repeated failures of the same message don't stack.
+  map[missionId] = [...list.filter((e) => e.id !== entry.id), entry];
+  writeOutbox(map);
+}
+
+function removeOutboxEntry(missionId: string, id: string): void {
+  const map = readOutbox();
+  const list = map[missionId];
+  if (!list) return;
+  const next = list.filter((e) => e.id !== id);
+  if (next.length > 0) map[missionId] = next;
+  else delete map[missionId];
+  writeOutbox(map);
 }
 
 type StreamLogLevel = "debug" | "info" | "warn" | "error";
@@ -254,6 +400,17 @@ function streamLog(
       console.error(...args);
       break;
   }
+}
+
+function formatMissionDocumentTitle(mission: Mission | null | undefined) {
+  if (!mission) return DEFAULT_DOCUMENT_TITLE;
+  const title = getMissionTitle(mission, {
+    maxLength: MAX_DOCUMENT_MISSION_TITLE_LENGTH,
+    fallback: getMissionShortName(mission.id),
+  }).trim();
+  return title
+    ? `${title} | ${DEFAULT_DOCUMENT_TITLE}`
+    : DEFAULT_DOCUMENT_TITLE;
 }
 
 function readLegacyControlDraft(): string {
@@ -387,22 +544,127 @@ import { useVirtualTimelineAnchor } from "@/hooks/use-virtual-timeline-anchor";
 import { useLocalStorage } from "@/hooks/use-local-storage";
 import { useCopyToClipboard } from "@/hooks/use-copy-to-clipboard";
 import { useVisibilityPolling } from "@/hooks/use-visibility-polling";
-import { DesktopStream } from "@/components/desktop-stream";
-import { NewMissionDialog } from "@/components/new-mission-dialog";
 import {
   MissionSwitcher,
   normalizeMetadataText,
 } from "@/components/mission-switcher";
-import { WorkerPanel } from "@/components/worker-panel";
 import { WorkersStrip } from "@/components/workers-strip";
-import {
-  SubagentsPanel,
-  type SubagentEntry,
-} from "@/components/subagents-panel";
+import type { SubagentEntry } from "@/components/subagents-panel";
 import { RelativeTime } from "@/components/ui/relative-time";
+
+const DesktopStream = dynamic(() =>
+  import("@/components/desktop-stream").then((m) => m.DesktopStream),
+);
+const MissionAutomationsDialog = dynamic(() =>
+  import("@/components/mission-automations-dialog").then(
+    (m) => m.MissionAutomationsDialog,
+  ),
+);
+const MissionDebugStats = dynamic(() =>
+  import("./MissionDebugStats").then((m) => m.MissionDebugStats),
+);
+const NewMissionDialog = dynamic(() =>
+  import("@/components/new-mission-dialog").then((m) => m.NewMissionDialog),
+);
+const PerfOverlay = dynamic(() =>
+  import("@/components/perf-overlay").then((m) => m.PerfOverlay),
+);
 
 type ToolItem = Extract<ChatItem, { kind: "tool" }>;
 type SidePanelItem = Extract<ChatItem, { kind: "thinking" | "stream" }>;
+
+/**
+ * Merge a `getQueue()` snapshot into history items for one mission: mark
+ * existing user rows as queued and append rows for queue entries missing
+ * from history.
+ *
+ * `snapshotIsFresh` must be false when a local queue mutation (remove /
+ * clear) happened while the snapshot was in flight — such a snapshot may
+ * still contain a just-deleted message, and merging it would resurrect the
+ * message as a ghost row that the server can no longer delete (404). Stale
+ * snapshots are ignored entirely; the post-mutation queue sync reconciles
+ * flags with a fresh fetch.
+ */
+function mergeQueuedMessagesIntoItems(
+  historyItems: ChatItem[],
+  queuedMessages: QueuedMessage[],
+  missionId: string,
+  snapshotIsFresh: boolean,
+): ChatItem[] {
+  if (!snapshotIsFresh) return historyItems;
+  const missionQueuedMessages = queuedMessages.filter(
+    (qm) => qm.mission_id === missionId,
+  );
+  if (missionQueuedMessages.length === 0) return historyItems;
+  const queuedIds = new Set(missionQueuedMessages.map((qm) => qm.id));
+  // Mark existing items as queued
+  let next = historyItems.map((item) =>
+    item.kind === "user" && queuedIds.has(item.id)
+      ? { ...item, queued: true }
+      : item,
+  );
+  // Add any queued messages not already in history
+  const existingIds = new Set(next.map((item) => item.id));
+  const newQueuedItems: ChatItem[] = missionQueuedMessages
+    .filter((qm) => !existingIds.has(qm.id))
+    .map((qm) => ({
+      kind: "user" as const,
+      id: qm.id,
+      content: qm.content,
+      timestamp: Date.now(),
+      agent: qm.agent ?? undefined,
+      queued: true,
+    }));
+  if (newQueuedItems.length > 0) next = [...next, ...newQueuedItems];
+  return next;
+}
+
+// Mirror of the server's conversation-anchored snapshot (see
+// `get_mission_snapshot` in src/api/control.rs). Keep these in sync.
+const SNAPSHOT_CONVERSATIONAL_MESSAGES = 10;
+const SNAPSHOT_MAX_EVENTS = 1500;
+const CONVERSATION_EVENT_TYPES = new Set([
+  "user_message",
+  "assistant_message",
+  "assistant_message_canonical",
+]);
+
+// Trim a sequence-ASC event list to the conversation-anchored tail: everything
+// from the Nth-most-recent user/assistant message to the head (tool calls in
+// between included), hard-capped at SNAPSHOT_MAX_EVENTS. Applied to the IDB
+// cache path so a cache hit behaves like `getMissionSnapshot` — without it a
+// stale or oversized cached tail would be replayed in full (slow load) and the
+// recent-message anchoring would be bypassed.
+function anchorEventsToRecentConversation(
+  events: StoredEvent[],
+): StoredEvent[] {
+  // Anchor ONLY when at least N conversation messages exist, matching the
+  // server: `nth_recent_event_sequence(N)` returns None below N, in which case
+  // get_mission_snapshot falls back to the plain recent-events tail (no
+  // conversation trim). So set the anchor only on reaching the Nth-most-recent
+  // message; with fewer than N, leave `anchorIdx = -1` and keep everything
+  // (still bounded by the MAX cap below). Setting it on every message would
+  // drop any leading events before the oldest message and diverge from the
+  // backend for short (1–9 message) missions.
+  let convoSeen = 0;
+  let anchorIdx = -1;
+  for (let i = events.length - 1; i >= 0; i--) {
+    if (CONVERSATION_EVENT_TYPES.has(events[i].event_type)) {
+      convoSeen += 1;
+      if (convoSeen >= SNAPSHOT_CONVERSATIONAL_MESSAGES) {
+        anchorIdx = i;
+        break;
+      }
+    }
+  }
+  let start = anchorIdx === -1 ? 0 : anchorIdx;
+  // Hard cap: never replay more than MAX events (mirrors the server's
+  // overflow fallback to the most-recent MAX).
+  if (events.length - start > SNAPSHOT_MAX_EVENTS) {
+    start = events.length - SNAPSHOT_MAX_EVENTS;
+  }
+  return start === 0 ? events : events.slice(start);
+}
 
 // Module-level so all duration consumers share the same implementation.
 function formatDuration(seconds: number): string {
@@ -411,6 +673,25 @@ function formatDuration(seconds: number): string {
   const mins = Math.floor(seconds / 60);
   const secs = seconds % 60;
   return `${mins}m${secs > 0 ? ` ${secs}s` : ""}`;
+}
+
+// Wall-clock (ms) of when this item last "did something" — used to anchor the
+// inline "Agent is working" heartbeat at the most recent event so the timer
+// resets each time a new event lands (healthy agent) and climbs when nothing
+// arrives (stalled/hung). Phase items carry no time of their own.
+function itemActivityTime(item: ChatItem): number | null {
+  switch (item.kind) {
+    case "tool":
+    case "thinking":
+    case "stream":
+      return item.endTime ?? item.startTime;
+    case "user":
+    case "assistant":
+    case "system":
+      return item.timestamp;
+    default:
+      return null;
+  }
 }
 
 // Renders a live-updating duration string anchored at `startTime`. ONLY this
@@ -502,7 +783,7 @@ type ItemViews = {
   chatDisplayItems: ChatItem[];
   /** The last non-queued item; used by a few pinned UI bits. */
   lastNonQueuedItem: ChatItem | undefined;
-  /** Thinking + streaming items, for the side panel. */
+  /** Thinking items, plus stream drafts while the side panel is open. */
   thinkingItems: SidePanelItem[];
   /** Completed (de-duplicated by content) + in-flight thinking count. */
   thinkingItemsCount: number;
@@ -523,9 +804,10 @@ type ItemViews = {
  * Keep this pure — it's called from a `useMemo` and must not touch
  * React state or refs.
  */
-function deriveItemViews(
+export function deriveItemViews(
   items: ChatItem[],
   showThinkingPanel: boolean,
+  missionIsRunning = false,
 ): ItemViews {
   // Pass 1: dedup by id (last occurrence wins, preserve original order).
   // Record the last index per id, then emit items whose index matches.
@@ -544,13 +826,13 @@ function deriveItemViews(
   for (let i = 0; i < dedupedItems.length; i++) {
     const item = dedupedItems[i];
     if (item.kind !== "thinking" && item.kind !== "stream") continue;
-    const key = item.content.trim();
+    const key = `${item.kind}:${item.content.trim()}`;
     if (key) lastThinkingItemIndexByContent.set(key, i);
   }
   if (lastThinkingItemIndexByContent.size > 0) {
     dedupedItems = dedupedItems.filter((item, index) => {
       if (item.kind !== "thinking" && item.kind !== "stream") return true;
-      const key = item.content.trim();
+      const key = `${item.kind}:${item.content.trim()}`;
       return !key || lastThinkingItemIndexByContent.get(key) === index;
     });
   }
@@ -564,22 +846,29 @@ function deriveItemViews(
     if (item.kind === "user" && item.queued) {
       hasQueuedUser = true;
     }
-    if (item.kind === "thinking" || item.kind === "stream") {
+    if (
+      item.kind === "thinking" ||
+      (showThinkingPanel && item.kind === "stream")
+    ) {
       thinkingItems.push(item as SidePanelItem);
+    }
+    if (item.kind === "thinking") {
       if (!item.done) hasActiveThinking = true;
     }
   }
   const lastThinkingIndexByContent = new Map<string, number>();
   for (let i = 0; i < thinkingItems.length; i++) {
-    const key = thinkingItems[i].content.trim();
+    const key = `${thinkingItems[i].kind}:${thinkingItems[i].content.trim()}`;
     if (key) lastThinkingIndexByContent.set(key, i);
   }
   if (lastThinkingIndexByContent.size > 0) {
     thinkingItems = thinkingItems.filter((item, index) => {
-      const key = item.content.trim();
+      const key = `${item.kind}:${item.content.trim()}`;
       return !key || lastThinkingIndexByContent.get(key) === index;
     });
-    hasActiveThinking = thinkingItems.some((item) => !item.done);
+    hasActiveThinking = thinkingItems.some(
+      (item) => item.kind === "thinking" && !item.done,
+    );
   }
 
   let displayItems: ChatItem[];
@@ -619,6 +908,7 @@ function deriveItemViews(
   let completedThinking = 0;
   let activeThinking = 0;
   for (const t of thinkingItems) {
+    if (t.kind !== "thinking") continue;
     if (!t.done) {
       activeThinking += 1;
       continue;
@@ -630,10 +920,51 @@ function deriveItemViews(
   }
   const thinkingItemsCount = completedThinking + activeThinking;
 
+  let orderedChatDisplayItems = chatDisplayItems;
+  if (!missionIsRunning) {
+    const finalAssistantIndex = chatDisplayItems.findLastIndex(
+      (item) => item.kind === "assistant",
+    );
+    if (finalAssistantIndex !== -1) {
+      const beforeFinalAssistant = chatDisplayItems.slice(
+        0,
+        finalAssistantIndex,
+      );
+      const finalAssistant = chatDisplayItems[finalAssistantIndex];
+      const afterFinalAssistant = chatDisplayItems.slice(
+        finalAssistantIndex + 1,
+      );
+      const lateTools: ChatItem[] = [];
+      const remainingAfterFinalAssistant: ChatItem[] = [];
+      for (const item of afterFinalAssistant) {
+        if (item.kind === "tool" && !item.isUiTool) {
+          lateTools.push(item);
+        } else {
+          remainingAfterFinalAssistant.push(item);
+        }
+      }
+      if (lateTools.length > 0) {
+        orderedChatDisplayItems = [
+          ...beforeFinalAssistant,
+          ...lateTools,
+          finalAssistant,
+          ...remainingAfterFinalAssistant,
+        ];
+      }
+    }
+  }
+
   // Pass 3: group consecutive tool/thinking blocks for collapsed display.
   const groupedItems: GroupedItem[] = [];
   let currentToolGroup: ToolItem[] = [];
   let currentThinkingGroup: SidePanelItem[] = [];
+  let lastAssistantItemIndex = -1;
+  for (let i = orderedChatDisplayItems.length - 1; i >= 0; i--) {
+    if (orderedChatDisplayItems[i].kind === "assistant") {
+      lastAssistantItemIndex = i;
+      break;
+    }
+  }
   const flushToolGroup = () => {
     if (currentToolGroup.length === 0) return;
     if (currentToolGroup.length === 1) {
@@ -656,12 +987,18 @@ function deriveItemViews(
     });
     currentThinkingGroup = [];
   };
-  for (const item of chatDisplayItems) {
+  for (let index = 0; index < orderedChatDisplayItems.length; index++) {
+    const item = orderedChatDisplayItems[index];
     if (item.kind === "tool" && !item.isUiTool) {
       flushThinkingGroup();
       currentToolGroup.push(item);
     } else if (item.kind === "thinking" || item.kind === "stream") {
-      if (showThinkingPanel) {
+      const isTerminalStreamOnlyResponse =
+        item.kind === "stream" &&
+        item.done &&
+        !missionIsRunning &&
+        index > lastAssistantItemIndex;
+      if (showThinkingPanel && !isTerminalStreamOnlyResponse) {
         // Thinking/stream items are routed to the side panel in this
         // mode — they don't render inline at all. Keep the tool group
         // open across them so consecutive tool calls (with thinking
@@ -670,8 +1007,26 @@ function deriveItemViews(
         // row with no "Show N previous tools" collapse button.
         continue;
       }
-      // Inline thinking: break the current tool group so ordering
-      // renders as tool → thinking → tool in the chat.
+      if (
+        !missionIsRunning &&
+        lastAssistantItemIndex !== -1 &&
+        index > lastAssistantItemIndex &&
+        item.done
+      ) {
+        // A full history replay can race an older live items tail and
+        // leave completed thought groups after the final assistant row.
+        // Completed thoughts remain available in the Thoughts panel; they
+        // should not appear as the visual bottom of a finished turn.
+        //
+        // Only applies once the mission has stopped: while it is still
+        // running, every thought after the last assistant reply belongs to
+        // the in-progress turn (a continued mission or a goal-mode auto
+        // iteration whose previous reply is now the "last assistant"), so
+        // those must keep rendering inline when the side panel is closed.
+        continue;
+      }
+      // Inline thinking/streaming: break the current tool group so ordering
+      // renders as tool → thought/draft → tool in the chat.
       flushToolGroup();
       currentThinkingGroup.push(item as SidePanelItem);
     } else {
@@ -708,6 +1063,26 @@ type QuestionInfo = {
   /** True when the only meaningful option is "Other" (free-text input). */
   freeTextOnly?: boolean;
 };
+
+/**
+ * True when a goal `status` means the goal loop has stopped driving the
+ * mission, so the goal pill should be cleared.
+ *
+ * The two goal backends speak different dialects: Codex emits the exact tokens
+ * `complete` / `budgetLimited` / `cleared`, while the Grok native loop emits
+ * decorated forms like `aborted:cancelled`, `aborted:no_goal_sentinel`, and
+ * `budget_limited` (snake_case). Match tolerantly — by prefix and normalized
+ * separators — so a stopped Grok goal mission doesn't leave a stale pill.
+ */
+function isTerminalGoalStatus(status: string): boolean {
+  const normalized = status.toLowerCase().replace(/[_-]/g, "");
+  return (
+    normalized === "complete" ||
+    normalized === "cleared" ||
+    normalized === "budgetlimited" ||
+    normalized.startsWith("aborted")
+  );
+}
 
 function parseQuestionArgs(args: unknown): QuestionInfo[] {
   if (!isRecord(args)) return [];
@@ -755,7 +1130,30 @@ function QuestionToolItem({
   item: ToolItem;
   onSubmit: (toolCallId: string, answers: string[][]) => Promise<void>;
 }) {
-  const questions = useMemo(() => parseQuestionArgs(item.args), [item.args]);
+  const parsedQuestions = useMemo(
+    () => parseQuestionArgs(item.args),
+    [item.args],
+  );
+  // Fallback for empty/malformed payloads (e.g. a question tool-call whose
+  // streamed input never assembled into args): render a single free-text
+  // reply so the user can still answer and unblock the mission, instead of a
+  // dead-end "Failed to render" error.
+  const isFallback = parsedQuestions.length === 0;
+  const questions = useMemo<QuestionInfo[]>(
+    () =>
+      isFallback
+        ? [
+            {
+              question:
+                "The agent asked for your input, but the question didn't include any content. Reply below to continue.",
+              options: [],
+              multiple: false,
+              freeTextOnly: true,
+            },
+          ]
+        : parsedQuestions,
+    [isFallback, parsedQuestions],
+  );
   const [answers, setAnswers] = useState<string[][]>(() =>
     questions.map(() => []),
   );
@@ -989,12 +1387,7 @@ function QuestionToolItem({
               <button
                 onClick={handleSubmit}
                 disabled={!canSubmit || submitting}
-                className={cn(
-                  "inline-flex items-center gap-2 rounded-lg px-4 py-2 text-sm font-medium transition-colors",
-                  !canSubmit || submitting
-                    ? "bg-white/5 text-white/30 cursor-not-allowed"
-                    : "bg-indigo-500/20 text-indigo-200 hover:bg-indigo-500/30",
-                )}
+                className="inline-flex items-center gap-2 rounded-lg bg-indigo-500 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-indigo-600 disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:bg-indigo-500"
               >
                 {submitting ? "Sending…" : "Submit Answer"}
               </button>
@@ -1019,7 +1412,6 @@ function formatTime(timestamp: number): string {
   const date = new Date(timestamp);
   return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 }
-
 
 function statusLabel(state: ControlRunState): {
   label: string;
@@ -1054,7 +1446,10 @@ function missionStatusLabel(
     case "active":
       return { label: "Active", className: "bg-indigo-500/20 text-indigo-400" };
     case "awaiting_user":
-      return { label: "Needs You", className: "bg-sky-500/20 text-sky-400" };
+      return {
+        label: "Needs You",
+        className: "bg-amber-500/20 text-amber-400",
+      };
     case "acknowledged":
       return {
         label: "Acknowledged",
@@ -1318,16 +1713,18 @@ function SharedFilePreviewModal({
 
   return (
     <div
-      className="fixed inset-0 z-50 flex items-center justify-center p-4"
+      className="fixed inset-0 z-50 flex items-center justify-center p-4 md:p-8"
       onClick={(e) => {
         if (e.target === e.currentTarget) onClose();
       }}
     >
-      <div className="absolute inset-0 bg-black/60 backdrop-blur-sm pointer-events-none" />
+      <div className="absolute inset-0 bg-black/70 backdrop-blur-sm pointer-events-none" />
       <div
         onClick={(e) => e.stopPropagation()}
         className={cn(
-          "relative rounded-2xl bg-[#1a1a1a] border border-white/[0.06] shadow-xl w-full max-w-4xl",
+          // Full-page reader (viewport minus padding) so the document clearly
+          // sits over the page instead of reading as a chat-width expansion.
+          "relative flex h-full w-full max-w-6xl flex-col rounded-2xl bg-[#1a1a1a] border border-white/[0.06] shadow-xl",
           "animate-in fade-in zoom-in-95 duration-200",
         )}
       >
@@ -1374,7 +1771,7 @@ function SharedFilePreviewModal({
           </div>
         </div>
 
-        <div className="max-h-[70vh] overflow-auto">
+        <div className="min-h-0 flex-1 overflow-auto">
           {loading ? (
             <div className="p-5">
               <Shimmer />
@@ -1629,15 +2026,22 @@ function SharedFileCard({ file }: { file: SharedFile }) {
         </button>
       </div>
 
-      {previewOpen && canPreview && (
-        <SharedFilePreviewModal
-          file={file}
-          resolvedUrl={resolvedUrl}
-          isApiUrl={isApiUrl}
-          onClose={() => setPreviewOpen(false)}
-          onDownload={() => void handleDownload()}
-        />
-      )}
+      {/* Portal to body: the card lives inside a virtualized row positioned
+          with transform:translateY, which would otherwise trap the modal's
+          position:fixed and render it inside the conversation. */}
+      {previewOpen &&
+        canPreview &&
+        typeof document !== "undefined" &&
+        createPortal(
+          <SharedFilePreviewModal
+            file={file}
+            resolvedUrl={resolvedUrl}
+            isApiUrl={isApiUrl}
+            onClose={() => setPreviewOpen(false)}
+            onDownload={() => void handleDownload()}
+          />,
+          document.body,
+        )}
     </>
   );
 }
@@ -1701,30 +2105,17 @@ function ThinkingGroupItem({
   );
 
   const hasActiveItem = items.some((item) => !item.done);
-  const [expanded, setExpanded] = useState(hasActiveItem);
-  const hasAutoCollapsedRef = useRef(false);
+  // Collapsed by default, including while active: the transcript shows one
+  // compact pill ("Thinking for 12s") that matches the tool-call rows'
+  // height, instead of auto-expanding into a tall content card. Live
+  // reasoning is one click away here or in the Thinking side panel.
+  const [expanded, setExpanded] = useState(false);
 
   // Get the earliest start time and latest end time
   const startTime = Math.min(...items.map((item) => item.startTime));
   const endTime = items.every((item) => item.done && item.endTime)
     ? Math.max(...items.map((item) => item.endTime || item.startTime))
     : undefined;
-
-  // Auto-collapse when all thinking is done
-  useEffect(() => {
-    if (!hasActiveItem && expanded && !hasAutoCollapsedRef.current) {
-      const duration = Math.floor((Date.now() - startTime) / 1000);
-      if (duration > 30) {
-        hasAutoCollapsedRef.current = true;
-        return;
-      }
-      const timer = setTimeout(() => {
-        setExpanded(false);
-        hasAutoCollapsedRef.current = true;
-      }, 1500);
-      return () => clearTimeout(timer);
-    }
-  }, [hasActiveItem, expanded, startTime]);
 
   // Only the active branch ticks once per second via `<LiveDuration>`.
   // When the group is fully done, we render a fixed string and never
@@ -1734,8 +2125,11 @@ function ThinkingGroupItem({
       ? formatDuration(Math.floor((endTime - startTime) / 1000))
       : null;
 
-  // If no non-empty items, don't render anything
-  if (nonEmptyItems.length === 0) {
+  // Nothing to show only when there is no content AND nothing in flight.
+  // An active group with still-empty content keeps its liveness pill —
+  // previously it rendered nothing, which also suppressed the "Agent is
+  // working" pill and left a dead gap in the transcript.
+  if (nonEmptyItems.length === 0 && !hasActiveItem) {
     return null;
   }
 
@@ -2036,8 +2430,7 @@ const ThinkingPanel = memo(function ThinkingPanel({
     overscan: 6,
   });
   // See `chatVirtualizer` below for rationale.
-  thoughtsVirtualizer.shouldAdjustScrollPositionOnItemSizeChange = () =>
-    false;
+  thoughtsVirtualizer.shouldAdjustScrollPositionOnItemSizeChange = () => false;
   const {
     isAtBottom: isThoughtsAtBottom,
     scrollToBottom: scrollThoughtsToBottom,
@@ -2162,10 +2555,11 @@ const ThinkingPanel = memo(function ThinkingPanel({
               <button
                 type="button"
                 onClick={() => scrollThoughtsToBottom()}
-                className="absolute bottom-3 right-3 flex h-8 w-8 items-center justify-center rounded-full border border-white/[0.1] bg-black/50 text-white/60 shadow-lg transition-colors hover:bg-white/[0.08] hover:text-white"
+                className="absolute bottom-3 right-3 inline-flex items-center gap-2 rounded-full border border-white/[0.12] bg-white/90 px-3 py-2 text-xs font-medium text-slate-700 shadow-lg backdrop-blur transition-all hover:bg-white hover:text-slate-950 dark:border-white/[0.1] dark:bg-black/70 dark:text-white/65 dark:hover:bg-white/[0.1] dark:hover:text-white/90"
                 title="Scroll to bottom"
               >
                 <ArrowDown className="h-4 w-4" />
+                Auto-scroll paused
               </button>
             )}
           </>
@@ -2181,6 +2575,7 @@ function MissionWorkbenchPanel({
   role,
   isRunning,
   childMissions,
+  queueLen,
   onClose,
   onResume,
   onCancel,
@@ -2188,6 +2583,7 @@ function MissionWorkbenchPanel({
   onOpenSwitcher,
   onViewMission,
   onSetStatus,
+  onCopyDebug,
   runSettingsSlot,
   className,
 }: {
@@ -2196,6 +2592,8 @@ function MissionWorkbenchPanel({
   role: ReturnType<typeof inferMissionRole>;
   isRunning: boolean;
   childMissions: Mission[];
+  /** Pending message count, surfaced inline alongside status. */
+  queueLen?: number;
   onClose: () => void;
   onResume: () => void;
   onCancel: (missionId: string) => void;
@@ -2203,10 +2601,13 @@ function MissionWorkbenchPanel({
   onOpenSwitcher: () => void;
   onViewMission: (missionId: string) => void;
   onSetStatus: (status: MissionStatus) => void | Promise<void>;
+  /** Copy a JSON debug snapshot (mission + stream phase) to the clipboard. */
+  onCopyDebug: () => void | Promise<void>;
   /**
    * Optional slot for the mission's run-settings editor (the
-   * `<NewMissionDialog mode="edit">` trigger). Rendered next to Resume/Stop
-   * so it's accessible without a separate toolbar button.
+   * `<NewMissionDialog mode="edit">` trigger). Rendered on its own row below
+   * the action grid so the dialog's larger button doesn't break the 2-col
+   * rhythm of the other actions.
    */
   runSettingsSlot?: React.ReactNode;
   className?: string;
@@ -2222,6 +2623,20 @@ function MissionWorkbenchPanel({
     (mission.status === "interrupted" ||
       mission.status === "blocked" ||
       mission.status === "failed");
+
+  // Effective model: an explicit per-mission override wins, otherwise fall
+  // back to the model recorded from the last run's metadata. Strip any
+  // `provider/` prefix for display (matching the assistant message badge) but
+  // keep the full value in the tooltip.
+  const modelOverride = mission?.model_override?.trim() || undefined;
+  const modelRecorded = mission?.metadata_model?.trim() || undefined;
+  const modelRaw = modelOverride || modelRecorded || null;
+  const modelEffort = mission?.model_effort?.trim() || undefined;
+  const modelDisplay = modelRaw
+    ? modelRaw.includes("/")
+      ? modelRaw.split("/").pop()
+      : modelRaw
+    : null;
 
   const [markAsOpen, setMarkAsOpen] = useState(false);
   const markAsRef = useRef<HTMLDivElement>(null);
@@ -2259,23 +2674,23 @@ function MissionWorkbenchPanel({
       )}
       aria-label="Mission workbench"
     >
-      <div className="flex items-center justify-between border-b border-white/[0.06] px-4 py-3">
+      <div className="flex items-center justify-between border-b border-white/[0.06] px-3 py-2">
         <div className="flex min-w-0 items-center gap-2">
-          <BriefcaseBusiness className="h-4 w-4 shrink-0 text-indigo-400" />
-          <span className="truncate text-sm font-medium text-white">
+          <BriefcaseBusiness className="h-3.5 w-3.5 shrink-0 text-indigo-400" />
+          <span className="truncate text-xs font-medium text-white/90">
             Workbench
           </span>
         </div>
         <button
           onClick={onClose}
-          className="flex h-6 w-6 items-center justify-center rounded-lg text-white/40 hover:bg-white/[0.04] hover:text-white transition-colors"
+          className="flex h-5 w-5 items-center justify-center rounded text-white/40 hover:bg-white/[0.04] hover:text-white transition-colors"
           title="Close workbench"
         >
-          <X className="h-3.5 w-3.5" />
+          <X className="h-3 w-3" />
         </button>
       </div>
 
-      <div className="min-h-0 flex-1 overflow-y-auto p-4 space-y-4">
+      <div className="min-h-0 flex-1 overflow-y-auto p-2.5 text-xs">
         {!mission ? (
           <div className="flex h-full flex-col items-center justify-center text-center">
             <Inbox className="mb-3 h-8 w-8 text-white/20" />
@@ -2284,126 +2699,145 @@ function MissionWorkbenchPanel({
             </p>
             <button
               onClick={onOpenSwitcher}
-              className="mt-4 rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2 text-sm text-white/70 hover:bg-white/[0.04]"
+              className="mt-4 rounded-md border border-white/[0.06] bg-white/[0.02] px-2.5 py-1.5 text-xs text-white/70 hover:bg-white/[0.04]"
             >
               Open mission switcher
             </button>
           </div>
         ) : (
           <>
-            <section className="space-y-3">
-              <div>
-                <p className="mb-1 text-[10px] uppercase tracking-wide text-white/30">
-                  Mission
-                </p>
-                <h2
-                  className="line-clamp-3 text-sm font-medium leading-snug text-white/85"
-                  title={title}
-                >
-                  {title}
-                </h2>
-              </div>
-              <div className="grid grid-cols-2 gap-2">
-                <div className="rounded-md border border-white/[0.05] bg-white/[0.02] p-2">
-                  <p className="text-[10px] text-white/30">Status</p>
-                  <div className="mt-1 flex items-center gap-1.5">
-                    <span
-                      className={cn(
-                        "h-2 w-2 rounded-full",
-                        missionStatusDotClass(mission.status, isRunning),
-                      )}
-                    />
-                    <span
-                      className={cn("text-xs font-medium", status?.className)}
-                    >
-                      {status?.label}
-                    </span>
-                  </div>
-                </div>
-                <div className="rounded-md border border-white/[0.05] bg-white/[0.02] p-2">
-                  <p className="text-[10px] text-white/30">Role</p>
-                  <p className="mt-1 truncate text-xs font-medium capitalize text-white/70">
-                    {role ?? "mission"}
-                  </p>
-                </div>
-                <div className="rounded-md border border-white/[0.05] bg-white/[0.02] p-2">
-                  <p className="text-[10px] text-white/30">Workspace</p>
-                  <p
-                    className="mt-1 truncate text-xs font-medium text-white/70"
-                    title={workspaceLabel}
-                  >
-                    {workspaceLabel ?? "Unassigned"}
-                  </p>
-                </div>
-                <div className="rounded-md border border-white/[0.05] bg-white/[0.02] p-2">
-                  <p className="text-[10px] text-white/30">Updated</p>
-                  <RelativeTime
-                    date={mission.updated_at}
-                    className="mt-1 text-xs font-medium text-white/70"
-                  />
-                </div>
-              </div>
-              {mission.short_description && (
-                <p className="rounded-md border border-white/[0.05] bg-white/[0.02] p-2 text-xs leading-relaxed text-white/50">
-                  {mission.short_description}
-                </p>
-              )}
-            </section>
+            <p
+              className="line-clamp-2 text-xs font-medium leading-snug text-white/85"
+              title={title}
+            >
+              {title}
+            </p>
 
-            <section className="space-y-2">
-              <p className="text-[10px] uppercase tracking-wide text-white/30">
+            <dl className="mt-2 space-y-0.5 text-[11px]">
+              <Row label="Status">
+                <span className="flex items-center gap-1.5">
+                  <span
+                    className={cn(
+                      "h-1.5 w-1.5 rounded-full",
+                      missionStatusDotClass(mission.status, isRunning),
+                    )}
+                  />
+                  <span className={cn("font-medium", status?.className)}>
+                    {status?.label}
+                  </span>
+                </span>
+              </Row>
+              {queueLen !== undefined && queueLen > 0 && (
+                <Row label="Queue">
+                  <span
+                    className={cn(
+                      "font-mono tabular-nums",
+                      queueLen >= 3 ? "text-orange-300" : "text-amber-300",
+                    )}
+                  >
+                    {queueLen}
+                  </span>
+                </Row>
+              )}
+              <Row label="Role">
+                <span className="capitalize font-mono text-white/70">
+                  {role ?? "mission"}
+                </span>
+              </Row>
+              <Row label="Model">
+                <span className="flex min-w-0 items-center justify-end gap-1.5">
+                  {modelOverride && (
+                    <span className="shrink-0 text-[10px] font-medium uppercase tracking-wide text-indigo-300/80">
+                      override
+                    </span>
+                  )}
+                  <span
+                    className={cn(
+                      "max-w-[130px] truncate font-mono",
+                      modelDisplay ? "text-white/70" : "text-white/40",
+                    )}
+                    title={
+                      modelRaw
+                        ? modelEffort
+                          ? `${modelRaw} (${modelEffort} effort)`
+                          : modelRaw
+                        : undefined
+                    }
+                  >
+                    {modelDisplay ?? "Default"}
+                  </span>
+                </span>
+              </Row>
+              <Row label="Workspace">
+                <span
+                  className="truncate font-mono text-white/70 max-w-[160px]"
+                  title={workspaceLabel}
+                >
+                  {workspaceLabel ?? "Unassigned"}
+                </span>
+              </Row>
+              <Row label="Updated">
+                <RelativeTime
+                  date={mission.updated_at}
+                  className="font-mono text-white/70"
+                />
+              </Row>
+            </dl>
+
+            {mission.short_description && (
+              <p className="workbench-mission-description mt-2 rounded-md border border-white/[0.05] bg-white/[0.02] px-2 py-1.5 text-[11px] leading-relaxed text-white/50">
+                {mission.short_description}
+              </p>
+            )}
+
+            <div className="mt-3 border-t border-white/[0.06] pt-2.5">
+              <p className="mb-1.5 text-[10px] uppercase tracking-wide text-white/30">
                 Actions
               </p>
-              <div className="grid grid-cols-2 gap-2">
+              <div className="grid grid-cols-2 gap-1.5">
                 {canResume && (
-                  <button
+                  <WorkbenchActionButton
                     onClick={onResume}
-                    className="inline-flex items-center justify-center gap-1.5 rounded-lg border border-emerald-500/20 bg-emerald-500/10 px-3 py-2 text-xs font-medium text-emerald-300 hover:bg-emerald-500/15"
-                  >
-                    <RotateCcw className="h-3.5 w-3.5" />
-                    Resume
-                  </button>
+                    tone="emerald"
+                    icon={RotateCcw}
+                    label="Resume"
+                  />
                 )}
                 {isRunning && (
-                  <button
+                  <WorkbenchActionButton
                     onClick={() => onCancel(mission.id)}
-                    className="inline-flex items-center justify-center gap-1.5 rounded-lg border border-red-500/20 bg-red-500/10 px-3 py-2 text-xs font-medium text-red-300 hover:bg-red-500/15"
-                  >
-                    <Square className="h-3.5 w-3.5" />
-                    Stop
-                  </button>
+                    tone="red"
+                    icon={Square}
+                    label="Stop"
+                  />
                 )}
-                <button
+                <WorkbenchActionButton
                   onClick={onOpenAutomations}
-                  className="inline-flex items-center justify-center gap-1.5 rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2 text-xs font-medium text-white/70 hover:bg-white/[0.04]"
-                >
-                  <Clock className="h-3.5 w-3.5" />
-                  Automations
-                </button>
-                <button
+                  icon={Clock}
+                  label="Automations"
+                />
+                <WorkbenchActionButton
                   onClick={onOpenSwitcher}
-                  className="inline-flex items-center justify-center gap-1.5 rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2 text-xs font-medium text-white/70 hover:bg-white/[0.04]"
-                >
-                  <Layers className="h-3.5 w-3.5" />
-                  Switch
-                </button>
+                  icon={Layers}
+                  label="Switch"
+                />
                 <div ref={markAsRef} className="relative">
                   <button
                     onClick={() => setMarkAsOpen((prev) => !prev)}
                     aria-haspopup="menu"
                     aria-expanded={markAsOpen}
                     className={cn(
-                      "inline-flex w-full items-center justify-center gap-1.5 rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2 text-xs font-medium text-white/70 hover:bg-white/[0.04]",
+                      "inline-flex h-7 w-full items-center justify-center gap-1 rounded-md border border-white/[0.06] bg-white/[0.02] px-2 text-[11px] font-medium text-white/70 hover:bg-white/[0.04]",
                       markAsOpen && "bg-white/[0.06] text-white",
                     )}
                   >
-                    <Flag className="h-3.5 w-3.5" />
-                    Mark As
+                    <Flag className="h-3 w-3" />
+                    Mark as
                   </button>
                   {markAsOpen && (
                     <div
                       role="menu"
-                      className="absolute right-0 top-full z-20 mt-1 w-40 overflow-hidden rounded-lg border border-white/[0.08] bg-[#1a1a1a] shadow-xl"
+                      className="absolute right-0 top-full z-20 mt-1 w-36 overflow-hidden rounded-md border border-white/[0.08] bg-[#1a1a1a] shadow-xl"
                     >
                       {(
                         ["completed", "blocked", "failed"] as MissionStatus[]
@@ -2420,7 +2854,7 @@ function MissionWorkbenchPanel({
                           }}
                           disabled={mission.status === nextStatus}
                           spinnerClassName="h-3 w-3"
-                          className="flex w-full items-center justify-between gap-2 px-3 py-2 text-xs capitalize text-white/70 transition-colors hover:bg-white/[0.06] disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-transparent"
+                          className="flex w-full items-center justify-between gap-2 px-2.5 py-1.5 text-[11px] capitalize text-white/70 transition-colors hover:bg-white/[0.06] disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-transparent"
                         >
                           <span>{nextStatus.replace("_", " ")}</span>
                           {mission.status === nextStatus && (
@@ -2431,50 +2865,106 @@ function MissionWorkbenchPanel({
                     </div>
                   )}
                 </div>
-                {runSettingsSlot && (
-                  <div className="col-span-2 [&>div]:w-full [&>div>button]:w-full [&>div>button]:justify-center">
-                    {runSettingsSlot}
-                  </div>
-                )}
+                <WorkbenchActionButton
+                  onClick={onCopyDebug}
+                  icon={Clipboard}
+                  label="Copy debug"
+                  title="Copy mission + stream debug info as JSON"
+                />
               </div>
-            </section>
+              {runSettingsSlot && (
+                <div className="mt-1.5 [&>div]:w-full [&>div>button]:w-full [&>div>button]:justify-center [&>div>button]:h-7 [&>div>button]:px-2 [&>div>button]:py-0 [&>div>button]:text-[11px] [&>div>button]:gap-1 [&>div>button>svg]:h-3 [&>div>button>svg]:w-3 [&>div>button>span]:!inline">
+                  {runSettingsSlot}
+                </div>
+              )}
+            </div>
 
             {childMissions.length > 0 && (
-              <section className="space-y-2">
-                <div className="flex items-center justify-between">
+              <div className="mt-3 border-t border-white/[0.06] pt-2.5">
+                <div className="mb-1.5 flex items-center justify-between">
                   <p className="text-[10px] uppercase tracking-wide text-white/30">
-                    Worker Missions
+                    Workers
                   </p>
                   <span className="text-[10px] tabular-nums text-white/30">
                     {childMissions.length}
                   </span>
                 </div>
-                <div className="space-y-1.5">
-                  {childMissions.slice(0, 6).map((child) => (
+                <div className="space-y-0.5">
+                  {childMissions.slice(0, 8).map((child) => (
                     <button
                       key={child.id}
                       onClick={() => onViewMission(child.id)}
-                      className="flex w-full items-center gap-2 rounded-md border border-white/[0.05] bg-white/[0.02] px-2.5 py-2 text-left hover:bg-white/[0.04]"
+                      className="flex w-full items-center gap-2 rounded px-1.5 py-1 text-left hover:bg-white/[0.04]"
                     >
                       <span
                         className={cn(
-                          "h-2 w-2 rounded-full",
+                          "h-1.5 w-1.5 rounded-full shrink-0",
                           missionStatusDotClass(child.status),
                         )}
                       />
-                      <span className="min-w-0 flex-1 truncate text-xs text-white/70">
+                      <span className="min-w-0 flex-1 truncate text-[11px] text-white/70">
                         {child.title?.trim() || getMissionShortName(child.id)}
                       </span>
-                      <ChevronRight className="h-3 w-3 text-white/30" />
+                      <ChevronRight className="h-3 w-3 shrink-0 text-white/30" />
                     </button>
                   ))}
                 </div>
-              </section>
+              </div>
             )}
           </>
         )}
       </div>
     </aside>
+  );
+}
+
+function Row({
+  label,
+  children,
+}: {
+  label: string;
+  children: React.ReactNode;
+}) {
+  return (
+    <div className="flex items-center justify-between gap-2 py-0.5">
+      <dt className="text-white/40">{label}</dt>
+      <dd className="min-w-0">{children}</dd>
+    </div>
+  );
+}
+
+function WorkbenchActionButton({
+  onClick,
+  icon: Icon,
+  label,
+  tone,
+  title,
+}: {
+  onClick: () => void | Promise<void>;
+  icon: React.ComponentType<{ className?: string }>;
+  label: string;
+  tone?: "emerald" | "red";
+  title?: string;
+}) {
+  const toneClasses =
+    tone === "emerald"
+      ? "border-emerald-500/25 bg-emerald-500/10 text-emerald-400 hover:bg-emerald-500/15"
+      : tone === "red"
+        ? "border-red-500/25 bg-red-500/10 text-red-400 hover:bg-red-500/15"
+        : "border-white/[0.06] bg-white/[0.02] text-white/70 hover:bg-white/[0.04]";
+  return (
+    <button
+      type="button"
+      onClick={() => void onClick()}
+      title={title}
+      className={cn(
+        "inline-flex h-7 w-full items-center justify-center gap-1 rounded-md border px-2 text-[11px] font-medium transition-colors",
+        toneClasses,
+      )}
+    >
+      <Icon className="h-3 w-3" />
+      {label}
+    </button>
   );
 }
 
@@ -3040,14 +3530,17 @@ const ToolCallItem = memo(function ToolCallItem({
   highlighted = false,
   workspaceId,
   missionId,
+  onLoadDetails,
 }: {
   item: Extract<ChatItem, { kind: "tool" }>;
   highlighted?: boolean;
   workspaceId?: string;
   missionId?: string;
+  onLoadDetails?: (toolCallId: string) => Promise<void>;
 }) {
   const [expanded, setExpanded] = useState(false);
-  const isDone = item.result !== undefined;
+  const isLazy = item.lazy === true;
+  const isDone = !isLazy && item.result !== undefined;
 
   // Only running tools live-tick (via `<LiveDuration>` below). Done rows
   // freeze on a fixed string; previously every visible done tool subscribed
@@ -3069,6 +3562,13 @@ const ToolCallItem = memo(function ToolCallItem({
   );
   const resultStr = resultPreview?.preview ?? null;
   const [resultExpanded, setResultExpanded] = useState(false);
+  const handleToggleExpanded = useCallback(() => {
+    const nextExpanded = !expanded;
+    setExpanded(nextExpanded);
+    if (nextExpanded && isLazy && !item.loading) {
+      void onLoadDetails?.(item.toolCallId);
+    }
+  }, [expanded, isLazy, item.loading, item.toolCallId, onLoadDetails]);
 
   // Memoize cancelled detection - check if tool was cancelled due to mission ending
   const isCancelled = useMemo(() => {
@@ -3130,13 +3630,14 @@ const ToolCallItem = memo(function ToolCallItem({
     >
       {/* Compact header */}
       <button
-        onClick={() => setExpanded(!expanded)}
+        onClick={handleToggleExpanded}
         className={cn(
           "flex items-center gap-1.5 px-2.5 py-1 rounded-full",
           "bg-white/[0.04] border border-white/[0.06]",
           "text-white/40 hover:text-white/60 hover:bg-white/[0.06]",
           "transition-all duration-200",
-          !isDone && "border-amber-500/20",
+          !isDone && !isLazy && "border-amber-500/20",
+          isLazy && "border-white/[0.06]",
           isDone && isCancelled && "border-amber-500/20",
           isDone && !isError && !isCancelled && "border-emerald-500/20",
           isDone && isError && "border-red-500/20",
@@ -3146,7 +3647,8 @@ const ToolCallItem = memo(function ToolCallItem({
           toolName={item.name}
           className={cn(
             "h-3 w-3",
-            !isDone && "animate-pulse text-amber-400",
+            !isDone && !isLazy && "animate-pulse text-amber-400",
+            isLazy && "text-white/40",
             isDone && isCancelled && "text-amber-400",
             isDone && !isError && !isCancelled && "text-emerald-400",
             isDone && isError && "text-red-400",
@@ -3159,7 +3661,13 @@ const ToolCallItem = memo(function ToolCallItem({
           </span>
         )}
         <span className="text-xs text-white/30 ml-1">
-          {isDone ? (
+          {isLazy ? (
+            item.loading ? (
+              "loading"
+            ) : (
+              "hidden"
+            )
+          ) : isDone ? (
             isCancelled ? (
               "cancelled"
             ) : (
@@ -3172,14 +3680,21 @@ const ToolCallItem = memo(function ToolCallItem({
             </>
           )}
         </span>
-        {isDone && !isError && !isCancelled && (
+        {!isLazy && isDone && !isError && !isCancelled && (
           <CheckCircle className="h-3 w-3 text-emerald-400" />
         )}
-        {isDone && isCancelled && (
+        {!isLazy && isDone && isCancelled && (
           <XCircle className="h-3 w-3 text-amber-400" />
         )}
-        {isDone && isError && <XCircle className="h-3 w-3 text-red-400" />}
-        {!isDone && <Loader className="h-3 w-3 animate-spin text-amber-400" />}
+        {!isLazy && isDone && isError && (
+          <XCircle className="h-3 w-3 text-red-400" />
+        )}
+        {!isDone && !isLazy && (
+          <Loader className="h-3 w-3 animate-spin text-amber-400" />
+        )}
+        {isLazy && item.loading && (
+          <Loader className="h-3 w-3 animate-spin text-white/40" />
+        )}
         <ChevronDown
           className={cn(
             "h-3 w-3 transition-transform duration-200 ml-1",
@@ -3193,6 +3708,27 @@ const ToolCallItem = memo(function ToolCallItem({
       {expanded && (
         <div className="mt-2">
           <div className="rounded-lg border border-white/[0.06] bg-white/[0.02] p-3 space-y-3">
+            {/* Arguments */}
+            {isLazy && (
+              <div className="flex items-center justify-between gap-3 rounded border border-white/[0.06] bg-white/[0.03] px-3 py-2 text-xs text-white/45">
+                <span>
+                  Details hidden
+                  {typeof item.contentBytes === "number" ||
+                  typeof item.resultBytes === "number"
+                    ? ` (${formatBytes((item.contentBytes ?? 0) + (item.resultBytes ?? 0))})`
+                    : ""}
+                </span>
+                <button
+                  type="button"
+                  onClick={() => void onLoadDetails?.(item.toolCallId)}
+                  disabled={item.loading}
+                  className="rounded bg-white/[0.06] px-2 py-1 text-[10px] font-medium text-white/70 hover:bg-white/[0.1] disabled:opacity-50"
+                >
+                  {item.loading ? "Loading" : "Load details"}
+                </button>
+              </div>
+            )}
+
             {/* Arguments */}
             {argsStr && (
               <div>
@@ -3301,17 +3837,64 @@ function CollapsedToolGroup({
   tools,
   isExpanded,
   onToggleExpand,
+  measureRow,
   workspaceId,
   missionId,
+  onLoadToolDetails,
 }: {
   tools: Extract<ChatItem, { kind: "tool" }>[];
   isExpanded: boolean;
   onToggleExpand: () => void;
+  /** Synchronously re-measure this group's virtualizer row — part of the
+      anti-flash fix: lets the layout effect below update row offsets in the
+      same pre-paint pass as the scroll adjustment. */
+  measureRow?: (el: HTMLElement) => void;
   workspaceId?: string;
   missionId?: string;
+  onLoadToolDetails?: (toolCallId: string) => Promise<void>;
 }) {
   const hiddenCount = tools.length - 1;
   const lastTool = tools[tools.length - 1];
+
+  // Keep the toggle pinned under the cursor across expand/collapse: revealed
+  // tools render *above* the toggle, so without compensation the toggle (and
+  // everything below) is pushed down and the user has to chase it. Record the
+  // toggle's viewport position before flipping, then re-align the scroller
+  // after layout (plus two rAF passes so the virtualizer's async re-measure
+  // doesn't undo the adjustment).
+  const toggleRef = useRef<HTMLButtonElement | null>(null);
+  const anchorTopRef = useRef<number | null>(null);
+
+  const handleToggle = () => {
+    anchorTopRef.current =
+      toggleRef.current?.getBoundingClientRect().top ?? null;
+    onToggleExpand();
+  };
+
+  useLayoutEffect(() => {
+    const anchorTop = anchorTopRef.current;
+    if (anchorTop == null) return;
+    anchorTopRef.current = null;
+    // Re-measure the virtualizer row *synchronously* so subsequent rows'
+    // offsets and the scroll adjustment land in the same pre-paint pass —
+    // without this the virtualizer re-measures via ResizeObserver after
+    // paint, and the intermediate frame flashes stale row offsets.
+    const rowEl = toggleRef.current?.closest("[data-index]");
+    if (rowEl instanceof HTMLElement) measureRow?.(rowEl);
+    const align = () => {
+      const el = toggleRef.current;
+      if (!el) return;
+      const scroller = el.closest(".overflow-y-auto");
+      if (!scroller) return;
+      const delta = el.getBoundingClientRect().top - anchorTop;
+      if (Math.abs(delta) > 0.5) scroller.scrollTop += delta;
+    };
+    align();
+    // Single post-paint safety pass; a no-op (read-only) when the
+    // synchronous path above already settled everything.
+    const raf = requestAnimationFrame(align);
+    return () => cancelAnimationFrame(raf);
+  }, [isExpanded, measureRow]);
 
   // Helper to render appropriate tool component
   const renderTool = (tool: Extract<ChatItem, { kind: "tool" }>) => {
@@ -3324,16 +3907,24 @@ function CollapsedToolGroup({
         item={tool}
         workspaceId={workspaceId}
         missionId={missionId}
+        onLoadDetails={onLoadToolDetails}
       />
     );
   };
 
+  // The group expands *upward*: revealed tools render above the toggle, so
+  // the toggle row and the last tool keep their position relative to the
+  // conversation below and auto-scroll isn't disturbed by content growing
+  // toward the bottom. Chevrons follow: collapsed points up (reveal above),
+  // expanded points right (neutral "fold away", not a direction the
+  // content grows in).
   if (isExpanded) {
-    // Show all tools with a collapse button at the top
     return (
       <div className="space-y-2">
+        {tools.slice(0, -1).map((tool) => renderTool(tool))}
         <button
-          onClick={onToggleExpand}
+          ref={toggleRef}
+          onClick={handleToggle}
           className={cn(
             "flex items-center gap-1.5 px-2.5 py-1 rounded-full",
             "bg-white/[0.02] border border-white/[0.04]",
@@ -3341,12 +3932,12 @@ function CollapsedToolGroup({
             "transition-all duration-200 text-xs",
           )}
         >
-          <ChevronUp className="h-3 w-3" />
+          <ChevronRight className="h-3 w-3" />
           <span>
             Hide {hiddenCount} previous tool{hiddenCount > 1 ? "s" : ""}
           </span>
         </button>
-        {tools.map((tool) => renderTool(tool))}
+        {renderTool(lastTool)}
       </div>
     );
   }
@@ -3355,7 +3946,8 @@ function CollapsedToolGroup({
   return (
     <div className="space-y-2">
       <button
-        onClick={onToggleExpand}
+        ref={toggleRef}
+        onClick={handleToggle}
         className={cn(
           "flex items-center gap-1.5 px-2.5 py-1 rounded-full",
           "bg-white/[0.02] border border-white/[0.04]",
@@ -3363,7 +3955,7 @@ function CollapsedToolGroup({
           "transition-all duration-200 text-xs",
         )}
       >
-        <ChevronDown className="h-3 w-3" />
+        <ChevronUp className="h-3 w-3" />
         <span>
           Show {hiddenCount} previous tool{hiddenCount > 1 ? "s" : ""}
         </span>
@@ -3381,6 +3973,7 @@ type ChatItemRowProps = {
   basePath: string | undefined;
   isToolGroupExpanded: boolean;
   onToggleToolGroup: (groupId: string) => void;
+  measureRow?: (el: HTMLElement) => void;
   onResume: () => void;
   onToolResult: (
     toolCallId: string,
@@ -3388,6 +3981,12 @@ type ChatItemRowProps = {
     result: unknown,
   ) => Promise<void>;
   onOptimisticToolResult: (toolCallId: string, result: unknown) => void;
+  onRetryUserMessage: (msg: {
+    id: string;
+    content: string;
+    agent?: string;
+  }) => void;
+  onLoadToolDetails?: (toolCallId: string) => Promise<void>;
 };
 
 /**
@@ -3405,9 +4004,12 @@ const ChatItemRow = memo(function ChatItemRow({
   basePath,
   isToolGroupExpanded,
   onToggleToolGroup,
+  measureRow,
   onResume,
   onToolResult,
   onOptimisticToolResult,
+  onRetryUserMessage,
+  onLoadToolDetails,
 }: ChatItemRowProps) {
   const renderedContent =
     item.kind === "assistant" && item.sharedFiles?.length
@@ -3433,14 +4035,17 @@ const ChatItemRow = memo(function ChatItemRow({
           tools={item.tools}
           isExpanded={isToolGroupExpanded}
           onToggleExpand={() => onToggleToolGroup(item.groupId)}
+          measureRow={measureRow}
           workspaceId={workspaceId}
           missionId={missionId}
+          onLoadToolDetails={onLoadToolDetails}
         />
       </div>
     );
   }
 
   if (item.kind === "user") {
+    const sendStatus = item.sendStatus;
     return (
       <div
         id={`chat-item-${item.id}`}
@@ -3454,10 +4059,14 @@ const ChatItemRow = memo(function ChatItemRow({
         <div className="max-w-[80%]">
           <div
             className={cn(
-              "rounded-2xl rounded-tr-md px-4 py-3 text-white selection-light",
+              "user-message-bubble rounded-2xl rounded-tr-md px-4 py-3 selection-light transition-opacity duration-200",
               item.queued
-                ? "border-2 border-dashed border-indigo-500/60 bg-indigo-500/20"
-                : "bg-indigo-500",
+                ? "user-message-bubble-queued border-2 border-dashed"
+                : "user-message-bubble-solid",
+              // In-flight sends read as tentative; failed sends keep a
+              // rose ring so an undelivered message is unmistakable.
+              sendStatus === "sending" && "opacity-60",
+              sendStatus === "failed" && "opacity-90 ring-1 ring-rose-500/40",
             )}
           >
             <p className="whitespace-pre-wrap text-sm break-words">
@@ -3465,7 +4074,36 @@ const ChatItemRow = memo(function ChatItemRow({
             </p>
           </div>
           <div className="mt-1 text-right flex items-center justify-end gap-2">
-            {item.queued === true && (
+            {sendStatus === "sending" && (
+              <span className="inline-flex items-center gap-1 text-[10px] text-white/40">
+                <Loader className="h-2.5 w-2.5 motion-safe:animate-spin" />
+                Sending…
+              </span>
+            )}
+            {sendStatus === "failed" && (
+              <>
+                <span className="text-[10px] text-rose-500">
+                  {item.failedReason === "rejected"
+                    ? "Not delivered"
+                    : "Not sent — offline"}
+                </span>
+                <button
+                  type="button"
+                  onClick={() =>
+                    onRetryUserMessage({
+                      id: item.id,
+                      content: item.content,
+                      agent: item.agent,
+                    })
+                  }
+                  className="inline-flex items-center gap-1 text-[10px] font-medium text-rose-500 hover:text-rose-400"
+                >
+                  <RotateCcw className="h-2.5 w-2.5" />
+                  Retry
+                </button>
+              </>
+            )}
+            {item.queued === true && sendStatus !== "failed" && (
               <span className="text-[10px] text-white/30">Queued</span>
             )}
             <span className="text-[10px] text-white/30">
@@ -3485,7 +4123,9 @@ const ChatItemRow = memo(function ChatItemRow({
     // ServerShutdown turns auto-resume — render with the check icon so the
     // visual weight matches "this is being handled", not "agent died".
     const MessageStatusIcon =
-      item.success || item.terminalReason === "ServerShutdown" ? CheckCircle : XCircle;
+      item.success || item.terminalReason === "ServerShutdown"
+        ? CheckCircle
+        : XCircle;
     const displayModel = item.model
       ? item.model.includes("/")
         ? item.model.split("/").pop()
@@ -3577,7 +4217,19 @@ const ChatItemRow = memo(function ChatItemRow({
             </div>
           )}
         </div>
-        <CopyButton text={item.content} className="self-start mt-8" />
+        <div className="flex flex-col items-center gap-1 self-start mt-8">
+          <CopyButton text={item.content} />
+          <button
+            type="button"
+            onClick={() =>
+              controlAskStore.set({ open: true, seed: item.content })
+            }
+            title="Ask the co-pilot about this"
+            className="opacity-0 group-hover:opacity-100 transition-opacity text-[rgb(var(--foreground)/0.4)] hover:text-[rgb(var(--copilot))]"
+          >
+            <Sparkles className="h-3.5 w-3.5" />
+          </button>
+        </div>
       </div>
     );
   }
@@ -3729,6 +4381,7 @@ const ChatItemRow = memo(function ChatItemRow({
           highlighted={highlighted}
           workspaceId={workspaceId}
           missionId={missionId}
+          onLoadDetails={onLoadToolDetails}
         />
       );
     }
@@ -3743,6 +4396,7 @@ const ChatItemRow = memo(function ChatItemRow({
         highlighted={highlighted}
         workspaceId={workspaceId}
         missionId={missionId}
+        onLoadDetails={onLoadToolDetails}
       />
     );
   }
@@ -3808,6 +4462,7 @@ function AttachmentPreview({
 export default function ControlClient() {
   const searchParams = useSearchParams();
   const router = useRouter();
+  const showPerfOverlay = searchParams.get("debug") === "perf";
 
   const [items, setItems] = useControlItemsStore();
   const itemsRef = useRef<ChatItem[]>([]);
@@ -3879,6 +4534,12 @@ export default function ControlClient() {
   const [queueLen, setQueueLen] = useControlQueueStore();
   const lastQueueLenRef = useRef<number | null>(null);
   const syncingQueueRef = useRef(false);
+  // Bumped whenever the user locally mutates the queue (remove / clear all).
+  // getQueue() snapshots capture the generation *before* the fetch and compare
+  // it when applying — a snapshot taken while a deletion was in flight may
+  // still contain the deleted message, and merging it would resurrect the
+  // message as a ghost row (visible in the queue strip, 404 on re-delete).
+  const queueMutationGenRef = useRef(0);
 
   // Backwards-pagination state. Long missions can have 20k+ history events
   // and the initial load is capped at HISTORY_PAGE_SIZE for memory + render
@@ -4003,10 +4664,8 @@ export default function ControlClient() {
     "connected" | "disconnected" | "reconnecting"
   >("disconnected");
   const [reconnectAttempt, setReconnectAttempt] = useState(0);
-  const [showStreamDiagnostics, setShowStreamDiagnostics] = useState(false);
   const [streamDiagnostics, setStreamDiagnostics] =
     useControlStreamingDiagnosticsStore();
-  const [diagTick, setDiagTick] = useState(0);
 
   // Progress state (for "Subtask X of Y" indicator), tracked per mission
   const [progressByMission, setProgressByMission] = useState<
@@ -4032,29 +4691,11 @@ export default function ControlClient() {
 
   // Library context for agents
 
-  // Only tick when stream is active to avoid unnecessary re-renders
-  const streamIsActive =
-    streamDiagnostics.phase === "open" ||
-    streamDiagnostics.phase === "streaming" ||
-    streamDiagnostics.phase === "connecting";
-  useEffect(() => {
-    if (!streamIsActive) return;
-    const interval = setInterval(() => setDiagTick((prev) => prev + 1), 1000);
-    return () => clearInterval(interval);
-  }, [streamIsActive]);
-
   // Parallel missions state
   const [runningMissions, setRunningMissions] = useState<RunningMissionInfo[]>(
     [],
   );
   const [showMissionSwitcher, setShowMissionSwitcher] = useState(false);
-  const [showWorkerPanel, setShowWorkerPanel] = useState(false);
-  // Per-mission record of which missions the user has explicitly dismissed
-  // the worker panel for. Used so the auto-open effect doesn't keep reopening
-  // the panel after the user closes it while a streaming boss keeps spawning
-  // sub-agents.
-  const workerPanelDismissedRef = useRef<Set<string>>(new Set());
-  const workerPanelAutoOpenedForRef = useRef<string | null>(null);
   const [highlightedItemId, setHighlightedItemId] = useState<string | null>(
     null,
   );
@@ -4129,9 +4770,6 @@ export default function ControlClient() {
     },
     [setThinkingSlice],
   );
-  // Deferred mirror used by the heavy chat-list regrouping memo so the toggle
-  // click stays interactive even on long missions.
-  const deferredShowThinkingPanel = useDeferredValue(showThinkingPanel);
   const thinkingPanelManuallyHidden = thinkingSlice.manuallyHidden;
   const setThinkingPanelManuallyHidden = useCallback(
     (next: boolean | ((prev: boolean) => boolean)) => {
@@ -4146,6 +4784,27 @@ export default function ControlClient() {
   const [showWorkbenchPanel, setShowWorkbenchPanel] = useState(
     () => searchParams.get("workbench") === "1",
   );
+  const [askSlice, setAskSlice] = useControlAskStore();
+  const showAskPanel = askSlice.open;
+  const setShowAskPanel = useCallback(
+    (next: boolean | ((v: boolean) => boolean)) =>
+      setAskSlice((s) => ({
+        ...s,
+        open: typeof next === "function" ? next(s.open) : next,
+      })),
+    [setAskSlice],
+  );
+  // ⌘/ (or Ctrl+/) toggles the Ask co-pilot panel.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key === "/") {
+        e.preventDefault();
+        setShowAskPanel((v) => !v);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [setShowAskPanel]);
   const handleToggleThinkingPanel = useCallback(() => {
     setShowThinkingPanel((prev) => {
       const next = !prev;
@@ -4154,33 +4813,61 @@ export default function ControlClient() {
     });
   }, [setShowThinkingPanel, setThinkingPanelManuallyHidden]);
 
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (!event.metaKey || event.code !== "ShiftRight" || event.repeat) {
+        return;
+      }
+      event.preventDefault();
+      handleToggleThinkingPanel();
+    };
+
+    document.addEventListener("keydown", handleKeyDown);
+    return () => document.removeEventListener("keydown", handleKeyDown);
+  }, [handleToggleThinkingPanel]);
+
   const handleCloseThinkingPanel = useCallback(() => {
     setShowThinkingPanel(false);
     setThinkingPanelManuallyHidden(true);
   }, [setShowThinkingPanel, setThinkingPanelManuallyHidden]);
 
-  const adjustVisibleItemsLimit = useCallback((historyItems: ChatItem[]) => {
-    let lastAssistantIdx = -1;
-    for (let i = historyItems.length - 1; i >= 0; i--) {
-      if (historyItems[i].kind === "assistant") {
-        lastAssistantIdx = i;
-        break;
+  // Anchor the initial visible window on the last N conversation messages
+  // (user + assistant), not the last single assistant message. On tool-heavy
+  // missions a long run of tool calls would otherwise push the recent
+  // back-and-forth above the fold, behind "Load older messages". Expanding
+  // the window to span from the Nth-most-recent message through the newest
+  // item keeps the last ~10 turns (and the tool calls between them) visible
+  // immediately; everything older stays one click away.
+  const CONVERSATIONAL_ANCHOR_COUNT = 10;
+  const conversationalAnchorIndex = useCallback(
+    (historyItems: ChatItem[]): number => {
+      let convoSeen = 0;
+      let anchorIdx = -1;
+      for (let i = historyItems.length - 1; i >= 0; i--) {
+        const kind = historyItems[i].kind;
+        if (kind === "assistant" || kind === "user") {
+          anchorIdx = i;
+          convoSeen += 1;
+          if (convoSeen >= CONVERSATIONAL_ANCHOR_COUNT) break;
+        }
       }
-    }
+      return anchorIdx;
+    },
+    [],
+  );
 
-    if (lastAssistantIdx === -1) {
-      setVisibleItemsLimit(INITIAL_VISIBLE_ITEMS);
-      return;
-    }
-
-    const required = historyItems.length - lastAssistantIdx;
-    if (required <= INITIAL_VISIBLE_ITEMS) {
-      setVisibleItemsLimit(INITIAL_VISIBLE_ITEMS);
-      return;
-    }
-
-    setVisibleItemsLimit(required);
-  }, []);
+  const adjustVisibleItemsLimit = useCallback(
+    (historyItems: ChatItem[]) => {
+      const anchorIdx = conversationalAnchorIndex(historyItems);
+      if (anchorIdx === -1) {
+        setVisibleItemsLimit(INITIAL_VISIBLE_ITEMS);
+        return;
+      }
+      const required = historyItems.length - anchorIdx;
+      setVisibleItemsLimit(Math.max(INITIAL_VISIBLE_ITEMS, required));
+    },
+    [conversationalAnchorIndex],
+  );
 
   const HISTORY_EVENT_TYPES = useMemo(
     () => [
@@ -4209,24 +4896,20 @@ export default function ControlClient() {
    * compare is enough.
    */
   const missionMaxSeqRef = useRef<Map<string, number>>(new Map());
+  const lazyToolDetailsRef = useRef<Map<string, StoredEvent[]>>(new Map());
+  const lazyToolDetailsLoadingRef = useRef<Set<string>>(new Set());
 
-  // Page size for each backwards-paginate-older fetch (both the explicit
-  // "Load older messages" button and the post-initial background fill).
-  // Tuned for memory headroom on long missions — see the
-  // `chatScrollContainerRef` comment block above.
+  // Page size for each backwards-paginate-older fetch (the explicit
+  // "Load older messages" button / scroll-up). Tuned for memory headroom on
+  // long missions — see the `chatScrollContainerRef` comment block above.
   const HISTORY_PAGE_SIZE = 5000;
-  // Cap how far the background fill walks back from the head on first load.
-  // Past this depth the user has to click "Load older messages" — keeps
-  // memory + render cost predictable on huge missions while still feeling
-  // "complete" for typical ones.
-  const BACKGROUND_FILL_TARGET = 2000;
-  // Per-page size used by the background fill. Smaller than the explicit
-  // "Load older" button so each chunk costs less and we can interleave with
-  // live SSE events without long main-thread stalls.
-  const BACKGROUND_FILL_PAGE_SIZE = 500;
+  const HISTORY_DELTA_PAGE_SIZE = 1000;
+  const HISTORY_FALLBACK_PAGE_SIZE = 1000;
+  const HISTORY_TRACE_TAIL = 10;
 
   const loadHistoryEvents = useCallback(
     async (id: string, opts?: { sinceSeq?: number }) => {
+      const cacheKey = `${getRuntimeApiBase()}::${id}`;
       if (opts?.sinceSeq !== undefined) {
         // Delta load — used on reconnect/visibility/periodic sync.
         // The server returns events with sequence > sinceSeq already
@@ -4234,7 +4917,10 @@ export default function ControlClient() {
         const { events, meta } = await getMissionEventsWithMeta(id, {
           types: HISTORY_EVENT_TYPES,
           sinceSeq: opts.sinceSeq,
-          limit: HISTORY_PAGE_SIZE,
+          limit: HISTORY_DELTA_PAGE_SIZE,
+          includeCounts: false,
+          profile: "conversation",
+          traceTail: HISTORY_TRACE_TAIL,
         });
         const maxSequence = meta.maxSequence ?? opts.sinceSeq;
         // If the page was capped by `limit`, advance the cursor to the
@@ -4246,7 +4932,7 @@ export default function ControlClient() {
             ? events[events.length - 1].sequence
             : opts.sinceSeq;
         const cursor =
-          events.length >= HISTORY_PAGE_SIZE && lastSeq < maxSequence
+          events.length >= HISTORY_DELTA_PAGE_SIZE && lastSeq < maxSequence
             ? lastSeq
             : maxSequence;
         missionMaxSeqRef.current.set(id, cursor);
@@ -4257,20 +4943,35 @@ export default function ControlClient() {
       let metaMaxSeq: number | undefined;
       let metaTotal: number | undefined;
 
-      const cached = await readCachedEvents(id).catch(() => null);
+      const cached = await readCachedEvents(cacheKey).catch(() => null);
       let cacheHit = false;
       let eventMergeCount = 0;
       if (cached && cached.events.length > 0) {
         try {
+          const cachedTailMaxSequence = cached.events.reduce(
+            (max, event) => Math.max(max, event.sequence),
+            0,
+          );
           const delta = await getMissionEventsWithMeta(id, {
             types: HISTORY_EVENT_TYPES,
-            sinceSeq: cached.maxSequence,
-            limit: HISTORY_PAGE_SIZE,
+            sinceSeq: cachedTailMaxSequence,
+            limit: HISTORY_DELTA_PAGE_SIZE,
+            includeCounts: false,
+            profile: "conversation",
+            traceTail: HISTORY_TRACE_TAIL,
           });
           // If the server's max sequence is *behind* what we cached, the
           // mission was reset or replaced server-side and our cache is
           // bogus — drop it and reload fresh.
-          if ((delta.meta.maxSequence ?? 0) >= cached.maxSequence) {
+          const maxSequence = delta.meta.maxSequence ?? 0;
+          const lastDeltaSeq =
+            delta.events.length > 0
+              ? delta.events[delta.events.length - 1].sequence
+              : cachedTailMaxSequence;
+          const deltaWasCapped =
+            delta.events.length >= HISTORY_DELTA_PAGE_SIZE &&
+            lastDeltaSeq < maxSequence;
+          if (maxSequence >= cachedTailMaxSequence && !deltaWasCapped) {
             // Merge cached tail + delta. Both are sorted by sequence;
             // dedup defensively in case the server re-sent an overlap row.
             const seen = new Set<number>();
@@ -4288,11 +4989,29 @@ export default function ControlClient() {
               }
             }
             merged.sort((a, b) => a.sequence - b.sequence);
-            sorted = merged;
-            metaMaxSeq = delta.meta.maxSequence;
-            metaTotal = delta.meta.totalEvents;
+            // Bound the cached tail to the conversation-anchored window, just
+            // like the server snapshot, so a cache hit doesn't replay a
+            // stale/oversized history or bypass the recent-message anchoring.
+            // `metaTotal` below stays the true server total, so trimming here
+            // simply leaves older events to the on-demand "Load older" path.
+            sorted = anchorEventsToRecentConversation(merged);
+            metaMaxSeq = maxSequence;
+            // The delta fetch above runs with `includeCounts: false`, so the
+            // server omits `X-Total-Events` and `delta.meta.totalEvents` is
+            // undefined. Derive the total from the cached total (always a real
+            // value — writes are gated on `metaTotal !== undefined`) plus the
+            // events this delta genuinely added. Otherwise the total reads as
+            // 0, `computeHasMoreOlder()` returns false, and the "Load older
+            // messages" button vanishes on reopen even though older history
+            // exists.
+            const addedByDelta = merged.length - cached.events.length;
+            metaTotal =
+              delta.meta.totalEvents ??
+              (cached.totalEvents > 0
+                ? cached.totalEvents + addedByDelta
+                : undefined);
             cacheHit = true;
-            eventMergeCount = merged.length;
+            eventMergeCount = sorted.length;
           }
         } catch {
           // Network or auth failure on the delta — fall through to the
@@ -4303,7 +5022,10 @@ export default function ControlClient() {
 
       if (!sorted) {
         try {
-          const snapshot = await getMissionSnapshot(id);
+          const snapshot = await getMissionSnapshot(id, {
+            profile: "conversation",
+            traceTail: HISTORY_TRACE_TAIL,
+          });
           sorted = snapshot.events.sort((a, b) => a.sequence - b.sequence);
           metaMaxSeq = snapshot.latest_sequence;
           metaTotal = snapshot.total_events;
@@ -4311,7 +5033,9 @@ export default function ControlClient() {
         } catch {
           const fallback = await getMissionEventsWithMeta(id, {
             types: HISTORY_EVENT_TYPES,
-            limit: HISTORY_PAGE_SIZE,
+            limit: HISTORY_FALLBACK_PAGE_SIZE,
+            profile: "conversation",
+            traceTail: HISTORY_TRACE_TAIL,
           });
           sorted = fallback.events.sort((a, b) => a.sequence - b.sequence);
           metaMaxSeq = fallback.meta.maxSequence;
@@ -4353,37 +5077,20 @@ export default function ControlClient() {
         metaTotal !== undefined &&
         sorted.length > 0
       ) {
-        void writeCachedEvents(id, sorted, metaMaxSeq, metaTotal).catch(
+        void writeCachedEvents(cacheKey, sorted, metaMaxSeq, metaTotal).catch(
           () => undefined,
         );
       }
 
-      // Kick off the background fill so the rest of the history streams in
-      // after first paint. Scheduled via setTimeout(0) so the caller's
-      // setItems/render commits first — running the next fetch synchronously
-      // here would just stall the same task we tried to free up. The ref
-      // indirection breaks TDZ against `streamOlderHistory`, which is
-      // declared after the older-paginator below.
-      const hasMoreLocal = metaTotal !== undefined && sorted.length < metaTotal;
-      if (hasMoreLocal) {
-        const fillFn = streamOlderHistoryRef.current;
-        if (fillFn) {
-          setTimeout(() => {
-            void fillFn(id);
-          }, 0);
-        }
-      }
+      // No eager background fill. The snapshot is conversation-anchored
+      // (it already includes the last N message turns plus the tool calls
+      // between them), so walking thousands more events back on open just
+      // re-replayed the whole accumulated set on the main thread per page —
+      // the "loads forever" jank on tool-heavy missions. Older history now
+      // loads purely on demand via "Load older messages" / scroll-up.
       return sorted;
     },
     [HISTORY_EVENT_TYPES],
-  );
-
-  // Bridge between `loadHistoryEvents` (declared above) and
-  // `streamOlderHistory` (declared below). `loadHistoryEvents` schedules
-  // the background fill at the tail end of its initial-load branch, but
-  // can't reference `streamOlderHistory` by name without a TDZ violation.
-  const streamOlderHistoryRef = useRef<((id: string) => Promise<void>) | null>(
-    null,
   );
 
   /**
@@ -4428,160 +5135,6 @@ export default function ControlClient() {
   const [expandedToolGroups, setExpandedToolGroups] = useState<Set<string>>(
     new Set(),
   );
-
-  // Single O(n) pass derives every downstream view. Replaces 7 separate
-  // `useMemo` hooks that each looped over `items` (see `deriveItemViews`
-  // for the rationale).
-  const {
-    lastNonQueuedItem,
-    thinkingItems: rawThinkingItems,
-    thinkingItemsCount,
-    hasActiveThinking,
-    groupedItems,
-  } = useMemo(
-    // `showThinkingPanel` reroutes thinking items between the inline chat
-    // and the side panel, which flips the structure of `groupedItems` and
-    // forces React to reconcile every chat row. On long missions that can
-    // block the main thread for several seconds, so feed it through
-    // `useDeferredValue`: the toggle button + panel mount react instantly
-    // while the chat-list regrouping is treated as a non-urgent transition.
-    () =>
-      perfBus.time("replay:group", () => {
-        const views = deriveItemViews(items, deferredShowThinkingPanel);
-        perfBus.updateDiagnostics({ renderCount: views.groupedItems.length });
-        return views;
-      }),
-    [items, deferredShowThinkingPanel],
-  );
-  // `deriveItemViews` produces a fresh `thinkingItems` array on every change
-  // to `items`, even when the chat update was unrelated to thoughts (e.g. a
-  // `text_delta` on the assistant message). Reuse the previous reference
-  // when the thinking subset is unchanged so `React.memo(ThinkingPanel)`
-  // can skip the re-render.
-  const thinkingItems = useStableShallowArray(rawThinkingItems) as SidePanelItem[];
-
-  const containerRef = useRef<HTMLDivElement>(null);
-  const chatVirtualizer = useVirtualizer({
-    count: groupedItems.length,
-    getScrollElement: () => containerRef.current,
-    getItemKey: (index) => {
-      const item = groupedItems[index];
-      return item ? getGroupedItemKey(item) : index;
-    },
-    estimateSize: (index) => {
-      const item = groupedItems[index];
-      if (!item) return 160;
-      if (item.kind === "user") return 96;
-      if (item.kind === "assistant") return 180;
-      if (item.kind === "tool_group") return 160;
-      if (item.kind === "thinking_group") return 120;
-      if (item.kind === "tool") return 140;
-      return 100;
-    },
-    overscan: 8,
-  });
-  // Suppress tanstack-virtual's automatic scroll-offset compensation.
-  // Default behavior: every time an item above the viewport measures and
-  // differs from its estimate, the virtualizer calls `_scrollToOffset`
-  // to shift `scrollTop` by the delta. Six or seven of these can fire in
-  // a single frame after the user scrolls up into a freshly-rendered
-  // region, and the user perceives the scrollbar sliding back toward
-  // the bottom while they're trying to read. Returning `false` from
-  // this hook stops the per-item shifts; bottom pinning (when the user
-  // is at the bottom) is already handled by `useVirtualTimelineAnchor`'s
-  // `scheduleBottomCorrection`, so we don't need both forces fighting.
-  // This is an instance field on the Virtualizer, not part of
-  // `useVirtualizer`'s typed options — hence the direct assignment.
-  chatVirtualizer.shouldAdjustScrollPositionOnItemSizeChange = () => false;
-  const chatAnchorKey = useMemo(
-    () =>
-      groupedItems
-        .slice(-8)
-        .map((item) => {
-          const key = getGroupedItemKey(item);
-          if (item.kind === "thinking_group") {
-            const tailThoughts = item.thoughts.slice(-4);
-            return `${key}:${item.thoughts.length}:${tailThoughts.map((thought) => `${thought.id}:${thought.done ? "done" : "active"}:${thought.content.length}`).join(",")}`;
-          }
-          if (item.kind === "tool_group") {
-            return `${key}:${item.tools.length}`;
-          }
-          if (item.kind === "thinking" || item.kind === "stream") {
-            return `${key}:${item.done ? "done" : "active"}:${item.content.length}`;
-          }
-          if (item.kind === "assistant" || item.kind === "user") {
-            return `${key}:${item.content.length}`;
-          }
-          return key;
-        })
-        .join("|"),
-    [groupedItems],
-  );
-  const { isAtBottom, scrollToBottom } = useVirtualTimelineAnchor({
-    scrollElementRef: containerRef,
-    virtualizer: chatVirtualizer,
-    itemCount: groupedItems.length,
-    changeKey: chatAnchorKey,
-    resetKey: viewingMissionId,
-  });
-
-  const showAgentWorkingIndicator = useMemo(() => {
-    if (items.length === 0) return false;
-    if (items[items.length - 1]?.kind === "assistant") return false;
-    return !items.some(
-      (it) =>
-        ((it.kind === "thinking" || it.kind === "stream") &&
-          !it.done &&
-          !showThinkingPanel) ||
-        it.kind === "phase",
-    );
-  }, [items, showThinkingPanel]);
-
-  // Auto-show thinking panel when thinking starts (only on transition to active)
-  const prevHasActiveThinking = useRef(false);
-  useEffect(() => {
-    desktopSessionsRef.current = desktopSessions;
-  }, [desktopSessions]);
-
-  useEffect(() => {
-    desktopDisplayIdRef.current = desktopDisplayId;
-  }, [desktopDisplayId]);
-
-  useEffect(() => {
-    hasDesktopSessionRef.current = hasDesktopSession;
-  }, [hasDesktopSession]);
-
-  useEffect(() => {
-    // Only auto-show when transitioning from no active thinking to active thinking
-    if (
-      hasActiveThinking &&
-      !prevHasActiveThinking.current &&
-      !thinkingPanelManuallyHidden
-    ) {
-      setShowThinkingPanel(true);
-    }
-    prevHasActiveThinking.current = hasActiveThinking;
-  }, [hasActiveThinking, setShowThinkingPanel, thinkingPanelManuallyHidden]);
-
-  useEffect(() => {
-    setThinkingPanelManuallyHidden(false);
-  }, [setThinkingPanelManuallyHidden, viewingMissionId]);
-
-  // Tell the backend the user opened this mission. The server records
-  // `first_viewed_at` on the first call (starting the 1h ack grace timer
-  // for `awaiting_user` missions and painting the "opened" dot for
-  // Finished missions); later calls are no-ops on the server. Fire-and-
-  // forget — failure to record opening is not user-visible.
-  useEffect(() => {
-    if (!viewingMissionId) return;
-    markMissionOpened(viewingMissionId).catch((err) => {
-      console.warn("markMissionOpened failed", err);
-    });
-  }, [viewingMissionId]);
-
-  // `groupedItems`, `thinkingItems`, etc. are all produced in the single
-  // `deriveItemViews` pass above. The old per-view `useMemo` hooks used
-  // to live here and have been removed.
 
   const runningMissionById = useMemo(() => {
     return new Map(runningMissions.map((m) => [m.mission_id, m]));
@@ -4633,26 +5186,229 @@ export default function ControlClient() {
     return false;
   }, [viewingMissionId, viewingRunningInfo, runStateMissionId, runState]);
 
+  // Single O(n) pass derives every downstream view. Replaces 7 separate
+  // `useMemo` hooks that each looped over `items` (see `deriveItemViews`
+  // for the rationale).
+  const {
+    lastNonQueuedItem,
+    thinkingItems: rawThinkingItems,
+    thinkingItemsCount,
+    hasActiveThinking,
+    groupedItems,
+  } = useMemo(
+    () =>
+      perfBus.time("replay:group", () => {
+        const views = deriveItemViews(
+          items,
+          showThinkingPanel,
+          viewingMissionIsRunning,
+        );
+        perfBus.updateDiagnostics({ renderCount: views.groupedItems.length });
+        return views;
+      }),
+    [items, showThinkingPanel, viewingMissionIsRunning],
+  );
+  // `deriveItemViews` produces a fresh `thinkingItems` array on every change
+  // to `items`, even when the chat update was unrelated to thoughts (e.g. a
+  // `text_delta` on the assistant message). Reuse the previous reference
+  // when the thinking subset is unchanged so `React.memo(ThinkingPanel)`
+  // can skip the re-render.
+  const thinkingItems = useStableShallowArray(
+    rawThinkingItems,
+  ) as SidePanelItem[];
+
+  const containerRef = useRef<HTMLDivElement>(null);
+  const chatVirtualizer = useVirtualizer({
+    count: groupedItems.length,
+    getScrollElement: () => containerRef.current,
+    getItemKey: (index) => {
+      const item = groupedItems[index];
+      return item ? getGroupedItemKey(item) : index;
+    },
+    estimateSize: (index) => {
+      const item = groupedItems[index];
+      if (!item) return 160;
+      if (item.kind === "user") return 96;
+      if (item.kind === "assistant") return 180;
+      if (item.kind === "tool_group") return 160;
+      if (item.kind === "thinking_group") return 120;
+      if (item.kind === "tool") return 140;
+      return 100;
+    },
+    overscan: 8,
+  });
+  // Suppress tanstack-virtual's automatic scroll-offset compensation.
+  // Default behavior: every time an item above the viewport measures and
+  // differs from its estimate, the virtualizer calls `_scrollToOffset`
+  // to shift `scrollTop` by the delta. Six or seven of these can fire in
+  // a single frame after the user scrolls up into a freshly-rendered
+  // region, and the user perceives the scrollbar sliding back toward
+  // the bottom while they're trying to read. Returning `false` from
+  // this hook stops the per-item shifts; bottom pinning (when the user
+  // is at the bottom) is already handled by `useVirtualTimelineAnchor`'s
+  // `scheduleBottomCorrection`, so we don't need both forces fighting.
+  // This is an instance field on the Virtualizer, not part of
+  // `useVirtualizer`'s typed options — hence the direct assignment.
+  chatVirtualizer.shouldAdjustScrollPositionOnItemSizeChange = () => false;
+  // Anti-flash path for tool-group expansion: measure the row synchronously
+  // AND grow the sizer div in the same pre-paint pass. Without the sizer
+  // bump, scrollTop adjustments larger than the stale scrollHeight allows
+  // get clamped, painting one mis-anchored frame until the virtualizer's
+  // state flush catches up.
+  const measureRowSync = useCallback(
+    (el: HTMLElement) => {
+      chatVirtualizer.measureElement(el);
+      const sizer = el.parentElement;
+      if (sizer) sizer.style.height = `${chatVirtualizer.getTotalSize()}px`;
+    },
+    [chatVirtualizer],
+  );
+  const chatAnchorKey = useMemo(
+    () =>
+      groupedItems
+        .slice(-8)
+        .map((item) => {
+          const key = getGroupedItemKey(item);
+          if (item.kind === "thinking_group") {
+            const tailThoughts = item.thoughts.slice(-4);
+            return `${key}:${item.thoughts.length}:${tailThoughts.map((thought) => `${thought.id}:${thought.done ? "done" : "active"}:${thought.content.length}`).join(",")}`;
+          }
+          if (item.kind === "tool_group") {
+            return `${key}:${item.tools.length}`;
+          }
+          if (item.kind === "thinking" || item.kind === "stream") {
+            return `${key}:${item.done ? "done" : "active"}:${item.content.length}`;
+          }
+          if (item.kind === "assistant" || item.kind === "user") {
+            return `${key}:${item.content.length}`;
+          }
+          return key;
+        })
+        .join("|"),
+    [groupedItems],
+  );
+  const { isAtBottom, scrollToBottom } = useVirtualTimelineAnchor({
+    scrollElementRef: containerRef,
+    virtualizer: chatVirtualizer,
+    itemCount: groupedItems.length,
+    changeKey: chatAnchorKey,
+    resetKey: viewingMissionId,
+  });
+
+  // The inline "Agent is working" pill. Shown whenever the mission is running
+  // and nothing else inline is already animating liveness — i.e. no in-flight
+  // thinking/stream (with the side panel closed) and no phase row, both of
+  // which render their own live indicators. Unlike before, this stays visible
+  // *after* an intermediate assistant message: the agent keeps working between
+  // steps, and the corner sidebar pill alone is too easy to miss. `since`
+  // anchors the heartbeat timer at the most recent event so it resets on every
+  // new event and climbs when the run goes quiet.
+  const agentWorkingIndicator = useMemo(() => {
+    if (items.length === 0) return null;
+    const hasInlineLiveness = items.some(
+      (it) =>
+        ((it.kind === "thinking" || it.kind === "stream") &&
+          !it.done &&
+          !showThinkingPanel) ||
+        it.kind === "phase",
+    );
+    if (hasInlineLiveness) return null;
+    let since: number | null = null;
+    for (let i = items.length - 1; i >= 0; i--) {
+      const it = items[i];
+      // Queued user messages sit at the tail while the agent keeps inserting
+      // tool/assistant rows before them, so they are not "latest activity" —
+      // anchoring the heartbeat to a queued row's (older) timestamp makes the
+      // timer read as stalled while the mission is actively running. Skip them.
+      if (it.kind === "user" && it.queued) continue;
+      const t = itemActivityTime(it);
+      if (t != null) {
+        since = t;
+        break;
+      }
+    }
+    // No timed row to anchor on (e.g. only queued user messages): suppress the
+    // pill rather than pass 0, which LiveDuration would read as epoch ms and
+    // render as a ~decades-long elapsed time.
+    if (since == null) return null;
+    return { since };
+  }, [items, showThinkingPanel]);
+
+  // Auto-show thinking panel when thinking starts (only on transition to active)
+  const prevHasActiveThinking = useRef(false);
+  useEffect(() => {
+    desktopSessionsRef.current = desktopSessions;
+  }, [desktopSessions]);
+
+  useEffect(() => {
+    desktopDisplayIdRef.current = desktopDisplayId;
+  }, [desktopDisplayId]);
+
+  useEffect(() => {
+    hasDesktopSessionRef.current = hasDesktopSession;
+  }, [hasDesktopSession]);
+
+  const selectedDesktopSession = useMemo(
+    () =>
+      desktopSessions.find((session) => session.display === desktopDisplayId) ??
+      null,
+    [desktopDisplayId, desktopSessions],
+  );
+  const selectedDesktopBackend = (
+    selectedDesktopSession?.display_server ?? "wayland"
+  ).toLowerCase();
+  const selectedStreamLabel =
+    selectedDesktopBackend === "wayland" ? "App Surface" : "Legacy Surface";
+
+  useEffect(() => {
+    // Only auto-show when transitioning from no active thinking to active thinking
+    if (
+      hasActiveThinking &&
+      !prevHasActiveThinking.current &&
+      !thinkingPanelManuallyHidden
+    ) {
+      setShowThinkingPanel(true);
+    }
+    prevHasActiveThinking.current = hasActiveThinking;
+  }, [hasActiveThinking, setShowThinkingPanel, thinkingPanelManuallyHidden]);
+
+  useEffect(() => {
+    setThinkingPanelManuallyHidden(false);
+  }, [setThinkingPanelManuallyHidden, viewingMissionId]);
+
+  // Tell the backend the user opened this mission. The server records
+  // `first_viewed_at` on the first call (starting the 1h ack grace timer
+  // for `awaiting_user` missions and painting the "opened" dot for
+  // Finished missions); later calls are no-ops on the server. Fire-and-
+  // forget — failure to record opening is not user-visible.
+  useEffect(() => {
+    if (!viewingMissionId) return;
+    markMissionOpened(viewingMissionId).catch((err) => {
+      console.warn("markMissionOpened failed", err);
+    });
+  }, [viewingMissionId]);
+
+  // `groupedItems`, `thinkingItems`, etc. are all produced in the single
+  // `deriveItemViews` pass above. The old per-view `useMemo` hooks used
+  // to live here and have been removed.
+
   const viewingProgress = useMemo(() => {
     if (!viewingMissionId) return null;
     return progressByMission[viewingMissionId] ?? null;
   }, [progressByMission, viewingMissionId]);
 
+  // As live events stream in, keep the last N conversation messages within
+  // the visible window. Mirrors `adjustVisibleItemsLimit` but only grows the
+  // window (never shrinks it) so unrelated growth elsewhere is preserved.
   useEffect(() => {
     if (items.length === 0) return;
-    let lastAssistantIdx = -1;
-    for (let i = items.length - 1; i >= 0; i--) {
-      if (items[i].kind === "assistant") {
-        lastAssistantIdx = i;
-        break;
-      }
-    }
-    if (lastAssistantIdx === -1) return;
+    const anchorIdx = conversationalAnchorIndex(items);
+    if (anchorIdx === -1) return;
     const visibleStart = Math.max(0, items.length - visibleItemsLimit);
-    if (lastAssistantIdx < visibleStart) {
-      setVisibleItemsLimit(items.length - lastAssistantIdx);
+    if (anchorIdx < visibleStart) {
+      setVisibleItemsLimit(items.length - anchorIdx);
     }
-  }, [items, visibleItemsLimit]);
+  }, [items, visibleItemsLimit, conversationalAnchorIndex]);
 
   const viewingMissionStallInfo = useMemo(() => {
     if (!viewingMissionId) return null;
@@ -4716,11 +5472,14 @@ export default function ControlClient() {
 
   // Treat "waiting_for_tool" as not busy for message input (user should respond immediately)
   const isBusy = viewingRunState === "running";
+  // …but a tool-wait turn is still in flight: goal exit must take the
+  // cancelMission path so the blocked turn gets interrupted too.
+  const isTurnInFlight = viewingRunState !== "idle";
   const canSubmitComposer = canSubmitInput || input.trim().length > 0;
 
   // Goal-mode state, keyed by mission id. Updated from `goal_iteration` /
   // `goal_status` SSE events. Cleared when status reaches a terminal value
-  // (`complete`, `cleared`, `budgetLimited`) so finished goals stop showing
+  // (see `isTerminalGoalStatus`) so finished or stopped goals stop showing
   // a pill on subsequent renders.
   const [goalInfoByMission, setGoalInfoByMission] = useState<
     Record<string, { iteration: number; status: string; objective: string }>
@@ -4744,7 +5503,6 @@ export default function ControlClient() {
   const currentMissionRef = useRef<Mission | null>(null);
   const viewingMissionRef = useRef<Mission | null>(null);
   const submittingRef = useRef(false); // Guard against double-submission
-  const autoTitleAttemptedRef = useRef<Set<string>>(new Set()); // Track missions we've tried to auto-title
   const inputRef = useRef(input);
   const draftMissionIdRef = useRef<string | null>(viewingMissionId);
 
@@ -5366,6 +6124,83 @@ export default function ControlClient() {
     },
     [],
   );
+
+  const handleLoadToolDetails = useCallback(
+    async (toolCallId: string) => {
+      const missionId =
+        viewingMissionRef.current?.id ?? currentMissionRef.current?.id;
+      if (!missionId) return;
+      const cacheKey = `${missionId}::${toolCallId}`;
+
+      const applyToolEvents = (toolEvents: StoredEvent[]) => {
+        const mission = viewingMissionRef.current ?? currentMissionRef.current;
+        const hydrated = eventsToItems(toolEvents, mission).find(
+          (item): item is Extract<ChatItem, { kind: "tool" }> =>
+            item.kind === "tool" && item.toolCallId === toolCallId,
+        );
+        if (!hydrated) return false;
+
+        const replaceTool = (list: ChatItem[]) =>
+          list.map((item) =>
+            item.kind === "tool" && item.toolCallId === toolCallId
+              ? { ...hydrated, lazy: false, loading: false }
+              : item,
+          );
+
+        setItems((prev) => replaceTool(prev));
+        setMissionItems((prev) => {
+          const cached = prev[missionId];
+          if (!cached) return prev;
+          return { ...prev, [missionId]: replaceTool(cached) };
+        });
+        return true;
+      };
+
+      const cached = lazyToolDetailsRef.current.get(cacheKey);
+      if (cached) {
+        if (!applyToolEvents(cached)) {
+          toast.error("Failed to load tool details");
+        }
+        return;
+      }
+      if (lazyToolDetailsLoadingRef.current.has(cacheKey)) {
+        return;
+      }
+      lazyToolDetailsLoadingRef.current.add(cacheKey);
+
+      const markLoading = (loading: boolean) => {
+        const patch = (list: ChatItem[]) =>
+          list.map((item) =>
+            item.kind === "tool" && item.toolCallId === toolCallId
+              ? { ...item, loading }
+              : item,
+          );
+        setItems((prev) => patch(prev));
+        setMissionItems((prev) => {
+          const cachedItems = prev[missionId];
+          if (!cachedItems) return prev;
+          return { ...prev, [missionId]: patch(cachedItems) };
+        });
+      };
+
+      markLoading(true);
+      try {
+        const toolEvents = await getMissionToolCallEvents(missionId, toolCallId);
+        lazyToolDetailsRef.current.set(cacheKey, toolEvents);
+        if (!applyToolEvents(toolEvents)) {
+          markLoading(false);
+          toast.error("Failed to load tool details");
+        }
+      } catch {
+        markLoading(false);
+        toast.error("Failed to load tool details");
+      } finally {
+        lazyToolDetailsLoadingRef.current.delete(cacheKey);
+      }
+    },
+    [eventsToItems, setItems, setMissionItems],
+  );
+
   const eventsWorkerRef = useRef<Worker | null | false>(null);
   const eventsWorkerSeqRef = useRef(0);
   const eventsWorkerPendingRef = useRef(
@@ -5518,6 +6353,8 @@ export default function ControlClient() {
             types: HISTORY_EVENT_TYPES,
             beforeSeq,
             limit: opts?.limit ?? HISTORY_PAGE_SIZE,
+            profile: "conversation",
+            traceTail: HISTORY_TRACE_TAIL,
           });
           if (olderEvents.length === 0) {
             // Same per-mission gate as below — see comment on
@@ -5664,72 +6501,6 @@ export default function ControlClient() {
     [HISTORY_EVENT_TYPES, eventsToItems, computeHasMoreOlder, setItems],
   );
 
-  // Background fill: after the initial fetch shows the newest events,
-  // walk older pages until we've reached `BACKGROUND_FILL_TARGET` total
-  // history events or there are no more. Runs `silent` so the
-  // "Load older messages" button doesn't flash a loading state; bails
-  // if the user switches missions, if a fetch fails, or if the mission
-  // turns out to have fewer events than the target (server total reached).
-  const streamOlderHistory = useCallback(
-    async (id: string) => {
-      // Yield once so the initial-render setItems can commit and paint
-      // before we start eating network/main-thread time on background
-      // fills. Without this the first chunk can land before the user
-      // sees the latest message at all.
-      await new Promise((resolve) => setTimeout(resolve, 50));
-
-      const stillActive = (): boolean =>
-        currentMissionRef.current?.id === id ||
-        viewingMissionRef.current?.id === id;
-
-      // Up to a few page-loads, with a small inter-page yield so live
-      // SSE events can interleave on the main thread without jank.
-      // Hard ceiling (16) is a backstop; the loop normally exits via
-      // the `hasMore`/target check first.
-      for (let i = 0; i < 16; i++) {
-        if (!stillActive()) return;
-        const accumulated =
-          missionHistoricEventsRef.current.get(id)?.length ?? 0;
-        const total = missionTotalHistoryRef.current.get(id);
-        if (total !== undefined && accumulated >= total) return;
-        if (accumulated >= BACKGROUND_FILL_TARGET) return;
-        const minSeq = missionMinSeqRef.current.get(id);
-        if (minSeq === undefined || minSeq <= 1) return;
-
-        try {
-          await loadOlderHistoryEvents(id, {
-            silent: true,
-            limit: BACKGROUND_FILL_PAGE_SIZE,
-          });
-        } catch {
-          // Stop on error — the user's manual "Load older messages"
-          // path remains available for retry.
-          return;
-        }
-
-        // If accumulated didn't grow, the server returned an empty
-        // page and there's nothing left to fetch. Avoid the
-        // pathological tight loop.
-        const after = missionHistoricEventsRef.current.get(id)?.length ?? 0;
-        if (after <= accumulated) return;
-
-        // Small pause between pages so the main thread can run other
-        // work (live event handlers, scroll, input).
-        await new Promise((resolve) => setTimeout(resolve, 150));
-      }
-    },
-    [loadOlderHistoryEvents, BACKGROUND_FILL_PAGE_SIZE, BACKGROUND_FILL_TARGET],
-  );
-
-  // Wire the ref consumed by `loadHistoryEvents` (which is declared
-  // above `streamOlderHistory`, so it can't reference it directly).
-  useEffect(() => {
-    streamOlderHistoryRef.current = streamOlderHistory;
-    return () => {
-      streamOlderHistoryRef.current = null;
-    };
-  }, [streamOlderHistory]);
-
   // Load mission from URL param on mount (and retry on auth success)
   const [authRetryTrigger, setAuthRetryTrigger] = useState(0);
 
@@ -5771,6 +6542,7 @@ export default function ControlClient() {
       fetchingMissionIdRef.current = id; // Track which mission we're loading
       try {
         // Load mission, events, and queue in parallel for faster load
+        const queueGenAtFetch = queueMutationGenRef.current;
         const [mission, events, queuedMessages] = await Promise.all([
           loadMission(id),
           loadHistoryEvents(id).catch(() => null), // Don't fail if events unavailable
@@ -5829,9 +6601,7 @@ export default function ControlClient() {
           }
           // Skip terminal statuses — those clear the pill, matching the live handler.
           const isTerminalStatus = latestStatus
-            ? ["complete", "cleared", "budgetLimited", "aborted"].includes(
-                latestStatus,
-              )
+            ? isTerminalGoalStatus(latestStatus)
             : false;
           if (
             (latestIteration !== undefined || latestStatus !== undefined) &&
@@ -5859,31 +6629,12 @@ export default function ControlClient() {
         // correctly (see `seedPaginationStateAfterInitialLoad`).
         const historicEventsLen = historyItems.length;
         // Merge queued messages that belong to this mission
-        const missionQueuedMessages = queuedMessages.filter(
-          (qm) => qm.mission_id === id,
+        historyItems = mergeQueuedMessagesIntoItems(
+          historyItems,
+          queuedMessages,
+          id,
+          queueGenAtFetch === queueMutationGenRef.current,
         );
-        if (missionQueuedMessages.length > 0) {
-          const queuedIds = new Set(missionQueuedMessages.map((qm) => qm.id));
-          // Mark existing items as queued
-          historyItems = historyItems.map((item) =>
-            item.kind === "user" && queuedIds.has(item.id)
-              ? { ...item, queued: true }
-              : item,
-          );
-          // Add any queued messages not already in history
-          const existingIds = new Set(historyItems.map((item) => item.id));
-          const newQueuedItems: ChatItem[] = missionQueuedMessages
-            .filter((qm) => !existingIds.has(qm.id))
-            .map((qm) => ({
-              kind: "user" as const,
-              id: qm.id,
-              content: qm.content,
-              timestamp: Date.now(),
-              agent: qm.agent ?? undefined,
-              queued: true,
-            }));
-          historyItems = [...historyItems, ...newQueuedItems];
-        }
         setItems(historyItems);
         adjustVisibleItemsLimit(historyItems);
         seedPaginationStateAfterInitialLoad(id, historicEventsLen);
@@ -5940,6 +6691,7 @@ export default function ControlClient() {
           applyDesktopSessionState(mission);
           router.replace(`/control?mission=${mission.id}`, { scroll: false });
           // Load full events and queue in background (including tool calls)
+          const queueGenAtFetch = queueMutationGenRef.current;
           Promise.all([
             loadHistoryEvents(mission.id),
             getQueue().catch(() => []),
@@ -5954,33 +6706,12 @@ export default function ControlClient() {
               // queued items (see `seedPaginationStateAfterInitialLoad`).
               const historicEventsLen = historyItems.length;
               // Merge queued messages that belong to this mission
-              const missionQueuedMessages = queuedMessages.filter(
-                (qm) => qm.mission_id === mission.id,
+              historyItems = mergeQueuedMessagesIntoItems(
+                historyItems,
+                queuedMessages,
+                mission.id,
+                queueGenAtFetch === queueMutationGenRef.current,
               );
-              if (missionQueuedMessages.length > 0) {
-                const queuedIds = new Set(
-                  missionQueuedMessages.map((qm) => qm.id),
-                );
-                historyItems = historyItems.map((item) =>
-                  item.kind === "user" && queuedIds.has(item.id)
-                    ? { ...item, queued: true }
-                    : item,
-                );
-                const existingIds = new Set(
-                  historyItems.map((item) => item.id),
-                );
-                const newQueuedItems: ChatItem[] = missionQueuedMessages
-                  .filter((qm) => !existingIds.has(qm.id))
-                  .map((qm) => ({
-                    kind: "user" as const,
-                    id: qm.id,
-                    content: qm.content,
-                    timestamp: Date.now(),
-                    agent: qm.agent ?? undefined,
-                    queued: true,
-                  }));
-                historyItems = [...historyItems, ...newQueuedItems];
-              }
               setItems(historyItems);
               adjustVisibleItemsLimit(historyItems);
               seedPaginationStateAfterInitialLoad(
@@ -6203,21 +6934,29 @@ export default function ControlClient() {
         const activeMission =
           viewingMissionRef.current ?? currentMissionRef.current;
         const activeMissionId = activeMission?.id;
+        const activeMissionIsRunning =
+          !!activeMissionId &&
+          runningMissionsRef.current.some(
+            (mission) =>
+              mission.mission_id === activeMissionId &&
+              mission.state !== "finished",
+          );
 
         // Only auto-open for sessions belonging to the current mission.
         // When expecting a desktop session (ToolCall detected but no ToolResult yet),
         // also include unattributed sessions (mission_id is null) since the backend
-        // background task may not have attributed them yet.
+        // background task may not have attributed them yet. A running mission can
+        // also adopt unattributed sessions discovered by the dev backend's Xvfb scan.
         const expecting = expectingDesktopSessionRef.current;
         const currentMissionSessions = activeMissionId
           ? runningSessions.filter(
               (s) =>
                 s.mission_id === activeMissionId ||
-                (expecting && !s.mission_id),
+                ((expecting || activeMissionIsRunning) && !s.mission_id),
             )
           : expecting
             ? runningSessions.filter((s) => !s.mission_id)
-            : [];
+            : runningSessions.filter((s) => !s.mission_id);
         const hasCurrentMissionSession = currentMissionSessions.length > 0;
 
         // Auto-select first active session from current mission if current display isn't running anywhere
@@ -6348,6 +7087,63 @@ export default function ControlClient() {
       });
   }, []);
 
+  // Exit a /goal loop from the GoalBar: mirrors the automations dialog's
+  // stop-native-loop path — cancellation lets native harnesses clear their
+  // goal state first (Codex: thread/goal/clear), then we flip any goal-loop
+  // automation row inactive and clear the local goal info so the bar
+  // disappears immediately.
+  const handleExitGoal = useCallback(
+    async (missionId: string, running: boolean) => {
+      try {
+        const automations = await listMissionAutomations(missionId).catch(
+          () => [],
+        );
+        const goalRow = automations.find(
+          (a) => a.active && a.command_source?.type === "native_loop",
+        );
+        if (running) {
+          // Mid-turn: cancellation lets native harnesses clear their goal
+          // state first (Codex: thread/goal/clear), then interrupts the turn.
+          await cancelMission(missionId);
+        }
+        // Idle (or belt-and-braces while running): deactivate the loop row so
+        // the next agent_finished hook doesn't re-fire the continuation. No
+        // cancelMission here when idle — an idle mission shouldn't get marked
+        // interrupted just because the user ended its goal loop.
+        if (goalRow) {
+          try {
+            await updateAutomation(goalRow.id, { active: false });
+          } catch (err) {
+            // While running, the observer flips it inactive when the harness
+            // emits the aborted GoalStatus, so a local failure is non-fatal.
+            // While idle there is no turn in flight to emit that status: the
+            // loop would stay live, so keep the bar and surface the error.
+            if (!running) {
+              throw err instanceof Error
+                ? err
+                : new Error("Failed to deactivate the goal loop");
+            }
+          }
+        }
+        setGoalInfoByMission((prev) => {
+          const next = { ...prev };
+          delete next[missionId];
+          return next;
+        });
+        toast.success(
+          running
+            ? "Goal loop stopped; current turn interrupted"
+            : "Goal loop ended",
+        );
+      } catch (err) {
+        toast.error(
+          err instanceof Error ? err.message : "Failed to exit goal loop",
+        );
+      }
+    },
+    [],
+  );
+
   // Handle cancelling a parallel mission
   const handleCancelMission = async (missionId: string) => {
     try {
@@ -6397,6 +7193,7 @@ export default function ControlClient() {
       // This ensures we don't show stale cached events
       try {
         // Load mission, events, and queue in parallel for faster load
+        const queueGenAtFetch = queueMutationGenRef.current;
         const [mission, events, queuedMessages] = await Promise.all([
           getMission(missionId),
           loadHistoryEvents(missionId).catch(() => null), // Don't fail if events unavailable
@@ -6420,29 +7217,12 @@ export default function ControlClient() {
         // (see `seedPaginationStateAfterInitialLoad`).
         const historicEventsLen = historyItems.length;
         // Merge queued messages that belong to this mission
-        const missionQueuedMessages = queuedMessages.filter(
-          (qm) => qm.mission_id === missionId,
+        historyItems = mergeQueuedMessagesIntoItems(
+          historyItems,
+          queuedMessages,
+          missionId,
+          queueGenAtFetch === queueMutationGenRef.current,
         );
-        if (missionQueuedMessages.length > 0) {
-          const queuedIds = new Set(missionQueuedMessages.map((qm) => qm.id));
-          historyItems = historyItems.map((item) =>
-            item.kind === "user" && queuedIds.has(item.id)
-              ? { ...item, queued: true }
-              : item,
-          );
-          const existingIds = new Set(historyItems.map((item) => item.id));
-          const newQueuedItems: ChatItem[] = missionQueuedMessages
-            .filter((qm) => !existingIds.has(qm.id))
-            .map((qm) => ({
-              kind: "user" as const,
-              id: qm.id,
-              content: qm.content,
-              timestamp: Date.now(),
-              agent: qm.agent ?? undefined,
-              queued: true,
-            }));
-          historyItems = [...historyItems, ...newQueuedItems];
-        }
 
         setItems(historyItems);
         adjustVisibleItemsLimit(historyItems);
@@ -7205,13 +7985,17 @@ export default function ControlClient() {
             }
           }
         } else {
-          // Event has NO mission_id (from main session)
-          // Only show if we're viewing the current/main mission OR if currentMission
-          // hasn't been loaded yet (to handle race condition during initial load)
-          if (currentMissionId && viewingId !== currentMissionId) {
-            // We're viewing a parallel mission, skip main session events
+          // Event has NO mission_id (a main-session event). Show it only when
+          // we positively know the viewed mission IS the main/current mission.
+          // If currentMissionId isn't known yet (a load/switch race), fail
+          // CLOSED and drop it — history catch-up backfills it on the next
+          // sync — rather than risk rendering a main-session message inside an
+          // unrelated parallel mission's view (cross-mission leak).
+          if (viewingId !== currentMissionId) {
             if (event.type !== "status") {
-              filterReason = "event has no mission_id for parallel mission";
+              filterReason = currentMissionId
+                ? "event has no mission_id for parallel mission"
+                : "event has no mission_id; current mission unknown (fail-closed)";
             }
           }
         }
@@ -7262,7 +8046,12 @@ export default function ControlClient() {
         }
 
         const nextQueueLen = typeof q === "number" ? q : 0;
-        setQueueLen(nextQueueLen);
+        // Only adopt the queue length when the status concerns the viewed
+        // mission — parallel missions emit their own per-mission Status
+        // events and must not clobber the viewed mission's badge.
+        if (shouldApplyStatus) {
+          setQueueLen(nextQueueLen);
+        }
         setRunStateMissionId(effectiveMissionId);
 
         if (shouldApplyStatus && effectiveMissionId) {
@@ -7304,6 +8093,15 @@ export default function ControlClient() {
           "queued",
         );
         const queued = data["queued"] === true;
+        // The mission this echo belongs to (the SSE filter above already
+        // guarantees it matches the viewed mission). Used to stamp the new
+        // row and to stop content-based reconciliation from hijacking a
+        // same-content row that was created for a *different* mission.
+        const msgMissionId = eventMissionId ?? viewingId ?? undefined;
+        const sameMission = (item: ChatItem) =>
+          item.kind !== "user" ||
+          item.missionId == null ||
+          item.missionId === msgMissionId;
         setItems((prev) => {
           // Check if already added with this ID - if so, mark as not queued (being processed)
           const existingIndex = prev.findIndex((item) => item.id === msgId);
@@ -7326,7 +8124,8 @@ export default function ControlClient() {
             (item) =>
               item.kind === "user" &&
               item.id.startsWith("temp-") &&
-              item.content === msgContent,
+              item.content === msgContent &&
+              sameMission(item),
           );
 
           if (tempIndex !== -1) {
@@ -7353,7 +8152,9 @@ export default function ControlClient() {
               (item) =>
                 item.kind === "user" &&
                 item.content === msgContent &&
-                (item.id.startsWith("history-") || item.id.startsWith("temp-")),
+                (item.id.startsWith("history-") ||
+                  item.id.startsWith("temp-")) &&
+                sameMission(item),
             );
           if (contentIndex !== -1) {
             // Convert reversed index back to forward index
@@ -7379,6 +8180,7 @@ export default function ControlClient() {
               content: msgContent,
               timestamp: Date.now(),
               queued,
+              missionId: msgMissionId,
             },
           ];
         });
@@ -7444,14 +8246,21 @@ export default function ControlClient() {
         pendingStreamRef.current = null;
 
         setItems((prev) => {
-          // Mark any in-progress thinking as done instead of dropping it,
-          // so the Thinking panel can show a scrollable history.
-          let filtered = prev.map((it) => {
-            if ((it.kind === "thinking" || it.kind === "stream") && !it.done) {
-              return { ...it, done: true, endTime: now };
-            }
-            return it;
-          });
+          // Mark any in-progress thinking as done instead of dropping it, so
+          // the Thinking panel keeps a scrollable history. The in-progress
+          // text_delta draft is dropped, though: the assistant message
+          // appended below supersedes it, so keeping it would duplicate the
+          // reply as a stale "Draft". Mirrors the history reducer, which only
+          // keeps a trailing text_delta when no assistant message exists yet.
+          let filtered = prev
+            .map((it) =>
+              (it.kind === "thinking" || it.kind === "stream") && !it.done
+                ? { ...it, done: true, endTime: now }
+                : it,
+            )
+            .filter(
+              (it) => !(it.kind === "stream" && it.id === "text_delta_latest"),
+            );
 
           // When mission fails, mark all pending tool calls as failed
           // This ensures subagent headers don't stay stuck showing "Running for X"
@@ -7531,40 +8340,6 @@ export default function ControlClient() {
           phase: "idle",
         }));
 
-        // Auto-generate mission title on first successful assistant response (LLM-powered, best-effort).
-        // Use viewingMissionIdRef (not currentMissionRef) to target the correct mission —
-        // events are already filtered by viewingId, so this matches the event's mission.
-        const targetMissionId = viewingMissionIdRef.current;
-        const targetMission = viewingMissionRef.current;
-        if (
-          targetMissionId &&
-          !isFailure &&
-          !targetMission?.title &&
-          !autoTitleAttemptedRef.current.has(targetMissionId)
-        ) {
-          autoTitleAttemptedRef.current.add(targetMissionId);
-          const assistantContent = String(data["content"] ?? "");
-          // Use itemsRef for synchronous read — avoids side effects in state updaters
-          // and prevents double-firing in React StrictMode.
-          const firstUser = itemsRef.current.find((it) => it.kind === "user");
-          if (firstUser && firstUser.kind === "user") {
-            autoGenerateMissionTitle(
-              targetMissionId,
-              firstUser.content,
-              assistantContent,
-            ).then((title) => {
-              if (title) {
-                // Update local mission state so the UI reflects the new title immediately
-                setCurrentMission((m) =>
-                  m?.id === targetMissionId ? { ...m, title } : m,
-                );
-                setViewingMission((m) =>
-                  m?.id === targetMissionId ? { ...m, title } : m,
-                );
-              }
-            });
-          }
-        }
         return;
       }
 
@@ -7606,7 +8381,10 @@ export default function ControlClient() {
               ) {
                 updated[existingIdx] = {
                   ...existing,
-                  content: pending.content || existing.content,
+                  content: mergeStreamFragment(
+                    existing.content,
+                    pending.content,
+                  ),
                   done: pending.done,
                   endTime: pending.done ? now : existing.endTime,
                 };
@@ -7789,7 +8567,7 @@ export default function ControlClient() {
         const isContinuation = isStreamContinuation(content, existingContent);
 
         pendingStreamRef.current = {
-          content: content || existingPending?.content || "",
+          content: mergeStreamFragment(existingContent, content),
           startTime: isContinuation ? (existingPending?.startTime ?? now) : now,
         };
 
@@ -7888,6 +8666,33 @@ export default function ControlClient() {
           name === "question" ||
           name === "AskUserQuestion";
         const toolCallId = String(data["tool_call_id"] ?? "");
+        const now = Date.now();
+
+        // Mirror the history reducer (events-reducer.ts `tool_call`), which
+        // runs `finalizePendingThinking()` + `lastTextDelta = null` on every
+        // tool call. Without this the live `text_delta_latest` draft keeps
+        // mutating in place at the position it was first inserted (above this
+        // tool), so the "Streaming…" bubble never follows the conversation to
+        // the bottom. Cancel any buffered flush and forget the in-progress
+        // draft so the next text delta re-creates the bubble *after* the tool.
+        if (thinkingFlushRafRef.current !== null) {
+          cancelAnimationFrame(thinkingFlushRafRef.current);
+          thinkingFlushRafRef.current = null;
+        }
+        if (thinkingFlushTimeoutRef.current) {
+          clearTimeout(thinkingFlushTimeoutRef.current);
+          thinkingFlushTimeoutRef.current = null;
+        }
+        pendingThinkingRef.current = null;
+        if (streamFlushRafRef.current !== null) {
+          cancelAnimationFrame(streamFlushRafRef.current);
+          streamFlushRafRef.current = null;
+        }
+        if (streamFlushTimeoutRef.current) {
+          clearTimeout(streamFlushTimeoutRef.current);
+          streamFlushTimeoutRef.current = null;
+        }
+        pendingStreamRef.current = null;
 
         setItems((prev) => {
           const existingIdx = prev.findIndex(
@@ -7897,27 +8702,41 @@ export default function ControlClient() {
             return prev;
           }
 
+          // Finalize any in-flight thinking (kept as a completed Thought, like
+          // the history reducer) and drop the in-progress text_delta draft so
+          // post-tool text streams fresh below this tool rather than rewriting
+          // a bubble stuck above it.
+          const base = prev
+            .map((it) =>
+              it.kind === "thinking" && !it.done
+                ? { ...it, done: true, endTime: now }
+                : it,
+            )
+            .filter(
+              (it) => !(it.kind === "stream" && it.id === "text_delta_latest"),
+            );
+
           const toolItem: ChatItem = {
             kind: "tool",
-            id: `tool-${toolCallId || Date.now()}`,
+            id: `tool-${toolCallId || now}`,
             toolCallId,
             name,
             args: data["args"],
             isUiTool,
-            startTime: Date.now(),
+            startTime: now,
           };
 
           // Important: keep queued user messages at the end of the timeline.
           // If we append tool calls after a queued message, the UI can appear to "lose"
           // the assistant reply (it may be inserted before the queued message and then
           // scrolled out of view under a long tail of tools).
-          const firstQueuedIdx = prev.findIndex(
+          const firstQueuedIdx = base.findIndex(
             (item) => item.kind === "user" && item.queued === true,
           );
           if (firstQueuedIdx === -1) {
-            return [...prev, toolItem];
+            return [...base, toolItem];
           }
-          const updated = [...prev];
+          const updated = [...base];
           updated.splice(firstQueuedIdx, 0, toolItem);
           return updated;
         });
@@ -8020,7 +8839,15 @@ export default function ControlClient() {
         setItems((prev) =>
           prev.map((it) =>
             it.kind === "tool" && it.toolCallId === toolCallId
-              ? { ...it, result: data["result"], endTime }
+              ? // The live result fully hydrates the row, so a conversation
+                // stub must drop its lazy/loading UI state here too.
+                {
+                  ...it,
+                  result: data["result"],
+                  endTime,
+                  lazy: false,
+                  loading: false,
+                }
               : it,
           ),
         );
@@ -8226,12 +9053,7 @@ export default function ControlClient() {
         if (missionId && status) {
           // Clear pill on terminal statuses — keeps the UI uncluttered once
           // the goal is no longer driving the mission.
-          if (
-            status === "complete" ||
-            status === "cleared" ||
-            status === "budgetLimited" ||
-            status === "aborted"
-          ) {
+          if (isTerminalGoalStatus(status)) {
             setGoalInfoByMission((prev) => {
               if (!(missionId in prev)) return prev;
               const next = { ...prev };
@@ -8598,42 +9420,6 @@ export default function ControlClient() {
     };
   }, [setItems]);
 
-  const status = useMemo(() => statusLabel(viewingRunState), [viewingRunState]);
-  const StatusIcon = status.Icon;
-
-  const streamHints = useMemo(() => {
-    void diagTick;
-    const hints: string[] = [];
-    const ct = streamDiagnostics.contentType;
-    if (ct && !ct.toLowerCase().includes("text/event-stream")) {
-      hints.push(`Content-Type is "${ct}" (expected text/event-stream).`);
-    }
-    const ce = streamDiagnostics.contentEncoding;
-    if (ce && ce !== "identity") {
-      hints.push(`Content-Encoding is "${ce}". Disable gzip for SSE.`);
-    }
-    if (
-      streamDiagnostics.phase === "open" ||
-      streamDiagnostics.phase === "streaming"
-    ) {
-      const lastChunkAge = streamDiagnostics.lastChunkAt
-        ? Date.now() - streamDiagnostics.lastChunkAt
-        : null;
-      if (lastChunkAge !== null && lastChunkAge > 30000) {
-        hints.push(
-          "No SSE chunks for >30s. Likely proxy buffering or connection drops.",
-        );
-      }
-    }
-    if (
-      typeof streamDiagnostics.status === "number" &&
-      streamDiagnostics.status >= 400
-    ) {
-      hints.push(`Stream request returned HTTP ${streamDiagnostics.status}.`);
-    }
-    return hints;
-  }, [streamDiagnostics, diagTick]);
-
   const handleCopyDiagnostics = useCallback(async () => {
     const mission = viewingMission ?? currentMission;
     const payload = {
@@ -8693,16 +9479,37 @@ export default function ControlClient() {
       );
       const willBeQueued = isBusy && hasExistingUserMessages;
 
-      const restoreFailedOptimisticSend = () => {
-        setItems((prev) => prev.filter((item) => item.id !== tempId));
-        enhancedInputRef.current?.restoreDraft(trimmedContent, agent ?? null);
-        setInput(trimmedContent);
-        saveControlDraftForMission(trimmedContent, targetMissionId);
+      // On failure we KEEP the optimistic row (instead of deleting it) and
+      // flip it to a persistent "failed" state with an inline Retry — a
+      // transient toast was too easy to miss, which is exactly how a message
+      // got silently dropped during a redeploy. Network failures are also
+      // queued to the outbox so they auto-redeliver on reconnect.
+      const markOptimisticSendFailed = (reason: "network" | "rejected") => {
+        setItems((prev) =>
+          prev.map((item) =>
+            item.id === tempId && item.kind === "user"
+              ? {
+                  ...item,
+                  sendStatus: "failed" as const,
+                  failedReason: reason,
+                  queued: false,
+                }
+              : item,
+          ),
+        );
+        if (reason === "network" && targetMissionId) {
+          addOutboxEntry(targetMissionId, {
+            id: tempId,
+            content: trimmedContent,
+            agent: agent || undefined,
+            timestamp,
+          });
+        }
       };
 
       // Acknowledge the user's send immediately, before any mission sync or
-      // network round-trip. If sync/post fails below, the optimistic row is
-      // removed and the draft is restored.
+      // network round-trip. The row starts in "sending" (dimmed, with a
+      // spinner); on ack it becomes "sent", on failure "failed" + Retry.
       setItems((prev) => [
         ...prev,
         {
@@ -8711,8 +9518,12 @@ export default function ControlClient() {
           content: trimmedContent,
           timestamp,
           queued: willBeQueued,
+          sendStatus: "sending" as const,
+          agent: agent || undefined,
+          missionId: targetMissionId ?? undefined,
         },
       ]);
+      scrollToBottom("instant");
       enhancedInputRef.current?.clear();
       setInput("");
       saveControlDraftForMission("", targetMissionId);
@@ -8725,7 +9536,7 @@ export default function ControlClient() {
           let mission = await loadMission(targetMissionId);
 
           if (!mission) {
-            restoreFailedOptimisticSend();
+            markOptimisticSendFailed("rejected");
             toast.error("Mission not found");
             submittingRef.current = false;
             return;
@@ -8749,7 +9560,9 @@ export default function ControlClient() {
         } catch (err) {
           const errMsg = err instanceof Error ? err.message : String(err);
           console.error("Failed to sync mission before sending:", err);
-          restoreFailedOptimisticSend();
+          markOptimisticSendFailed(
+            isRetriableSendError(err) ? "network" : "rejected",
+          );
           toast.error(
             `Failed to sync mission: ${errMsg}. Check API connection in Settings.`,
           );
@@ -8768,6 +9581,9 @@ export default function ControlClient() {
             client_message_id: tempId,
           },
         );
+        // The message reached the backend — drop it from the outbox so a
+        // later reconnect-flush can't redeliver it.
+        if (targetMissionId) removeOutboxEntry(targetMissionId, tempId);
         setItems((prev) => {
           // Check if SSE already added this message (race condition where SSE arrives before API response)
           // If so, just remove the temp message to avoid duplicates
@@ -8785,26 +9601,223 @@ export default function ControlClient() {
           const effectiveQueued = isFirstMessage ? false : queued;
           return prev.map((item) =>
             item.id === tempId
-              ? { ...item, id, queued: effectiveQueued }
+              ? {
+                  ...item,
+                  id,
+                  queued: effectiveQueued,
+                  sendStatus: "sent" as const,
+                  failedReason: undefined,
+                }
               : item,
           );
         });
       } catch (err) {
         console.error(err);
-        // Restore via the imperative handle so a locked-agent badge is
-        // reinstated instead of surfacing as a raw "@agent " prefix.
-        // Use `trimmedContent` — it's what the optimistic item and the
-        // failed API call carried, so the restored draft matches what
-        // the user actually sent. Leading/trailing whitespace in
-        // `content` is intentionally dropped here.
-        restoreFailedOptimisticSend();
-        toast.error("Failed to send message");
+        // Keep the bubble and flip it to "failed" with an inline Retry. A
+        // network failure also lands in the outbox to auto-redeliver on
+        // reconnect (idempotent via client_message_id), so a dropped
+        // connection no longer silently loses the message.
+        markOptimisticSendFailed(
+          isRetriableSendError(err) ? "network" : "rejected",
+        );
+        toast.error("Message not delivered — tap Retry on the message");
       } finally {
         submittingRef.current = false;
       }
     },
-    [items, isBusy, applyDesktopSessionState, missionHistoryToItems],
+    [
+      items,
+      isBusy,
+      applyDesktopSessionState,
+      missionHistoryToItems,
+      scrollToBottom,
+    ],
   );
+
+  // Re-send a message that failed to reach the backend, reusing its original
+  // client_message_id so redelivery is idempotent. Used by both the inline
+  // Retry button and the automatic reconnect-flush below.
+  const handleRetryUserMessage = useCallback(
+    async (
+      msg: { id: string; content: string; agent?: string },
+      explicitMissionId?: string | null,
+    ) => {
+      // Bind redelivery to an explicit mission for outbox flushes — the viewing
+      // mission can change mid-flight, and posting to viewingMissionIdRef at
+      // send time would misroute a queued message to the wrong mission. Inline
+      // Retry omits it and falls back to the active view.
+      const missionId =
+        explicitMissionId !== undefined
+          ? explicitMissionId
+          : viewingMissionIdRef.current;
+      const markFailed = (reason: "network" | "rejected") => {
+        setItems((prev) =>
+          prev.map((it) =>
+            it.id === msg.id && it.kind === "user"
+              ? { ...it, sendStatus: "failed" as const, failedReason: reason }
+              : it,
+          ),
+        );
+        if (reason === "network" && missionId) {
+          addOutboxEntry(missionId, {
+            id: msg.id,
+            content: msg.content,
+            agent: msg.agent,
+            timestamp: Date.now(),
+          });
+        }
+      };
+      setItems((prev) =>
+        prev.map((it) =>
+          it.id === msg.id && it.kind === "user"
+            ? { ...it, sendStatus: "sending" as const, failedReason: undefined }
+            : it,
+        ),
+      );
+      // Mirror the main send path: a mission in a resumable state must be
+      // resumed before it will accept the message, otherwise redelivery
+      // silently drops it. Only adopt the mission into the active view if the
+      // user is still looking at it, so a background flush doesn't yank them.
+      if (missionId) {
+        try {
+          let mission = await loadMission(missionId);
+          if (!mission) {
+            markFailed("rejected");
+            return;
+          }
+          if (["failed", "interrupted", "blocked"].includes(mission.status)) {
+            mission = await resumeMission(mission.id, { skipMessage: true });
+          }
+          if (viewingMissionIdRef.current === missionId) {
+            setCurrentMission(mission);
+            setViewingMission(mission);
+            setViewingMissionId(mission.id);
+            applyDesktopSessionState(mission);
+          }
+        } catch (err) {
+          markFailed(isRetriableSendError(err) ? "network" : "rejected");
+          return;
+        }
+      }
+      try {
+        const { id, queued } = await postControlMessageWithRetry(msg.content, {
+          agent: msg.agent || undefined,
+          mission_id: missionId || undefined,
+          client_message_id: msg.id,
+        });
+        if (missionId) removeOutboxEntry(missionId, msg.id);
+        setItems((prev) => {
+          const sseAlreadyAdded = prev.some(
+            (item) => item.id === id && item.id !== msg.id,
+          );
+          if (sseAlreadyAdded) {
+            return prev.filter((item) => item.id !== msg.id);
+          }
+          // Mirror the main send path: the mission's first user message is
+          // never queued, even if the agent is busy. Trusting the backend
+          // `queued` flag here would show "Queued" on a retried first message
+          // when the initial send would not have.
+          const otherUserMessages = prev.filter(
+            (item) => item.kind === "user" && item.id !== msg.id,
+          );
+          const isFirstMessage = otherUserMessages.length === 0;
+          const effectiveQueued = isFirstMessage ? false : queued;
+          return prev.map((item) =>
+            item.id === msg.id
+              ? {
+                  ...item,
+                  id,
+                  queued: effectiveQueued,
+                  sendStatus: "sent" as const,
+                  failedReason: undefined,
+                }
+              : item,
+          );
+        });
+      } catch (err) {
+        markFailed(isRetriableSendError(err) ? "network" : "rejected");
+      }
+    },
+    [applyDesktopSessionState],
+  );
+
+  // Surface and auto-flush the unsent-message outbox. Pending messages are
+  // always re-surfaced into the chat (so they stay visible with a Retry even
+  // while the stream is down); redelivery itself runs once the stream is
+  // connected (reconnect after a deploy/network drop, or a fresh mount with
+  // leftover messages). The in-flight guard prevents a re-render from
+  // double-firing an entry; redelivery is idempotent via client_message_id.
+  const flushingOutboxRef = useRef<Set<string>>(new Set());
+  useEffect(() => {
+    if (!viewingMissionId) return;
+    const pending = getOutboxForMission(viewingMissionId);
+    if (pending.length === 0) return;
+    const connected = connectionState === "connected";
+
+    // Always surface undelivered outbox messages so the user keeps seeing them
+    // (with an inline Retry while the stream is down), instead of them only
+    // re-appearing once the SSE stream reconnects. After a refresh the bubbles
+    // may not be in `items` yet.
+    setItems((prev) => {
+      const present = new Set(prev.map((it) => it.id));
+      const missing = pending.filter((m) => !present.has(m.id));
+      if (missing.length === 0) return prev;
+      return [
+        ...prev,
+        ...missing.map((m) => ({
+          kind: "user" as const,
+          id: m.id,
+          content: m.content,
+          timestamp: m.timestamp,
+          agent: m.agent,
+          sendStatus: connected ? ("sending" as const) : ("failed" as const),
+          failedReason: connected ? undefined : ("network" as const),
+          missionId: viewingMissionId,
+        })),
+      ];
+    });
+
+    // Redelivery only happens once the stream is connected.
+    if (!connected) return;
+
+    let cancelled = false;
+    (async () => {
+      for (const msg of pending) {
+        if (cancelled) break;
+        if (flushingOutboxRef.current.has(msg.id)) continue;
+        flushingOutboxRef.current.add(msg.id);
+        // Flip the already-surfaced bubble to "sending" while we deliver it.
+        setItems((prev) =>
+          prev.map((it) =>
+            it.id === msg.id && it.kind === "user"
+              ? {
+                  ...it,
+                  sendStatus: "sending" as const,
+                  failedReason: undefined,
+                }
+              : it,
+          ),
+        );
+        try {
+          // Bind to the mission this flush captured, not the live viewing ref,
+          // so a mid-flush mission switch can't misroute the message.
+          await handleRetryUserMessage(
+            {
+              id: msg.id,
+              content: msg.content,
+              agent: msg.agent,
+            },
+            viewingMissionId,
+          );
+        } finally {
+          flushingOutboxRef.current.delete(msg.id);
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [connectionState, viewingMissionId, handleRetryUserMessage]);
 
   const handleStop = async () => {
     const targetId = viewingMissionIdRef.current;
@@ -8821,31 +9834,39 @@ export default function ControlClient() {
     }
   };
 
-  const syncQueueForMission = useCallback(async (missionId: string) => {
-    if (!missionId || syncingQueueRef.current) return;
-    syncingQueueRef.current = true;
-    try {
-      const queuedMessages = await getQueue();
-      const queuedForMission = queuedMessages.filter(
-        (qm) => qm.mission_id === missionId,
-      );
-      const queuedIds = new Set(queuedForMission.map((qm) => qm.id));
+  const syncQueueForMission = useCallback(
+    async (missionId: string) => {
+      if (!missionId || syncingQueueRef.current) return;
+      syncingQueueRef.current = true;
+      try {
+        const queueGenAtFetch = queueMutationGenRef.current;
+        const queuedMessages = await getQueue();
+        // A local remove/clear landed while this snapshot was in flight —
+        // it may still contain the deleted message. Discard it; the
+        // mutation handler triggers its own (fresh) sync.
+        if (queueGenAtFetch !== queueMutationGenRef.current) return;
+        const queuedForMission = queuedMessages.filter(
+          (qm) => qm.mission_id === missionId,
+        );
+        const queuedIds = new Set(queuedForMission.map((qm) => qm.id));
 
-      setItems((prev) =>
-        prev.map((item) => {
-          if (item.kind !== "user") return item;
-          if (item.id.startsWith("temp-")) return item;
-          const shouldBeQueued = queuedIds.has(item.id);
-          if (item.queued === shouldBeQueued) return item;
-          return { ...item, queued: shouldBeQueued };
-        }),
-      );
-    } catch (err) {
-      console.warn("[control] failed to sync queue", err);
-    } finally {
-      syncingQueueRef.current = false;
-    }
-  }, [setItems]);
+        setItems((prev) =>
+          prev.map((item) => {
+            if (item.kind !== "user") return item;
+            if (item.id.startsWith("temp-")) return item;
+            const shouldBeQueued = queuedIds.has(item.id);
+            if (item.queued === shouldBeQueued) return item;
+            return { ...item, queued: shouldBeQueued };
+          }),
+        );
+      } catch (err) {
+        console.warn("[control] failed to sync queue", err);
+      } finally {
+        syncingQueueRef.current = false;
+      }
+    },
+    [setItems],
+  );
 
   // Reload mission history from the API. Used for visibility change,
   // periodic sync, and SSE reconnect catch-up.
@@ -8862,6 +9883,7 @@ export default function ControlClient() {
     async (missionId: string) => {
       try {
         const knownSeq = missionMaxSeqRef.current.get(missionId) ?? 0;
+        const queueGenAtFetch = queueMutationGenRef.current;
 
         if (knownSeq > 0) {
           const [mission, deltaEvents, queuedMessages] = await Promise.all([
@@ -8919,7 +9941,9 @@ export default function ControlClient() {
             // safely append.
             const hasLiveStreamingRow = itemsRef.current.some(
               (it) =>
-                (it.kind === "stream" && it.id === "text_delta_latest") ||
+                (it.kind === "stream" &&
+                  it.id === "text_delta_latest" &&
+                  !it.done) ||
                 (it.kind === "thinking" && !it.done),
             );
             const deltaTouchesStreamingTypes = deltaEvents.some(
@@ -8937,11 +9961,36 @@ export default function ControlClient() {
             const deltaItems = eventsToItems(deltaEvents, mission);
             setItems((prev) => {
               const existingIds = new Set(prev.map((it) => it.id));
+              const deltaItemsById = new Map(
+                deltaItems.map((item) => [item.id, item]),
+              );
+              let changed = false;
+              const updated = prev.map((item) => {
+                const incoming = deltaItemsById.get(item.id);
+                if (
+                  item.kind === "tool" &&
+                  incoming?.kind === "tool" &&
+                  incoming.lazy === true &&
+                  item.result === undefined
+                ) {
+                  changed = true;
+                  return {
+                    ...item,
+                    lazy: true,
+                    loading: false,
+                    hasResult: incoming.hasResult,
+                    contentBytes: incoming.contentBytes,
+                    resultBytes: incoming.resultBytes,
+                    endTime: incoming.endTime ?? item.endTime,
+                  };
+                }
+                return item;
+              });
               const additions = deltaItems.filter(
                 (it) => !existingIds.has(it.id),
               );
-              if (additions.length === 0) return prev;
-              const merged = [...prev, ...additions];
+              if (!changed && additions.length === 0) return prev;
+              const merged = [...updated, ...additions];
               adjustVisibleItemsLimit(merged);
               updateMissionItems(missionId, merged);
               return merged;
@@ -8951,36 +10000,43 @@ export default function ControlClient() {
 
           // Queue reconciliation still needs every tick — a message
           // could move from "queued" to "processing" with no new events.
-          const missionQueuedMessages = queuedMessages.filter(
-            (qm) => qm.mission_id === missionId,
-          );
-          const queuedIds = new Set(missionQueuedMessages.map((qm) => qm.id));
-          setItems((prev) => {
-            let changed = false;
-            const next = prev.map((item) => {
-              if (item.kind !== "user") return item;
-              const shouldBeQueued = queuedIds.has(item.id);
-              if (!!item.queued === shouldBeQueued) return item;
-              changed = true;
-              return { ...item, queued: shouldBeQueued };
+          // Skip when a local remove/clear landed while the snapshot was
+          // in flight: the snapshot may still contain the deleted message
+          // and re-adding it would resurrect a ghost row.
+          if (queueGenAtFetch === queueMutationGenRef.current) {
+            const missionQueuedMessages = queuedMessages.filter(
+              (qm) => qm.mission_id === missionId,
+            );
+            const queuedIds = new Set(
+              missionQueuedMessages.map((qm) => qm.id),
+            );
+            setItems((prev) => {
+              let changed = false;
+              const next = prev.map((item) => {
+                if (item.kind !== "user") return item;
+                const shouldBeQueued = queuedIds.has(item.id);
+                if (!!item.queued === shouldBeQueued) return item;
+                changed = true;
+                return { ...item, queued: shouldBeQueued };
+              });
+              const existingIds = new Set(prev.map((it) => it.id));
+              const newQueued: ChatItem[] = missionQueuedMessages
+                .filter((qm) => !existingIds.has(qm.id))
+                .map((qm) => ({
+                  kind: "user" as const,
+                  id: qm.id,
+                  content: qm.content,
+                  timestamp: Date.now(),
+                  agent: qm.agent ?? undefined,
+                  queued: true,
+                }));
+              if (newQueued.length === 0 && !changed) return prev;
+              const merged =
+                newQueued.length > 0 ? [...next, ...newQueued] : next;
+              updateMissionItems(missionId, merged);
+              return merged;
             });
-            const existingIds = new Set(prev.map((it) => it.id));
-            const newQueued: ChatItem[] = missionQueuedMessages
-              .filter((qm) => !existingIds.has(qm.id))
-              .map((qm) => ({
-                kind: "user" as const,
-                id: qm.id,
-                content: qm.content,
-                timestamp: Date.now(),
-                agent: qm.agent ?? undefined,
-                queued: true,
-              }));
-            if (newQueued.length === 0 && !changed) return prev;
-            const merged =
-              newQueued.length > 0 ? [...next, ...newQueued] : next;
-            updateMissionItems(missionId, merged);
-            return merged;
-          });
+          }
           if (!needsFullReload) return;
           // Orphan delta — clear the cursor and fall through to the
           // full reload below so state reconstructs with full context.
@@ -8988,6 +10044,7 @@ export default function ControlClient() {
         }
 
         // Full reload fallback (first load or counter reset).
+        const fullQueueGenAtFetch = queueMutationGenRef.current;
         const [mission, events, queuedMessages] = await Promise.all([
           getMission(missionId),
           loadHistoryEvents(missionId).catch(() => null),
@@ -9001,33 +10058,20 @@ export default function ControlClient() {
               mission,
             )
           : missionHistoryToItems(mission);
+        historyItems = appendUnpersistedLiveTail(
+          historyItems,
+          itemsRef.current,
+        );
 
         // Pre-queue length: pagination uses this to find the live tail
         // without clipping queued items (see `seedPaginationStateAfterInitialLoad`).
         const historicEventsLen = historyItems.length;
-        const missionQueuedMessages = queuedMessages.filter(
-          (qm) => qm.mission_id === missionId,
+        historyItems = mergeQueuedMessagesIntoItems(
+          historyItems,
+          queuedMessages,
+          missionId,
+          fullQueueGenAtFetch === queueMutationGenRef.current,
         );
-        if (missionQueuedMessages.length > 0) {
-          const queuedIds = new Set(missionQueuedMessages.map((qm) => qm.id));
-          historyItems = historyItems.map((item) =>
-            item.kind === "user" && queuedIds.has(item.id)
-              ? { ...item, queued: true }
-              : item,
-          );
-          const existingIds = new Set(historyItems.map((item) => item.id));
-          const newQueuedItems: ChatItem[] = missionQueuedMessages
-            .filter((qm) => !existingIds.has(qm.id))
-            .map((qm) => ({
-              kind: "user" as const,
-              id: qm.id,
-              content: qm.content,
-              timestamp: Date.now(),
-              agent: qm.agent ?? undefined,
-              queued: true,
-            }));
-          historyItems = [...historyItems, ...newQueuedItems];
-        }
 
         setItems(historyItems);
         adjustVisibleItemsLimit(historyItems);
@@ -9097,31 +10141,68 @@ export default function ControlClient() {
       .map((item) => ({
         id: item.id,
         content: item.content,
-        agent: null, // Agent info not stored in current item structure
+        agent: item.agent ?? null,
       }));
   }, [items]);
+
+  // Drop a message from the local timeline (and the viewed mission's cache,
+  // so the row doesn't come back from a cache restore).
+  const dropQueuedItemLocally = useCallback(
+    (messageId: string) => {
+      setItems((prev) => {
+        const next = prev.filter((item) => item.id !== messageId);
+        if (next.length === prev.length) return prev;
+        const missionId = viewingMissionIdRef.current;
+        if (missionId) updateMissionItems(missionId, next);
+        return next;
+      });
+    },
+    [setItems, updateMissionItems],
+  );
 
   // Handle removing a message from the queue
   const handleRemoveFromQueue = async (messageId: string) => {
     try {
       await removeFromQueue(messageId);
-      // Optimistically remove from local state
-      setItems((prev) => prev.filter((item) => item.id !== messageId));
+      // Invalidate in-flight getQueue() snapshots (they may predate the
+      // deletion and would resurrect the message), then drop it locally.
+      queueMutationGenRef.current += 1;
+      dropQueuedItemLocally(messageId);
       toast.success("Removed from queue");
+      // Belt-and-braces: reconcile against a fresh post-delete snapshot.
+      const missionId = viewingMissionIdRef.current;
+      if (missionId) void syncQueueForMission(missionId);
     } catch (err) {
+      if (isHttpStatusError(err, 404)) {
+        // The server no longer has this message (e.g. a stale snapshot
+        // resurrected an already-deleted row) — self-heal by dropping it.
+        queueMutationGenRef.current += 1;
+        dropQueuedItemLocally(messageId);
+        toast.success("Message already removed from queue");
+        return;
+      }
       console.error(err);
       toast.error("Failed to remove from queue");
     }
   };
 
-  // Handle clearing all queued messages
+  // Handle clearing all queued messages for the viewed mission
   const handleClearQueue = async () => {
     try {
-      const { cleared } = await clearQueue();
+      // Scope to the viewed mission so clearing here doesn't wipe other
+      // missions' queues.
+      const missionId = viewingMissionIdRef.current;
+      const { cleared } = await clearQueue(missionId ?? undefined);
+      queueMutationGenRef.current += 1;
       // Optimistically remove all queued items from local state
-      setItems((prev) =>
-        prev.filter((item) => !(item.kind === "user" && item.queued === true)),
-      );
+      setItems((prev) => {
+        const next = prev.filter(
+          (item) => !(item.kind === "user" && item.queued === true),
+        );
+        if (next.length === prev.length) return prev;
+        if (missionId) updateMissionItems(missionId, next);
+        return next;
+      });
       toast.success(
         `Cleared ${cleared} message${cleared !== 1 ? "s" : ""} from queue`,
       );
@@ -9136,6 +10217,38 @@ export default function ControlClient() {
     missionLoading &&
     !!viewingMissionId &&
     activeMission?.id !== viewingMissionId;
+
+  // The inline "Agent is working" pill renders *below* the virtualized
+  // timeline, so the bottom anchor (which keys off `groupedItems` only) never
+  // scrolls to reveal it — unlike the "is thinking" indicator, which is a real
+  // timeline item. Nudge to the bottom when the pill first appears while the
+  // user is already pinned there, so it shows up the same way thinking does.
+  const agentWorkingPillVisible =
+    viewingMissionIsRunning &&
+    activeMission?.status === "active" &&
+    !!agentWorkingIndicator;
+  const prevAgentWorkingPillVisible = useRef(false);
+  const pillLatchMissionId = useRef(viewingMissionId);
+  useEffect(() => {
+    // Reset the latch synchronously when the viewed mission changes, *before*
+    // evaluating the transition. A separate mission-id effect can't do this:
+    // effects run in declaration order, so the auto-scroll below would see a
+    // stale `true` from the previous running mission (no false→true edge) and
+    // never scroll on the new timeline. Folding the reset in here guarantees
+    // the new mission's first pill appearance counts as a real edge.
+    if (pillLatchMissionId.current !== viewingMissionId) {
+      pillLatchMissionId.current = viewingMissionId;
+      prevAgentWorkingPillVisible.current = false;
+    }
+    if (
+      agentWorkingPillVisible &&
+      !prevAgentWorkingPillVisible.current &&
+      isAtBottom
+    ) {
+      scrollToBottom("smooth");
+    }
+    prevAgentWorkingPillVisible.current = agentWorkingPillVisible;
+  }, [agentWorkingPillVisible, isAtBottom, scrollToBottom, viewingMissionId]);
   const workspaceNameById = useMemo(() => {
     return Object.fromEntries(workspaces.map((ws) => [ws.id, ws.name]));
   }, [workspaces]);
@@ -9149,12 +10262,175 @@ export default function ControlClient() {
       activeMission.short_description?.trim() ||
       getMissionShortName(activeMission.id)
     : null;
+  const [editingMissionTitle, setEditingMissionTitle] = useState(false);
+  const [missionTitleDraft, setMissionTitleDraft] = useState("");
+  const [savingMissionTitle, setSavingMissionTitle] = useState(false);
+  const cancelMissionTitleSaveRef = useRef(false);
+  const [showMissionMenu, setShowMissionMenu] = useState(false);
+  const [missionMenuPos, setMissionMenuPos] = useState<{
+    top: number;
+    left: number;
+  } | null>(null);
+  const [showDeleteMissionConfirm, setShowDeleteMissionConfirm] =
+    useState(false);
+  const missionMenuRef = useRef<HTMLDivElement>(null);
+  const missionMenuButtonRef = useRef<HTMLButtonElement>(null);
+  const openMissionMenu = useCallback(() => {
+    const rect = missionMenuButtonRef.current?.getBoundingClientRect();
+    if (rect) {
+      setMissionMenuPos({ top: rect.bottom + 6, left: rect.left });
+    }
+    setShowMissionMenu(true);
+  }, []);
+  const missionIsRunningOrActive =
+    viewingMissionIsRunning || activeMission?.status === "active";
   const missionStatus = activeMission
     ? missionStatusLabel(activeMission.status, viewingMissionIsRunning)
     : null;
+  const faviconStatus = useMemo<MissionStatus | null>(() => {
+    if (!activeMission) return null;
+    if (viewingMissionIsRunning) return activeMission.status;
+
+    for (let i = items.length - 1; i >= 0; i--) {
+      const item = items[i];
+      if (item.kind === "user") break;
+      if (item.kind === "assistant") {
+        return item.success ? "completed" : activeMission.status;
+      }
+    }
+
+    return activeMission.status;
+  }, [activeMission, items, viewingMissionIsRunning]);
+
+  useEffect(() => {
+    if (!editingMissionTitle) {
+      setMissionTitleDraft(activeMissionSelectorLabel ?? "");
+    }
+  }, [activeMissionSelectorLabel, editingMissionTitle]);
+
+  const saveMissionTitle = useCallback(async () => {
+    if (!activeMission || savingMissionTitle) return;
+    const nextTitle = missionTitleDraft.trim();
+    const previousTitle = activeMission.title ?? "";
+    if (!nextTitle || nextTitle === previousTitle.trim()) {
+      setEditingMissionTitle(false);
+      setMissionTitleDraft(activeMissionSelectorLabel ?? "");
+      return;
+    }
+
+    const applyTitle = (mission: Mission | null) =>
+      mission?.id === activeMission.id
+        ? { ...mission, title: nextTitle }
+        : mission;
+
+    setSavingMissionTitle(true);
+    setRecentMissions((prev) =>
+      prev.map((mission) =>
+        mission.id === activeMission.id
+          ? { ...mission, title: nextTitle }
+          : mission,
+      ),
+    );
+    setCurrentMission(applyTitle);
+    setViewingMission(applyTitle);
+    setEditingMissionTitle(false);
+
+    try {
+      await updateMissionTitle(activeMission.id, nextTitle);
+    } catch (error) {
+      console.error("Failed to update mission title:", error);
+      toast.error("Failed to update mission title");
+      const restoreTitle = (mission: Mission | null) =>
+        mission?.id === activeMission.id
+          ? { ...mission, title: previousTitle }
+          : mission;
+      setRecentMissions((prev) =>
+        prev.map((mission) =>
+          mission.id === activeMission.id
+            ? { ...mission, title: previousTitle }
+            : mission,
+        ),
+      );
+      setCurrentMission(restoreTitle);
+      setViewingMission(restoreTitle);
+      setMissionTitleDraft(previousTitle || activeMissionSelectorLabel || "");
+    } finally {
+      setSavingMissionTitle(false);
+    }
+  }, [
+    activeMission,
+    activeMissionSelectorLabel,
+    missionTitleDraft,
+    savingMissionTitle,
+    setCurrentMission,
+    setViewingMission,
+  ]);
+
+  const handleDeleteActiveMission = useCallback(async () => {
+    if (!activeMission) return;
+    const missionId = activeMission.id;
+    try {
+      await deleteMission(missionId);
+    } catch (error) {
+      console.error("Failed to delete mission:", error);
+      toast.error("Failed to delete mission");
+      return;
+    }
+    setShowDeleteMissionConfirm(false);
+    setViewingMissionId(null);
+    setViewingMission(null);
+    setCurrentMission(null);
+    setItems([]);
+    setVisibleItemsLimit(INITIAL_VISIBLE_ITEMS);
+    setHasDesktopSession(false);
+    setLastMissionId(null);
+    router.replace("/control", { scroll: false });
+    void refreshRecentMissions();
+    toast.success("Mission deleted");
+  }, [
+    activeMission,
+    refreshRecentMissions,
+    router,
+    setCurrentMission,
+    setViewingMission,
+    setViewingMissionId,
+  ]);
+
+  useEffect(() => {
+    if (!showMissionMenu) return;
+    const handlePointerDown = (event: MouseEvent) => {
+      const target = event.target as Node;
+      if (
+        missionMenuRef.current?.contains(target) ||
+        missionMenuButtonRef.current?.contains(target)
+      ) {
+        return;
+      }
+      setShowMissionMenu(false);
+    };
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setShowMissionMenu(false);
+    };
+    const handleResize = () => setShowMissionMenu(false);
+    document.addEventListener("mousedown", handlePointerDown);
+    document.addEventListener("keydown", handleKeyDown);
+    window.addEventListener("resize", handleResize);
+    return () => {
+      document.removeEventListener("mousedown", handlePointerDown);
+      document.removeEventListener("keydown", handleKeyDown);
+      window.removeEventListener("resize", handleResize);
+    };
+  }, [showMissionMenu]);
 
   // Update favicon with mission status dot
-  useFaviconStatus(activeMission?.status ?? null, viewingMissionIsRunning);
+  useFaviconStatus(faviconStatus, viewingMissionIsRunning);
+
+  useEffect(() => {
+    document.title = formatMissionDocumentTitle(activeMission);
+    return () => {
+      document.title = DEFAULT_DOCUMENT_TITLE;
+    };
+  }, [activeMission]);
 
   // Derive the last resolved model from assistant messages (for the debug dropdown)
   const lastResolvedModel = useMemo(() => {
@@ -9227,30 +10503,6 @@ export default function ControlClient() {
     activeMissionRole === "boss" ||
     hasInMissionSubagents;
 
-  // Auto-show the workers/sub-agents panel ONCE per mission, the first time
-  // the active mission acquires workers or sub-agents. Tracked with a ref so
-  // a streaming mission spawning a new worker doesn't keep reopening the
-  // panel after the user has closed it.
-  useEffect(() => {
-    const missionId = activeMission?.id;
-    if (!missionId) return;
-    if (childMissions.length === 0 && !hasInMissionSubagents) return;
-    if (workerPanelDismissedRef.current.has(missionId)) return;
-    if (workerPanelAutoOpenedForRef.current === missionId) return;
-    workerPanelAutoOpenedForRef.current = missionId;
-    setShowWorkerPanel(true);
-  }, [activeMission?.id, childMissions.length, hasInMissionSubagents]);
-
-  // Stable callback: closing the panel marks the current mission as dismissed
-  // so the auto-open effect above doesn't immediately reopen it.
-  const handleCloseWorkerPanel = useCallback(() => {
-    const missionId = activeMission?.id;
-    if (missionId) {
-      workerPanelDismissedRef.current.add(missionId);
-    }
-    setShowWorkerPanel(false);
-  }, [activeMission?.id]);
-
   // Determine if we should show the resume UI for interrupted/blocked/failed missions
   // Don't show resume UI if:
   // - Mission is running
@@ -9287,7 +10539,7 @@ export default function ControlClient() {
 
         {/* Opt-in perf overlay — `?debug=perf` only. Mounts no work in normal
           sessions; the bus and observer self-disable when the flag is off. */}
-        <PerfOverlay />
+        {showPerfOverlay && <PerfOverlay />}
 
         {/* Hidden file input */}
         <input
@@ -9315,33 +10567,99 @@ export default function ControlClient() {
           onRefresh={refreshRecentMissions}
         />
 
-        <MissionAutomationsDialog
-          open={showAutomationsDialog}
-          missionId={activeMission?.id ?? null}
-          missionLabel={
-            activeMission
-              ? activeWorkspaceLabel
-                ? `${activeWorkspaceLabel} · ${activeMission.title?.trim() || getMissionShortName(activeMission.id)}`
-                : activeMission.title?.trim() ||
-                  getMissionShortName(activeMission.id)
-              : null
-          }
-          missionBackend={activeMission?.backend ?? null}
-          onClose={() => setShowAutomationsDialog(false)}
+        {showAutomationsDialog && (
+          <MissionAutomationsDialog
+            open={showAutomationsDialog}
+            missionId={activeMission?.id ?? null}
+            missionLabel={
+              activeMission
+                ? activeWorkspaceLabel
+                  ? `${activeWorkspaceLabel} · ${activeMission.title?.trim() || getMissionShortName(activeMission.id)}`
+                  : activeMission.title?.trim() ||
+                    getMissionShortName(activeMission.id)
+                : null
+            }
+            missionBackend={activeMission?.backend ?? null}
+            onClose={() => setShowAutomationsDialog(false)}
+          />
+        )}
+
+        <ConfirmDialog
+          open={showDeleteMissionConfirm}
+          title="Delete mission?"
+          description={`"${activeMissionSelectorLabel ?? "This mission"}" will be permanently deleted, along with its workspace files and any child missions. This can't be undone.`}
+          confirmLabel="Delete mission"
+          variant="danger"
+          onConfirm={handleDeleteActiveMission}
+          onCancel={() => setShowDeleteMissionConfirm(false)}
         />
+
+        {showMissionMenu &&
+          activeMission &&
+          missionMenuPos &&
+          typeof document !== "undefined" &&
+          createPortal(
+            <div
+              ref={missionMenuRef}
+              role="menu"
+              style={{
+                position: "fixed",
+                top: missionMenuPos.top,
+                left: missionMenuPos.left,
+              }}
+              className="z-[60] min-w-[200px] overflow-hidden rounded-xl border border-white/[0.08] bg-[#1a1a1a] py-1 shadow-xl"
+            >
+              <button
+                type="button"
+                role="menuitem"
+                onClick={() => {
+                  setShowMissionMenu(false);
+                  setMissionTitleDraft(activeMissionSelectorLabel ?? "");
+                  cancelMissionTitleSaveRef.current = false;
+                  setEditingMissionTitle(true);
+                }}
+                className="flex w-full items-center gap-2.5 px-3 py-2 text-left text-sm text-white/80 transition-colors hover:bg-white/[0.06]"
+              >
+                <Pencil className="h-3.5 w-3.5" aria-hidden="true" />
+                Rename
+              </button>
+              <div className="my-1 h-px bg-white/[0.06]" />
+              <button
+                type="button"
+                role="menuitem"
+                disabled={missionIsRunningOrActive}
+                onClick={() => {
+                  setShowMissionMenu(false);
+                  setShowDeleteMissionConfirm(true);
+                }}
+                title={
+                  missionIsRunningOrActive
+                    ? "Cancel the mission before deleting"
+                    : undefined
+                }
+                className={cn(
+                  "flex w-full items-center gap-2.5 px-3 py-2 text-left text-sm transition-colors",
+                  missionIsRunningOrActive
+                    ? "cursor-not-allowed text-white/25"
+                    : "text-red-400 hover:bg-red-500/10",
+                )}
+              >
+                <Trash2 className="h-3.5 w-3.5" aria-hidden="true" />
+                Delete mission
+              </button>
+            </div>,
+            document.body,
+          )}
 
         {/* Header */}
         <div className="relative z-10 mb-6 flex items-center justify-between gap-2 lg:gap-4">
           <div className="flex items-center gap-3 min-w-0 overflow-hidden">
             {/* Unified Mission Selector */}
             <div className="relative">
-              <button
-                onClick={() => setShowMissionSwitcher(true)}
+              <div
                 className={cn(
-                  "flex h-9 items-center gap-2 px-3 rounded-lg transition-colors",
-                  "bg-indigo-500/20 hover:bg-indigo-500/30",
+                  "mission-selector-trigger flex h-9 items-center gap-2 px-3 rounded-lg transition-colors",
                 )}
-                title="Switch mission (⌘K)"
               >
                 {activeMission ? (
                   <>
@@ -9355,12 +10673,76 @@ export default function ControlClient() {
                       )}
                       title={missionStatus?.label}
                     />
-                    <span
-                      className="text-sm font-medium text-white/70 truncate max-w-[180px] sm:max-w-[260px]"
-                      title={activeMissionSelectorLabel ?? undefined}
-                    >
-                      {activeMissionSelectorLabel}
-                    </span>
+                    {editingMissionTitle ? (
+                      <input
+                        value={missionTitleDraft}
+                        onClick={(event) => event.stopPropagation()}
+                        onChange={(event) =>
+                          setMissionTitleDraft(event.target.value)
+                        }
+                        onBlur={() => {
+                          if (cancelMissionTitleSaveRef.current) {
+                            cancelMissionTitleSaveRef.current = false;
+                            return;
+                          }
+                          void saveMissionTitle();
+                        }}
+                        onKeyDown={(event) => {
+                          if (event.key === "Enter") {
+                            event.preventDefault();
+                            event.currentTarget.blur();
+                          } else if (event.key === "Escape") {
+                            event.preventDefault();
+                            cancelMissionTitleSaveRef.current = true;
+                            setEditingMissionTitle(false);
+                            setMissionTitleDraft(
+                              activeMissionSelectorLabel ?? "",
+                            );
+                          }
+                        }}
+                        autoFocus
+                        disabled={savingMissionTitle}
+                        className="mission-title-input h-6 w-[180px] rounded-md border px-2 text-sm font-medium outline-none focus:border-indigo-400/60 sm:w-[260px]"
+                      />
+                    ) : (
+                      <span
+                        className="mission-selector-title max-w-[180px] truncate text-sm font-medium sm:max-w-[260px]"
+                        title={activeMissionSelectorLabel ?? undefined}
+                        onClick={(event) => {
+                          event.preventDefault();
+                          event.stopPropagation();
+                          setMissionTitleDraft(
+                            activeMissionSelectorLabel ?? "",
+                          );
+                          cancelMissionTitleSaveRef.current = false;
+                          setEditingMissionTitle(true);
+                        }}
+                      >
+                        {activeMissionSelectorLabel}
+                      </span>
+                    )}
+                    {!editingMissionTitle && (
+                      <button
+                        ref={missionMenuButtonRef}
+                        type="button"
+                        onClick={(event) => {
+                          event.preventDefault();
+                          event.stopPropagation();
+                          if (showMissionMenu) {
+                            setShowMissionMenu(false);
+                          } else {
+                            openMissionMenu();
+                          }
+                        }}
+                        className="mission-selector-action inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-md transition-colors focus:outline-none focus:ring-1 focus:ring-indigo-400/50"
+                        aria-label="Mission actions"
+                        aria-haspopup="menu"
+                        aria-expanded={showMissionMenu}
+                        title="Mission actions"
+                      >
+                        <MoreVertical className="h-3 w-3" aria-hidden="true" />
+                      </button>
+                    )}
                   </>
                 ) : (
                   <>
@@ -9370,8 +10752,16 @@ export default function ControlClient() {
                     </span>
                   </>
                 )}
-                <ChevronDown className="h-3 w-3 text-white/40" />
-              </button>
+                <button
+                  type="button"
+                  onClick={() => setShowMissionSwitcher(true)}
+                  className="mission-selector-action inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-md transition-colors focus:outline-none focus:ring-1 focus:ring-indigo-400/50"
+                  aria-label="Switch mission"
+                  title="Switch mission (⌘K)"
+                >
+                  <ChevronDown className="h-3 w-3" aria-hidden="true" />
+                </button>
+              </div>
             </div>
           </div>
 
@@ -9413,6 +10803,26 @@ export default function ControlClient() {
               <span className="hidden sm:inline">Workbench</span>
             </button>
 
+            {/* Ask co-pilot toggle */}
+            <button
+              type="button"
+              onClick={() => setShowAskPanel((prev) => !prev)}
+              className={cn(
+                "flex items-center gap-2 rounded-lg border px-3 py-2 text-sm transition-colors",
+                showAskPanel
+                  ? "border-[rgb(var(--copilot)/0.4)] bg-[rgb(var(--copilot)/0.12)] text-[rgb(var(--copilot))]"
+                  : "border-white/[0.06] bg-white/[0.02] text-[rgb(var(--foreground)/0.7)] hover:bg-white/[0.04]",
+              )}
+              title={
+                showAskPanel
+                  ? "Hide Ask co-pilot"
+                  : "Ask about this mission (non-interrupting)"
+              }
+            >
+              <Sparkles className="h-4 w-4" />
+              <span className="hidden sm:inline">Ask</span>
+            </button>
+
             {/* Thinking panel toggle */}
             <button
               onClick={handleToggleThinkingPanel}
@@ -9440,33 +10850,9 @@ export default function ControlClient() {
               )}
             </button>
 
-            {/* Worker panel toggle - only shown for boss missions */}
-            {isBossMission && (
-              <button
-                onClick={() => setShowWorkerPanel((prev) => !prev)}
-                className={cn(
-                  "flex items-center gap-1.5 rounded-lg border px-2.5 py-2 text-sm transition-colors",
-                  showWorkerPanel
-                    ? "border-violet-500/30 bg-violet-500/10 text-violet-400"
-                    : "border-white/[0.06] bg-white/[0.02] text-white/70 hover:bg-white/[0.04]",
-                )}
-                title={
-                  showWorkerPanel ? "Hide worker panel" : "Show worker panel"
-                }
-              >
-                <Users className="h-4 w-4" />
-                <span className="hidden lg:inline">Workers</span>
-                {childMissions.length > 0 && (
-                  <span className="text-xs opacity-60">
-                    {childMissions.length}
-                  </span>
-                )}
-              </button>
-            )}
-
-            {/* Desktop stream toggle with display selector - only shown when a desktop session is active */}
+            {/* Stream toggle with display selector - only shown when a streamable session is active */}
             {hasDesktopSession && (
-              <div className="relative flex items-center">
+              <div className="relative flex items-center" data-testid="app-stream-toggle">
                 <button
                   onClick={() => setShowDesktopStream(!showDesktopStream)}
                   className={cn(
@@ -9477,12 +10863,12 @@ export default function ControlClient() {
                   )}
                   title={
                     showDesktopStream
-                      ? "Hide desktop stream"
-                      : "Show desktop stream"
+                      ? `Hide ${selectedStreamLabel.toLowerCase()}`
+                      : `Show ${selectedStreamLabel.toLowerCase()}`
                   }
                 >
-                  <Monitor className="h-4 w-4" />
-                  <span className="hidden lg:inline">Desktop</span>
+                  <AppWindow className="h-4 w-4" />
+                  <span className="hidden lg:inline">{selectedStreamLabel}</span>
                   {showDesktopStream ? (
                     <PanelRightClose className="h-4 w-4" />
                   ) : (
@@ -9498,7 +10884,7 @@ export default function ControlClient() {
                         ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-400"
                         : "border-white/[0.06] bg-white/[0.02] text-white/70 hover:bg-white/[0.04]",
                     )}
-                    title="Select display"
+                    title="Select app surface"
                   >
                     <span className="text-sm font-mono">
                       {desktopDisplayId}
@@ -9506,7 +10892,15 @@ export default function ControlClient() {
                     <ChevronDown className="h-3.5 w-3.5" />
                   </button>
                   {showDisplaySelector && (
-                    <div className="absolute right-0 top-full mt-1 z-50 min-w-[280px] rounded-lg border border-white/[0.06] bg-[#121214] shadow-xl">
+                    <div className="absolute right-0 top-full mt-1 z-50 min-w-[320px] overflow-hidden rounded-lg border border-white/[0.06] bg-[#121214] shadow-xl">
+                      <div className="border-b border-white/[0.06] px-3 py-2">
+                        <div className="text-xs font-medium text-white/75">
+                          App surfaces
+                        </div>
+                        <div className="mt-0.5 text-[11px] text-white/35">
+                          One interactive window stream per running app.
+                        </div>
+                      </div>
                       {/* Show sessions from API if available, otherwise show hardcoded list */}
                       {desktopSessions.length > 0 ? (
                         <>
@@ -9546,16 +10940,27 @@ export default function ControlClient() {
                                   }
                                 />
 
-                                {/* Display ID */}
-                                <span
-                                  className={cn(
-                                    "font-mono",
-                                    desktopDisplayId === session.display
-                                      ? "text-emerald-400"
-                                      : "text-white/70",
-                                  )}
-                                >
-                                  {session.display}
+                                <span className="flex min-w-0 flex-1 flex-col">
+                                  <span
+                                    className={cn(
+                                      "truncate leading-tight",
+                                      desktopDisplayId === session.display
+                                        ? "text-emerald-400"
+                                        : "text-white/70",
+                                    )}
+                                  >
+                                    {session.mission_title || session.display}
+                                  </span>
+                                  <span className="truncate text-[11px] leading-tight text-white/35">
+                                    <span className="font-mono">
+                                      {session.display}
+                                    </span>
+                                    {" - "}
+                                    {(session.display_server ?? "wayland").toUpperCase()}
+                                    {session.compositor
+                                      ? ` / ${session.compositor.toUpperCase()}`
+                                      : ""}
+                                  </span>
                                 </span>
 
                                 {/* Status label */}
@@ -9699,13 +11104,16 @@ export default function ControlClient() {
                               setShowDisplaySelector(false);
                             }}
                             className={cn(
-                              "flex w-full items-center px-3 py-2 text-sm font-mono transition-colors hover:bg-white/[0.04]",
+                              "flex w-full items-center px-3 py-2 text-sm transition-colors hover:bg-white/[0.04]",
                               desktopDisplayId === display
                                 ? "text-emerald-400"
                                 : "text-white/70",
                             )}
                           >
-                            {display}
+                            <span className="font-mono">{display}</span>
+                            <span className="ml-2 text-[11px] text-white/35">
+                              App surface ready
+                            </span>
                             {desktopDisplayId === display && (
                               <CheckCircle className="ml-auto h-3.5 w-3.5" />
                             )}
@@ -9718,329 +11126,35 @@ export default function ControlClient() {
               </div>
             )}
 
-            {/* Status panel */}
-            <div className="flex items-center gap-2 rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2">
-              {/* Connection status indicator - only show when not connected */}
-              {connectionState !== "connected" && (
-                <>
-                  <div
-                    className={cn(
-                      "flex items-center gap-2",
-                      connectionState === "reconnecting"
-                        ? "text-amber-400"
-                        : "text-red-400",
-                    )}
-                  >
-                    {connectionState === "reconnecting" ? (
-                      <>
-                        <RefreshCw className="h-3.5 w-3.5 animate-spin" />
-                        <span className="text-sm font-medium">
-                          Reconnecting
-                          {reconnectAttempt > 1
-                            ? ` (${reconnectAttempt})`
-                            : "..."}
-                        </span>
-                      </>
-                    ) : (
-                      <>
-                        <WifiOff className="h-3.5 w-3.5" />
-                        <span className="text-sm font-medium">
-                          Disconnected
-                        </span>
-                      </>
-                    )}
-                  </div>
-                  <div className="h-4 w-px bg-white/[0.08]" />
-                </>
-              )}
-
-              {/* Run state indicator with debug dropdown */}
-              <div className="relative">
-                <button
-                  onClick={() => setShowStreamDiagnostics((prev) => !prev)}
-                  className={cn(
-                    "flex items-center gap-2 rounded-md px-2 py-1 transition-colors hover:bg-white/[0.04]",
-                    status.className,
-                  )}
-                  title="Click for debug info"
-                >
-                  <StatusIcon
-                    className={cn(
-                      "h-3.5 w-3.5",
-                      viewingRunState !== "idle" && "animate-spin",
-                    )}
-                  />
-                  <span className="text-sm font-medium">{status.label}</span>
-                </button>
-
-                {showStreamDiagnostics && (
-                  <div className="absolute right-0 top-full z-50 mt-2 w-[280px] rounded-lg border border-white/[0.08] bg-[#121214] p-2.5 shadow-xl">
-                    {/* Mission Info */}
-                    {activeMission && (
-                      <div className="space-y-0.5 text-xs">
-                        <div className="flex items-center justify-between gap-2">
-                          <span className="text-white/40">Mission</span>
-                          <span className="font-mono text-[11px] text-white/60 select-all">
-                            {activeMission.id.slice(0, 8)}
-                          </span>
-                        </div>
-                        {activeMission.workspace_name && (
-                          <div className="flex items-center justify-between gap-2">
-                            <span className="text-white/40">Workspace</span>
-                            <span className="font-mono text-white/80">
-                              {activeMission.workspace_name}
-                            </span>
-                          </div>
-                        )}
-                        {activeMission.agent && (
-                          <div className="flex items-center justify-between gap-2">
-                            <span className="text-white/40">Agent</span>
-                            <span className="font-mono text-white/80">
-                              {activeMission.agent}
-                            </span>
-                          </div>
-                        )}
-                        {activeMission.backend && (
-                          <div className="flex items-center justify-between gap-2">
-                            <span className="text-white/40">Backend</span>
-                            <span className="font-mono text-white/80">
-                              {activeMission.backend}
-                            </span>
-                          </div>
-                        )}
-                        {activeMission.model_override && (
-                          <div className="flex items-center justify-between gap-2">
-                            <span className="text-white/40">
-                              Model override
-                            </span>
-                            <span
-                              className="font-mono text-[11px] text-indigo-400 truncate max-w-[160px]"
-                              title={activeMission.model_override}
-                            >
-                              {activeMission.model_override}
-                            </span>
-                          </div>
-                        )}
-                        {activeMission.model_effort && (
-                          <div className="flex items-center justify-between gap-2">
-                            <span className="text-white/40">Model effort</span>
-                            <span
-                              className="font-mono text-[11px] text-amber-300 truncate max-w-[160px]"
-                              title={activeMission.model_effort}
-                            >
-                              {activeMission.model_effort}
-                            </span>
-                          </div>
-                        )}
-                        {lastResolvedModel && (
-                          <div className="flex items-center justify-between gap-2">
-                            <span className="text-white/40">
-                              Resolved model
-                            </span>
-                            <span
-                              className="font-mono text-[11px] text-emerald-400 truncate max-w-[160px]"
-                              title={lastResolvedModel}
-                            >
-                              {lastResolvedModel}
-                            </span>
-                          </div>
-                        )}
-                      </div>
-                    )}
-
-                    {/* Orchestrator: Boss with workers */}
-                    {(childMissions.length > 0 ||
-                      activeMissionRole === "boss") && (
-                      <div className="mt-2 pt-2 border-t border-white/[0.06] space-y-1 text-xs">
-                        <div className="flex items-center justify-between gap-2">
-                          <span className="text-white/40">Role</span>
-                          <span className="font-mono text-[11px] text-violet-400">
-                            Boss
-                          </span>
-                        </div>
-                        <div className="flex items-center justify-between gap-2 mb-1">
-                          <span className="text-white/40">Workers</span>
-                          <span className="font-mono text-[11px] text-white/60">
-                            {childMissions.length}
-                          </span>
-                        </div>
-                        {childMissions.length > 0 && (
-                          <div className="space-y-0.5 max-h-[120px] overflow-y-auto">
-                            {childMissions.map((w) => (
-                              <a
-                                key={w.id}
-                                href={`/control?mission=${w.id}`}
-                                className="flex items-center gap-1.5 rounded px-1 py-0.5 hover:bg-white/[0.04] transition-colors"
-                              >
-                                <span
-                                  className={cn(
-                                    "h-1.5 w-1.5 rounded-full shrink-0",
-                                    w.status === "active" && "bg-indigo-400",
-                                    w.status === "completed" &&
-                                      "bg-emerald-400",
-                                    w.status === "failed" && "bg-red-400",
-                                    w.status === "interrupted" &&
-                                      "bg-amber-400",
-                                    w.status === "not_feasible" &&
-                                      "bg-rose-400",
-                                    ![
-                                      "active",
-                                      "completed",
-                                      "failed",
-                                      "interrupted",
-                                      "not_feasible",
-                                    ].includes(w.status) && "bg-white/30",
-                                  )}
-                                />
-                                <span className="font-mono text-[11px] text-white/70 truncate">
-                                  {w.title || w.id.slice(0, 8)}
-                                </span>
-                              </a>
-                            ))}
-                          </div>
-                        )}
-                      </div>
-                    )}
-
-                    {/* Orchestrator: Worker info */}
-                    {activeMission?.parent_mission_id && (
-                      <div className="mt-2 pt-2 border-t border-white/[0.06] space-y-0.5 text-xs">
-                        <div className="flex items-center justify-between gap-2">
-                          <span className="text-white/40">Role</span>
-                          <span className="font-mono text-[11px] text-cyan-400">
-                            Worker
-                          </span>
-                        </div>
-                        <div className="flex items-center justify-between gap-2">
-                          <span className="text-white/40">Boss</span>
-                          <a
-                            href={`/control?mission=${activeMission.parent_mission_id}`}
-                            className="font-mono text-[11px] text-cyan-400 hover:text-cyan-300 transition-colors select-all"
-                          >
-                            {activeMission.parent_mission_id.slice(0, 8)}
-                          </a>
-                        </div>
-                        {activeMission.working_directory && (
-                          <div className="flex items-center justify-between gap-2">
-                            <span className="text-white/40">Worktree</span>
-                            <span
-                              className="font-mono text-[11px] text-white/60 truncate max-w-[160px]"
-                              title={activeMission.working_directory}
-                            >
-                              {activeMission.working_directory.split("/").pop()}
-                            </span>
-                          </div>
-                        )}
-                      </div>
-                    )}
-
-                    {/* Stream Status */}
-                    <div
-                      className={cn(
-                        "space-y-0.5 text-xs",
-                        activeMission &&
-                          "mt-2 pt-2 border-t border-white/[0.06]",
-                      )}
-                    >
-                      <div className="flex items-center justify-between gap-2">
-                        <span className="text-white/40">Stream</span>
-                        <span className="flex items-center gap-1.5 font-mono text-white/80">
-                          <span
-                            className={cn(
-                              "h-1.5 w-1.5 rounded-full",
-                              (streamDiagnostics.phase === "streaming" ||
-                                streamDiagnostics.phase === "open") &&
-                                "bg-emerald-400",
-                              streamDiagnostics.phase === "connecting" &&
-                                "bg-amber-400",
-                              streamDiagnostics.phase === "error" &&
-                                "bg-red-400",
-                              (streamDiagnostics.phase === "closed" ||
-                                streamDiagnostics.phase === "idle") &&
-                                "bg-white/30",
-                            )}
-                          />
-                          {streamDiagnostics.phase}
-                        </span>
-                      </div>
-                      <div className="flex items-center justify-between gap-2">
-                        <span className="text-white/40">Activity</span>
-                        <span className="font-mono text-white/60 text-[11px]">
-                          {formatDiagAge(streamDiagnostics.lastEventAt)}
-                        </span>
-                      </div>
-                    </div>
-
-                    {streamDiagnostics.lastError && (
-                      <div className="mt-2 rounded border border-red-500/30 bg-red-500/10 px-2 py-1 text-[11px] text-red-300">
-                        {streamDiagnostics.lastError}
-                      </div>
-                    )}
-
-                    {streamHints.length > 0 && (
-                      <div className="mt-2 space-y-0.5 rounded border border-amber-500/30 bg-amber-500/10 px-2 py-1 text-[11px] text-amber-200">
-                        {streamHints.map((hint) => (
-                          <div key={hint}>{hint}</div>
-                        ))}
-                      </div>
-                    )}
-
-                    <button
-                      onClick={handleCopyDiagnostics}
-                      className="mt-2 w-full text-center text-[11px] text-white/40 hover:text-white/70 transition-colors"
-                    >
-                      Copy debug info
-                    </button>
-                  </div>
-                )}
-              </div>
-
-              {/* Queue count */}
-              <div className="h-4 w-px bg-white/[0.08]" />
+            {/* Connection status indicator — only surfaces when not connected.
+                Run state, queue length, and subtask progress now live in the
+                Workbench panel (open via the Workbench toggle). */}
+            {connectionState !== "connected" && (
               <div
-                className="flex items-center gap-1.5"
+                className={cn(
+                  "flex items-center gap-2 rounded-lg border px-3 py-2 text-sm transition-colors",
+                  connectionState === "reconnecting"
+                    ? "border-amber-500/30 bg-amber-500/10 text-amber-300"
+                    : "border-red-500/30 bg-red-500/10 text-red-300",
+                )}
                 title={
-                  viewingQueueLen > 0
-                    ? `${viewingQueueLen} message${viewingQueueLen > 1 ? "s" : ""} waiting to be processed`
-                    : "No messages queued"
+                  connectionState === "reconnecting"
+                    ? `Reconnecting${reconnectAttempt > 1 ? ` (attempt ${reconnectAttempt})` : "…"}`
+                    : "Disconnected from agent stream"
                 }
               >
-                <span className="text-[10px] uppercase tracking-wider text-white/40">
-                  Queue
-                </span>
-                <span
-                  className={cn(
-                    "text-sm font-medium tabular-nums",
-                    viewingQueueLen === 0 && "text-white/70",
-                    viewingQueueLen > 0 &&
-                      viewingQueueLen < 3 &&
-                      "text-amber-400",
-                    viewingQueueLen >= 3 && "text-orange-400",
-                  )}
-                >
-                  {viewingQueueLen}
+                {connectionState === "reconnecting" ? (
+                  <RefreshCw className="h-4 w-4 animate-spin" />
+                ) : (
+                  <WifiOff className="h-4 w-4" />
+                )}
+                <span className="hidden sm:inline">
+                  {connectionState === "reconnecting"
+                    ? "Reconnecting"
+                    : "Disconnected"}
                 </span>
               </div>
-
-              {/* Progress indicator */}
-              {viewingProgress && viewingProgress.total > 0 && (
-                <>
-                  <div className="h-4 w-px bg-white/[0.08]" />
-                  <div className="flex items-center gap-1.5">
-                    <span className="text-[10px] uppercase tracking-wider text-white/40">
-                      Subtask
-                    </span>
-                    <span className="text-sm font-medium text-emerald-400 tabular-nums">
-                      {Math.min(
-                        viewingProgress.completed + 1,
-                        viewingProgress.total,
-                      )}
-                      /{viewingProgress.total}
-                    </span>
-                  </div>
-                </>
-              )}
-            </div>
+            )}
           </div>
         </div>
 
@@ -10076,7 +11190,7 @@ export default function ControlClient() {
             <div
               ref={containerRef}
               data-testid="chat-scroll-container"
-              className="flex-1 overflow-y-auto p-6"
+              className="flex-1 overflow-y-auto px-6 pt-6 pb-2 [overflow-anchor:none]"
             >
               {/* Backwards pagination — only when there's actually more older
               history to fetch and the chat isn't empty. Click prepends the
@@ -10244,47 +11358,50 @@ export default function ControlClient() {
                             basePath={missionWorkingDirectory}
                             isToolGroupExpanded={isToolGroupExpanded}
                             onToggleToolGroup={handleToggleToolGroup}
+                            measureRow={measureRowSync}
                             onResume={stableResumeMission}
                             onToolResult={handleToolResultCommit}
                             onOptimisticToolResult={handleOptimisticToolResult}
+                            onRetryUserMessage={handleRetryUserMessage}
+                            onLoadToolDetails={handleLoadToolDetails}
                           />
                         </div>
                       );
                     })}
                   </div>
 
-                  {/* Show streaming indicator when running but no active thinking/phase visible inline.
-                  P2-#14: the items.some + last-index lookup live in `showAgentWorkingIndicator`
-                  memo so each NowTick render doesn't re-walk the whole items array. */}
-                  {viewingMissionIsRunning &&
-                    activeMission?.status === "active" &&
-                    showAgentWorkingIndicator && (
-                      <div className="flex justify-start gap-3 animate-fade-in">
-                        <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-indigo-500/20">
-                          <Bot className="h-4 w-4 text-indigo-400 animate-pulse" />
-                        </div>
-                        <div className="rounded-2xl rounded-tl-md bg-white/[0.03] border border-white/[0.06] px-4 py-3">
-                          <div className="flex items-center gap-2">
-                            <Loader className="h-4 w-4 text-indigo-400 animate-spin" />
-                            <span className="text-sm text-white/60">
-                              Agent is working...
-                            </span>
-                          </div>
-                        </div>
+                  {/* Compact "Agent is working" pill + live heartbeat timer,
+                  shown while running but no thinking/stream/phase is animating
+                  inline. P2-#14: the items.some walk lives in the
+                  `agentWorkingIndicator` memo so each NowTick render doesn't
+                  re-walk the whole items array. */}
+                  {agentWorkingPillVisible && agentWorkingIndicator && (
+                    <div className="flex justify-start animate-fade-in my-2">
+                      <div className="inline-flex items-center gap-1.5 rounded-full border border-indigo-500/20 bg-indigo-500/[0.08] px-2.5 py-1">
+                        <Loader className="h-3 w-3 text-indigo-400 animate-spin" />
+                        <span className="text-xs font-medium text-indigo-300">
+                          Agent is working
+                        </span>
+                        <span className="text-xs tabular-nums text-indigo-300/60">
+                          <LiveDuration
+                            startTime={agentWorkingIndicator.since}
+                          />
+                        </span>
                       </div>
-                    )}
+                    </div>
+                  )}
 
                   {/* Waiting banner for interactive user-input tools */}
                   {hasPendingUserInput && (
                     <div className="flex justify-center py-4 animate-fade-in">
-                      <div className="flex flex-col sm:flex-row items-start sm:items-center gap-3 rounded-xl px-5 py-4 bg-indigo-500/10 border border-indigo-500/20">
+                      <div className="flex flex-col sm:flex-row items-start sm:items-center gap-3 rounded-xl px-5 py-4 bg-indigo-500/10 border border-indigo-500/30">
                         <div className="flex items-center gap-3">
-                          <HelpCircle className="h-5 w-5 shrink-0 text-indigo-300" />
+                          <HelpCircle className="h-5 w-5 shrink-0 text-indigo-500" />
                           <div className="text-sm">
-                            <span className="font-medium text-indigo-200">
+                            <span className="font-medium text-foreground">
                               Waiting for your response
                             </span>
-                            <p className="text-white/50">
+                            <p className="text-muted-foreground">
                               The agent is paused until you answer the prompt
                               above.
                             </p>
@@ -10293,7 +11410,7 @@ export default function ControlClient() {
                         <button
                           type="button"
                           onClick={handleShowPendingUserInput}
-                          className="shrink-0 inline-flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-sm font-medium bg-indigo-500/20 text-indigo-200 hover:bg-indigo-500/30 border border-indigo-500/30 transition-colors"
+                          className="shrink-0 inline-flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-sm font-medium bg-indigo-600 text-white hover:bg-indigo-700 border border-indigo-600 transition-colors"
                         >
                           <ArrowDown className="h-3.5 w-3.5" />
                           Show prompt
@@ -10301,70 +11418,6 @@ export default function ControlClient() {
                       </div>
                     </div>
                   )}
-
-                  {/* Stall warning banner when agent hasn't reported activity for 60+ seconds */}
-                  {isViewingMissionStalled &&
-                    viewingMissionId &&
-                    !hasPendingUserInput && (
-                      <div className="flex justify-center py-4 animate-fade-in">
-                        <div
-                          className={cn(
-                            "flex flex-col sm:flex-row items-start sm:items-center gap-3 rounded-xl px-5 py-4",
-                            isViewingMissionSeverelyStalled
-                              ? "bg-red-500/10 border border-red-500/20"
-                              : "bg-amber-500/10 border border-amber-500/20",
-                          )}
-                        >
-                          <div className="flex items-center gap-3">
-                            <AlertTriangle
-                              className={cn(
-                                "h-5 w-5 shrink-0",
-                                isViewingMissionSeverelyStalled
-                                  ? "text-red-400"
-                                  : "text-amber-400",
-                              )}
-                            />
-                            <div className="text-sm">
-                              <span
-                                className={cn(
-                                  "font-medium",
-                                  isViewingMissionSeverelyStalled
-                                    ? "text-red-400"
-                                    : "text-amber-400",
-                                )}
-                              >
-                                Agent may be stuck
-                              </span>
-                              <span className="text-white/50 ml-1">
-                                : no activity for{" "}
-                                {Math.floor(viewingMissionStallSeconds)}s
-                              </span>
-                              <p className="text-white/40 text-xs mt-1">
-                                {isViewingMissionSeverelyStalled
-                                  ? "The agent appears to be stuck on a long-running operation. Consider stopping it."
-                                  : "A tool or external operation may be taking longer than expected."}
-                              </p>
-                            </div>
-                          </div>
-                          <button
-                            onClick={() =>
-                              handleCancelMission(viewingMissionId)
-                            }
-                            className={cn(
-                              "shrink-0 inline-flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-sm font-medium transition-colors",
-                              isViewingMissionSeverelyStalled
-                                ? "bg-red-500 text-white hover:bg-red-400"
-                                : "bg-amber-500/20 text-amber-400 hover:bg-amber-500/30 border border-amber-500/30",
-                            )}
-                          >
-                            <Square className="h-3.5 w-3.5" />
-                            {isViewingMissionSeverelyStalled
-                              ? "Force Stop"
-                              : "Stop"}
-                          </button>
-                        </div>
-                      </div>
-                    )}
 
                   {/* Continue banner for blocked missions */}
                   {activeMission?.status === "blocked" && items.length > 0 && (
@@ -10398,19 +11451,24 @@ export default function ControlClient() {
               )}
             </div>
 
-            {/* Scroll to bottom button */}
-            {!isAtBottom && items.length > 0 && (
-              <button
-                onClick={() => scrollToBottom()}
-                className="absolute bottom-20 right-6 p-2 rounded-full bg-white/[0.1] border border-white/[0.1] text-white/60 hover:bg-white/[0.15] hover:text-white/80 transition-all shadow-lg"
-                title="Scroll to bottom"
-              >
-                <ArrowDown className="h-4 w-4" />
-              </button>
-            )}
-
             {/* Input */}
-            <div className="border-t border-white/[0.06] bg-white/[0.01] p-4">
+            <div className="relative border-t border-white/[0.06] bg-white/[0.01] p-4">
+              {/* Auto-scroll pause chip. Anchored to the composer with
+              `bottom-full` so it floats *just above* the input instead of
+              overlapping it — previously it sat at `bottom-20` with no z-index,
+              so it landed behind the textarea / queue / stop controls. `z-20`
+              keeps it above the scrolling messages without covering (and thus
+              blocking clicks on) the composer below. */}
+              {!isAtBottom && items.length > 0 && (
+                <button
+                  onClick={() => scrollToBottom()}
+                  className="absolute bottom-full right-6 z-20 mb-3 inline-flex items-center gap-2 rounded-full border border-white/[0.12] bg-white/90 px-3 py-2 text-xs font-medium text-slate-700 shadow-lg backdrop-blur transition-all hover:bg-white hover:text-slate-950 dark:border-white/[0.1] dark:bg-black/70 dark:text-white/65 dark:hover:bg-white/[0.1] dark:hover:text-white/90"
+                  title="Scroll to bottom"
+                >
+                  <ArrowDown className="h-4 w-4" />
+                  Auto-scroll paused
+                </button>
+              )}
               {/* Upload progress */}
               {uploadProgress && (
                 <div className="mx-auto max-w-3xl mb-3">
@@ -10455,48 +11513,75 @@ export default function ControlClient() {
                 </div>
               )}
 
-              {/* Show resume buttons for interrupted/blocked missions, otherwise show normal input */}
-              {/* Both are always rendered to prevent unmounting the input (which loses typed text) */}
-              {showResumeUI && (
-                <div className="mx-auto flex max-w-3xl gap-3 items-center justify-center py-2">
-                  <div className="flex items-center gap-2 text-sm text-white/50 mr-4">
-                    <AlertTriangle className="h-4 w-4 text-amber-400" />
-                    <span>
-                      Mission{" "}
-                      {activeMission.status === "blocked"
-                        ? "blocked"
+              <div className="mx-auto max-w-3xl w-full space-y-2">
+                {/*
+                  Slim status banner above the composer for interrupted /
+                  blocked / failed missions. Lives inside the composer
+                  wrapper so it stretches to the same outer width as the
+                  paperclip + input + Send row underneath. The composer
+                  stays mounted so a user mid-typing isn't redirected to
+                  the resume button.
+                */}
+                {showResumeUI &&
+                  activeMission &&
+                  (() => {
+                    const statusLabel =
+                      activeMission.status === "blocked"
+                        ? "Mission blocked"
                         : activeMission.status === "failed"
-                          ? "failed"
-                          : "interrupted"}
-                    </span>
-                  </div>
-                  <button
-                    onClick={() => handleResumeMission()}
-                    disabled={missionLoading}
-                    className="flex items-center gap-2 rounded-xl border border-white/[0.06] bg-white/[0.02] hover:bg-white/[0.04] px-5 py-3 text-sm font-medium text-white/70 transition-colors disabled:opacity-50"
-                  >
-                    <PlayCircle className="h-4 w-4" />
-                    {activeMission.status === "blocked"
-                      ? "Continue"
-                      : activeMission.status === "failed"
-                        ? "Retry"
-                        : "Resume"}
-                  </button>
-                  <button
-                    onClick={() => setDismissedResumeUI(true)}
-                    className="flex items-center gap-2 rounded-xl border border-white/[0.06] bg-white/[0.02] hover:bg-white/[0.04] px-5 py-3 text-sm font-medium text-white/70 transition-colors"
-                  >
-                    <MessageSquare className="h-4 w-4" />
-                    Custom Message
-                  </button>
-                </div>
-              )}
-              <div
-                className={cn(
-                  "mx-auto max-w-3xl w-full space-y-2",
-                  showResumeUI && "hidden",
-                )}
-              >
+                          ? "Mission failed"
+                          : "Mission interrupted";
+                    const actionLabel =
+                      activeMission.status === "blocked"
+                        ? "Continue"
+                        : activeMission.status === "failed"
+                          ? "Retry"
+                          : "Resume";
+                    const toneIsRed = activeMission.status === "failed";
+                    return (
+                      <div
+                        className={cn(
+                          "flex w-full items-center gap-2 rounded-md border px-2.5 py-1.5 text-xs",
+                          toneIsRed
+                            ? "border-red-500/25 bg-red-500/10 text-red-400"
+                            : "border-amber-500/25 bg-amber-500/10 text-amber-400",
+                        )}
+                        role="status"
+                      >
+                        <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
+                        <span className="font-medium shrink-0">
+                          {statusLabel}
+                        </span>
+                        <span className="text-white/50 hidden sm:inline truncate">
+                          Type below to continue, or use the action on the
+                          right.
+                        </span>
+                        <span className="ml-auto inline-flex items-center gap-1 shrink-0">
+                          <button
+                            onClick={() => handleResumeMission()}
+                            disabled={missionLoading}
+                            className={cn(
+                              "inline-flex items-center gap-1 rounded border px-2 py-0.5 text-[11px] font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed",
+                              toneIsRed
+                                ? "border-red-500/30 bg-red-500/15 text-red-400 hover:bg-red-500/25"
+                                : "border-amber-500/30 bg-amber-500/15 text-amber-400 hover:bg-amber-500/25",
+                            )}
+                          >
+                            <PlayCircle className="h-3 w-3" />
+                            {actionLabel}
+                          </button>
+                          <button
+                            onClick={() => setDismissedResumeUI(true)}
+                            className="rounded p-0.5 text-white/40 hover:bg-white/10 hover:text-white/80 transition-colors"
+                            title="Dismiss"
+                            aria-label="Dismiss"
+                          >
+                            <X className="h-3.5 w-3.5" />
+                          </button>
+                        </span>
+                      </div>
+                    );
+                  })()}
                 {/* Queue Strip - shows queued messages when present */}
                 <QueueStrip
                   items={queuedItems}
@@ -10504,17 +11589,63 @@ export default function ControlClient() {
                   onClearAll={handleClearQueue}
                 />
 
+                {(() => {
+                  // Goal-mode bar — a flow row above the composer (not an
+                  // absolute overlay) so it never overlaps the streaming /
+                  // working indicators in the message list. Compact by default;
+                  // click to expand the full objective. Cleared by the SSE
+                  // handler at terminal status.
+                  const activeMissionId =
+                    viewingMission?.id ?? currentMission?.id;
+                  const goal = activeMissionId
+                    ? goalInfoByMission[activeMissionId]
+                    : undefined;
+                  if (!goal) return null;
+                  const statusLabel =
+                    goal.status === "active"
+                      ? `iter ${goal.iteration}`
+                      : goal.status === "paused"
+                        ? "paused"
+                        : goal.status;
+                  return (
+                    <GoalBar
+                      objective={goal.objective}
+                      statusLabel={statusLabel}
+                      running={isTurnInFlight}
+                      onExit={
+                        activeMissionId
+                          ? (running) => handleExitGoal(activeMissionId, running)
+                          : undefined
+                      }
+                    />
+                  );
+                })()}
+
+                {/* Stall warning bar when the agent hasn't reported activity
+                    for 60+ seconds. Lives in the composer stack with the
+                    GoalBar (same row grammar) instead of floating mid-list. */}
+                {isViewingMissionStalled &&
+                  viewingMissionId &&
+                  !hasPendingUserInput && (
+                    <StallBar
+                      seconds={viewingMissionStallSeconds}
+                      severe={isViewingMissionSeverelyStalled}
+                      onStop={() => handleCancelMission(viewingMissionId)}
+                      className="animate-fade-in"
+                    />
+                  )}
+
                 <form
                   onSubmit={(e) => e.preventDefault()}
-                  className="flex gap-3 items-end"
+                  className="flex gap-2 items-stretch"
                 >
                   <button
                     type="button"
                     onClick={() => fileInputRef.current?.click()}
-                    className="p-3 rounded-xl border border-white/[0.06] bg-white/[0.02] text-white/40 hover:text-white/70 hover:bg-white/[0.04] transition-colors shrink-0"
+                    className="flex h-[46px] w-[46px] shrink-0 items-center justify-center rounded-xl border border-white/[0.06] bg-white/[0.02] text-white/40 hover:text-white/70 hover:bg-white/[0.04] transition-colors"
                     title="Attach files"
                   >
-                    <Paperclip className="h-5 w-5" />
+                    <Paperclip className="h-4 w-4" />
                   </button>
 
                   <EnhancedInput
@@ -10527,71 +11658,39 @@ export default function ControlClient() {
                     placeholder="Message the root agent… (paste files to upload)"
                     backend={viewingMission?.backend ?? currentMission?.backend}
                   />
-                  {(() => {
-                    // Goal-mode pill — shown above the composer while a codex
-                    // `/goal` continuation loop is active. Cleared automatically
-                    // by the SSE handler when status hits a terminal value.
-                    const activeMissionId =
-                      viewingMission?.id ?? currentMission?.id;
-                    const goal = activeMissionId
-                      ? goalInfoByMission[activeMissionId]
-                      : undefined;
-                    if (!goal) return null;
-                    const statusLabel =
-                      goal.status === "active"
-                        ? `iter ${goal.iteration}`
-                        : goal.status === "paused"
-                          ? "paused"
-                          : goal.status;
-                    return (
-                      <div
-                        className="absolute -top-9 left-2 right-2 flex items-center gap-2 px-3 py-1.5 rounded-full bg-indigo-500/10 border border-indigo-500/30 text-xs text-indigo-200 max-w-fit"
-                        title={goal.objective}
-                      >
-                        <span className="font-semibold">Goal</span>
-                        <span className="text-indigo-300/60">·</span>
-                        <span>{statusLabel}</span>
-                        {goal.objective && (
-                          <>
-                            <span className="text-indigo-300/60">·</span>
-                            <span className="truncate max-w-[40ch] text-indigo-200/70">
-                              {goal.objective}
-                            </span>
-                          </>
-                        )}
-                      </div>
-                    );
-                  })()}
 
                   {isBusy ? (
-                    <>
+                    <div className="inline-flex h-[46px] shrink-0 rounded-xl border border-white/[0.06] bg-white/[0.02] overflow-hidden">
                       <button
                         type="button"
                         onClick={() => enhancedInputRef.current?.submit()}
                         disabled={!canSubmitComposer}
-                        className="flex items-center gap-2 rounded-xl bg-indigo-500/80 hover:bg-indigo-600 px-5 py-3 text-sm font-medium text-white transition-colors shrink-0 disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:bg-indigo-500/80"
+                        className="inline-flex items-center gap-1.5 px-3 text-sm font-medium text-indigo-300 hover:bg-indigo-500/15 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+                        title="Queue message"
                       >
                         <ListPlus className="h-4 w-4" />
-                        Queue
+                        <span className="hidden sm:inline">Queue</span>
                       </button>
+                      <div className="w-px bg-white/[0.06]" />
                       <button
                         type="button"
                         onClick={handleStop}
-                        className="flex items-center gap-2 rounded-xl bg-red-500 hover:bg-red-600 px-5 py-3 text-sm font-medium text-white transition-colors shrink-0"
+                        className="inline-flex items-center gap-1.5 px-3 text-sm font-medium text-red-300 hover:bg-red-500/15 transition-colors"
+                        title="Stop mission"
                       >
                         <Square className="h-4 w-4" />
-                        Stop
+                        <span className="hidden sm:inline">Stop</span>
                       </button>
-                    </>
+                    </div>
                   ) : (
                     <button
                       type="button"
                       onClick={() => enhancedInputRef.current?.submit()}
                       disabled={!canSubmitComposer}
-                      className="flex items-center gap-2 rounded-xl bg-indigo-500 hover:bg-indigo-600 px-5 py-3 text-sm font-medium text-white transition-colors shrink-0 disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:bg-indigo-500"
+                      className="inline-flex h-[46px] shrink-0 items-center gap-1.5 rounded-xl bg-indigo-500 hover:bg-indigo-600 px-4 text-sm font-medium text-white transition-colors disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:bg-indigo-500"
                     >
                       <Send className="h-4 w-4" />
-                      Send
+                      <span className="hidden sm:inline">Send</span>
                     </button>
                   )}
                 </form>
@@ -10600,18 +11699,18 @@ export default function ControlClient() {
           </div>
 
           {/* Right column: Workbench, Thinking Panel and Desktop Stream stacked */}
-          {(showWorkbenchPanel ||
-            showThinkingPanel ||
-            showDesktopStream ||
-            (showWorkerPanel && isBossMission)) && (
+          {(showWorkbenchPanel || showThinkingPanel || showDesktopStream) && (
             <div
+              data-testid="right-side-panel"
               className={cn(
                 // animate-fade-in is opacity-only and cheap; we drop the
                 // `transition-all duration-300` that was animating width on
                 // mount (the width change is what caused the chat-side reflow
                 // freeze when toggling the Workers panel).
                 "min-h-0 flex flex-col gap-4 animate-fade-in shrink-0",
-                showDesktopStream ? "flex-1 max-w-md" : "w-80",
+                showDesktopStream
+                  ? "basis-auto w-[clamp(400px,44vw,820px)] h-[min(720px,calc(100vh-7rem))] min-h-[420px] min-w-[360px] max-h-[calc(100vh-7rem)] max-w-[820px] resize overflow-hidden"
+                  : "w-80",
               )}
             >
               {showWorkbenchPanel && (
@@ -10621,6 +11720,7 @@ export default function ControlClient() {
                   role={activeMissionRole}
                   isRunning={viewingMissionIsRunning}
                   childMissions={childMissions}
+                  queueLen={viewingQueueLen}
                   onClose={() => setShowWorkbenchPanel(false)}
                   onResume={handleResumeMission}
                   onCancel={handleCancelMission}
@@ -10628,6 +11728,7 @@ export default function ControlClient() {
                   onOpenSwitcher={() => setShowMissionSwitcher(true)}
                   onViewMission={handleViewMission}
                   onSetStatus={handleSetStatus}
+                  onCopyDebug={handleCopyDiagnostics}
                   runSettingsSlot={
                     activeMission && !viewingMissionIsRunning ? (
                       <NewMissionDialog
@@ -10652,56 +11753,13 @@ export default function ControlClient() {
                 />
               )}
 
-              {/* Worker Panel — real child missions (parent_mission_id) */}
-              {showWorkerPanel && isBossMission && (
-                <WorkerPanel
-                  childMissions={childMissions}
-                  runningMissions={runningMissions}
-                  bossMissionId={activeMission?.id ?? ""}
-                  viewingMissionId={viewingMissionId}
-                  onSelectWorker={(missionId) => handleViewMission(missionId)}
-                  onClose={handleCloseWorkerPanel}
-                  className={cn(
-                    // Equal vertical split with siblings instead of fixed
-                    // max-height caps. `min-h-0` is required for the inner
-                    // `overflow-y-auto` to clip rather than push the flex
-                    // child to its content height.
-                    showWorkbenchPanel ||
-                      showThinkingPanel ||
-                      showDesktopStream ||
-                      hasInMissionSubagents
-                      ? "flex-1 min-h-0"
-                      : "flex-1",
-                  )}
-                />
-              )}
-
-              {/* Sub-agents Panel — in-mission Task / orchestrator workers */}
-              {showWorkerPanel && hasInMissionSubagents && (
-                <SubagentsPanel
-                  subagents={inMissionSubagents}
-                  onFocusItem={focusChatItem}
-                  onClose={handleCloseWorkerPanel}
-                  className={cn(
-                    showWorkbenchPanel ||
-                      showThinkingPanel ||
-                      showDesktopStream ||
-                      childMissions.length > 0
-                      ? "flex-1 min-h-0"
-                      : "flex-1",
-                  )}
-                />
-              )}
-
               {/* Thinking Panel */}
               {showThinkingPanel && (
                 <ThinkingPanel
                   items={thinkingItems}
                   onClose={handleCloseThinkingPanel}
                   className={
-                    showWorkbenchPanel ||
-                    showDesktopStream ||
-                    (showWorkerPanel && isBossMission)
+                    showWorkbenchPanel || showDesktopStream
                       ? "flex-1 min-h-0"
                       : "flex-1"
                   }
@@ -10710,7 +11768,7 @@ export default function ControlClient() {
                 />
               )}
 
-              {/* Desktop Stream Panel */}
+              {/* App Stream Panel */}
               {showDesktopStream && (
                 <div
                   className={cn(
@@ -10720,12 +11778,30 @@ export default function ControlClient() {
                 >
                   <DesktopStream
                     displayId={desktopDisplayId}
+                    displayServer={selectedDesktopSession?.display_server}
+                    compositor={selectedDesktopSession?.compositor}
                     className="h-full"
                     onClose={() => setShowDesktopStream(false)}
                   />
                 </div>
               )}
             </div>
+          )}
+
+          {/* Ask co-pilot panel (separate lane — never interrupts the agent) */}
+          {showAskPanel && viewingMissionId && (
+            <AskPanel
+              missionId={viewingMissionId}
+              seed={askSlice.seed}
+              onSeedConsumed={() =>
+                setAskSlice((s) => ({ ...s, seed: null }))
+              }
+              onClose={() => setShowAskPanel(false)}
+              onSendToAgent={(text) => {
+                setInput((prev) => (prev ? `${prev}\n\n${text}` : text));
+                setShowAskPanel(false);
+              }}
+            />
           )}
         </div>
       </div>

@@ -6,7 +6,7 @@ import { createPortal } from 'react-dom';
 import { useRouter } from 'next/navigation';
 import { Plus, X, ExternalLink, RefreshCw, SlidersHorizontal } from 'lucide-react';
 import useSWR from 'swr';
-import { getVisibleAgents, getSandboxedConfig, listBackends, listBackendAgents, getClaudeCodeConfig, getLibraryOpenCodeSettingsForProfile, listBackendModelOptions, listProviders, type Backend, type BackendAgent, type BackendModelOption, type ModelEffort, type Provider } from '@/lib/api';
+import { getVisibleAgents, getSandboxedConfig, listBackends, listBackendAgents, getClaudeCodeConfig, listBackendModelOptions, listProviders, type Backend, type BackendAgent, type BackendModelOption, type ModelEffort, type Provider } from '@/lib/api';
 import type { Workspace } from '@/lib/api';
 import { isBackendAvailable, useBackendConfigs } from '@/lib/use-backend-configs';
 
@@ -108,19 +108,6 @@ const parseAgentNames = (payload: unknown): string[] => {
   return Array.from(new Set(names));
 };
 
-const parseAgentNamesFromSettings = (settings: Record<string, unknown> | null | undefined): string[] => {
-  if (!settings) return [];
-  const agents = (settings as { agents?: unknown }).agents;
-  if (!agents) return [];
-  if (Array.isArray(agents)) {
-    return parseAgentNames(agents);
-  }
-  if (agents && typeof agents === 'object') {
-    return Object.keys(agents as Record<string, unknown>);
-  }
-  return [];
-};
-
 export function NewMissionDialog({
   workspaces,
   disabled = false,
@@ -189,10 +176,22 @@ export function NewMissionDialog({
     return backends?.filter((b) => isBackendAvailable(backendConfigs[b.id])) || [];
   }, [backends, backendConfigs]);
 
-  // SWR: fetch agents for each enabled backend
+  const workspaceProfile = useMemo(() => {
+    const targetWorkspace = newMissionWorkspace
+      ? workspaces.find((workspace) => workspace.id === newMissionWorkspace)
+      : workspaces.find((workspace) => workspace.id === '00000000-0000-0000-0000-000000000000')
+        || workspaces.find((workspace) => workspace.workspace_type === 'host');
+    return targetWorkspace?.config_profile || null;
+  }, [newMissionWorkspace, workspaces]);
+
+  // SWR: fetch agents for each enabled backend.  OpenCode agents are
+  // profile-aware: native `.opencode/agents/*.md` files live under the
+  // selected workspace's library config profile.
   const { data: opencodeAgents, mutate: mutateOpencodeAgents } = useSWR<BackendAgent[]>(
-    open && enabledBackends.some(b => b.id === 'opencode') ? 'backend-opencode-agents' : null,
-    () => listBackendAgents('opencode'),
+    open && enabledBackends.some(b => b.id === 'opencode')
+      ? `backend-opencode-agents:${workspaceProfile ?? 'default'}`
+      : null,
+    () => listBackendAgents('opencode', workspaceProfile),
     { revalidateOnFocus: true, dedupingInterval: 5000 }
   );
   const { data: claudecodeAgents, mutate: mutateClaudecodeAgents } = useSWR<BackendAgent[]>(
@@ -233,27 +232,6 @@ export function NewMissionDialog({
     { revalidateOnFocus: false, dedupingInterval: 30000 }
   );
 
-  const workspaceProfile = useMemo(() => {
-    const targetWorkspace = newMissionWorkspace
-      ? workspaces.find((workspace) => workspace.id === newMissionWorkspace)
-      : workspaces.find((workspace) => workspace.id === '00000000-0000-0000-0000-000000000000')
-        || workspaces.find((workspace) => workspace.workspace_type === 'host');
-    return targetWorkspace?.config_profile || null;
-  }, [newMissionWorkspace, workspaces]);
-
-  const effectiveProfileForAgents = workspaceProfile || 'default';
-
-  const { data: opencodeProfileSettings } = useSWR(
-    open && effectiveProfileForAgents ? ['opencode-profile-settings', effectiveProfileForAgents] : null,
-    ([, profile]) => getLibraryOpenCodeSettingsForProfile(profile as string),
-    { revalidateOnFocus: false, dedupingInterval: 30000 }
-  );
-
-  const opencodeProfileAgentNames = useMemo(
-    () => parseAgentNamesFromSettings(opencodeProfileSettings as Record<string, unknown> | null),
-    [opencodeProfileSettings]
-  );
-
   // Combine all agents from enabled backends
   const allAgents = useMemo((): CombinedAgent[] => {
     const result: CombinedAgent[] = [];
@@ -266,8 +244,7 @@ export function NewMissionDialog({
 
       if (backend.id === 'opencode') {
         // Filter out hidden OpenCode agents by name
-        const profileAgents = opencodeProfileAgentNames.map(name => ({ id: name, name }));
-        const backendAgents = profileAgents.length > 0 ? profileAgents : (opencodeAgents || []);
+        const backendAgents = opencodeAgents || [];
         const visibleAgents = backendAgents.filter(a => !openCodeHiddenAgents.includes(a.name));
         if (visibleAgents.length > 0) {
           agents = visibleAgents;
@@ -316,7 +293,7 @@ export function NewMissionDialog({
     }
 
     return result;
-  }, [enabledBackends, opencodeAgents, opencodeProfileAgentNames, claudecodeAgents, codexAgents, geminiAgents, grokAgents, agentsPayload, config, claudeCodeLibConfig]);
+  }, [enabledBackends, opencodeAgents, claudecodeAgents, codexAgents, geminiAgents, grokAgents, agentsPayload, config, claudeCodeLibConfig]);
 
   // Group agents by backend for display
   const agentsByBackend = useMemo(() => {
@@ -532,13 +509,7 @@ export function NewMissionDialog({
       return;
     }
 
-    // Try OpenCode second (prefer Sisyphus if available)
-    const sisyphus = allAgents.find(a => a.backend === 'opencode' && a.agent === 'Sisyphus');
-    if (sisyphus) {
-      setSelectedAgentValue(sisyphus.value);
-      setDefaultSet(true);
-      return;
-    }
+    // Try OpenCode second
     const openCodeAgent = allAgents.find(a => a.backend === 'opencode');
     if (openCodeAgent) {
       setSelectedAgentValue(openCodeAgent.value);
@@ -821,7 +792,7 @@ export function NewMissionDialog({
                       </option>
                       {backendAgentsList.map((agent) => (
                         <option key={agent.value} value={agent.value} className="bg-[#1a1a1a]">
-                          {agent.displayName}{agent.backend === 'opencode' && agent.agent === 'Sisyphus' ? ' (recommended)' : ''}
+                          {agent.displayName}
                         </option>
                       ))}
                     </optgroup>
@@ -892,7 +863,7 @@ export function NewMissionDialog({
               <p className="text-xs text-white/30 mt-1.5">
                 {selectedBackend === 'opencode'
                     ? 'Use provider/model format (e.g., openai/gpt-5-codex).'
-                    : 'Use the raw model ID (e.g., gpt-5-codex or claude-opus-4-7).'}
+                    : 'Use the raw model ID (e.g., gpt-5-codex or claude-opus-4-8).'}
               </p>
             </div>
 

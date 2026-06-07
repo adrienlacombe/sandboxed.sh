@@ -3,9 +3,9 @@
 use super::{
     now_string, sanitize_filename, Automation, AutomationExecution, CommandSource, DailyUsageStats,
     ExecutionStatus, FreshSession, HourlyUsageStats, Mission, MissionHistoryEntry, MissionMode,
-    MissionStatus, MissionStore, ModelUsageStats, PalomaCooldownState, PalomaDecision,
-    PalomaMissionCard, PalomaSchedulerJob, PalomaUserPreferences, RetryConfig, StopPolicy,
-    StoredEvent, TelegramActionExecution, TelegramActionExecutionKind,
+    MissionStatus, MissionStatusCounts, MissionStore, ModelUsageStats, PalomaCooldownState,
+    PalomaDecision, PalomaMissionCard, PalomaSchedulerJob, PalomaUserPreferences, RetryConfig,
+    StopPolicy, StoredEvent, TelegramActionExecution, TelegramActionExecutionKind,
     TelegramActionExecutionStatus, TelegramAlert, TelegramAlertPreference, TelegramChannel,
     TelegramChatMission, TelegramConversation, TelegramConversationMessage,
     TelegramConversationMessageDirection, TelegramMissionInterestLevel,
@@ -13,7 +13,7 @@ use super::{
     TelegramStructuredMemoryEntry, TelegramStructuredMemoryKind, TelegramStructuredMemoryScope,
     TelegramStructuredMemorySearchHit, TelegramUser, TelegramUserCursor, TelegramUserRole,
     TelegramWorkflow, TelegramWorkflowEvent, TelegramWorkflowKind, TelegramWorkflowStatus,
-    TriggerType, WebhookConfig,
+    ToolCallSummary, TriggerType, WebhookConfig,
 };
 use crate::api::control::{AgentEvent, AgentTreeNode, DesktopSessionInfo, TextOp};
 use async_trait::async_trait;
@@ -109,15 +109,16 @@ const TELEGRAM_MEMORY_SEARCH_STOPWORDS: &[&str] = &[
 fn usage_cost_with_read_side_estimate(
     model: &str,
     stored_cost_cents: u64,
+    cost_source: &str,
     input_tokens: u64,
     output_tokens: u64,
     cache_creation_tokens: u64,
     cache_read_tokens: u64,
 ) -> u64 {
-    if stored_cost_cents > 0 {
+    if stored_cost_cents > 0 && cost_source == "actual" {
         return stored_cost_cents;
     }
-    crate::cost::cost_cents_from_usage(
+    let estimated = crate::cost::cost_cents_from_usage(
         model,
         &crate::cost::TokenUsage {
             input_tokens,
@@ -125,7 +126,19 @@ fn usage_cost_with_read_side_estimate(
             cache_creation_input_tokens: Some(cache_creation_tokens),
             cache_read_input_tokens: Some(cache_read_tokens),
         },
-    )
+    );
+    if estimated > 0 {
+        return estimated;
+    }
+    stored_cost_cents
+}
+
+fn usage_model_key(raw_model: &str, stored_normalized_model: &str) -> String {
+    let raw_model = raw_model.trim();
+    if !raw_model.is_empty() {
+        return crate::cost::normalized_model(raw_model);
+    }
+    stored_normalized_model.trim().to_string()
 }
 
 #[derive(serde::Serialize)]
@@ -597,6 +610,23 @@ CREATE TABLE IF NOT EXISTS telegram_channels (
 CREATE INDEX IF NOT EXISTS idx_telegram_channels_mission ON telegram_channels(mission_id);
 CREATE INDEX IF NOT EXISTS idx_telegram_channels_active ON telegram_channels(active);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_telegram_channels_bot_token ON telegram_channels(bot_token);
+
+-- Token usage from the OpenAI-compatible /v1 router (external clients:
+-- assistant gateways, IDEs with proxy keys, ...). Mission usage lives in
+-- mission_events metadata; both sources are merged by the usage summary.
+CREATE TABLE IF NOT EXISTS proxy_usage (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp TEXT NOT NULL,
+    model TEXT NOT NULL,
+    input_tokens INTEGER NOT NULL DEFAULT 0,
+    output_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+    cost_cents INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_proxy_usage_timestamp ON proxy_usage(timestamp);
+CREATE INDEX IF NOT EXISTS idx_proxy_usage_model ON proxy_usage(model);
 "#;
 
 /// Content size threshold for inline storage (64KB).
@@ -666,7 +696,7 @@ impl SqliteMissionStore {
             _ => {
                 return Err(rusqlite::Error::ToSqlConversionFailure(
                     format!("Unknown command source type: {}", command_source_type).into(),
-                ))
+                ));
             }
         };
 
@@ -704,7 +734,7 @@ impl SqliteMissionStore {
             _ => {
                 return Err(rusqlite::Error::ToSqlConversionFailure(
                     format!("Unknown trigger type: {}", trigger_type).into(),
-                ))
+                ));
             }
         };
 
@@ -2311,6 +2341,38 @@ impl MissionStore for SqliteMissionStore {
         .map_err(|e| e.to_string())?
     }
 
+    async fn count_missions_by_status(&self) -> Result<MissionStatusCounts, String> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let mut stmt = conn
+                .prepare("SELECT status, COUNT(*) FROM missions GROUP BY status")
+                .map_err(|e| e.to_string())?;
+
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                })
+                .map_err(|e| e.to_string())?;
+
+            let mut counts = MissionStatusCounts::default();
+            for row in rows {
+                let (status, count) = row.map_err(|e| e.to_string())?;
+                let count = usize::try_from(count).unwrap_or(0);
+                counts.total += count;
+                match parse_status(&status) {
+                    MissionStatus::Active => counts.active += count,
+                    MissionStatus::Completed => counts.completed += count,
+                    MissionStatus::Failed => counts.failed += count,
+                    _ => {}
+                }
+            }
+            Ok(counts)
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
     async fn get_mission(&self, id: Uuid) -> Result<Option<Mission>, String> {
         let conn = self.conn.clone();
         let id_str = id.to_string();
@@ -3711,13 +3773,30 @@ impl MissionStore for SqliteMissionStore {
                         &event_type,
                         &content,
                     );
-                    conn.execute(
-                        "UPDATE mission_events
-                         SET metadata = ?1, timestamp = ?2, content = ?3, content_file = ?4
-                         WHERE id = ?5",
-                        params![metadata_str, now, content_inline, content_file, row_id],
-                    )
-                    .map_err(|e| e.to_string())?;
+                    if event_type == "text_delta" {
+                        let sequence: i64 = conn
+                            .query_row(
+                                "SELECT COALESCE(MAX(sequence), 0) + 1 FROM mission_events WHERE mission_id = ?1",
+                                params![&mid],
+                                |row| row.get(0),
+                            )
+                            .unwrap_or(1);
+                        conn.execute(
+                            "UPDATE mission_events
+                             SET sequence = ?1, metadata = ?2, timestamp = ?3, content = ?4, content_file = ?5
+                             WHERE id = ?6",
+                            params![sequence, metadata_str, now, content_inline, content_file, row_id],
+                        )
+                        .map_err(|e| e.to_string())?;
+                    } else {
+                        conn.execute(
+                            "UPDATE mission_events
+                             SET metadata = ?1, timestamp = ?2, content = ?3, content_file = ?4
+                             WHERE id = ?5",
+                            params![metadata_str, now, content_inline, content_file, row_id],
+                        )
+                        .map_err(|e| e.to_string())?;
+                    }
                     return Ok(());
                 }
             }
@@ -4078,6 +4157,161 @@ impl MissionStore for SqliteMissionStore {
         .map_err(|e| e.to_string())?
     }
 
+    async fn get_events_for_tool_call(
+        &self,
+        mission_id: Uuid,
+        tool_call_id: &str,
+    ) -> Result<Vec<StoredEvent>, String> {
+        let conn = self.conn.clone();
+        let mid = mission_id.to_string();
+        let tool_call_id = tool_call_id.to_string();
+
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, mission_id, sequence, event_type, timestamp, event_id, tool_call_id, tool_name, content, content_file, metadata
+                     FROM mission_events
+                     WHERE mission_id = ?1 AND tool_call_id = ?2
+                     ORDER BY sequence ASC",
+                )
+                .map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map(params![&mid, &tool_call_id], |row| {
+                    let content: Option<String> = row.get(8)?;
+                    let content_file: Option<String> = row.get(9)?;
+                    let full_content = SqliteMissionStore::load_content(
+                        content.as_deref(),
+                        content_file.as_deref(),
+                    );
+                    let metadata_str: String = row
+                        .get::<_, Option<String>>(10)?
+                        .unwrap_or_else(|| "{}".to_string());
+                    let mid_str: String = row.get(1)?;
+
+                    Ok(StoredEvent {
+                        id: row.get(0)?,
+                        mission_id: parse_uuid_or_nil(&mid_str),
+                        sequence: row.get(2)?,
+                        event_type: row.get(3)?,
+                        timestamp: row.get(4)?,
+                        event_id: row.get(5)?,
+                        tool_call_id: row.get(6)?,
+                        tool_name: row.get(7)?,
+                        content: full_content,
+                        metadata: serde_json::from_str(&metadata_str)
+                            .unwrap_or(serde_json::json!({})),
+                    })
+                })
+                .map_err(|e| e.to_string())?;
+            let mut events = Vec::new();
+            for row in rows {
+                events.push(row.map_err(|e| e.to_string())?);
+            }
+            Ok(events)
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
+    async fn get_recent_tool_call_ids(
+        &self,
+        mission_id: Uuid,
+        limit: usize,
+    ) -> Result<Vec<String>, String> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let conn = self.conn.clone();
+        let mid = mission_id.to_string();
+        let limit = limit as i64;
+
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT tool_call_id
+                     FROM mission_events
+                     WHERE mission_id = ?1
+                       AND tool_call_id IS NOT NULL
+                       AND event_type IN ('tool_call', 'tool_result')
+                     GROUP BY tool_call_id
+                     ORDER BY MAX(sequence) DESC
+                     LIMIT ?2",
+                )
+                .map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map(params![&mid, limit], |row| row.get::<_, String>(0))
+                .map_err(|e| e.to_string())?;
+            let mut ids = Vec::new();
+            for row in rows {
+                ids.push(row.map_err(|e| e.to_string())?);
+            }
+            Ok(ids)
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
+    async fn get_tool_call_summaries(
+        &self,
+        mission_id: Uuid,
+        tool_call_ids: &[String],
+    ) -> Result<HashMap<String, ToolCallSummary>, String> {
+        if tool_call_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let conn = self.conn.clone();
+        let mid = mission_id.to_string();
+        let ids = tool_call_ids.to_vec();
+
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let ids_json = serde_json::to_string(&ids).unwrap_or_else(|_| "[]".to_string());
+            let mut stmt = conn
+                .prepare(
+                    "SELECT tool_call_id, event_type, sequence, timestamp, content, content_file
+                     FROM mission_events
+                     WHERE mission_id = ?1
+                       AND tool_call_id IN (SELECT value FROM json_each(?2))
+                       AND event_type IN ('tool_call', 'tool_result')
+                     ORDER BY sequence ASC",
+                )
+                .map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map(params![&mid, &ids_json], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                    ))
+                })
+                .map_err(|e| e.to_string())?;
+            let mut summaries: HashMap<String, ToolCallSummary> = HashMap::new();
+            for row in rows {
+                let (tool_call_id, event_type, sequence, timestamp, content, content_file) =
+                    row.map_err(|e| e.to_string())?;
+                let full_content =
+                    SqliteMissionStore::load_content(content.as_deref(), content_file.as_deref());
+                let summary = summaries.entry(tool_call_id).or_default();
+                if event_type == "tool_call" {
+                    summary.call_content_bytes = full_content.len();
+                } else {
+                    summary.has_result = true;
+                    summary.result_sequence = Some(sequence);
+                    summary.result_timestamp = Some(timestamp);
+                    summary.result_content_bytes = full_content.len();
+                }
+            }
+            Ok(summaries)
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
     async fn max_event_sequence(&self, mission_id: Uuid) -> Result<i64, String> {
         let conn = self.conn.clone();
         let mid = mission_id.to_string();
@@ -4092,6 +4326,43 @@ impl MissionStore for SqliteMissionStore {
                 )
                 .unwrap_or(0);
             Ok(max_seq)
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
+    async fn nth_recent_event_sequence(
+        &self,
+        mission_id: Uuid,
+        anchor_types: &[&str],
+        n: usize,
+    ) -> Result<Option<i64>, String> {
+        if n == 0 {
+            return Ok(None);
+        }
+        let conn = self.conn.clone();
+        let mid = mission_id.to_string();
+        let types: Vec<String> = anchor_types.iter().map(|s| s.to_string()).collect();
+        // OFFSET is zero-based: the Nth-most-recent row is at offset N-1.
+        let offset = (n - 1) as i64;
+
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let types_json = serde_json::to_string(&types).unwrap_or_else(|_| "[]".to_string());
+            // Backed by idx_events_mission_type_sequence (mission_id,
+            // event_type, sequence) — the DESC walk + small OFFSET is cheap.
+            let seq: Option<i64> = conn
+                .query_row(
+                    "SELECT sequence FROM mission_events
+                     WHERE mission_id = ?1 AND event_type IN (SELECT value FROM json_each(?2))
+                     ORDER BY sequence DESC
+                     LIMIT 1 OFFSET ?3",
+                    params![&mid, &types_json, offset],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|e| e.to_string())?;
+            Ok(seq)
         })
         .await
         .map_err(|e| e.to_string())?
@@ -4358,49 +4629,42 @@ impl MissionStore for SqliteMissionStore {
     ) -> Result<Vec<ModelUsageStats>, String> {
         let conn = self.conn.lock().await;
 
-        // Aggregate by normalized model from assistant_message events. Falls back
-        // to the raw `model` string if `model_normalized` is missing. Token and
-        // cost fields tolerate the legacy flat shape (`cost_cents`) and missing
-        // values via COALESCE.
+        // Read individual rows so stale stored `model_normalized` values can be
+        // corrected with the current normalizer and estimated costs can be
+        // recalculated under the corrected model.
         let base_query = r#"
             SELECT
+                COALESCE(json_extract(metadata, '$.model'), '') AS raw_model,
+                COALESCE(json_extract(metadata, '$.model_normalized'), '') AS stored_model,
+                COALESCE(CAST(json_extract(metadata, '$.usage.input_tokens') AS INTEGER), 0) AS input_tokens,
+                COALESCE(CAST(json_extract(metadata, '$.usage.output_tokens') AS INTEGER), 0) AS output_tokens,
+                COALESCE(CAST(json_extract(metadata, '$.usage.cache_creation_input_tokens') AS INTEGER), 0) AS cache_creation_tokens,
+                COALESCE(CAST(json_extract(metadata, '$.usage.cache_read_input_tokens') AS INTEGER), 0) AS cache_read_tokens,
                 COALESCE(
-                    json_extract(metadata, '$.model_normalized'),
-                    json_extract(metadata, '$.model'),
+                    json_extract(metadata, '$.cost.source'),
                     ''
-                ) AS model,
-                COUNT(*) AS requests,
-                COALESCE(SUM(CAST(json_extract(metadata, '$.usage.input_tokens') AS INTEGER)), 0) AS input_tokens,
-                COALESCE(SUM(CAST(json_extract(metadata, '$.usage.output_tokens') AS INTEGER)), 0) AS output_tokens,
-                COALESCE(SUM(CAST(json_extract(metadata, '$.usage.cache_creation_input_tokens') AS INTEGER)), 0) AS cache_creation_tokens,
-                COALESCE(SUM(CAST(json_extract(metadata, '$.usage.cache_read_input_tokens') AS INTEGER)), 0) AS cache_read_tokens,
-                COALESCE(SUM(
-                    CASE WHEN CAST(
-                        COALESCE(
-                            json_extract(metadata, '$.cost.amount_cents'),
-                            json_extract(metadata, '$.cost_cents'),
-                            0
-                        ) AS INTEGER
-                    ) > 0
-                    THEN CAST(
-                        COALESCE(
-                            json_extract(metadata, '$.cost.amount_cents'),
-                            json_extract(metadata, '$.cost_cents'),
-                            0
-                        ) AS INTEGER
-                    ) ELSE 0 END
-                ), 0) AS cost_cents
+                ) AS cost_source,
+                CASE WHEN CAST(
+                    COALESCE(
+                        json_extract(metadata, '$.cost.amount_cents'),
+                        json_extract(metadata, '$.cost_cents'),
+                        0
+                    ) AS INTEGER
+                ) > 0
+                THEN CAST(
+                    COALESCE(
+                        json_extract(metadata, '$.cost.amount_cents'),
+                        json_extract(metadata, '$.cost_cents'),
+                        0
+                    ) AS INTEGER
+                ) ELSE 0 END AS cost_cents
             FROM mission_events
             WHERE event_type = 'assistant_message'
         "#;
 
         let sql = match since {
-            Some(_) => format!(
-                "{base_query} AND timestamp >= ?1 GROUP BY model ORDER BY cost_cents DESC, requests DESC"
-            ),
-            None => format!(
-                "{base_query} GROUP BY model ORDER BY cost_cents DESC, requests DESC"
-            ),
+            Some(_) => format!("{base_query} AND timestamp >= ?1"),
+            None => base_query.to_string(),
         };
 
         let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
@@ -4411,13 +4675,15 @@ impl MissionStore for SqliteMissionStore {
         };
         let rows = stmt
             .query_map(params.as_slice(), |row| {
-                let model: String = row.get(0)?;
-                let requests: i64 = row.get(1)?;
+                let raw_model: String = row.get(0)?;
+                let stored_model: String = row.get(1)?;
                 let input_tokens: i64 = row.get(2)?;
                 let output_tokens: i64 = row.get(3)?;
                 let cache_creation_tokens: i64 = row.get(4)?;
                 let cache_read_tokens: i64 = row.get(5)?;
-                let cost_cents: i64 = row.get(6)?;
+                let cost_source: String = row.get(6)?;
+                let cost_cents: i64 = row.get(7)?;
+                let model = usage_model_key(&raw_model, &stored_model);
                 let input_tokens = input_tokens.max(0) as u64;
                 let output_tokens = output_tokens.max(0) as u64;
                 let cache_creation_tokens = cache_creation_tokens.max(0) as u64;
@@ -4426,6 +4692,7 @@ impl MissionStore for SqliteMissionStore {
                 let cost_cents = usage_cost_with_read_side_estimate(
                     &model,
                     stored_cost_cents,
+                    &cost_source,
                     input_tokens,
                     output_tokens,
                     cache_creation_tokens,
@@ -4433,7 +4700,7 @@ impl MissionStore for SqliteMissionStore {
                 );
                 Ok(ModelUsageStats {
                     model,
-                    requests: requests.max(0) as u64,
+                    requests: 1,
                     input_tokens,
                     output_tokens,
                     cache_creation_tokens,
@@ -4443,7 +4710,7 @@ impl MissionStore for SqliteMissionStore {
             })
             .map_err(|e| e.to_string())?;
 
-        let mut out: Vec<ModelUsageStats> = Vec::new();
+        let mut by_model: BTreeMap<String, ModelUsageStats> = BTreeMap::new();
         for r in rows {
             let row = r.map_err(|e| e.to_string())?;
             // Skip empty-model rows that carry no usage signal at all
@@ -4456,8 +4723,35 @@ impl MissionStore for SqliteMissionStore {
             {
                 continue;
             }
-            out.push(row);
+            let entry = by_model
+                .entry(row.model.clone())
+                .or_insert_with(|| ModelUsageStats {
+                    model: row.model.clone(),
+                    requests: 0,
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    cache_creation_tokens: 0,
+                    cache_read_tokens: 0,
+                    cost_cents: 0,
+                });
+            entry.requests = entry.requests.saturating_add(row.requests);
+            entry.input_tokens = entry.input_tokens.saturating_add(row.input_tokens);
+            entry.output_tokens = entry.output_tokens.saturating_add(row.output_tokens);
+            entry.cache_creation_tokens = entry
+                .cache_creation_tokens
+                .saturating_add(row.cache_creation_tokens);
+            entry.cache_read_tokens = entry
+                .cache_read_tokens
+                .saturating_add(row.cache_read_tokens);
+            entry.cost_cents = entry.cost_cents.saturating_add(row.cost_cents);
         }
+        let mut out: Vec<ModelUsageStats> = by_model.into_values().collect();
+        out.sort_by(|a, b| {
+            b.cost_cents
+                .cmp(&a.cost_cents)
+                .then_with(|| b.requests.cmp(&a.requests))
+                .then_with(|| a.model.cmp(&b.model))
+        });
         Ok(out)
     }
 
@@ -4470,41 +4764,34 @@ impl MissionStore for SqliteMissionStore {
         let base_query = r#"
             SELECT
                 substr(timestamp, 1, 10) AS day,
-                COALESCE(
-                    json_extract(metadata, '$.model_normalized'),
-                    json_extract(metadata, '$.model'),
-                    ''
-                ) AS model,
-                COUNT(*) AS requests,
-                COALESCE(SUM(CAST(json_extract(metadata, '$.usage.input_tokens') AS INTEGER)), 0) AS input_tokens,
-                COALESCE(SUM(CAST(json_extract(metadata, '$.usage.output_tokens') AS INTEGER)), 0) AS output_tokens,
-                COALESCE(SUM(CAST(json_extract(metadata, '$.usage.cache_creation_input_tokens') AS INTEGER)), 0) AS cache_creation_tokens,
-                COALESCE(SUM(CAST(json_extract(metadata, '$.usage.cache_read_input_tokens') AS INTEGER)), 0) AS cache_read_tokens,
-                COALESCE(SUM(
-                    CASE WHEN CAST(
-                        COALESCE(
-                            json_extract(metadata, '$.cost.amount_cents'),
-                            json_extract(metadata, '$.cost_cents'),
-                            0
-                        ) AS INTEGER
-                    ) > 0
-                    THEN CAST(
-                        COALESCE(
-                            json_extract(metadata, '$.cost.amount_cents'),
-                            json_extract(metadata, '$.cost_cents'),
-                            0
-                        ) AS INTEGER
-                    ) ELSE 0 END
-                ), 0) AS cost_cents
+                COALESCE(json_extract(metadata, '$.model'), '') AS raw_model,
+                COALESCE(json_extract(metadata, '$.model_normalized'), '') AS stored_model,
+                COALESCE(CAST(json_extract(metadata, '$.usage.input_tokens') AS INTEGER), 0) AS input_tokens,
+                COALESCE(CAST(json_extract(metadata, '$.usage.output_tokens') AS INTEGER), 0) AS output_tokens,
+                COALESCE(CAST(json_extract(metadata, '$.usage.cache_creation_input_tokens') AS INTEGER), 0) AS cache_creation_tokens,
+                COALESCE(CAST(json_extract(metadata, '$.usage.cache_read_input_tokens') AS INTEGER), 0) AS cache_read_tokens,
+                COALESCE(json_extract(metadata, '$.cost.source'), '') AS cost_source,
+                CASE WHEN CAST(
+                    COALESCE(
+                        json_extract(metadata, '$.cost.amount_cents'),
+                        json_extract(metadata, '$.cost_cents'),
+                        0
+                    ) AS INTEGER
+                ) > 0
+                THEN CAST(
+                    COALESCE(
+                        json_extract(metadata, '$.cost.amount_cents'),
+                        json_extract(metadata, '$.cost_cents'),
+                        0
+                    ) AS INTEGER
+                ) ELSE 0 END AS cost_cents
             FROM mission_events
             WHERE event_type = 'assistant_message'
         "#;
 
         let sql = match since {
-            Some(_) => {
-                format!("{base_query} AND timestamp >= ?1 GROUP BY day, model ORDER BY day ASC")
-            }
-            None => format!("{base_query} GROUP BY day, model ORDER BY day ASC"),
+            Some(_) => format!("{base_query} AND timestamp >= ?1 ORDER BY day ASC"),
+            None => format!("{base_query} ORDER BY day ASC"),
         };
 
         let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
@@ -4516,13 +4803,15 @@ impl MissionStore for SqliteMissionStore {
         let rows = stmt
             .query_map(params.as_slice(), |row| {
                 let day: String = row.get(0)?;
-                let model: String = row.get(1)?;
-                let requests: i64 = row.get(2)?;
+                let raw_model: String = row.get(1)?;
+                let stored_model: String = row.get(2)?;
                 let input_tokens: i64 = row.get(3)?;
                 let output_tokens: i64 = row.get(4)?;
                 let cache_creation_tokens: i64 = row.get(5)?;
                 let cache_read_tokens: i64 = row.get(6)?;
-                let cost_cents: i64 = row.get(7)?;
+                let cost_source: String = row.get(7)?;
+                let cost_cents: i64 = row.get(8)?;
+                let model = usage_model_key(&raw_model, &stored_model);
                 let input_tokens = input_tokens.max(0) as u64;
                 let output_tokens = output_tokens.max(0) as u64;
                 let cache_creation_tokens = cache_creation_tokens.max(0) as u64;
@@ -4530,6 +4819,7 @@ impl MissionStore for SqliteMissionStore {
                 let cost_cents = usage_cost_with_read_side_estimate(
                     &model,
                     cost_cents.max(0) as u64,
+                    &cost_source,
                     input_tokens,
                     output_tokens,
                     cache_creation_tokens,
@@ -4537,7 +4827,7 @@ impl MissionStore for SqliteMissionStore {
                 );
                 Ok((
                     day,
-                    requests.max(0) as u64,
+                    1,
                     input_tokens,
                     output_tokens,
                     cache_read_tokens,
@@ -4581,40 +4871,33 @@ impl MissionStore for SqliteMissionStore {
         let base_query = r#"
             SELECT
                 substr(timestamp, 1, 13) AS hour,
-                COALESCE(
-                    json_extract(metadata, '$.model_normalized'),
-                    json_extract(metadata, '$.model'),
-                    ''
-                ) AS model,
-                COUNT(*) AS requests,
-                COALESCE(SUM(CAST(json_extract(metadata, '$.usage.input_tokens') AS INTEGER)), 0) AS input_tokens,
-                COALESCE(SUM(CAST(json_extract(metadata, '$.usage.output_tokens') AS INTEGER)), 0) AS output_tokens,
-                COALESCE(SUM(CAST(json_extract(metadata, '$.usage.cache_creation_input_tokens') AS INTEGER)), 0) AS cache_creation_tokens,
-                COALESCE(SUM(CAST(json_extract(metadata, '$.usage.cache_read_input_tokens') AS INTEGER)), 0) AS cache_read_tokens,
-                COALESCE(SUM(
-                    CASE WHEN CAST(
-                        COALESCE(
-                            json_extract(metadata, '$.cost.amount_cents'),
-                            json_extract(metadata, '$.cost_cents'),
-                            0
-                        ) AS INTEGER
-                    ) > 0
-                    THEN CAST(
-                        COALESCE(
-                            json_extract(metadata, '$.cost.amount_cents'),
-                            json_extract(metadata, '$.cost_cents'),
-                            0
-                        ) AS INTEGER
-                    ) ELSE 0 END
-                ), 0) AS cost_cents
+                COALESCE(json_extract(metadata, '$.model'), '') AS raw_model,
+                COALESCE(json_extract(metadata, '$.model_normalized'), '') AS stored_model,
+                COALESCE(CAST(json_extract(metadata, '$.usage.input_tokens') AS INTEGER), 0) AS input_tokens,
+                COALESCE(CAST(json_extract(metadata, '$.usage.output_tokens') AS INTEGER), 0) AS output_tokens,
+                COALESCE(CAST(json_extract(metadata, '$.usage.cache_creation_input_tokens') AS INTEGER), 0) AS cache_creation_tokens,
+                COALESCE(CAST(json_extract(metadata, '$.usage.cache_read_input_tokens') AS INTEGER), 0) AS cache_read_tokens,
+                COALESCE(json_extract(metadata, '$.cost.source'), '') AS cost_source,
+                CASE WHEN CAST(
+                    COALESCE(
+                        json_extract(metadata, '$.cost.amount_cents'),
+                        json_extract(metadata, '$.cost_cents'),
+                        0
+                    ) AS INTEGER
+                ) > 0
+                THEN CAST(
+                    COALESCE(
+                        json_extract(metadata, '$.cost.amount_cents'),
+                        json_extract(metadata, '$.cost_cents'),
+                        0
+                    ) AS INTEGER
+                ) ELSE 0 END AS cost_cents
             FROM mission_events
             WHERE event_type = 'assistant_message'
         "#;
         let sql = match since {
-            Some(_) => {
-                format!("{base_query} AND timestamp >= ?1 GROUP BY hour, model ORDER BY hour ASC")
-            }
-            None => format!("{base_query} GROUP BY hour, model ORDER BY hour ASC"),
+            Some(_) => format!("{base_query} AND timestamp >= ?1 ORDER BY hour ASC"),
+            None => format!("{base_query} ORDER BY hour ASC"),
         };
         let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
         let since_owned = since.map(|s| s.to_string());
@@ -4625,13 +4908,15 @@ impl MissionStore for SqliteMissionStore {
         let rows = stmt
             .query_map(params.as_slice(), |row| {
                 let hour: String = row.get(0)?;
-                let model: String = row.get(1)?;
-                let requests: i64 = row.get(2)?;
+                let raw_model: String = row.get(1)?;
+                let stored_model: String = row.get(2)?;
                 let input_tokens: i64 = row.get(3)?;
                 let output_tokens: i64 = row.get(4)?;
                 let cache_creation_tokens: i64 = row.get(5)?;
                 let cache_read_tokens: i64 = row.get(6)?;
-                let cost_cents: i64 = row.get(7)?;
+                let cost_source: String = row.get(7)?;
+                let cost_cents: i64 = row.get(8)?;
+                let model = usage_model_key(&raw_model, &stored_model);
                 let input_tokens = input_tokens.max(0) as u64;
                 let output_tokens = output_tokens.max(0) as u64;
                 let cache_creation_tokens = cache_creation_tokens.max(0) as u64;
@@ -4639,6 +4924,7 @@ impl MissionStore for SqliteMissionStore {
                 let cost_cents = usage_cost_with_read_side_estimate(
                     &model,
                     cost_cents.max(0) as u64,
+                    &cost_source,
                     input_tokens,
                     output_tokens,
                     cache_creation_tokens,
@@ -4646,7 +4932,7 @@ impl MissionStore for SqliteMissionStore {
                 );
                 Ok((
                     hour,
-                    requests.max(0) as u64,
+                    1,
                     input_tokens,
                     output_tokens,
                     cache_read_tokens,
@@ -4676,6 +4962,159 @@ impl MissionStore for SqliteMissionStore {
             entry.cost_cents = entry.cost_cents.saturating_add(cost_cents);
         }
         Ok(by_hour.into_values().collect())
+    }
+
+    async fn record_proxy_usage(
+        &self,
+        model: &str,
+        input_tokens: u64,
+        output_tokens: u64,
+        cost_cents: u64,
+    ) -> Result<(), String> {
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "INSERT INTO proxy_usage (timestamp, model, input_tokens, output_tokens, cost_cents)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![
+                chrono::Utc::now().to_rfc3339(),
+                model,
+                input_tokens as i64,
+                output_tokens as i64,
+                cost_cents as i64,
+            ],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    async fn get_proxy_usage_by_model(
+        &self,
+        since: Option<&str>,
+    ) -> Result<Vec<ModelUsageStats>, String> {
+        let conn = self.conn.lock().await;
+        // Models are normalized and costs finalized at write time, so plain
+        // SQL aggregation is enough (unlike mission_events, which re-derives
+        // both from stored metadata on read).
+        let base_query = r#"
+            SELECT
+                model,
+                COUNT(*) AS requests,
+                SUM(input_tokens) AS input_tokens,
+                SUM(output_tokens) AS output_tokens,
+                SUM(cache_creation_tokens) AS cache_creation_tokens,
+                SUM(cache_read_tokens) AS cache_read_tokens,
+                SUM(cost_cents) AS cost_cents
+            FROM proxy_usage
+        "#;
+        let sql = match since {
+            Some(_) => format!("{base_query} WHERE timestamp >= ?1 GROUP BY model"),
+            None => format!("{base_query} GROUP BY model"),
+        };
+        let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+        let since_owned = since.map(|s| s.to_string());
+        let params: Vec<&dyn rusqlite::ToSql> = match since_owned.as_ref() {
+            Some(s) => vec![s],
+            None => vec![],
+        };
+        let rows = stmt
+            .query_map(params.as_slice(), |row| {
+                Ok(ModelUsageStats {
+                    model: row.get(0)?,
+                    requests: row.get::<_, i64>(1)?.max(0) as u64,
+                    input_tokens: row.get::<_, i64>(2)?.max(0) as u64,
+                    output_tokens: row.get::<_, i64>(3)?.max(0) as u64,
+                    cache_creation_tokens: row.get::<_, i64>(4)?.max(0) as u64,
+                    cache_read_tokens: row.get::<_, i64>(5)?.max(0) as u64,
+                    cost_cents: row.get::<_, i64>(6)?.max(0) as u64,
+                })
+            })
+            .map_err(|e| e.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())
+    }
+
+    async fn get_proxy_usage_by_day(
+        &self,
+        since: Option<&str>,
+    ) -> Result<Vec<DailyUsageStats>, String> {
+        let conn = self.conn.lock().await;
+        let base_query = r#"
+            SELECT
+                substr(timestamp, 1, 10) AS day,
+                COUNT(*) AS requests,
+                SUM(input_tokens) AS input_tokens,
+                SUM(output_tokens) AS output_tokens,
+                SUM(cache_read_tokens) AS cache_read_tokens,
+                SUM(cost_cents) AS cost_cents
+            FROM proxy_usage
+        "#;
+        let sql = match since {
+            Some(_) => format!("{base_query} WHERE timestamp >= ?1 GROUP BY day ORDER BY day ASC"),
+            None => format!("{base_query} GROUP BY day ORDER BY day ASC"),
+        };
+        let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+        let since_owned = since.map(|s| s.to_string());
+        let params: Vec<&dyn rusqlite::ToSql> = match since_owned.as_ref() {
+            Some(s) => vec![s],
+            None => vec![],
+        };
+        let rows = stmt
+            .query_map(params.as_slice(), |row| {
+                Ok(DailyUsageStats {
+                    day: row.get(0)?,
+                    requests: row.get::<_, i64>(1)?.max(0) as u64,
+                    input_tokens: row.get::<_, i64>(2)?.max(0) as u64,
+                    output_tokens: row.get::<_, i64>(3)?.max(0) as u64,
+                    cache_read_tokens: row.get::<_, i64>(4)?.max(0) as u64,
+                    cost_cents: row.get::<_, i64>(5)?.max(0) as u64,
+                })
+            })
+            .map_err(|e| e.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())
+    }
+
+    async fn get_proxy_usage_by_hour(
+        &self,
+        since: Option<&str>,
+    ) -> Result<Vec<HourlyUsageStats>, String> {
+        let conn = self.conn.lock().await;
+        let base_query = r#"
+            SELECT
+                substr(timestamp, 1, 13) AS hour,
+                COUNT(*) AS requests,
+                SUM(input_tokens) AS input_tokens,
+                SUM(output_tokens) AS output_tokens,
+                SUM(cache_read_tokens) AS cache_read_tokens,
+                SUM(cost_cents) AS cost_cents
+            FROM proxy_usage
+        "#;
+        let sql = match since {
+            Some(_) => {
+                format!("{base_query} WHERE timestamp >= ?1 GROUP BY hour ORDER BY hour ASC")
+            }
+            None => format!("{base_query} GROUP BY hour ORDER BY hour ASC"),
+        };
+        let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+        let since_owned = since.map(|s| s.to_string());
+        let params: Vec<&dyn rusqlite::ToSql> = match since_owned.as_ref() {
+            Some(s) => vec![s],
+            None => vec![],
+        };
+        let rows = stmt
+            .query_map(params.as_slice(), |row| {
+                Ok(HourlyUsageStats {
+                    hour: row.get(0)?,
+                    requests: row.get::<_, i64>(1)?.max(0) as u64,
+                    input_tokens: row.get::<_, i64>(2)?.max(0) as u64,
+                    output_tokens: row.get::<_, i64>(3)?.max(0) as u64,
+                    cache_read_tokens: row.get::<_, i64>(4)?.max(0) as u64,
+                    cost_cents: row.get::<_, i64>(5)?.max(0) as u64,
+                })
+            })
+            .map_err(|e| e.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())
     }
 
     async fn create_automation(&self, automation: Automation) -> Result<Automation, String> {
@@ -9202,6 +9641,7 @@ mod tests {
     use crate::agents::{
         CompletionConfidence, CompletionEvidence, CompletionSignal, CostSource, TerminalReason,
     };
+    use crate::api::control::AgentEvent;
     use crate::api::mission_store::{
         now_string, Automation, AutomationDriver, CommandSource, FreshSession, MissionMode,
         MissionStatus, MissionStore, PalomaCooldownState, PalomaDecision, PalomaMissionCard,
@@ -10602,12 +11042,34 @@ mod tests {
                         "input_tokens": 500,
                         "output_tokens": 200
                     },
-                    "cost": { "amount_cents": 4, "source": "estimated" }
+                    "cost": { "amount_cents": 4, "source": "actual" }
                 })
                 .to_string()
             ],
         )
         .expect("insert gpt-4o");
+
+        // Legacy rows may carry a stale normalized model. Prefer the raw model
+        // and recalculate estimated costs with current pricing.
+        conn.execute(
+            query,
+            params![
+                mission.id.to_string(),
+                4i64,
+                "2026-04-22T00:03:00Z",
+                json!({
+                    "model": "gpt-5.5",
+                    "model_normalized": "gpt-5",
+                    "usage": {
+                        "input_tokens": 10000,
+                        "output_tokens": 2000
+                    },
+                    "cost": { "amount_cents": 33, "source": "estimated" }
+                })
+                .to_string()
+            ],
+        )
+        .expect("insert legacy gpt-5.5");
 
         drop(conn);
 
@@ -10616,27 +11078,43 @@ mod tests {
             .await
             .expect("aggregate by model");
 
-        // Ordered by cost_cents DESC: sonnet (37) before gpt-4o (4).
-        assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].model, "claude-3-5-sonnet");
-        assert_eq!(rows[0].requests, 2);
-        assert_eq!(rows[0].input_tokens, 3000);
-        assert_eq!(rows[0].output_tokens, 1300);
-        assert_eq!(rows[0].cache_creation_tokens, 200);
-        assert_eq!(rows[0].cache_read_tokens, 400);
-        assert_eq!(rows[0].cost_cents, 37);
+        assert_eq!(rows.len(), 3);
+        let sonnet = rows
+            .iter()
+            .find(|row| row.model == "claude-3-5-sonnet")
+            .expect("sonnet usage");
+        assert_eq!(sonnet.requests, 2);
+        assert_eq!(sonnet.input_tokens, 3000);
+        assert_eq!(sonnet.output_tokens, 1300);
+        assert_eq!(sonnet.cache_creation_tokens, 200);
+        assert_eq!(sonnet.cache_read_tokens, 400);
+        assert_eq!(sonnet.cost_cents, 37);
 
-        assert_eq!(rows[1].model, "gpt-4o");
-        assert_eq!(rows[1].requests, 1);
-        assert_eq!(rows[1].cost_cents, 4);
+        let gpt_4o = rows
+            .iter()
+            .find(|row| row.model == "gpt-4o")
+            .expect("gpt-4o usage");
+        assert_eq!(gpt_4o.requests, 1);
+        assert_eq!(gpt_4o.cost_cents, 4);
+
+        let gpt_55 = rows
+            .iter()
+            .find(|row| row.model == "gpt-5.5")
+            .expect("gpt-5.5 usage");
+        assert_eq!(gpt_55.requests, 1);
+        assert_eq!(gpt_55.input_tokens, 10000);
+        assert_eq!(gpt_55.output_tokens, 2000);
+        assert_eq!(gpt_55.cost_cents, 11);
+        assert!(!rows.iter().any(|row| row.model == "gpt-5"));
 
         // since=… filter should drop the older entries.
         let recent = store
             .get_usage_by_model(Some("2026-04-22T00:01:30Z"))
             .await
             .expect("filtered aggregate");
-        assert_eq!(recent.len(), 1);
-        assert_eq!(recent[0].model, "gpt-4o");
+        assert_eq!(recent.len(), 2);
+        assert!(recent.iter().any(|row| row.model == "gpt-4o"));
+        assert!(recent.iter().any(|row| row.model == "gpt-5.5"));
     }
 
     #[tokio::test]
@@ -11461,6 +11939,100 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn nth_recent_event_sequence_anchors_on_conversation_messages() {
+        use crate::api::control::AgentEvent;
+        // The conversation-anchored snapshot needs the sequence of the
+        // Nth-most-recent user/assistant message, ignoring the (far more
+        // numerous) tool calls in between.
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let store = SqliteMissionStore::new(temp_dir.path().to_path_buf(), "test-user")
+            .await
+            .expect("sqlite store");
+        let mission = store
+            .create_mission(Some("Tool heavy"), None, None, None, None, None, None)
+            .await
+            .expect("mission");
+
+        let anchor_types = ["user_message", "assistant_message"];
+
+        // No conversation messages yet → None.
+        assert_eq!(
+            store
+                .nth_recent_event_sequence(mission.id, &anchor_types, 1)
+                .await
+                .expect("query"),
+            None
+        );
+
+        // Interleave 5 assistant messages with 3 tool calls between each.
+        // Record each assistant message's sequence as we go.
+        let mut assistant_seqs: Vec<i64> = Vec::new();
+        for n in 0..5 {
+            store
+                .log_event(
+                    mission.id,
+                    &AgentEvent::AssistantMessage {
+                        id: Uuid::new_v4(),
+                        content: format!("assistant-{n}"),
+                        success: true,
+                        cost_cents: 0,
+                        cost_source: CostSource::Unknown,
+                        usage: None,
+                        model: None,
+                        model_normalized: None,
+                        mission_id: Some(mission.id),
+                        shared_files: None,
+                        resumable: false,
+                        completion_evidence: None,
+                    },
+                )
+                .await
+                .expect("log assistant");
+            assistant_seqs.push(store.max_event_sequence(mission.id).await.expect("max"));
+            for t in 0..3 {
+                store
+                    .log_event(
+                        mission.id,
+                        &AgentEvent::ToolCall {
+                            tool_call_id: format!("tc-{n}-{t}"),
+                            name: "bash".to_string(),
+                            args: serde_json::json!({"cmd": "echo hi"}),
+                            mission_id: Some(mission.id),
+                        },
+                    )
+                    .await
+                    .expect("log tool");
+            }
+        }
+
+        // 1st-most-recent conversation message = the last assistant (index 4).
+        assert_eq!(
+            store
+                .nth_recent_event_sequence(mission.id, &anchor_types, 1)
+                .await
+                .expect("query"),
+            Some(assistant_seqs[4])
+        );
+        // 3rd-most-recent = assistant index 2, even though ~6 tool calls
+        // sit between it and the head.
+        assert_eq!(
+            store
+                .nth_recent_event_sequence(mission.id, &anchor_types, 3)
+                .await
+                .expect("query"),
+            Some(assistant_seqs[2])
+        );
+        // Asking for more conversation messages than exist → None.
+        assert_eq!(
+            store
+                .nth_recent_event_sequence(mission.id, &anchor_types, 6)
+                .await
+                .expect("query"),
+            None
+        );
+    }
+
+    #[tokio::test]
     async fn paloma_cooldown_preserved_when_status_update_is_a_noop() {
         // Regression: heartbeats and internal restarts can re-set the same
         // status. Wiping cooldown in that case would skip the user's
@@ -12195,6 +12767,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn text_delta_latest_update_advances_sequence_for_since_seq_replay() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let store = SqliteMissionStore::new(temp_dir.path().to_path_buf(), "test-user")
+            .await
+            .expect("sqlite store");
+        let mission = store
+            .create_mission(Some("streaming"), None, None, None, None, None, None)
+            .await
+            .expect("mission");
+
+        store
+            .log_event(
+                mission.id,
+                &AgentEvent::TextDelta {
+                    content: "first draft".to_string(),
+                    mission_id: Some(mission.id),
+                },
+            )
+            .await
+            .expect("first text delta");
+        let first_seq = store
+            .max_event_sequence(mission.id)
+            .await
+            .expect("first max sequence");
+
+        store
+            .log_event(
+                mission.id,
+                &AgentEvent::ToolCall {
+                    tool_call_id: "tool-1".to_string(),
+                    name: "bash".to_string(),
+                    args: json!({ "command": "true" }),
+                    mission_id: Some(mission.id),
+                },
+            )
+            .await
+            .expect("tool call");
+        let after_tool_seq = store
+            .max_event_sequence(mission.id)
+            .await
+            .expect("tool max sequence");
+
+        store
+            .log_event(
+                mission.id,
+                &AgentEvent::TextDelta {
+                    content: "final useful draft".to_string(),
+                    mission_id: Some(mission.id),
+                },
+            )
+            .await
+            .expect("updated text delta");
+        let final_seq = store
+            .max_event_sequence(mission.id)
+            .await
+            .expect("final max sequence");
+
+        assert!(after_tool_seq > first_seq);
+        assert!(final_seq > after_tool_seq);
+
+        let replay = store
+            .get_events_since(mission.id, after_tool_seq, None, None)
+            .await
+            .expect("events since tool");
+        assert_eq!(replay.len(), 1);
+        assert_eq!(replay[0].event_type, "text_delta");
+        assert_eq!(replay[0].content, "final useful draft");
+        assert_eq!(replay[0].sequence, final_seq);
+    }
+
+    #[tokio::test]
     async fn stale_query_uses_max_timestamp_not_max_sequence() {
         // Regression for a subtler variant: `log_event` updates an existing
         // row in-place when it sees a duplicate `event_id` (e.g. a
@@ -12422,5 +13065,60 @@ mod tests {
             ids.contains(&preserved_active_id),
             "active harness_loop row represents an in-progress loop and must survive"
         );
+    }
+
+    #[tokio::test]
+    async fn proxy_usage_records_and_aggregates() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let store = SqliteMissionStore::new(temp_dir.path().to_path_buf(), "test-user")
+            .await
+            .expect("sqlite store");
+
+        store
+            .record_proxy_usage("gpt-oss-120b", 1_000, 200, 3)
+            .await
+            .expect("record 1");
+        store
+            .record_proxy_usage("gpt-oss-120b", 500, 100, 2)
+            .await
+            .expect("record 2");
+        store
+            .record_proxy_usage("zai-glm-4.7", 50, 10, 1)
+            .await
+            .expect("record 3");
+
+        let by_model = store
+            .get_proxy_usage_by_model(None)
+            .await
+            .expect("by model");
+        assert_eq!(by_model.len(), 2);
+        let gpt = by_model
+            .iter()
+            .find(|m| m.model == "gpt-oss-120b")
+            .expect("gpt row");
+        assert_eq!(gpt.requests, 2);
+        assert_eq!(gpt.input_tokens, 1_500);
+        assert_eq!(gpt.output_tokens, 300);
+        assert_eq!(gpt.cost_cents, 5);
+
+        // All three rows were written "now", so they share one day/hour bucket.
+        let by_day = store.get_proxy_usage_by_day(None).await.expect("by day");
+        assert_eq!(by_day.len(), 1);
+        assert_eq!(by_day[0].requests, 3);
+        assert_eq!(by_day[0].input_tokens, 1_550);
+        assert_eq!(by_day[0].cost_cents, 6);
+
+        let by_hour = store.get_proxy_usage_by_hour(None).await.expect("by hour");
+        assert_eq!(by_hour.len(), 1);
+        assert_eq!(by_hour[0].requests, 3);
+        assert_eq!(by_hour[0].hour.len(), "2026-06-04T10".len());
+
+        // A `since` in the future excludes everything.
+        let future = (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+        let filtered = store
+            .get_proxy_usage_by_model(Some(&future))
+            .await
+            .expect("filtered");
+        assert!(filtered.is_empty());
     }
 }

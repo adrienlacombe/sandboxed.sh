@@ -27,12 +27,13 @@ RUN mkdir -p src/bin \
     && echo "fn main() {}" > src/bin/desktop_mcp.rs \
     && echo "fn main() {}" > src/bin/workspace_mcp.rs \
     && echo "fn main() {}" > src/bin/orchestrator_mcp.rs \
+    && echo "fn main() {}" > src/bin/assistant_mcp.rs \
     && cargo build --release --lib 2>/dev/null || true \
     && cargo build --release 2>/dev/null || true
 
 # Copy real source and build
 COPY src/ src/
-RUN cargo build --release --bin sandboxed-sh --bin desktop-mcp --bin workspace-mcp --bin orchestrator-mcp
+RUN cargo build --release --bin sandboxed-sh --bin desktop-mcp --bin workspace-mcp --bin orchestrator-mcp --bin assistant-mcp
 
 # ---------------------------------------------------------------------------
 # Stage 2: Dashboard builder
@@ -64,8 +65,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     git curl jq unzip openssh-client ca-certificates gnupg \
     # nspawn / container workspaces
     systemd-container debootstrap \
-    # Desktop automation
-    xvfb i3 x11-utils x11-xserver-utils xdotool scrot imagemagick \
+    # Wayland app streaming and automation
+    sway grim wtype wlrctl wf-recorder wayvnc cage imagemagick \
     tesseract-ocr at-spi2-core \
     fonts-liberation fonts-dejavu fonts-noto \
     # Chromium
@@ -97,6 +98,7 @@ COPY --from=rust-builder /build/target/release/sandboxed-sh /usr/local/bin/sandb
 COPY --from=rust-builder /build/target/release/desktop-mcp /usr/local/bin/desktop-mcp
 COPY --from=rust-builder /build/target/release/workspace-mcp /usr/local/bin/workspace-mcp
 COPY --from=rust-builder /build/target/release/orchestrator-mcp /usr/local/bin/orchestrator-mcp
+COPY --from=rust-builder /build/target/release/assistant-mcp /usr/local/bin/assistant-mcp
 
 # -- Copy dashboard standalone build ------------------------------------------
 COPY --from=dashboard-builder /build/dashboard/.next/standalone /opt/dashboard
@@ -116,18 +118,6 @@ RUN curl -fsSL https://opencode.ai/install | bash -s -- --no-modify-path \
 RUN curl -fsSL https://x.ai/cli/install.sh | GROK_BIN_DIR=/usr/local/bin bash \
     && echo "[docker] Grok Build CLI installed: $(grok --version 2>/dev/null || echo 'unknown')" \
     || echo "[docker] WARNING: Grok Build CLI install failed (will be installed on first mission)"
-
-# -- RTK (CLI output compressor for token savings) --
-RUN RTK_ARCH=$(case "$(uname -m)" in aarch64|arm64) echo "aarch64";; *) echo "x86_64";; esac) \
-    && curl -fsSL "https://github.com/rtk-ai/rtk/releases/latest/download/rtk-${RTK_ARCH}-unknown-linux-gnu.tar.gz" \
-    | tar xz -C /usr/local/bin rtk \
-    && chmod +x /usr/local/bin/rtk \
-    && echo "[docker] RTK installed: $(rtk --version 2>/dev/null || echo 'unknown')" \
-    || echo "[docker] WARNING: RTK install failed (token savings will not be available)"
-
-# -- i3 config (from install_desktop.sh) -------------------------------------
-RUN mkdir -p /root/.config/i3
-COPY docker/i3config /root/.config/i3/config
 
 # -- Caddy config + entrypoint -----------------------------------------------
 COPY docker/Caddyfile /etc/caddy/Caddyfile

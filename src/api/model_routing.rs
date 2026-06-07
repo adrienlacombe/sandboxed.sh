@@ -5,7 +5,6 @@
 //! - View provider health status and cooldowns
 //! - Resolve a chain into ordered entries (for debugging)
 //! - Clear cooldowns
-//! - RTK token savings stats
 
 use std::sync::Arc;
 
@@ -18,7 +17,6 @@ use axum::{
 use serde::{Deserialize, Serialize};
 
 use crate::provider_health::{ChainEntry, ModelChain};
-use crate::tools::terminal::rtk_stats;
 
 /// Register model routing routes.
 pub fn routes() -> Router<Arc<super::routes::AppState>> {
@@ -30,14 +28,13 @@ pub fn routes() -> Router<Arc<super::routes::AppState>> {
         .route("/chains/:id", put(update_chain))
         .route("/chains/:id", delete(delete_chain))
         .route("/chains/:id/resolve", get(resolve_chain))
+        .route("/chains/:id/test", post(test_chain))
         // Health tracking
         .route("/health", get(list_health))
         .route("/health/:account_id", get(get_account_health))
         .route("/health/:account_id/clear", post(clear_cooldown))
         // Observability
         .route("/events", get(list_fallback_events))
-        // RTK stats
-        .route("/rtk-stats", get(get_rtk_stats))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -321,6 +318,53 @@ async fn resolve_chain(
     ))
 }
 
+/// POST /api/model-routing/chains/:id/test - Send a 1-token test request
+/// through a chain.
+///
+/// Runs behind the dashboard JWT (unlike `/v1/chat/completions`, which
+/// requires a proxy bearer), so the debug panel can exercise a chain without
+/// holding a proxy key.
+async fn test_chain(
+    State(state): State<Arc<super::routes::AppState>>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    if state.chain_store.get(&id).await.is_none() {
+        return Err((StatusCode::NOT_FOUND, format!("Chain '{}' not found", id)));
+    }
+
+    let body = serde_json::json!({
+        "model": id,
+        "messages": [{"role": "user", "content": "ping"}],
+        "max_tokens": 1,
+    });
+    let body_bytes = bytes::Bytes::from(serde_json::to_vec(&body).expect("test body serializes"));
+    let response = super::proxy::chat_completions_inner(
+        state.clone(),
+        axum::http::HeaderMap::new(),
+        body_bytes,
+    )
+    .await;
+
+    let status = response.status();
+    let collected = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to read test response: {}", e),
+            )
+        })?;
+    let payload: serde_json::Value = serde_json::from_slice(&collected).unwrap_or_else(
+        |_| serde_json::json!({ "raw": String::from_utf8_lossy(&collected).to_string() }),
+    );
+
+    Ok(Json(serde_json::json!({
+        "ok": status.is_success(),
+        "status": status.as_u16(),
+        "response": payload,
+    })))
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Health Tracking
 // ─────────────────────────────────────────────────────────────────────────────
@@ -364,38 +408,4 @@ async fn list_fallback_events(
     State(state): State<Arc<super::routes::AppState>>,
 ) -> Json<Vec<crate::provider_health::FallbackEvent>> {
     Json(state.health_tracker.get_recent_events(200).await)
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// RTK Stats
-// ─────────────────────────────────────────────────────────────────────────────
-
-#[derive(Debug, Serialize)]
-struct RtkStatsResponse {
-    commands_processed: u64,
-    original_chars: u64,
-    compressed_chars: u64,
-    chars_saved: u64,
-    savings_percent: f64,
-}
-
-/// GET /api/model-routing/rtk-stats - Get RTK token savings stats.
-///
-/// Returns statistics about CLI output compression via RTK.
-async fn get_rtk_stats() -> Json<RtkStatsResponse> {
-    let (commands, original, compressed): (u64, u64, u64) = rtk_stats();
-    let chars_saved = original.saturating_sub(compressed);
-    let savings_percent = if original > 0 {
-        (chars_saved as f64 / original as f64) * 100.0
-    } else {
-        0.0
-    };
-
-    Json(RtkStatsResponse {
-        commands_processed: commands,
-        original_chars: original,
-        compressed_chars: compressed,
-        chars_saved,
-        savings_percent,
-    })
 }

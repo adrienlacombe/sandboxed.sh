@@ -147,42 +147,30 @@ fn resolve_model(session_model: Option<&str>, default_model: Option<&str>) -> Op
         .or_else(|| default_model.map(|s| s.to_string()))
 }
 
-/// How a codex `delta` field should be combined with prior content of
-/// the same item.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DeltaSemantics {
-    /// Each delta is a new token to append (`item/agentMessage/delta`,
-    /// `item/reasoning/textDelta`).
-    Incremental,
-    /// Each delta is the full text-so-far. Atomic replacement
-    /// (`item/reasoning/summaryTextDelta` — observed empirically on prod
-    /// after the snowball regression). New streams (where the delta
-    /// doesn't extend the buffer) replace it too — codex sometimes
-    /// resets the summary draft mid-item without firing item/completed.
-    CumulativeSnapshot,
-}
-
-/// Fold a codex delta into a per-item buffer with explicit semantics.
+/// Fold a codex delta into a per-item buffer.
 ///
-/// `Incremental` always appends. `CumulativeSnapshot` replaces the buffer
-/// — even when the new snapshot doesn't extend the prior one, because
-/// codex's summary stream can restart mid-item. The earlier prod bug
-/// ("The saved goalThe saved goal isThe saved goal is active…" 36×) was
-/// our heuristic-only fold appending a fresh-start summary on top of the
-/// stable reasoning text.
-fn fold_delta_into(buffer: &mut String, delta: &str, semantics: DeltaSemantics) {
-    match semantics {
-        DeltaSemantics::Incremental => {
-            buffer.push_str(delta);
-        }
-        DeltaSemantics::CumulativeSnapshot => {
-            // Drop pure echoes (delta is an earlier substring of the buffer).
-            if !buffer.is_empty() && buffer.starts_with(delta) && buffer.len() > delta.len() {
-                return;
-            }
-            buffer.clear();
-            buffer.push_str(delta);
-        }
+/// All codex `*/delta` notifications (`item/agentMessage/delta`,
+/// `item/reasoning/textDelta`, `item/reasoning/summaryTextDelta`) carry
+/// incremental token deltas on current CLI builds (verified on 0.128.0:
+/// a ~500-char summary arrives as ~94 token-sized deltas). Append by
+/// default, but absorb two snapshot-shaped payloads some builds emit
+/// through the same methods:
+/// - prefix-extension (delta starts with the buffer) → replace, so a full
+///   text-so-far resend doesn't duplicate;
+/// - echo (buffer starts with the delta) → drop, so a shorter resend
+///   doesn't shrink or duplicate.
+///
+/// `summaryTextDelta` was previously treated as a cumulative snapshot
+/// (wholesale replacement per delta). On 0.128.0 that collapsed every
+/// reasoning summary to whichever single token chunk was longest — the
+/// Thoughts panel showed/stored 35-char fragments (mission 2e8af5f7,
+/// 87 identical truncated thinking events).
+fn fold_delta_into(buffer: &mut String, delta: &str) {
+    if !buffer.is_empty() && delta.starts_with(buffer.as_str()) {
+        buffer.clear();
+        buffer.push_str(delta);
+    } else if !buffer.starts_with(delta) {
+        buffer.push_str(delta);
     }
 }
 
@@ -215,11 +203,10 @@ async fn send_message_streaming_app_server(
     };
 
     // Note: codex app-server does NOT honor `OPENAI_API_KEY`/`OPENAI_OAUTH_TOKEN`
-    // env vars (per `app-server/src/lib.rs:646-647`) — it reads `~/.codex/auth.json`
-    // (CODEX_HOME-relative). Auth flows through the per-mission codexhome-XXXX
-    // dir already populated by the workspace bootstrap; the legacy
-    // `oauth_token`-via-env path used by exec mode is dead here, so we don't
-    // forward it.
+    // env vars (per `app-server/src/lib.rs:646-647`). For ChatGPT OAuth
+    // rotation we use app-server's external token mode instead: the backend
+    // supplies an access token at startup and answers refresh requests under
+    // our per-account lock.
     let app_cfg = AppServerConfig {
         cli_path: cfg.cli_path.clone(),
         enabled_features: vec!["goals".to_string()],
@@ -238,9 +225,33 @@ async fn send_message_streaming_app_server(
 
     // Initialize handshake — without `experimentalApi: true`, every
     // thread/goal/* RPC is rejected.
-    if let Err(e) = session_arc.initialize("sandboxed-sh", "1.2.0").await {
+    if let Err(e) = session_arc
+        .initialize("sandboxed-sh", env!("CARGO_PKG_VERSION"))
+        .await
+    {
         let _ = session_arc.shutdown().await;
         return Err(anyhow::anyhow!("codex app-server initialize failed: {}", e));
+    }
+
+    if let Some(external_auth) = cfg.external_chatgpt_auth.as_ref() {
+        if let Err(e) = session_arc
+            .login_chatgpt_auth_tokens(
+                &external_auth.access_token,
+                &external_auth.chatgpt_account_id,
+                external_auth.chatgpt_plan_type.as_deref(),
+            )
+            .await
+        {
+            let _ = session_arc.shutdown().await;
+            return Err(anyhow::anyhow!(
+                "codex account/login/start chatgptAuthTokens failed: {}",
+                e
+            ));
+        }
+        tracing::info!(
+            chatgpt_account_id = %external_auth.chatgpt_account_id,
+            "Configured Codex app-server external ChatGPT OAuth tokens"
+        );
     }
     // Best-effort `notifications/initialized` — codex tolerates clients that
     // skip this but it matches the LSP-style handshake.
@@ -307,14 +318,35 @@ async fn send_message_streaming_app_server(
                 "/goal requires an objective — got empty string"
             ));
         }
-        if let Err(e) = session_for_rpc
-            .goal_set(GoalSetParams {
-                thread_id: thread_id.clone(),
-                objective: user_payload.clone(),
-                token_budget: None,
-            })
-            .await
-        {
+        // The goals db (`~/.codex/goals_1.sqlite`) is shared by every
+        // app-server in the container, and a freshly spawned server can
+        // receive goal/set while a sibling is still running the sqlx
+        // migrations — surfacing as a transient "no such table:
+        // thread_goals". Retry briefly before giving up (observed live:
+        // the migration completes within seconds).
+        let mut goal_set_result: anyhow::Result<serde_json::Value> = Ok(serde_json::Value::Null);
+        for attempt in 1..=3u32 {
+            goal_set_result = session_for_rpc
+                .goal_set(GoalSetParams {
+                    thread_id: thread_id.clone(),
+                    objective: user_payload.clone(),
+                    token_budget: None,
+                })
+                .await;
+            match &goal_set_result {
+                Err(e) if attempt < 3 && e.to_string().contains("no such table") => {
+                    tracing::warn!(
+                        attempt,
+                        error = %e,
+                        "thread/goal/set hit a goals-db migration race; retrying"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(1500 * attempt as u64))
+                        .await;
+                }
+                _ => break,
+            }
+        }
+        if let Err(e) = goal_set_result {
             let _ = session_arc.shutdown().await;
             return Err(anyhow::anyhow!("codex thread/goal/set failed: {}", e));
         }
@@ -359,6 +391,7 @@ async fn send_message_streaming_app_server(
         // Mutable so we can swap in a fresh session after a reconnect.
         let mut session_arc = session_arc;
         let mut inbound = inbound;
+        let cancel_token = cfg.cancel_token.clone();
 
         // Cap the number of automatic reconnects per mission so a
         // systemic codex crash doesn't loop forever. One retry covers
@@ -369,9 +402,47 @@ async fn send_message_streaming_app_server(
 
         'outer: loop {
             loop {
-                let msg = match inbound.recv().await {
-                    Some(m) => m,
-                    None => break, // inner loop → check whether to reconnect
+                let msg = tokio::select! {
+                    _ = async {
+                        if let Some(token) = cancel_token.as_ref() {
+                            token.cancelled().await;
+                        } else {
+                            std::future::pending::<()>().await;
+                        }
+                    } => {
+                        tracing::info!(
+                            thread_id = %thread_id,
+                            is_goal_mission,
+                            "codex app-server cancellation requested"
+                        );
+                        if is_goal_mission {
+                            if let Err(e) = session_arc.goal_clear(&thread_id).await {
+                                tracing::warn!(
+                                    thread_id = %thread_id,
+                                    "codex thread/goal/clear failed during cancellation: {}",
+                                    e
+                                );
+                            }
+                            let _ = tx
+                                .send(ExecutionEvent::GoalStatus {
+                                    status: "cleared".to_string(),
+                                    objective: translator.goal_objective.clone(),
+                                })
+                                .await;
+                        } else if let Err(e) = session_arc.turn_interrupt(&thread_id, None).await {
+                            tracing::debug!(
+                                thread_id = %thread_id,
+                                "codex turn/interrupt failed during cancellation: {}",
+                                e
+                            );
+                        }
+                        let _ = tx.send(ExecutionEvent::Cancelled).await;
+                        break 'outer;
+                    }
+                    msg = inbound.recv() => match msg {
+                        Some(m) => m,
+                        None => break, // inner loop → check whether to reconnect
+                    },
                 };
 
                 match msg {
@@ -388,28 +459,57 @@ async fn send_message_streaming_app_server(
                             terminal = true;
                         }
                     }
-                    InboundMessage::ServerRequest {
-                        id,
-                        method,
-                        params: _,
-                    } => {
+                    InboundMessage::ServerRequest { id, method, params } => {
                         // Codex elicits permission for command exec, file change,
                         // and dynamic-tool invocations through server-initiated
                         // requests. Exec mode runs with
                         // `--dangerously-bypass-approvals-and-sandbox`; we mirror
                         // that policy here by auto-approving every elicitation.
-                        // Auth-refresh requests get a typed JSON-RPC error
-                        // because we don't carry refresh credentials in the
-                        // app-server path (codex reads its own auth.json).
                         let send_err = if method == "account/chatgptAuthTokens/refresh" {
-                            session_arc
-                                .respond_to_server_request_error(
-                                    id,
-                                    -32603,
-                                    "sandboxed-sh: auth refresh not supported by client; \
-                                     codex must re-read $CODEX_HOME/auth.json",
-                                )
-                                .await
+                            match cfg.external_chatgpt_auth.as_ref() {
+                                Some(external_auth) => {
+                                    let previous_account_id = params
+                                        .get("previousAccountId")
+                                        .and_then(|value| value.as_str());
+                                    match crate::api::ai_providers::refresh_codex_oauth_account_for_app_server(
+                                        &external_auth.working_dir,
+                                        previous_account_id,
+                                        Some(&external_auth.chatgpt_account_id),
+                                    )
+                                    .await
+                                    {
+                                        Ok(account) => {
+                                            let result = serde_json::json!({
+                                                "accessToken": account.access_token,
+                                                "chatgptAccountId": account.chatgpt_account_id,
+                                                "chatgptPlanType": external_auth.chatgpt_plan_type,
+                                            });
+                                            session_arc.respond_to_server_request(id, result).await
+                                        }
+                                        Err(error) => {
+                                            session_arc
+                                                .respond_to_server_request_error(
+                                                    id,
+                                                    -32603,
+                                                    &format!(
+                                                        "sandboxed-sh: ChatGPT OAuth refresh failed: {}",
+                                                        error
+                                                    ),
+                                                )
+                                                .await
+                                        }
+                                    }
+                                }
+                                None => {
+                                    session_arc
+                                        .respond_to_server_request_error(
+                                            id,
+                                            -32603,
+                                            "sandboxed-sh: auth refresh requested without external ChatGPT OAuth context",
+                                        )
+                                        .await
+                                }
+                            }
                         } else {
                             let result = elicitation_auto_approve(&method);
                             session_arc.respond_to_server_request(id, result).await
@@ -457,7 +557,10 @@ async fn send_message_streaming_app_server(
                     break 'outer;
                 }
             };
-            if let Err(e) = new_session.initialize("sandboxed-sh", "1.2.0").await {
+            if let Err(e) = new_session
+                .initialize("sandboxed-sh", env!("CARGO_PKG_VERSION"))
+                .await
+            {
                 tracing::error!("codex app-server reconnect: initialize failed: {}", e);
                 stream_closed_unexpectedly = true;
                 break 'outer;
@@ -542,11 +645,56 @@ struct AppServerEventTranslator {
     /// `turn/started` for the same turn (codex re-emits on resume) doesn't
     /// double-count.
     counted_turn_ids: std::collections::HashSet<String>,
+    /// True while a goal-mode turn is still active. A goal can transition to
+    /// `complete` before the current turn emits its final assistant message;
+    /// ending immediately on the goal update drops that closing response.
+    goal_turn_active: bool,
+    /// Set after a terminal goal update (`complete` / `budgetLimited`). The
+    /// stream becomes terminal once the active turn completes.
+    goal_terminal_seen: bool,
 }
 
 struct TranslateOutcome {
     events: Vec<ExecutionEvent>,
     terminal: bool,
+}
+
+fn usage_tokens(usage: &serde_json::Value, keys: &[&str]) -> u64 {
+    keys.iter()
+        .find_map(|key| usage.get(*key).and_then(|v| v.as_u64()))
+        .unwrap_or(0)
+}
+
+fn codex_usage_from_turn_params(params: &serde_json::Value) -> Option<(u64, u64)> {
+    let turn = params.get("turn");
+    let usage = turn
+        .and_then(|turn| turn.get("tokenUsage").or_else(|| turn.get("usage")))
+        .or_else(|| params.get("tokenUsage"))
+        .or_else(|| params.get("usage"))?;
+
+    let input = usage_tokens(
+        usage,
+        &[
+            "inputTokens",
+            "input_tokens",
+            "promptTokens",
+            "prompt_tokens",
+            "totalInputTokens",
+            "total_input_tokens",
+        ],
+    );
+    let output = usage_tokens(
+        usage,
+        &[
+            "outputTokens",
+            "output_tokens",
+            "completionTokens",
+            "completion_tokens",
+            "totalOutputTokens",
+            "total_output_tokens",
+        ],
+    );
+    (input > 0 || output > 0).then_some((input, output))
 }
 
 impl AppServerEventTranslator {
@@ -577,7 +725,7 @@ impl AppServerEventTranslator {
                         .to_string();
                     let entry = self.delta_buffers.entry(item_id).or_default();
                     // Agent-message deltas are incremental tokens.
-                    fold_delta_into(entry, delta, DeltaSemantics::Incremental);
+                    fold_delta_into(entry, delta);
                     events.push(ExecutionEvent::TextDelta {
                         content: entry.clone(),
                     });
@@ -590,22 +738,23 @@ impl AppServerEventTranslator {
                         .and_then(|v| v.as_str())
                         .unwrap_or("__anon_reasoning")
                         .to_string();
-                    // The two reasoning sub-streams have different
-                    // semantics, observed empirically (PR #403 prod
-                    // smoke): `textDelta` is incremental,
-                    // `summaryTextDelta` is cumulative snapshot. They
-                    // get separate buffer keys to avoid one stream
-                    // contaminating the other.
-                    let (kind, semantics) = if method == "item/reasoning/summaryTextDelta" {
-                        ("summary", DeltaSemantics::CumulativeSnapshot)
+                    // Both reasoning sub-streams carry incremental token
+                    // deltas on current CLI builds (0.128.0 verified for
+                    // `summaryTextDelta`; treating it as a cumulative
+                    // snapshot collapsed summaries to single token chunks).
+                    // They keep separate buffer keys so one stream can't
+                    // contaminate the other.
+                    let kind = if method == "item/reasoning/summaryTextDelta" {
+                        "summary"
                     } else {
-                        ("reasoning", DeltaSemantics::Incremental)
+                        "reasoning"
                     };
                     let key = format!("{}:{}", kind, item_id);
-                    let entry = self.delta_buffers.entry(key).or_default();
-                    fold_delta_into(entry, delta, semantics);
+                    let entry = self.delta_buffers.entry(key.clone()).or_default();
+                    fold_delta_into(entry, delta);
                     events.push(ExecutionEvent::Thinking {
                         content: entry.clone(),
+                        item_id: Some(key),
                     });
                 }
             }
@@ -686,25 +835,13 @@ impl AppServerEventTranslator {
                         .unwrap_or("")
                         .to_string();
                     if !turn_id.is_empty() && !self.emitted_usage_for_turn.contains(&turn_id) {
-                        if let Some(usage) = turn.get("tokenUsage").or_else(|| turn.get("usage")) {
-                            let input = usage
-                                .get("inputTokens")
-                                .or_else(|| usage.get("input_tokens"))
-                                .or_else(|| usage.get("promptTokens"))
-                                .and_then(|v| v.as_u64())
-                                .unwrap_or(0);
-                            let output = usage
-                                .get("outputTokens")
-                                .or_else(|| usage.get("output_tokens"))
-                                .or_else(|| usage.get("completionTokens"))
-                                .and_then(|v| v.as_u64())
-                                .unwrap_or(0);
-                            if input > 0 || output > 0 {
-                                events.push(ExecutionEvent::Usage {
-                                    input_tokens: input,
-                                    output_tokens: output,
-                                });
-                            }
+                        if let Some((input_tokens, output_tokens)) =
+                            codex_usage_from_turn_params(params)
+                        {
+                            events.push(ExecutionEvent::Usage {
+                                input_tokens,
+                                output_tokens,
+                            });
                         }
                         self.emitted_usage_for_turn.insert(turn_id);
                     }
@@ -726,15 +863,22 @@ impl AppServerEventTranslator {
                             });
                             terminal = true;
                         }
-                        // For goal missions, both `interrupted` and
-                        // `completed` are non-terminal at the turn level —
-                        // codex's goals.rs may launch the next turn or emit
-                        // `thread/goal/updated` with a terminal status; we
-                        // wait for that signal instead of guessing.
+                        // For goal missions, turn completion is terminal only
+                        // after we have already seen a terminal goal status.
+                        // `thread/goal/updated {status: complete}` can arrive
+                        // before the current turn emits its closing assistant
+                        // message; waiting for turn completion keeps that
+                        // final response in the stream.
                         // For non-goal missions, the mission ends when its
                         // single turn ends (whether interrupted or completed).
                         "interrupted" | "completed" if !is_goal_mission => {
                             terminal = true;
+                        }
+                        "interrupted" | "completed" if is_goal_mission => {
+                            self.goal_turn_active = false;
+                            if self.goal_terminal_seen {
+                                terminal = true;
+                            }
                         }
                         _ => {}
                     }
@@ -748,6 +892,7 @@ impl AppServerEventTranslator {
             // automatically. For non-goal missions there's only ever one
             // turn, so a counter would be noise.
             "turn/started" if is_goal_mission => {
+                self.goal_turn_active = true;
                 let turn_id = params
                     .get("turn")
                     .and_then(|t| t.get("id"))
@@ -785,7 +930,10 @@ impl AppServerEventTranslator {
                         });
                     }
                     if status == "complete" || status == "budgetLimited" {
-                        terminal = true;
+                        self.goal_terminal_seen = true;
+                        if !self.goal_turn_active {
+                            terminal = true;
+                        }
                     }
                 }
             }
@@ -836,6 +984,8 @@ pub fn registry_entry() -> Arc<dyn Backend> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+    use std::collections::{HashMap, HashSet};
 
     #[test]
     fn parse_goal_prefix_detects_simple_goal() {
@@ -901,14 +1051,16 @@ mod tests {
     fn fold_delta_appends_incremental_tokens() {
         let mut buf = String::new();
         for tok in ["P", "O", "N", "G"] {
-            fold_delta_into(&mut buf, tok, DeltaSemantics::Incremental);
+            fold_delta_into(&mut buf, tok);
         }
         assert_eq!(buf, "PONG");
     }
 
     #[test]
     fn fold_delta_replaces_cumulative_snapshots() {
-        // Snapshot stream extending normally.
+        // Snapshot-shaped stream (each payload extends the previous one)
+        // must replace, not append — older app-server builds send full
+        // text-so-far through delta methods.
         let mut buf = String::new();
         for snapshot in [
             "The",
@@ -916,39 +1068,228 @@ mod tests {
             "The targeted Lean",
             "The targeted Lean module",
         ] {
-            fold_delta_into(&mut buf, snapshot, DeltaSemantics::CumulativeSnapshot);
+            fold_delta_into(&mut buf, snapshot);
         }
         assert_eq!(buf, "The targeted Lean module");
     }
 
     #[test]
-    fn fold_delta_cumulative_handles_stream_restart() {
-        // Codex sometimes restarts a summary draft mid-item: the
-        // existing buffer "Done with first draft." is followed by a
-        // fresh sequence beginning with "The". The new delta does NOT
-        // extend the buffer, but cumulative-snapshot semantics replace
-        // wholesale anyway — this is the regression that produced the
-        // 36x snowball "The saved goalThe saved goal isThe saved goal
-        // is active…" on prod.
-        let mut buf = String::from("Done with first draft.");
-        fold_delta_into(&mut buf, "The", DeltaSemantics::CumulativeSnapshot);
-        assert_eq!(buf, "The");
-    }
-
-    #[test]
-    fn fold_delta_cumulative_drops_echo() {
-        // Pure echo of an earlier substring should not shrink the buffer.
+    fn fold_delta_drops_echo() {
+        // Pure echo of an earlier prefix should not shrink the buffer.
         let mut buf = String::from("The targeted Lean");
-        fold_delta_into(&mut buf, "The targeted", DeltaSemantics::CumulativeSnapshot);
+        fold_delta_into(&mut buf, "The targeted");
         assert_eq!(buf, "The targeted Lean");
     }
 
     #[test]
     fn fold_delta_idempotent_on_repeated_snapshot() {
         let mut buf = String::new();
-        fold_delta_into(&mut buf, "stable", DeltaSemantics::CumulativeSnapshot);
-        fold_delta_into(&mut buf, "stable", DeltaSemantics::CumulativeSnapshot);
+        fold_delta_into(&mut buf, "stable");
+        fold_delta_into(&mut buf, "stable");
         assert_eq!(buf, "stable");
+    }
+
+    #[test]
+    fn fold_delta_accumulates_summary_token_deltas() {
+        // Regression for the truncated-thoughts bug (mission 2e8af5f7):
+        // `item/reasoning/summaryTextDelta` on CLI 0.128.0 streams token
+        // deltas; cumulative-snapshot replacement collapsed the summary to
+        // its longest single chunk. Token deltas must accumulate.
+        let mut buf = String::new();
+        for tok in [
+            "**Solving the riddle carefully**\n\nI",
+            "'m",
+            " working",
+            " through",
+            " the",
+            " sheep",
+            " puzzle.",
+        ] {
+            fold_delta_into(&mut buf, tok);
+        }
+        assert_eq!(
+            buf,
+            "**Solving the riddle carefully**\n\nI'm working through the sheep puzzle."
+        );
+    }
+
+    #[test]
+    fn fold_delta_still_appends_true_token_deltas() {
+        let mut buf = String::new();
+        fold_delta_into(&mut buf, "Hello ");
+        fold_delta_into(&mut buf, "world");
+        assert_eq!(buf, "Hello world");
+    }
+
+    #[test]
+    fn reasoning_thinking_events_carry_distinct_item_ids() {
+        // Regression for mission dbc8a7e9 seq 6651: the translator must
+        // tag each Thinking event with the per-item buffer key so the
+        // mission_runner can detect when codex moves to a new reasoning
+        // item and finalize the previous thought instead of concatenating
+        // unrelated cumulative snapshots into one buffer.
+        let mut translator = AppServerEventTranslator {
+            delta_buffers: HashMap::new(),
+            emitted_usage_for_turn: HashSet::new(),
+            counted_turn_ids: HashSet::new(),
+            goal_iteration: 0,
+            goal_objective: String::new(),
+            goal_turn_active: false,
+            goal_terminal_seen: false,
+        };
+
+        let notify = |item_id: &str, delta: &str| {
+            json!({
+                "itemId": item_id,
+                "delta": delta,
+            })
+        };
+
+        let collect = |events: Vec<ExecutionEvent>| -> Vec<(Option<String>, String)> {
+            events
+                .into_iter()
+                .filter_map(|e| match e {
+                    ExecutionEvent::Thinking { content, item_id } => Some((item_id, content)),
+                    _ => None,
+                })
+                .collect()
+        };
+
+        // Item A: cumulative summary snapshots.
+        let mut events = Vec::new();
+        events.extend(
+            translator
+                .handle_notification(
+                    "item/reasoning/summaryTextDelta",
+                    &notify("A", "The recovery log."),
+                    false,
+                )
+                .events,
+        );
+        events.extend(
+            translator
+                .handle_notification(
+                    "item/reasoning/summaryTextDelta",
+                    &notify("A", "The recovery log. Do not duplicate."),
+                    false,
+                )
+                .events,
+        );
+        // Item B: brand new reasoning, starts at "Work".
+        events.extend(
+            translator
+                .handle_notification(
+                    "item/reasoning/summaryTextDelta",
+                    &notify("B", "Work"),
+                    false,
+                )
+                .events,
+        );
+        events.extend(
+            translator
+                .handle_notification(
+                    "item/reasoning/summaryTextDelta",
+                    &notify("B", "Worktrees are ready"),
+                    false,
+                )
+                .events,
+        );
+
+        let thinkings = collect(events);
+        assert_eq!(thinkings.len(), 4);
+        // Item A's snapshots share an item_id.
+        assert_eq!(thinkings[0].0, Some("summary:A".to_string()));
+        assert_eq!(thinkings[1].0, Some("summary:A".to_string()));
+        // Item B's snapshots share a *different* item_id.
+        assert_eq!(thinkings[2].0, Some("summary:B".to_string()));
+        assert_eq!(thinkings[3].0, Some("summary:B".to_string()));
+        assert_ne!(thinkings[1].0, thinkings[2].0);
+        // Per-item contents are clean cumulative snapshots (the runner is
+        // free to REPLACE per item, no overlap merging required).
+        assert_eq!(thinkings[1].1, "The recovery log. Do not duplicate.");
+        assert_eq!(thinkings[3].1, "Worktrees are ready");
+    }
+
+    #[test]
+    fn codex_turn_completed_extracts_usage_aliases() {
+        let mut translator = AppServerEventTranslator {
+            delta_buffers: HashMap::new(),
+            emitted_usage_for_turn: HashSet::new(),
+            counted_turn_ids: HashSet::new(),
+            goal_iteration: 0,
+            goal_objective: String::new(),
+            goal_turn_active: false,
+            goal_terminal_seen: false,
+        };
+
+        let outcome = translator.handle_notification(
+            "turn/completed",
+            &json!({
+                "turn": {
+                    "id": "turn-1",
+                    "status": "completed"
+                },
+                "usage": {
+                    "total_input_tokens": 1234,
+                    "total_output_tokens": 56
+                }
+            }),
+            false,
+        );
+
+        assert!(outcome.events.iter().any(|event| matches!(
+            event,
+            ExecutionEvent::Usage {
+                input_tokens: 1234,
+                output_tokens: 56
+            }
+        )));
+    }
+
+    #[test]
+    fn goal_complete_waits_for_active_turn_completion() {
+        let mut translator = AppServerEventTranslator::default();
+
+        let started = translator.handle_notification(
+            "turn/started",
+            &json!({ "turn": { "id": "turn-1" } }),
+            true,
+        );
+        assert!(!started.terminal);
+
+        let complete = translator.handle_notification(
+            "thread/goal/updated",
+            &json!({
+                "goal": {
+                    "status": "complete",
+                    "objective": "finish the debug task"
+                }
+            }),
+            true,
+        );
+        assert!(!complete.terminal);
+        assert!(complete.events.iter().any(|event| matches!(
+            event,
+            ExecutionEvent::GoalStatus { status, .. } if status == "complete"
+        )));
+
+        let text = translator.handle_notification(
+            "item/agentMessage/delta",
+            &json!({ "itemId": "msg-1", "delta": "FINAL_RESPONSE_DEBUG_OK" }),
+            true,
+        );
+        assert!(!text.terminal);
+        assert!(text.events.iter().any(|event| matches!(
+            event,
+            ExecutionEvent::TextDelta { content } if content == "FINAL_RESPONSE_DEBUG_OK"
+        )));
+
+        let turn_completed = translator.handle_notification(
+            "turn/completed",
+            &json!({ "turn": { "id": "turn-1", "status": "completed" } }),
+            true,
+        );
+        assert!(turn_completed.terminal);
     }
 
     #[tokio::test]

@@ -105,6 +105,15 @@ pub struct Mission {
     pub first_viewed_at: Option<String>,
 }
 
+/// Aggregate mission counts by status.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MissionStatusCounts {
+    pub total: usize,
+    pub active: usize,
+    pub completed: usize,
+    pub failed: usize,
+}
+
 fn default_backend() -> String {
     "claudecode".to_string()
 }
@@ -133,6 +142,16 @@ pub struct StoredEvent {
     pub tool_name: Option<String>,
     pub content: String,
     pub metadata: serde_json::Value,
+}
+
+/// Persisted summary for one tool call across all of its stored events.
+#[derive(Debug, Clone, Default)]
+pub struct ToolCallSummary {
+    pub has_result: bool,
+    pub result_sequence: Option<i64>,
+    pub result_timestamp: Option<String>,
+    pub call_content_bytes: usize,
+    pub result_content_bytes: usize,
 }
 
 /// Aggregated AI token/cost usage for a single (normalized) model.
@@ -1070,6 +1089,9 @@ pub trait MissionStore: Send + Sync {
     /// List missions, ordered by updated_at descending.
     async fn list_missions(&self, limit: usize, offset: usize) -> Result<Vec<Mission>, String>;
 
+    /// Count missions by status without applying list pagination.
+    async fn count_missions_by_status(&self) -> Result<MissionStatusCounts, String>;
+
     /// Get a single mission by ID.
     async fn get_mission(&self, id: Uuid) -> Result<Option<Mission>, String>;
 
@@ -1328,6 +1350,39 @@ pub trait MissionStore: Send + Sync {
         Ok(vec![])
     }
 
+    /// Get all persisted events for a specific tool call, ordered by
+    /// sequence ASC. Used by lazy history hydration.
+    async fn get_events_for_tool_call(
+        &self,
+        mission_id: Uuid,
+        tool_call_id: &str,
+    ) -> Result<Vec<StoredEvent>, String> {
+        let _ = (mission_id, tool_call_id);
+        Ok(vec![])
+    }
+
+    /// Get the most recent distinct tool call ids for a mission, ordered by
+    /// their latest event sequence descending. Used to keep conversation
+    /// profile trace tails stable across paged event responses.
+    async fn get_recent_tool_call_ids(
+        &self,
+        mission_id: Uuid,
+        limit: usize,
+    ) -> Result<Vec<String>, String> {
+        let _ = (mission_id, limit);
+        Ok(vec![])
+    }
+
+    /// Get persisted summaries for specific tool calls.
+    async fn get_tool_call_summaries(
+        &self,
+        mission_id: Uuid,
+        tool_call_ids: &[String],
+    ) -> Result<HashMap<String, ToolCallSummary>, String> {
+        let _ = (mission_id, tool_call_ids);
+        Ok(HashMap::new())
+    }
+
     /// Count events for a mission, optionally filtered by type.
     async fn count_events(
         &self,
@@ -1353,6 +1408,22 @@ pub trait MissionStore: Send + Sync {
     async fn max_event_sequence(&self, mission_id: Uuid) -> Result<i64, String> {
         let _ = mission_id;
         Ok(0)
+    }
+
+    /// Sequence of the Nth-most-recent event whose type is in `anchor_types`
+    /// (e.g. the 10th-most-recent user/assistant message). Returns `None`
+    /// when the mission has fewer than `n` such events. Used to load a
+    /// *conversation-anchored* snapshot tail — everything from this sequence
+    /// to the head — instead of a raw event-count tail that, on tool-heavy
+    /// missions, would be dominated by tool calls and bury recent messages.
+    async fn nth_recent_event_sequence(
+        &self,
+        mission_id: Uuid,
+        anchor_types: &[&str],
+        n: usize,
+    ) -> Result<Option<i64>, String> {
+        let _ = (mission_id, anchor_types, n);
+        Ok(None)
     }
 
     /// Get total cost in cents across all missions.
@@ -1395,6 +1466,43 @@ pub trait MissionStore: Send + Sync {
     /// Aggregate AI usage per UTC hour. Buckets with no usage are omitted.
     /// Returned timestamps are in `YYYY-MM-DDTHH` form (no minutes/seconds).
     async fn get_usage_by_hour(
+        &self,
+        _since: Option<&str>,
+    ) -> Result<Vec<HourlyUsageStats>, String> {
+        Ok(Vec::new())
+    }
+
+    /// Record one OpenAI-compatible /v1 router request's token usage.
+    /// `model` should already be normalized (see `crate::cost::normalized_model`).
+    async fn record_proxy_usage(
+        &self,
+        _model: &str,
+        _input_tokens: u64,
+        _output_tokens: u64,
+        _cost_cents: u64,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// Aggregate /v1 router usage per model. Merged with mission usage by the
+    /// usage summary endpoint.
+    async fn get_proxy_usage_by_model(
+        &self,
+        _since: Option<&str>,
+    ) -> Result<Vec<ModelUsageStats>, String> {
+        Ok(Vec::new())
+    }
+
+    /// Aggregate /v1 router usage per UTC day.
+    async fn get_proxy_usage_by_day(
+        &self,
+        _since: Option<&str>,
+    ) -> Result<Vec<DailyUsageStats>, String> {
+        Ok(Vec::new())
+    }
+
+    /// Aggregate /v1 router usage per UTC hour (`YYYY-MM-DDTHH`).
+    async fn get_proxy_usage_by_hour(
         &self,
         _since: Option<&str>,
     ) -> Result<Vec<HourlyUsageStats>, String> {

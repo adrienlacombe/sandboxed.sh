@@ -9,12 +9,42 @@
 
 ## Backend Services (Thomas)
 
-Thomas's server runs two instances:
+Thomas's server runs two sandboxed.sh instances plus the Hermes assistant stack:
 
 | Service | Port | Domain | Binary |
 |---------|------|--------|--------|
 | `sandboxed-sh-prod` | 3000 | agent-backend.thomas.md | `/usr/local/bin/sandboxed-sh-prod` |
 | `sandboxed-sh-dev` | 3002 | agent-backend-dev.thomas.md | `/usr/local/bin/sandboxed-sh-dev` |
+| `hermes-assistant` | 8642 (loopback) | agent-backend.thomas.md `/hermes-remote` | `/usr/local/bin/hermes` (gateway) |
+| `hermes-dashboard` | 9130 (loopback) | agent-backend.thomas.md `/hermes-desktop` | `/usr/local/bin/hermes` (dashboard) |
+
+**Hermes endpoints** (nginx config in
+`/etc/nginx/sites-enabled/agent-backend.thomas.md` — NOT tracked in git):
+
+- `/hermes-remote` → the gateway's OpenAI-compatible API server (loopback 8642),
+  re-exposed by the sandboxed.sh backend itself (`hermes_remote_proxy` in
+  `src/api/system.rs`). `/v1/*` + SSE only, no WebSocket. Used for *split mode*
+  (a local Hermes sets `GATEWAY_PROXY_URL`/`GATEWAY_PROXY_KEY` and delegates
+  agent work). Key = `API_SERVER_KEY` in `/etc/sandboxed-sh/hermes-assistant.env`,
+  readable via `GET /api/system/hermes-assistant/remote`.
+- `/hermes-desktop` → the full Hermes dashboard backend (loopback 9130) for the
+  desktop app's **native Remote-gateway mode** (`/api/status` + `wss /api/ws`).
+  Unit: `/etc/systemd/system/hermes-dashboard.service` (`hermes dashboard
+  --no-open --host 127.0.0.1 --port 9130 --skip-build`, same `HERMES_HOME`
+  `/var/lib/hermes-assistant` as the gateway so sessions/memory are shared,
+  auth via `HERMES_DASHBOARD_SESSION_TOKEN` = same key, stub web dist at
+  `/var/lib/hermes-assistant/web_dist`). The nginx location pins
+  `Host 127.0.0.1:9130` (host-header check) and must NOT add `X-Forwarded-For`
+  (the WS gate requires a loopback peer).
+
+Hermes gotchas:
+
+- After a prod deploy, `systemctl restart hermes-assistant` so the gateway
+  respawns the freshly installed `/usr/local/bin/assistant-mcp`.
+- When testing the WS handshake with curl, force `--http1.1` — ALPN negotiates
+  h2, which has no `Upgrade` header, and the resulting 401 is a red herring.
+- When rotating the `hsk_` key, update `API_SERVER_KEY`,
+  `HERMES_DASHBOARD_SESSION_TOKEN`, and the desktop's `connection.json` together.
 
 ```bash
 # Production
@@ -175,8 +205,26 @@ auto-resumes from the backend but loses the in-flight turn's progress.
 Worse, an agent in a retry loop can chainsaw the host (the original
 incident: 5 deploys + 2 rollbacks in 90 minutes).
 
-The orchestrator MCP exposes a `deploy_sandboxed_sh` tool that hits the
-internal `/api/system/deploy` endpoint with the safety rails:
+The orchestrator MCP exposes a `deploy_sandboxed_sh` tool that hits an
+internal `/api/system/deploy` endpoint with safety rails.
+
+**Targeting rule:** `deploy_sandboxed_sh` deploys the backend API it is sent
+to. If `target_environment` is omitted, the tool uses the API that launched the
+mission. A prod mission therefore deploys prod by default; a dev mission deploys
+dev by default. To deploy a different Sandboxed.sh environment, set
+`target_environment` explicitly:
+
+| Target | Tool argument | API URL | Service restarted |
+|--------|---------------|---------|-------------------|
+| Current mission API | omit `target_environment` | mission `API_URL` | current API's service |
+| Production | `"prod"` | `http://127.0.0.1:3000` | `sandboxed-sh-prod.service` |
+| Development | `"dev"` | `http://127.0.0.1:3002` | `sandboxed-sh-dev.service` |
+
+The backend also receives an `expected_service` guard from the MCP and refuses
+with HTTP 409 if the request reaches the wrong service. This prevents a prod
+mission that intends to test dev from accidentally deploying prod.
+
+Safety rails:
 
 - **Self-protection** — refuses by default if the calling mission lives on
   the service being restarted. Override with `force=true` only if you
@@ -193,6 +241,7 @@ From inside an agent that has the orchestrator MCP, the call shape is:
 {
   "tool": "deploy_sandboxed_sh",
   "arguments": {
+    "target_environment": "dev",  // optional; "dev" or "prod"; omit for current API
     "git_ref": "origin/master",   // optional; omit to use current checkout
     "skip_build": false,          // optional; true if you built elsewhere
     "force": false                // override safety rails
@@ -210,9 +259,22 @@ Successful response:
 }
 ```
 
-A refusal (HTTP 409 self-target or 429 debounce) surfaces a message that
-explains the override knob, so an agent can decide whether to retry with
-`force=true` or back off.
+A refusal surfaces a message that explains the next step:
+
+- HTTP 409 target mismatch: the request reached the wrong service/API URL.
+- HTTP 409 self-target: pass `force=true` only if killing the caller is acceptable.
+- HTTP 429 debounce: wait or pass `force=true` for an urgent deploy.
+
+For a dev-only restart without rebuilding, use the explicit service command:
+
+```bash
+ssh -i ~/.ssh/cursor root@95.216.112.253 "systemctl restart sandboxed-sh-dev"
+```
+
+Do not call `deploy_sandboxed_sh` from a prod mission unless you intend to
+deploy a Sandboxed.sh backend. For dev testing from prod, prefer
+`target_environment: "dev"` so the request goes to the dev API and carries the
+`sandboxed-sh-dev.service` guard.
 
 ## Locking down the SSH backdoor
 
@@ -374,7 +436,7 @@ Then restart the backend. Workspace-scoped MCPs must be in PATH for both host wo
 
 **Config profile not being applied:** Check that:
 1. The configs exist in the **correct library path** (`.sandboxed-sh/library/` for production, not `.openagent/library/` which was the old path)
-2. The library has the `configs/<profile>/.opencode/oh-my-opencode.json` file
+2. The library has the expected `configs/<profile>/.opencode/` files
 3. Pull latest library: `cd ~/.sandboxed-sh/library && git pull`
 
 **Missions not using correct settings:**
@@ -382,7 +444,7 @@ Then restart the backend. Workspace-scoped MCPs must be in PATH for both host wo
 **Missions stuck:** Look for running CLI processes:
 
 ```bash
-ps aux | grep -E "claude|oh-my-opencode"
+ps aux | grep -E "claude|opencode"
 machinectl list   # For container workspaces
 ```
 

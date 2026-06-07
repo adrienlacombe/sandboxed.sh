@@ -37,19 +37,45 @@ private struct ControlDiagnosticsOverlay: View {
     let mergeCount: Int
     let renderCount: Int
     let droppedEvents: Int
+    let streamDiagnostics: [APIService.ControlStreamDiagnostic]
+    let performanceRecords: [ControlPerformanceRecord]
+    let hotRenderCounts: [(name: String, count: Int)]
 
     var body: some View {
+        let latestStream = streamDiagnostics.last
+        let latestError = streamDiagnostics.reversed().first { $0.phase == .error }
         VStack(alignment: .leading, spacing: 3) {
             Text("control diagnostics")
                 .font(.caption2.weight(.semibold))
                 .foregroundStyle(Theme.textMuted)
             diagnosticRow("mission", missionId.map { String($0.prefix(8)) } ?? "none")
-            diagnosticRow("transport", "\(transport.lowercased()) · \(streamScope)")
+            diagnosticRow("transport", "\(latestStream?.transport.rawValue ?? transport.lowercased()) · \(streamScope)")
+            diagnosticRow("stream", latestStream?.phase.rawValue ?? "?")
+            if let latestError {
+                diagnosticRow(
+                    "last err",
+                    latestError.status.map { "http \($0)" } ?? String((latestError.error ?? "?").prefix(18)),
+                    warning: true
+                )
+            }
             diagnosticRow("max seq", maxSequence.map(String.init) ?? "?")
             diagnosticRow("cache", cacheHit.map { $0 ? "hit" : "miss" } ?? "?")
             diagnosticRow("merge", "\(mergeCount) ev")
             diagnosticRow("render", "\(renderCount) rows")
             diagnosticRow("drops", "\(droppedEvents)", warning: droppedEvents > 0)
+            if let slowest = performanceRecords.max(by: { $0.durationMilliseconds < $1.durationMilliseconds }) {
+                Divider()
+                    .overlay(Theme.border)
+                diagnosticRow("slowest", slowest.name)
+                diagnosticRow("time", slowest.compactDuration, warning: slowest.durationMilliseconds >= 16)
+            }
+            if !hotRenderCounts.isEmpty {
+                Divider()
+                    .overlay(Theme.border)
+                ForEach(hotRenderCounts.prefix(3), id: \.name) { item in
+                    diagnosticRow(item.name, "\(item.count)x", warning: item.count > renderCount * 2 && renderCount > 0)
+                }
+            }
         }
         .font(.caption2.monospacedDigit())
         .padding(8)
@@ -79,11 +105,20 @@ struct ControlView: View {
         var updatedAt: Date
     }
 
+    private struct PendingSendEntry: Codable, Equatable {
+        let id: String
+        let missionId: String?
+        let content: String
+        let createdAt: Date
+    }
+
     private static let draftTextKey = "control_draft_text"
     private static let missionDraftsKey = "control_mission_drafts_v1"
     private static let lastMissionIdKey = "control_last_mission_id"
+    private static let pendingSendsKey = "control_pending_sends_v1"
     private static let maxDraftCacheBytes = 64 * 1_024
     private static let maxDraftCacheEntries = 50
+    private static let maxStreamDiagnostics = 80
 
     @State private var messages: [ChatMessage] = []
     @State private var inputText = ControlView.loadGlobalDraftText()
@@ -96,10 +131,18 @@ struct ControlView: View {
     @State private var pendingSendCount = 0
     @State private var queuedItems: [QueuedMessage] = []
     @State private var showQueueSheet = false
+    /// Bumped on every local queue mutation (remove / clear). In-flight
+    /// `getQueue()` responses captured under an older generation are
+    /// discarded — they may still contain a just-deleted message and would
+    /// resurrect it as a ghost row.
+    @State private var queueMutationGeneration = 0
     @State private var currentMission: Mission?
     @State private var viewingMission: Mission?
     @State private var isLoading = true
     @State private var streamTask: Task<Void, Never>?
+    @State private var streamGeneration = 0
+    @State private var latestStreamSeq: Int64?
+    @State private var streamDiagnostics: [APIService.ControlStreamDiagnostic] = []
     @State private var showMissionMenu = false
     /// Monotonic counter — each increment is a request to scroll to the bottom.
     /// Counter rather than a Bool because the conversation `ScrollView` is
@@ -142,6 +185,8 @@ struct ControlView: View {
     @State private var controlCacheStale = false
     @State private var controlMergeCount = 0
     @State private var controlDroppedEvents = 0
+    @State private var controlPerformanceRecords: [ControlPerformanceRecord] = []
+    @State private var controlHotRenderCounts: [(name: String, count: Int)] = []
     @AppStorage("control_debug_perf") private var showControlDiagnostics = false
 
     /// Per-mission high-water mark for `sequence`. When non-nil, reload paths
@@ -182,6 +227,7 @@ struct ControlView: View {
 
     // Thoughts panel state
     @State private var showThoughts = false
+    @State private var showAskSheet = false
     @State private var textOpBuffers: [String: String] = [:]
 
     // Tool grouping state - track which groups are expanded
@@ -212,6 +258,10 @@ struct ControlView: View {
     private let api = APIService.shared
     private let nav = NavigationState.shared
     private let bottomAnchorId = "bottom-anchor"
+
+    private var diagnostics: ControlPerformanceDiagnostics {
+        ControlPerformanceDiagnostics.shared
+    }
     
     var body: some View {
         bodyContent
@@ -239,7 +289,14 @@ struct ControlView: View {
         .onChange(of: inputText) { _, newText in
             scheduleDraftSave(newText)
         }
+        .onChange(of: showControlDiagnostics) { _, enabled in
+            if enabled {
+                diagnostics.reset()
+                updateControlPerformanceSnapshot()
+            }
+        }
         .onDisappear {
+            networkMonitor.noteStreamIdle()
             streamTask?.cancel()
             connectionState = .disconnected
             reconnectAttempt = 0
@@ -260,6 +317,21 @@ struct ControlView: View {
                 .presentationDetents([.medium, .large])
                 .presentationDragIndicator(.visible)
                 .presentationBackgroundInteraction(.enabled(upThrough: .medium))
+        }
+        .sheet(isPresented: $showAskSheet) {
+            if let missionId = viewingMission?.id ?? currentMission?.id {
+                AskSheet(
+                    missionId: missionId,
+                    onSendToAgent: { text in
+                        inputText = inputText.isEmpty ? text : inputText + "\n\n" + text
+                        showAskSheet = false
+                    },
+                    onDismiss: { showAskSheet = false }
+                )
+                .presentationDetents([.medium, .large])
+                .presentationDragIndicator(.visible)
+                .presentationBackgroundInteraction(.enabled(upThrough: .medium))
+            }
         }
         .sheet(isPresented: $showWorkerSheet) {
             WorkerSheetView(workers: childMissions, runningWorkers: runningMissions)
@@ -449,6 +521,14 @@ struct ControlView: View {
                     .foregroundStyle(
                         messages.contains(where: { $0.isThinking }) ? Theme.accent : Theme.textSecondary
                     )
+            }
+            Button {
+                showAskSheet = true
+                HapticService.lightTap()
+            } label: {
+                Image(systemName: "sparkles")
+                    .font(.system(size: 14))
+                    .foregroundStyle(Color.cyan)
             }
             if !childMissions.isEmpty {
                 Button {
@@ -678,13 +758,22 @@ struct ControlView: View {
                 cacheHit: controlCacheHit,
                 mergeCount: controlMergeCount,
                 renderCount: groupedItems.count,
-                droppedEvents: controlDroppedEvents
+                droppedEvents: controlDroppedEvents,
+                streamDiagnostics: streamDiagnostics,
+                performanceRecords: controlPerformanceRecords,
+                hotRenderCounts: controlHotRenderCounts
             )
             .padding(.top, 8)
             .padding(.trailing, 8)
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
             .allowsHitTesting(false)
         }
+    }
+
+    private func updateControlPerformanceSnapshot() {
+        guard showControlDiagnostics else { return }
+        controlPerformanceRecords = diagnostics.recentRecords
+        controlHotRenderCounts = diagnostics.hotRenderCounts
     }
 
     /// Main vertical stack: connection banner, optional stale-cache pill,
@@ -768,9 +857,11 @@ struct ControlView: View {
         saveDraft(inputText, missionId: oldId)
         UserDefaults.standard.set(newId, forKey: Self.lastMissionIdKey)
         inputText = loadDraft(missionId: newId)
+        networkMonitor.noteStreamIdle()
         streamTask?.cancel()
         connectionState = .disconnected
         reconnectAttempt = 0
+        latestStreamSeq = nil
         startStreaming()
     }
 
@@ -790,6 +881,7 @@ struct ControlView: View {
     /// SwiftUI type-checker doesn't OOM on the long modifier chain.
     private func handleScenePhaseChange(from oldPhase: ScenePhase, to newPhase: ScenePhase) {
         if newPhase != .active {
+            networkMonitor.setSceneActive(false)
             // Save draft text when leaving foreground. This is the
             // synchronous flush path — the debounced .onChange in
             // inputText handles the steady-state case, but
@@ -799,6 +891,7 @@ struct ControlView: View {
             saveCurrentDraft(inputText)
         }
         guard oldPhase != .active && newPhase == .active else { return }
+        networkMonitor.setSceneActive(true)
         // If the SSE is already reconnecting (or its inactivity watchdog
         // is about to fire), the reconnect path will call
         // resumeMissionAfterReconnect — duplicating that work here causes
@@ -810,11 +903,37 @@ struct ControlView: View {
         case .reconnecting: sseIsRecovering = true
         default: sseIsRecovering = false
         }
+        let streamIsTerminalBadState: Bool
+        switch connectionState {
+        case .authExpired, .invalidConfiguration:
+            streamIsTerminalBadState = true
+        default:
+            streamIsTerminalBadState = false
+        }
         Task {
+            guard !streamIsTerminalBadState else { return }
             if !sseIsRecovering, let missionId = viewingMissionId {
-                await reloadMissionFromServer(id: missionId)
+                if !shouldSkipForegroundReload(missionId: missionId) {
+                    await reloadMissionFromServer(id: missionId)
+                }
             }
             await refreshRunningMissions()
+        }
+    }
+
+    private func shouldSkipForegroundReload(missionId: String) -> Bool {
+        guard networkMonitor.isStreamFresh(maxAge: NetworkMonitor.staleAfter * 2),
+              let latestStreamSeq,
+              let knownSeq = missionMaxSeq[missionId] else {
+            return false
+        }
+        return latestStreamSeq <= knownSeq
+    }
+
+    private func recordStreamDiagnostic(_ diagnostic: APIService.ControlStreamDiagnostic) {
+        streamDiagnostics.append(diagnostic)
+        if streamDiagnostics.count > Self.maxStreamDiagnostics {
+            streamDiagnostics.removeFirst(streamDiagnostics.count - Self.maxStreamDiagnostics)
         }
     }
 
@@ -918,25 +1037,13 @@ struct ControlView: View {
                         .disabled(isLoadingEarlier)
                     }
 
-                    ForEach(groupedItems) { item in
-                        switch item {
-                        case .single(let message):
-                            MessageBubble(
-                                message: message,
-                                isCopied: copiedMessageId == message.id,
-                                onCopy: { copyMessage(message) },
-                                onRetry: message.sendState.isFailed ? { retryFailedMessage(message) } : nil
-                            )
-                            .id(message.id)
-                        case .toolGroup(let groupId, let tools):
-                            ToolGroupView(
-                                groupId: groupId,
-                                tools: tools,
-                                expandedGroups: $expandedToolGroups
-                            )
-                            .id(item.id)
-                        }
-                    }
+                    ConversationRowsView(
+                        groupedItems: groupedItems,
+                        copiedMessageId: copiedMessageId,
+                        expandedToolGroups: $expandedToolGroups,
+                        onCopy: copyMessage,
+                        onRetry: retryFailedMessage
+                    )
 
                     // Show working indicator after messages when this mission is running but no active streaming item
                     if viewingMissionIsRunning && !hasActiveStreamingItem {
@@ -1023,6 +1130,7 @@ struct ControlView: View {
                 }
             }
             .environment(\.missionFileContext, inlineImageContext)
+            .environment(\.controlPerformanceDiagnosticsEnabled, showControlDiagnostics)
         }
     }
 
@@ -1080,7 +1188,14 @@ struct ControlView: View {
     }
 
     private func recomputeGroupedItems() {
-        groupedItems = Self.buildGroupedItems(from: messages)
+        groupedItems = diagnostics.measure(
+            "control.group_messages",
+            detail: viewingMissionId ?? "none",
+            count: messages.count
+        ) {
+            Self.buildGroupedItems(from: messages)
+        }
+        updateControlPerformanceSnapshot()
     }
 
     /// Check if the currently viewed mission is running (not just any mission)
@@ -1621,6 +1736,51 @@ struct ControlView: View {
         }
     }
 
+    // MARK: - Pending Send Cache
+
+    private static func loadPendingSends() -> [PendingSendEntry] {
+        guard let data = UserDefaults.standard.data(forKey: pendingSendsKey),
+              let entries = try? JSONDecoder().decode([PendingSendEntry].self, from: data) else {
+            return []
+        }
+        return entries
+    }
+
+    private static func storePendingSends(_ entries: [PendingSendEntry]) {
+        if let data = try? JSONEncoder().encode(entries), !entries.isEmpty {
+            UserDefaults.standard.set(data, forKey: pendingSendsKey)
+        } else {
+            UserDefaults.standard.removeObject(forKey: pendingSendsKey)
+        }
+    }
+
+    private func rememberPendingSend(id: String, missionId: String?, content: String) {
+        var entries = Self.loadPendingSends()
+        entries.removeAll { $0.id == id }
+        entries.append(PendingSendEntry(id: id, missionId: missionId, content: content, createdAt: Date()))
+        Self.storePendingSends(entries)
+    }
+
+    private func forgetPendingSend(id: String) {
+        var entries = Self.loadPendingSends()
+        entries.removeAll { $0.id == id }
+        Self.storePendingSends(entries)
+    }
+
+    private func restorePendingSends(for missionId: String?) {
+        let entries = Self.loadPendingSends().filter { $0.missionId == missionId }
+        guard !entries.isEmpty else { return }
+        for entry in entries where !messages.contains(where: { $0.id == entry.id }) {
+            messages.append(ChatMessage(
+                id: entry.id,
+                type: .user,
+                content: entry.content,
+                sendState: .failed(reason: "Not sent before the app closed")
+            ))
+        }
+        recomputeGroupedItems()
+    }
+
     // Cache both mission metadata and events for consistent display
     private struct CachedMissionData: Codable {
         let mission: Mission
@@ -1628,8 +1788,13 @@ struct ControlView: View {
         let cachedAt: Date
     }
 
+    private struct CachedMissionDataBox: @unchecked Sendable {
+        let value: CachedMissionData
+    }
+
     private static let maxCachedMissions = 10  // Limit cache size
     private static let maxCachedEventsPerMission = 1_500
+    private static let maxSynchronousCacheBytes = 256 * 1_024
     /// Legacy key prefix used when mission blobs lived in UserDefaults. Kept
     /// only so the one-time migration below can purge them on first launch
     /// after upgrade — every payload bloats cfprefsd's in-memory plist.
@@ -1803,12 +1968,8 @@ struct ControlView: View {
     }
 
     private func loadCachedMissionData(_ missionId: String) -> CachedMissionData? {
-        // Synchronous read on the call site (cold start) — the file is
-        // bounded by `loadEarlierPageLimit` * StoredEvent size (~few MB
-        // worst case) and decoding it on @MainActor is unavoidable here
-        // because the caller needs the result immediately to render the
-        // first frame. Subsequent caches written in the background.
         guard let url = Self.cacheFileURL(missionId: missionId),
+              Self.cacheFileSize(url: url) <= Self.maxSynchronousCacheBytes,
               let data = try? Data(contentsOf: url),
               let cached = try? JSONDecoder().decode(CachedMissionData.self, from: data) else {
             return nil
@@ -1821,6 +1982,39 @@ struct ControlView: View {
         }
 
         return cached
+    }
+
+    private func loadCachedMissionDataAsync(_ missionId: String) async -> CachedMissionData? {
+        guard let url = Self.cacheFileURL(missionId: missionId) else { return nil }
+        let box = try? await Task.detached(priority: .userInitiated) {
+            let data = try Data(contentsOf: url)
+            let cached = try JSONDecoder().decode(CachedMissionData.self, from: data)
+            return CachedMissionDataBox(value: cached)
+        }.value
+        guard let cached = box?.value else { return nil }
+
+        if var cachedKeys = UserDefaults.standard.stringArray(forKey: Self.cacheKeysKey) {
+            cachedKeys.removeAll { $0 == missionId }
+            cachedKeys.append(missionId)
+            UserDefaults.standard.set(cachedKeys, forKey: Self.cacheKeysKey)
+        }
+        return cached
+    }
+
+    private func scheduleLargeCachedMissionLoad(id: String) {
+        guard let url = Self.cacheFileURL(missionId: id),
+              Self.cacheFileSize(url: url) > Self.maxSynchronousCacheBytes else { return }
+        Task {
+            guard let cached = await loadCachedMissionDataAsync(id) else { return }
+            guard viewingMissionId == id else { return }
+            let cachedMaxSeq = cached.events.compactMap(\.sequence).max() ?? 0
+            if let currentMaxSeq = missionMaxSeq[id], currentMaxSeq >= cachedMaxSeq {
+                return
+            }
+            controlCacheHit = true
+            controlCacheStale = false
+            applyViewingMissionWithEvents(cached.mission, events: cached.events)
+        }
     }
 
     private func removeMissionFromCache(_ missionId: String) {
@@ -1856,6 +2050,10 @@ struct ControlView: View {
         return dir.appendingPathComponent("\(safeId).json", isDirectory: false)
     }
 
+    nonisolated private static func cacheFileSize(url: URL) -> Int {
+        (try? url.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0
+    }
+
     nonisolated private static func writeCachedMissionFile(missionId: String, data: Data) throws {
         guard let url = cacheFileURL(missionId: missionId) else { return }
         // Atomic write — partial files left after a crash would fail to
@@ -1886,6 +2084,7 @@ struct ControlView: View {
                 content: entry.content
             )
         }
+        restorePendingSends(for: mission.id)
         recomputeGroupedItems()
 
         if scrollToBottom {
@@ -1893,6 +2092,68 @@ struct ControlView: View {
             scrollToBottomTick += 1
         }
         clearLoadingHistoryAfterRender()
+    }
+
+    private func replayedGoalInfo(for mission: Mission, events: [StoredEvent]) -> GoalPillInfo? {
+        guard mission.goalMode else { return nil }
+
+        var replayed: GoalPillInfo? = GoalPillInfo(
+            iteration: 0,
+            status: "active",
+            objective: mission.goalObjective ?? ""
+        )
+
+        for event in events {
+            switch event.eventType {
+            case "goal_iteration":
+                let metadata = event.metadata.mapValues(\.value)
+                let iteration = intValue(metadata["iteration"]) ?? replayed?.iteration ?? 0
+                let eventObjective = event.content.trimmingCharacters(in: .whitespacesAndNewlines)
+                let objective =
+                    metadata["objective"] as? String ??
+                    (!eventObjective.isEmpty ? eventObjective : nil) ??
+                    replayed?.objective ??
+                    mission.goalObjective ??
+                    ""
+                replayed = GoalPillInfo(
+                    iteration: iteration,
+                    status: replayed?.status ?? "active",
+                    objective: objective
+                )
+
+            case "goal_status":
+                let metadata = event.metadata.mapValues(\.value)
+                let status = metadata["status"] as? String ?? event.content
+                let objective =
+                    metadata["objective"] as? String ??
+                    replayed?.objective ??
+                    mission.goalObjective ??
+                    ""
+                switch status {
+                case "complete", "cleared", "budgetLimited":
+                    replayed = nil
+                default:
+                    replayed = GoalPillInfo(
+                        iteration: replayed?.iteration ?? 0,
+                        status: status,
+                        objective: objective
+                    )
+                }
+
+            default:
+                continue
+            }
+        }
+
+        return replayed
+    }
+
+    private func intValue(_ value: Any?) -> Int? {
+        if let int = value as? Int { return int }
+        if let int64 = value as? Int64 { return Int(int64) }
+        if let double = value as? Double { return Int(double) }
+        if let string = value as? String { return Int(string) }
+        return nil
     }
 
     private func rememberMissionEvents(_ events: [StoredEvent], for missionId: String) -> [StoredEvent] {
@@ -1930,56 +2191,47 @@ struct ControlView: View {
     }
 
     private func applyViewingMissionWithEvents(_ mission: Mission, events: [StoredEvent], scrollToBottom: Bool = true) {
-        isLoadingHistory = true  // Suppress animated auto-scroll during history load
+        diagnostics.measure(
+            "control.apply_snapshot",
+            detail: mission.id,
+            count: events.count
+        ) {
+            isLoadingHistory = true  // Suppress animated auto-scroll during history load
 
-        viewingMission = mission
-        viewingMissionId = mission.id
-        goalInfo = mission.goalMode
-            ? GoalPillInfo(iteration: goalInfo?.iteration ?? 0, status: "active", objective: mission.goalObjective ?? "")
-            : nil
+            viewingMission = mission
+            viewingMissionId = mission.id
 
-        // Ensure deterministic replay order in case the backend returns unsorted results
-        let orderedEvents = rememberMissionEvents(events, for: mission.id)
-
-        // Track total event count for pagination
-        loadedEventCount = orderedEvents.count
-        controlMergeCount = orderedEvents.count
-
-        // Clear and replay all events to rebuild message history
-        messages.removeAll()
-
-        for event in orderedEvents {
-            var data: [String: Any] = [:]
-
-            // Add metadata first (lower priority)
-            for (key, value) in event.metadata {
-                data[key] = value.value
+            // Ensure deterministic replay order in case the backend returns unsorted results
+            let orderedEvents = diagnostics.measure(
+                "control.sort_remember_events",
+                detail: mission.id,
+                count: events.count
+            ) {
+                rememberMissionEvents(events, for: mission.id)
             }
 
-            // Add core fields last (higher priority - these should never be overwritten)
-            data["mission_id"] = event.missionId
-            data["content"] = event.content
-            if event.eventType == "text_op",
-               let jsonData = event.content.data(using: .utf8),
-               let ops = try? JSONSerialization.jsonObject(with: jsonData) {
-                data["ops"] = ops
-            }
+            // Track total event count for pagination
+            loadedEventCount = orderedEvents.count
+            controlMergeCount = orderedEvents.count
+            goalInfo = replayedGoalInfo(for: mission, events: orderedEvents)
 
-            if let eventId = event.eventId {
-                data["id"] = eventId
-            }
-            if let toolCallId = event.toolCallId {
-                data["tool_call_id"] = toolCallId
-            }
-            if let toolName = event.toolName {
-                data["name"] = toolName
-            }
+            // Clear and replay all events to rebuild message history
+            messages.removeAll(keepingCapacity: true)
 
-            handleStreamEvent(type: event.eventType, data: data, isHistoricalReplay: true)
+            diagnostics.measure(
+                "control.replay_events",
+                detail: mission.id,
+                count: orderedEvents.count
+            ) {
+                let replay = ChatHistoryReducer.reduceWithState(events: orderedEvents, mission: mission)
+                messages = replay.messages
+                textOpBuffers = replay.textOpBuffers
+            }
+            restorePendingSends(for: mission.id)
+
+            // Recompute grouped items once after all events are processed
+            recomputeGroupedItems()
         }
-
-        // Recompute grouped items once after all events are processed
-        recomputeGroupedItems()
 
         if scrollToBottom {
             shouldScrollImmediately = true
@@ -2015,34 +2267,43 @@ struct ControlView: View {
     private func applyDeltaEvents(_ events: [StoredEvent]) {
         guard !events.isEmpty else { return }
 
-        let orderedEvents = events.sorted { lhs, rhs in
-            if lhs.sequence != rhs.sequence { return lhs.sequence < rhs.sequence }
-            if lhs.timestamp != rhs.timestamp { return lhs.timestamp < rhs.timestamp }
-            return lhs.id < rhs.id
-        }
-
-        for event in orderedEvents {
-            var data: [String: Any] = [:]
-            for (key, value) in event.metadata {
-                data[key] = value.value
+        diagnostics.measure(
+            "control.apply_delta",
+            detail: viewingMissionId ?? "none",
+            count: events.count
+        ) {
+            let orderedEvents = events.sorted { lhs, rhs in
+                if lhs.sequence != rhs.sequence { return lhs.sequence < rhs.sequence }
+                if lhs.timestamp != rhs.timestamp { return lhs.timestamp < rhs.timestamp }
+                return lhs.id < rhs.id
             }
-            data["mission_id"] = event.missionId
-            data["content"] = event.content
-            if event.eventType == "text_op",
-               let jsonData = event.content.data(using: .utf8),
-               let ops = try? JSONSerialization.jsonObject(with: jsonData) {
-                data["ops"] = ops
+
+            for event in orderedEvents {
+                handleStreamEvent(type: event.eventType, data: eventDataForReplay(event), isHistoricalReplay: true)
             }
-            if let eventId = event.eventId { data["id"] = eventId }
-            if let toolCallId = event.toolCallId { data["tool_call_id"] = toolCallId }
-            if let toolName = event.toolName { data["name"] = toolName }
 
-            handleStreamEvent(type: event.eventType, data: data, isHistoricalReplay: true)
+            loadedEventCount += orderedEvents.count
+            controlMergeCount = orderedEvents.count
+            recomputeGroupedItems()
         }
+    }
 
-        loadedEventCount += orderedEvents.count
-        controlMergeCount = orderedEvents.count
-        recomputeGroupedItems()
+    private func eventDataForReplay(_ event: StoredEvent) -> [String: Any] {
+        var data: [String: Any] = [:]
+        for (key, value) in event.metadata {
+            data[key] = value.value
+        }
+        data["mission_id"] = event.missionId
+        data["content"] = event.content
+        if event.eventType == "text_op",
+           let jsonData = event.content.data(using: .utf8),
+           let ops = try? JSONSerialization.jsonObject(with: jsonData) {
+            data["ops"] = ops
+        }
+        if let eventId = event.eventId { data["id"] = eventId }
+        if let toolCallId = event.toolCallId { data["tool_call_id"] = toolCallId }
+        if let toolName = event.toolName { data["name"] = toolName }
+        return data
     }
 
     /// Decide what to load on cold start. The previous code did
@@ -2078,6 +2339,9 @@ struct ControlView: View {
             hasCache = false
             if updateViewing {
                 controlCacheHit = false
+                if let currentId = currentMission?.id ?? viewingMissionId {
+                    scheduleLargeCachedMissionLoad(id: currentId)
+                }
             }
         }
 
@@ -2094,7 +2358,12 @@ struct ControlView: View {
                 // Fetch events for event-based display
                 if updateViewing || viewingMissionId == nil || viewingMissionId == mission.id {
                     do {
-                        let snapshot = try await api.getMissionSnapshot(id: mission.id)
+                        let snapshot = try await diagnostics.measureAsync(
+                            "control.fetch_current_snapshot",
+                            detail: mission.id
+                        ) {
+                            try await api.getMissionSnapshot(id: mission.id)
+                        }
                         let events = snapshot.events
                         controlCacheHit = hasCache
 
@@ -2130,6 +2399,11 @@ struct ControlView: View {
     private func loadMission(id: String) async {
         // Set target immediately for race condition tracking
         fetchingMissionId = id
+        defer {
+            if fetchingMissionId == id {
+                fetchingMissionId = nil
+            }
+        }
         let previousViewingMission = viewingMission
         let previousViewingId = viewingMissionId
         viewingMissionId = id
@@ -2154,6 +2428,7 @@ struct ControlView: View {
         } else {
             hasCache = false
             controlCacheHit = false
+            scheduleLargeCachedMissionLoad(id: id)
         }
 
         // Only show loading state if we don't have cached data to display
@@ -2162,7 +2437,12 @@ struct ControlView: View {
         }
 
         do {
-            let snapshot = try await api.getMissionSnapshot(id: id)
+            let snapshot = try await diagnostics.measureAsync(
+                "control.fetch_snapshot",
+                detail: id
+            ) {
+                try await api.getMissionSnapshot(id: id)
+            }
             let mission = snapshot.mission
 
             // Race condition guard: only update if this is still the mission we want
@@ -2224,12 +2504,17 @@ struct ControlView: View {
         defer { isLoadingEarlier = false }
 
         do {
-            let olderEvents = try await api.getMissionEvents(
-                id: missionId,
-                types: historyEventTypes,
-                limit: Self.loadEarlierPageLimit,
-                beforeSeq: missionMinSeq[missionId]
-            )
+            let olderEvents = try await diagnostics.measureAsync(
+                "control.fetch_earlier",
+                detail: missionId
+            ) {
+                try await api.getMissionEvents(
+                    id: missionId,
+                    types: historyEventTypes,
+                    limit: Self.loadEarlierPageLimit,
+                    beforeSeq: missionMinSeq[missionId]
+                )
+            }
             guard viewingMissionId == missionId else { return }
 
             if !olderEvents.isEmpty, let mission = viewingMission {
@@ -2264,33 +2549,89 @@ struct ControlView: View {
     /// (post SSE reconnect) and `reloadMissionFromServer` (post scene-phase active).
     /// Caller is responsible for the fallback path when this returns anything
     /// other than `.applied`.
+    /// Safety cap on the number of pages a single delta-resume will drain
+    /// (50 * 5000 = 250k events). Prevents an unbounded loop on a pathological
+    /// mission while still catching up multi-day backlogs in one pass.
+    static let deltaResumeMaxPages = 50
+
+    /// Result of draining the delta backlog: the events fetched and the
+    /// sequence the cursor should advance to.
+    struct DeltaDrain {
+        let events: [StoredEvent]
+        let finalCursor: Int64
+        let pages: Int
+    }
+
+    /// Pure, dependency-free paginator: keep calling `fetchPage(cursor)` until a
+    /// page comes back short (fully caught up), the page reaches the server's
+    /// reported max sequence, the page makes no forward progress (defensive
+    /// guard), or we hit `maxPages`. Returns every event drained plus the cursor
+    /// to persist.
+    ///
+    /// This loop is the fix for the staleness bug: the SSE stream does NOT
+    /// replay events missed while disconnected (the server ignores `since_seq`
+    /// on the stream), so this delta fetch is the only gap-filler. The previous
+    /// code fetched a single page, leaving a multi-day backlog permanently
+    /// behind (the tail froze on an old message). Extracted as `static` so it's
+    /// unit-testable without a live `APIService`.
+    static func drainDelta(
+        from initialCursor: Int64,
+        pageLimit: Int,
+        maxPages: Int,
+        fetchPage: (Int64) async throws -> (events: [StoredEvent], maxSeq: Int64)
+    ) async rethrows -> DeltaDrain {
+        var cursor = initialCursor
+        var collected: [StoredEvent] = []
+        var pages = 0
+        while pages < maxPages {
+            let (events, maxSeq) = try await fetchPage(cursor)
+            collected.append(contentsOf: events)
+            pages += 1
+            let pageMax = events.map { $0.sequence }.max() ?? cursor
+            let fullPage = events.count >= pageLimit
+            if !fullPage || pageMax >= maxSeq || pageMax <= cursor {
+                return DeltaDrain(events: collected, finalCursor: max(maxSeq, pageMax), pages: pages)
+            }
+            cursor = pageMax
+        }
+        return DeltaDrain(events: collected, finalCursor: cursor, pages: pages)
+    }
+
     private func tryDeltaResume(missionId id: String) async -> DeltaResumeOutcome {
-        guard let knownSeq = missionMaxSeq[id] else { return .noCursor }
+        guard let initialCursor = missionMaxSeq[id] else { return .noCursor }
+        let drain: DeltaDrain
         do {
-            let result = try await api.getMissionEventsWithMeta(
-                id: id,
-                types: historyEventTypes,
-                limit: Self.deltaResumePageLimit,
-                sinceSeq: knownSeq
-            )
-            guard viewingMissionId == id else { return .viewChanged }
-            let maxSeq = result.maxSequence ?? knownSeq
-            _ = mergeMissionEvents(result.events, for: id)
-            applyDeltaEvents(result.events)
-            // If the page was capped by the limit, advance the cursor to the
-            // largest sequence we actually saw so the next call resumes from
-            // there — otherwise we'd skip rows between this page and the
-            // true max. Use `max()` rather than `last`: the API contract is
-            // ASC-by-sequence but defensive callers shouldn't trust input
-            // ordering.
-            let pageMax = result.events.map { $0.sequence }.max() ?? knownSeq
-            let cursor = (result.events.count >= Self.deltaResumePageLimit && pageMax < maxSeq) ? pageMax : maxSeq
-            missionMaxSeq[id] = cursor
-            return .applied
+            drain = try await Self.drainDelta(
+                from: initialCursor,
+                pageLimit: Self.deltaResumePageLimit,
+                maxPages: Self.deltaResumeMaxPages
+            ) { cursor in
+                let result = try await diagnostics.measureAsync(
+                    "control.fetch_delta",
+                    detail: id
+                ) {
+                    try await api.getMissionEventsWithMeta(
+                        id: id,
+                        types: historyEventTypes,
+                        limit: Self.deltaResumePageLimit,
+                        sinceSeq: cursor
+                    )
+                }
+                return (result.events, result.maxSequence ?? cursor)
+            }
         } catch {
             print("Delta resume failed: \(error)")
             return .failed
         }
+        // Apply only if the user is still viewing this mission (a long drain may
+        // have outlived the selection).
+        guard viewingMissionId == id else { return .viewChanged }
+        if !drain.events.isEmpty {
+            _ = mergeMissionEvents(drain.events, for: id)
+            applyDeltaEvents(drain.events)
+        }
+        missionMaxSeq[id] = max(drain.finalCursor, missionMaxSeq[id] ?? initialCursor)
+        return .applied
     }
 
     // Reload mission from server without showing loading state or cache.
@@ -2329,7 +2670,12 @@ struct ControlView: View {
             // clear the cache and fall back, since the mission really does
             // have no events.
             do {
-                let snapshot = try await api.getMissionSnapshot(id: id)
+                let snapshot = try await diagnostics.measureAsync(
+                    "control.fetch_reload_snapshot",
+                    detail: id
+                ) {
+                    try await api.getMissionSnapshot(id: id)
+                }
                 guard viewingMissionId == id else { return }
                 if snapshot.events.isEmpty {
                     removeMissionFromCache(mission.id)
@@ -2736,6 +3082,7 @@ struct ControlView: View {
             sendState: .pending
         )
         messages.append(tempMessage)
+        rememberPendingSend(id: clientMessageId, missionId: pendingMissionId, content: content)
         recomputeGroupedItems()
         scrollToBottomTick += 1
         pendingSendCount += 1
@@ -2757,6 +3104,7 @@ struct ControlView: View {
                 if let index = messages.firstIndex(where: { $0.id == clientMessageId || $0.id == messageId }) {
                     messages[index].sendState = .sent
                 }
+                forgetPendingSend(id: clientMessageId)
 
                 // Update queue count when message was queued
                 if queued {
@@ -2815,6 +3163,7 @@ struct ControlView: View {
                 if let index = messages.firstIndex(where: { $0.id == id }) {
                     messages[index].sendState = .sent
                 }
+                forgetPendingSend(id: id)
                 if queued { queueLength += 1 }
             } catch {
                 let reason = (error as? LocalizedError)?.errorDescription
@@ -2843,7 +3192,20 @@ struct ControlView: View {
 
     private func loadQueueItems() async {
         do {
-            queuedItems = try await api.getQueue()
+            let generation = queueMutationGeneration
+            let allQueued = try await api.getQueue()
+            // A local remove/clear landed while this fetch was in flight —
+            // the snapshot may still contain the deleted message. Discard it.
+            guard generation == queueMutationGeneration else { return }
+            // GET /api/control/queue returns every mission's queued messages;
+            // scope the sheet to the mission being viewed so we never show
+            // (or delete) another mission's queue entries.
+            let missionId = viewingMissionId ?? currentMission?.id
+            if let missionId {
+                queuedItems = allQueued.filter { $0.missionId == missionId }
+            } else {
+                queuedItems = allQueued
+            }
         } catch {
             print("Failed to load queue: \(error)")
         }
@@ -2861,9 +3223,14 @@ struct ControlView: View {
             queuedItems.removeAll { $0.id == messageId }
             queueLength = max(0, queueLength - 1)
         }
+        queueMutationGeneration += 1
         Task {
             do {
                 try await api.removeFromQueue(messageId: messageId)
+            } catch APIError.httpError(404, _) {
+                // Already gone server-side (e.g. a stale snapshot had
+                // resurrected an already-deleted row) — the optimistic
+                // removal was correct; nothing to roll back.
             } catch {
                 print("Failed to remove from queue: \(error)")
                 // Reconcile with the server on error so the row reappears
@@ -2876,16 +3243,19 @@ struct ControlView: View {
     }
 
     /// Synchronous optimistic clear — same rationale as
-    /// `removeFromQueueOptimistic`.
+    /// `removeFromQueueOptimistic`. Scoped to the viewed mission so clearing
+    /// here doesn't wipe other missions' queues.
     private func clearQueueOptimistic() {
         withAnimation(.easeOut(duration: 0.2)) {
             queuedItems = []
             queueLength = 0
         }
+        queueMutationGeneration += 1
         showQueueSheet = false
+        let missionId = viewingMissionId ?? currentMission?.id
         Task {
             do {
-                _ = try await api.clearQueue()
+                _ = try await api.clearQueue(missionId: missionId)
                 HapticService.success()
             } catch {
                 print("Failed to clear queue: \(error)")
@@ -2899,10 +3269,12 @@ struct ControlView: View {
     }
 
     private func startStreaming() {
+        streamGeneration += 1
+        let generation = streamGeneration
         streamTask?.cancel()
         let missionFilter = viewingMissionId
         streamTask = Task {
-            // Exponential backoff: 1s, 2s, 4s, 8s, 16s, max 30s
+            // Exponential backoff with jitter: 1s, 2s, 4s, 8s, 16s, max 30s.
             let maxBackoff: UInt64 = 30
             var currentBackoff: UInt64 = 1
 
@@ -2918,6 +3290,7 @@ struct ControlView: View {
                 // Use OSAllocatedUnfairLock for thread-safe boolean access across actor boundaries
                 // Track successful (non-error) events separately from all events
                 let receivedSuccessfulEvent = OSAllocatedUnfairLock(initialState: false)
+                let stopRetrying = OSAllocatedUnfairLock(initialState: false)
                 let pendingEvents = OSAllocatedUnfairLock(initialState: [BufferedStreamEvent]())
                 let flushScheduled = OSAllocatedUnfairLock(initialState: false)
 
@@ -2940,8 +3313,14 @@ struct ControlView: View {
                         guard !batch.isEmpty else { return }
 
                         await MainActor.run {
+                            guard generation == self.streamGeneration else { return }
+                            let hasLiveSignal = batch.contains { event in
+                                event.type != "error"
+                                    && event.type != "connected"
+                                    && event.type != "parseError"
+                            }
                             let wasReconnecting = !self.connectionState.isConnected && self.reconnectAttempt > 0
-                            if !self.connectionState.isConnected {
+                            if hasLiveSignal && !self.connectionState.isConnected {
                                 self.connectionState = .connected
                                 self.reconnectAttempt = 0
 
@@ -2962,17 +3341,63 @@ struct ControlView: View {
                             // half-open-socket false-positive.
                             self.networkMonitor.noteStreamActivity()
                             for event in batch {
+                                let rawData = event.data.mapValues { $0.value }
+                                if event.type == "heartbeat" {
+                                    if let seq = rawData["seq"] as? Int64 {
+                                        self.latestStreamSeq = seq
+                                    } else if let seq = rawData["seq"] as? Int {
+                                        self.latestStreamSeq = Int64(seq)
+                                    }
+                                    continue
+                                }
+                                if event.type == "connected" {
+                                    self.networkMonitor.noteStreamConnected()
+                                    continue
+                                }
                                 self.handleStreamEvent(
                                     type: event.type,
-                                    data: event.data.mapValues { $0.value }
+                                    data: rawData
                                 )
                             }
                         }
                     }
                 }
 
+                let currentSinceSeq = await MainActor.run {
+                    missionFilter.flatMap { self.missionMaxSeq[$0] }
+                }
                 _ = await withCheckedContinuation { continuation in
-                    let innerTask = api.streamControl(missionId: missionFilter) { eventType, data in
+                    let innerTask = api.streamControl(
+                        missionId: missionFilter,
+                        sinceSeq: currentSinceSeq,
+                        preferWebSocket: true,
+                        generation: generation,
+                        onDiagnostic: { diagnostic in
+                            Task { @MainActor in
+                                guard generation == self.streamGeneration else { return }
+                                self.recordStreamDiagnostic(diagnostic)
+                            }
+                        }
+                    ) { eventType, data in
+                        guard generation == self.streamGeneration else { return }
+                        if eventType == "error" {
+                            if let status = data["status"] as? Int, status == 401 {
+                                stopRetrying.withLock { $0 = true }
+                                Task { @MainActor in
+                                    guard generation == self.streamGeneration else { return }
+                                    api.markSessionExpired()
+                                    self.connectionState = .authExpired
+                                    self.networkMonitor.noteStreamAuthExpired()
+                                }
+                            } else if (data["reason"] as? String) == "invalid_configuration" {
+                                stopRetrying.withLock { $0 = true }
+                                Task { @MainActor in
+                                    guard generation == self.streamGeneration else { return }
+                                    self.connectionState = .invalidConfiguration
+                                    self.networkMonitor.noteStreamInvalidConfiguration()
+                                }
+                            }
+                        }
                         // Only server-sourced events count for backoff reset.
                         // `connected` is a synthetic the client emits when it
                         // opens the stream — counting it would let a server
@@ -3013,16 +3438,27 @@ struct ControlView: View {
 
                 // Stream ended - check if we should reconnect
                 guard !Task.isCancelled else { break }
+                if stopRetrying.withLock({ $0 }) { break }
 
                 // Update state to reconnecting
                 await MainActor.run {
+                    guard generation == self.streamGeneration else { return }
                     reconnectAttempt += 1
                     connectionState = .reconnecting(attempt: reconnectAttempt)
                     networkMonitor.noteStreamReconnecting(attempt: reconnectAttempt)
                 }
 
-                // Wait before reconnecting (exponential backoff)
-                try? await Task.sleep(for: .seconds(currentBackoff))
+                while !Task.isCancelled {
+                    let pathIsUp = await MainActor.run { self.networkMonitor.pathSatisfied }
+                    if pathIsUp { break }
+                    try? await Task.sleep(for: .seconds(1))
+                }
+
+                // Wait before reconnecting. Jitter prevents every suspended
+                // client from hammering the backend at the same cadence after
+                // a network flap.
+                let jitteredBackoff = Double(currentBackoff) * Double.random(in: 0.8...1.3)
+                try? await Task.sleep(for: .seconds(jitteredBackoff))
                 currentBackoff = min(currentBackoff * 2, maxBackoff)
 
                 // Check cancellation again after sleep
@@ -3139,6 +3575,11 @@ struct ControlView: View {
         let previousProgress = progress
         viewingMissionId = id
         fetchingMissionId = id
+        defer {
+            if fetchingMissionId == id {
+                fetchingMissionId = nil
+            }
+        }
 
         // Clear stale workers from previous mission immediately
         childMissions = []
@@ -3161,6 +3602,7 @@ struct ControlView: View {
             controlCacheHit = false
             isLoading = true
             controlCacheStale = false
+            scheduleLargeCachedMissionLoad(id: id)
         }
 
         // Determine the run state for this mission from runningMissions
@@ -3183,7 +3625,12 @@ struct ControlView: View {
         progress = nil
 
         do {
-            let snapshot = try await api.getMissionSnapshot(id: id)
+            let snapshot = try await diagnostics.measureAsync(
+                "control.fetch_switch_snapshot",
+                detail: id
+            ) {
+                try await api.getMissionSnapshot(id: id)
+            }
             let mission = snapshot.mission
 
             // Race condition guard: only update if this is still the mission we want
@@ -3247,7 +3694,12 @@ struct ControlView: View {
     private func refreshViewingMissionSnapshot() async {
         guard let id = viewingMissionId else { return }
         do {
-            let snapshot = try await api.getMissionSnapshot(id: id)
+            let snapshot = try await diagnostics.measureAsync(
+                "control.fetch_refresh_snapshot",
+                detail: id
+            ) {
+                try await api.getMissionSnapshot(id: id)
+            }
             guard viewingMissionId == id else { return }
             currentMission = currentMission?.id == snapshot.mission.id ? snapshot.mission : currentMission
             if !snapshot.events.isEmpty {
@@ -3477,9 +3929,11 @@ struct ControlView: View {
                     // from the SSE event in case the server normalised it.
                     messages[index].sendState = .sent
                     messages[index].content = content
+                    forgetPendingSend(id: id)
                 } else {
                     let message = ChatMessage(id: id, type: .user, content: content)
                     messages.append(message)
+                    forgetPendingSend(id: id)
                 }
             }
             
@@ -3996,6 +4450,40 @@ private struct ScrollOffsetPreferenceKey: PreferenceKey {
     }
 }
 
+// MARK: - Conversation Rows
+
+private struct ConversationRowsView: View {
+    let groupedItems: [GroupedChatItem]
+    let copiedMessageId: String?
+    @Binding var expandedToolGroups: Set<String>
+    let onCopy: (ChatMessage) -> Void
+    let onRetry: (ChatMessage) -> Void
+
+    var body: some View {
+        ForEach(groupedItems) { item in
+            switch item {
+            case .single(let message):
+                MessageBubble(
+                    message: message,
+                    isCopied: copiedMessageId == message.id,
+                    onCopy: { onCopy(message) },
+                    onRetry: message.sendState.isFailed ? { onRetry(message) } : nil
+                )
+                .modifier(ControlBodyRenderProbe(name: "MessageBubble"))
+                .id(message.id)
+            case .toolGroup(let groupId, let tools):
+                ToolGroupView(
+                    groupId: groupId,
+                    tools: tools,
+                    expandedGroups: $expandedToolGroups
+                )
+                .modifier(ControlBodyRenderProbe(name: "ToolGroupView"))
+                .id(item.id)
+            }
+        }
+    }
+}
+
 // MARK: - Message Bubble
 
 private struct MessageBubble: View {
@@ -4175,6 +4663,7 @@ private struct MessageBubble: View {
                 }
 
                 MarkdownView(message.content)
+                    .modifier(ControlBodyRenderProbe(name: "MarkdownView"))
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(.horizontal, 16)
                     .padding(.vertical, 12)
@@ -4251,7 +4740,9 @@ private struct SharedFileCardView: View {
             // skeleton matches the inline rich-image placeholder so the
             // chat feels consistent while either type loads.
             Group {
-                if let data = imageData, let uiImage = UIImage(data: data) {
+                if let url = fullURL,
+                   let data = imageData,
+                   let uiImage = ImageMemoryCache.shared.cachedImage(for: url) ?? UIImage(data: data) {
                     Image(uiImage: uiImage)
                         .resizable()
                         .aspectRatio(contentMode: .fit)
@@ -4382,6 +4873,12 @@ private struct SharedFileCardView: View {
         isLoadingImage = true
         imageLoadFailed = false
 
+        if ImageMemoryCache.shared.cachedImage(for: url) != nil {
+            imageData = Data()
+            isLoadingImage = false
+            return
+        }
+
         do {
             var request = URLRequest(url: url)
             // Bound the per-image fetch to the same window as JSON requests so
@@ -4399,8 +4896,8 @@ private struct SharedFileCardView: View {
             // Check response status
             if let httpResponse = response as? HTTPURLResponse {
                 if httpResponse.statusCode == 200 {
-                    // Validate that the data is actually parseable as an image
-                    if UIImage(data: data) != nil {
+                    // Validate/downsample before storing row state.
+                    if await ImageMemoryCache.shared.image(from: data, url: url) != nil {
                         await MainActor.run {
                             self.imageData = data
                         }
@@ -5339,6 +5836,12 @@ private struct MissionSwitcherSheet: View {
     @State private var backendSearchQuery = ""
     @State private var backendSearchResults: [MissionSearchResult] = []
     @State private var isBackendSearchLoading = false
+    @State private var derivedMissionById: [String: Mission] = [:]
+    @State private var derivedFilteredRunning: [RunningMissionInfo] = []
+    @State private var derivedFilteredRecent: [Mission] = []
+    @State private var derivedOrderedRunning: [RunningRow] = []
+    @State private var derivedJustCompletedMissions: [Mission] = []
+    @State private var derivedRecentMissionsForList: [Mission] = []
 
     private let backendSearchDebounceNanos: UInt64 = 250_000_000
 
@@ -5346,99 +5849,10 @@ private struct MissionSwitcherSheet: View {
         normalizeMetadataText(searchText)
     }
 
-    private var runningMissionIds: Set<String> {
-        Set(runningMissions.map { $0.missionId })
-    }
-
     private func preferredMissionForDuplicateId(_ lhs: Mission, _ rhs: Mission) -> Mission {
         let lhsUpdated = lhs.updatedDate ?? .distantPast
         let rhsUpdated = rhs.updatedDate ?? .distantPast
         return rhsUpdated >= lhsUpdated ? rhs : lhs
-    }
-
-    private var missionById: [String: Mission] {
-        Dictionary(
-            recentMissions.map { ($0.id, $0) },
-            uniquingKeysWith: preferredMissionForDuplicateId
-        )
-    }
-
-    private var filteredRunning: [RunningMissionInfo] {
-        let liveCandidates = runningMissions.filter { info in
-            guard let mission = missionById[info.missionId] else { return true }
-            return !mission.hasFinishedSuccessfully
-        }
-        if normalizedSearchQuery.isEmpty {
-            return liveCandidates
-        }
-        return liveCandidates
-            .compactMap { info -> (RunningMissionInfo, Double)? in
-                let score = runningMissionSearchScore(
-                    info,
-                    query: normalizedSearchQuery,
-                    linkedMission: missionById[info.missionId]
-                )
-                return score > 0 ? (info, score) : nil
-            }
-            .sorted { lhs, rhs in
-                if lhs.1 == rhs.1 {
-                    let lhsUpdated = missionById[lhs.0.missionId]?.updatedDate ?? .distantPast
-                    let rhsUpdated = missionById[rhs.0.missionId]?.updatedDate ?? .distantPast
-                    if lhsUpdated != rhsUpdated {
-                        return lhsUpdated > rhsUpdated
-                    }
-                    return lhs.0.missionId < rhs.0.missionId
-                }
-                return lhs.1 > rhs.1
-            }
-            .map(\.0)
-    }
-
-    private var filteredRecent: [Mission] {
-        let nonRunning = recentMissions.filter { !runningMissionIds.contains($0.id) }
-        if normalizedSearchQuery.isEmpty {
-            return nonRunning
-        }
-
-        let localMatches: [Mission] = nonRunning
-            .compactMap { mission -> (Mission, Double)? in
-                let score = missionSearchRelevanceScore(mission, query: normalizedSearchQuery)
-                return score > 0 ? (mission, score) : nil
-            }
-            .sorted { lhs, rhs in
-                if lhs.1 == rhs.1 {
-                    return (lhs.0.updatedDate ?? .distantPast) > (rhs.0.updatedDate ?? .distantPast)
-                }
-                return lhs.1 > rhs.1
-            }
-            .map(\.0)
-
-        if backendSearchQuery == normalizedSearchQuery {
-            let byId = Dictionary(
-                nonRunning.map { ($0.id, $0) },
-                uniquingKeysWith: preferredMissionForDuplicateId
-            )
-            var merged: [Mission] = []
-            var seen = Set<String>()
-
-            for result in backendSearchResults {
-                let mission = byId[result.mission.id] ?? result.mission
-                guard !runningMissionIds.contains(mission.id) else { continue }
-                if seen.insert(mission.id).inserted {
-                    merged.append(mission)
-                }
-            }
-
-            for mission in localMatches {
-                if seen.insert(mission.id).inserted {
-                    merged.append(mission)
-                }
-            }
-
-            return merged
-        }
-
-        return localMatches
     }
 
     /// A running row carries layout hints so we can render boss + nested
@@ -5453,12 +5867,30 @@ private struct MissionSwitcherSheet: View {
         var id: String { info.missionId }
     }
 
-    /// boss missionId -> [worker missionId]. Built from the full mission set
-    /// (not just the search-filtered one) so we still know about workers when
-    /// the boss matched the query but a worker didn't.
-    private var bossWorkerIds: [String: [String]] {
+    private var missionListSignature: String {
+        let runningPart = runningMissions
+            .map { "\($0.missionId):\($0.state):\($0.title ?? ""):\($0.currentActivity ?? "")" }
+            .joined(separator: "|")
+        let recentPart = recentMissions
+            .map {
+                "\($0.id):\($0.status.displayLabel):\($0.updatedDate?.timeIntervalSince1970 ?? 0):\($0.parentMissionId ?? ""):\($0.title ?? ""):\($0.shortDescription ?? ""):\($0.backend ?? "")"
+            }
+            .joined(separator: "|")
+        let backendPart = backendSearchResults
+            .map { "\($0.mission.id):\($0.relevanceScore)" }
+            .joined(separator: "|")
+        return [
+            runningPart,
+            recentPart,
+            searchText,
+            backendSearchQuery,
+            backendPart
+        ].joined(separator: "||")
+    }
+
+    private func bossWorkerIds(from missions: [Mission]) -> [String: [String]] {
         var map: [String: [String]] = [:]
-        for mission in recentMissions {
+        for mission in missions {
             if let parent = mission.parentMissionId, !parent.isEmpty {
                 map[parent, default: []].append(mission.id)
             }
@@ -5466,13 +5898,11 @@ private struct MissionSwitcherSheet: View {
         return map
     }
 
-    /// Running missions ordered to nest workers under their boss (matching the
-    /// Next.js cmd+K palette): bosses first with their workers indented, then
-    /// standalone running missions, then any orphan workers whose boss isn't
-    /// currently running.
-    private var orderedRunning: [RunningRow] {
-        let filtered = filteredRunning
-        let workerIdsByBoss = bossWorkerIds
+    private func orderedRunningRows(
+        filtered: [RunningMissionInfo],
+        missionById: [String: Mission],
+        workerIdsByBoss: [String: [String]]
+    ) -> [RunningRow] {
         let filteredById: [String: RunningMissionInfo] = Dictionary(
             uniqueKeysWithValues: filtered.map { ($0.missionId, $0) }
         )
@@ -5515,44 +5945,119 @@ private struct MissionSwitcherSheet: View {
         return rows
     }
 
-    /// Mission ids included in the Just Completed micro-section, so Recent
-    /// can exclude them and we don't show the same row twice.
-    private var justCompletedIds: Set<String> {
-        Set(justCompletedMissions.map { $0.id })
-    }
+    private func recomputeMissionSections() {
+        let query = normalizedSearchQuery
+        let runningIds = Set(runningMissions.map { $0.missionId })
+        let missionById = Dictionary(
+            recentMissions.map { ($0.id, $0) },
+            uniquingKeysWith: preferredMissionForDuplicateId
+        )
 
-    /// Successfully-finished missions that landed in the last 24h. Capped to
-    /// keep the section glanceable. Hidden while searching — the ranked list
-    /// takes over and grouping just gets in the way.
-    ///
-    /// Only `.completed`, `.acknowledged`, and `.awaitingUser` qualify here:
-    /// the backend sometimes lands successful turns as `.interrupted` (the
-    /// watchdog/cancel race), so excluding the failure-shaped statuses keeps
-    /// the section honest. Interrupted/failed/blocked rows still appear under
-    /// "Recent" below.
-    private var justCompletedMissions: [Mission] {
-        guard normalizedSearchQuery.isEmpty else { return [] }
-        let cutoff = Date().addingTimeInterval(-24 * 60 * 60)
-        return recentMissions
-            .filter { mission in
-                guard !runningMissionIds.contains(mission.id) else { return false }
-                switch mission.status {
-                case .completed, .acknowledged, .awaitingUser:
-                    return true
-                default:
-                    return false
+        let liveCandidates = runningMissions.filter { info in
+            guard let mission = missionById[info.missionId] else { return true }
+            return !mission.hasFinishedSuccessfully
+        }
+        let filteredRunning: [RunningMissionInfo]
+        if query.isEmpty {
+            filteredRunning = liveCandidates
+        } else {
+            filteredRunning = liveCandidates
+                .compactMap { info -> (RunningMissionInfo, Double)? in
+                    let score = runningMissionSearchScore(
+                        info,
+                        query: query,
+                        linkedMission: missionById[info.missionId]
+                    )
+                    return score > 0 ? (info, score) : nil
                 }
-            }
-            .filter { ($0.updatedDate ?? .distantPast) >= cutoff }
-            .prefix(5)
-            .map { $0 }
-    }
+                .sorted { lhs, rhs in
+                    if lhs.1 == rhs.1 {
+                        let lhsUpdated = missionById[lhs.0.missionId]?.updatedDate ?? .distantPast
+                        let rhsUpdated = missionById[rhs.0.missionId]?.updatedDate ?? .distantPast
+                        if lhsUpdated != rhsUpdated {
+                            return lhsUpdated > rhsUpdated
+                        }
+                        return lhs.0.missionId < rhs.0.missionId
+                    }
+                    return lhs.1 > rhs.1
+                }
+                .map(\.0)
+        }
 
-    /// Recent missions excluding any row already shown in Just Completed,
-    /// so the same mission never appears twice.
-    private var recentMissionsForList: [Mission] {
-        let justCompleted = justCompletedIds
-        return filteredRecent.filter { !justCompleted.contains($0.id) }
+        let nonRunning = recentMissions.filter { !runningIds.contains($0.id) }
+        let filteredRecent: [Mission]
+        if query.isEmpty {
+            filteredRecent = nonRunning
+        } else {
+            let localMatches: [Mission] = nonRunning
+                .compactMap { mission -> (Mission, Double)? in
+                    let score = missionSearchRelevanceScore(mission, query: query)
+                    return score > 0 ? (mission, score) : nil
+                }
+                .sorted { lhs, rhs in
+                    if lhs.1 == rhs.1 {
+                        return (lhs.0.updatedDate ?? .distantPast) > (rhs.0.updatedDate ?? .distantPast)
+                    }
+                    return lhs.1 > rhs.1
+                }
+                .map(\.0)
+
+            if backendSearchQuery == query {
+                let byId = Dictionary(
+                    nonRunning.map { ($0.id, $0) },
+                    uniquingKeysWith: preferredMissionForDuplicateId
+                )
+                var merged: [Mission] = []
+                var seen = Set<String>()
+
+                for result in backendSearchResults {
+                    let mission = byId[result.mission.id] ?? result.mission
+                    guard !runningIds.contains(mission.id) else { continue }
+                    if seen.insert(mission.id).inserted {
+                        merged.append(mission)
+                    }
+                }
+
+                for mission in localMatches {
+                    if seen.insert(mission.id).inserted {
+                        merged.append(mission)
+                    }
+                }
+
+                filteredRecent = merged
+            } else {
+                filteredRecent = localMatches
+            }
+        }
+
+        let cutoff = Date().addingTimeInterval(-24 * 60 * 60)
+        let justCompletedMissions = query.isEmpty
+            ? recentMissions
+                .filter { mission in
+                    guard !runningIds.contains(mission.id) else { return false }
+                    switch mission.status {
+                    case .completed, .acknowledged, .awaitingUser:
+                        return true
+                    default:
+                        return false
+                    }
+                }
+                .filter { ($0.updatedDate ?? .distantPast) >= cutoff }
+                .prefix(5)
+                .map { $0 }
+            : []
+        let justCompletedIds = Set(justCompletedMissions.map(\.id))
+
+        derivedMissionById = missionById
+        derivedFilteredRunning = filteredRunning
+        derivedFilteredRecent = filteredRecent
+        derivedOrderedRunning = orderedRunningRows(
+            filtered: filteredRunning,
+            missionById: missionById,
+            workerIdsByBoss: bossWorkerIds(from: recentMissions)
+        )
+        derivedJustCompletedMissions = justCompletedMissions
+        derivedRecentMissionsForList = filteredRecent.filter { !justCompletedIds.contains($0.id) }
     }
 
     @ViewBuilder
@@ -5597,11 +6102,11 @@ private struct MissionSwitcherSheet: View {
                 }
 
                 // Running missions — boss + nested workers, then standalone.
-                if !orderedRunning.isEmpty {
+                if !derivedOrderedRunning.isEmpty {
                     Section("Running") {
-                        ForEach(orderedRunning) { row in
+                        ForEach(derivedOrderedRunning) { row in
                             let info = row.info
-                            let mission = missionById[info.missionId]
+                            let mission = derivedMissionById[info.missionId]
                             MissionRow(
                                 missionId: info.missionId,
                                 displayName: mission.map { missionDisplayName(for: $0) },
@@ -5628,8 +6133,8 @@ private struct MissionSwitcherSheet: View {
                     }
                 }
 
-                missionSection("Just Completed", missions: justCompletedMissions)
-                missionSection("Recent", missions: recentMissionsForList)
+                missionSection("Just Completed", missions: derivedJustCompletedMissions)
+                missionSection("Recent", missions: derivedRecentMissionsForList)
 
                 if isBackendSearchLoading && !normalizedSearchQuery.isEmpty {
                     Section {
@@ -5643,7 +6148,7 @@ private struct MissionSwitcherSheet: View {
                     }
                 }
 
-                if filteredRunning.isEmpty && filteredRecent.isEmpty && !normalizedSearchQuery.isEmpty {
+                if derivedFilteredRunning.isEmpty && derivedFilteredRecent.isEmpty && !normalizedSearchQuery.isEmpty {
                     ContentUnavailableView(
                         "No Missions Found",
                         systemImage: "magnifyingglass",
@@ -5654,9 +6159,14 @@ private struct MissionSwitcherSheet: View {
             .searchable(text: $searchText, prompt: "Search missions...")
             .onChange(of: searchText) { _, newValue in
                 scheduleBackendSearch(for: newValue)
+                recomputeMissionSections()
             }
             .onAppear {
+                recomputeMissionSections()
                 scheduleBackendSearch(for: searchText)
+            }
+            .onChange(of: missionListSignature) { _, _ in
+                recomputeMissionSections()
             }
             .onDisappear {
                 backendSearchTask?.cancel()

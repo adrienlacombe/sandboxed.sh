@@ -67,7 +67,7 @@ impl OpenCodeAgent {
         };
 
         let agent_event = match oc_event {
-            OpenCodeEvent::Thinking { content } => {
+            OpenCodeEvent::Thinking { content, .. } => {
                 tracing::info!(
                     content_len = content.len(),
                     content_preview = %content.chars().take(100).collect::<String>(),
@@ -116,6 +116,7 @@ impl OpenCodeAgent {
                 resumable: ctx.mission_id.is_some(), // Can resume if within a mission
             },
             OpenCodeEvent::MessageComplete { .. } => return, // Don't forward completion marker
+            OpenCodeEvent::Cancelled => return,              // Runner handles cancellation state
             OpenCodeEvent::TurnSummary { .. } => return,     // Summary is handled elsewhere
             OpenCodeEvent::Usage { .. } => return,           // Usage tracked at runner level
             // Goal events are codex-only today; OpenCode missions never

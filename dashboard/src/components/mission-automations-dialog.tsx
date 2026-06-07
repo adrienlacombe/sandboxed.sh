@@ -795,9 +795,9 @@ export function MissionAutomationsDialog({
     }
   };
 
-  /** Stop a native harness loop: cancel the mission's current turn (coarse —
-   *  Phase 3 will use harness-native cancel like codex `thread/goal/clear`)
-   *  and mark the automation inactive so the panel reflects the new state. */
+  /** Stop a native harness loop: the backend cancellation path asks native
+   *  harnesses to clear their goal state first (Codex: `thread/goal/clear`),
+   *  then interrupts the active turn and marks the panel row inactive. */
   const handleStopNativeLoop = async () => {
     if (!pendingStop) return;
     setStopping(true);
@@ -996,11 +996,17 @@ export function MissionAutomationsDialog({
                 {/* Row 1: Command source type + Trigger type */}
                 {(() => {
                   const harnessForBackend =
-                    missionBackend === 'claudecode' || missionBackend === 'codex'
+                    missionBackend === 'claudecode' || missionBackend === 'codex' || missionBackend === 'opencode'
                       ? missionBackend
                       : null;
                   const harnessLabel =
-                    harnessForBackend === 'claudecode' ? 'Claude Code' : harnessForBackend === 'codex' ? 'Codex' : null;
+                    harnessForBackend === 'claudecode'
+                      ? 'Claude Code'
+                      : harnessForBackend === 'codex'
+                        ? 'Codex'
+                        : harnessForBackend === 'opencode'
+                          ? 'OpenCode'
+                          : null;
                   const nativeLoopDisabled = !harnessForBackend;
                   return (
                     <div className="grid grid-cols-2 gap-3">
@@ -1026,7 +1032,7 @@ export function MissionAutomationsDialog({
                             disabled={nativeLoopDisabled}
                           >
                             {nativeLoopDisabled
-                              ? 'Native harness loop (Claude/Codex only)'
+                              ? 'Native harness loop (Claude/Codex/OpenCode only)'
                               : `Native harness loop (${harnessLabel} /goal)`}
                           </option>
                         </select>

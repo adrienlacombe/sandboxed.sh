@@ -16,6 +16,7 @@
 //! - `POST /api/tools/{name}/toggle` - Enable/disable a tool
 
 pub mod ai_providers;
+pub mod ask;
 mod auth;
 pub mod automation_variables;
 pub mod backends;
@@ -26,6 +27,7 @@ pub mod control_metrics;
 pub mod deferred_proxy;
 pub mod desktop;
 mod desktop_stream;
+pub mod durable_jobs;
 pub mod fido;
 mod fs;
 mod github_auth;

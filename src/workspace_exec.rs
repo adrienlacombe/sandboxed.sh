@@ -69,6 +69,22 @@ fn environ_has_keepalive_marker(environ: &[u8]) -> bool {
         .any(|entry| entry == expected.as_bytes())
 }
 
+/// Build a valid transient systemd scope unit name for a mission container.
+/// systemd unit names allow `[A-Za-z0-9:._-]`; replace anything else with `_`.
+fn mission_scope_unit(machine_name: &str) -> String {
+    let sanitized: String = machine_name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, ':' | '.' | '_' | '-') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    format!("sandboxed-mission-{sanitized}.scope")
+}
+
 fn select_container_resolv_conf() -> Option<PathBuf> {
     let default_path = PathBuf::from("/etc/resolv.conf");
     let content = fs::read_to_string(&default_path).ok()?;
@@ -601,7 +617,36 @@ impl WorkspaceExec {
             .filter(|name| !name.trim().is_empty())
             .context("Container workspace has no machine name")?;
 
-        let mut cmd = Command::new("systemd-nspawn");
+        // Per-mission isolation (Layer 1). When `MISSION_MEMORY_MAX` is set,
+        // boot the container inside its own transient systemd scope with a
+        // memory cap so one mission's runaway build (e.g. a 46G Lean
+        // compilation) can't starve the host or the API process, and so
+        // `systemctl stop <scope>` reliably kills the whole build tree on
+        // cancel/teardown. Unset (default) = unchanged direct nspawn boot, so
+        // shipping this binary is a no-op until the env is enabled (dev first).
+        let mission_mem_max = std::env::var("MISSION_MEMORY_MAX")
+            .ok()
+            .filter(|s| !s.trim().is_empty());
+        let mission_mem_high = std::env::var("MISSION_MEMORY_HIGH")
+            .ok()
+            .filter(|s| !s.trim().is_empty());
+        let mut cmd = if let Some(mem_max) = &mission_mem_max {
+            let scope_unit = mission_scope_unit(&name);
+            let mut c = Command::new("systemd-run");
+            c.arg("--scope")
+                .arg(format!("--unit={scope_unit}"))
+                .arg("--collect")
+                .arg(format!("--property=MemoryMax={mem_max}"));
+            if let Some(mem_high) = &mission_mem_high {
+                c.arg(format!("--property=MemoryHigh={mem_high}"));
+            }
+            // systemd-nspawn's own scope-creation is disabled below via
+            // --register=no/--keep-unit, so it joins this scope's cgroup.
+            c.arg("systemd-nspawn");
+            c
+        } else {
+            Command::new("systemd-nspawn")
+        };
         cmd.arg("-D").arg(root);
         cmd.arg(format!("--machine={}", name));
         cmd.arg("--quiet");
@@ -755,7 +800,38 @@ impl WorkspaceExec {
             let env_ref = if env.is_empty() { None } else { Some(&env) };
             Self::build_shell_command_with_env(&rel_cwd, program, args, env_ref)
         };
-        let mut cmd = Command::new(nsenter);
+        // Per-mission isolation, nsenter edition. `nsenter` only enters the
+        // container's *namespaces* — the spawned process stays in the
+        // caller's cgroup (the API service's), so without this wrapper a
+        // runaway build attached to an already-running container bypasses
+        // the boot-path mission scope entirely (observed live: a 47 GiB
+        // Lean build throttling the whole service cgroup while the
+        // container's own scope sat at 24G/2MB). Wrap each attach in its
+        // own capped transient scope when `MISSION_MEMORY_MAX` is set.
+        let mission_mem_max = std::env::var("MISSION_MEMORY_MAX")
+            .ok()
+            .filter(|s| !s.trim().is_empty());
+        let mut cmd = if let Some(mem_max) = &mission_mem_max {
+            let mut c = Command::new("systemd-run");
+            c.arg("--scope")
+                .arg("--quiet")
+                .arg("--collect")
+                .arg(format!(
+                    "--unit=sandboxed-exec-{}",
+                    uuid::Uuid::new_v4().simple()
+                ))
+                .arg(format!("--property=MemoryMax={mem_max}"));
+            if let Some(mem_high) = std::env::var("MISSION_MEMORY_HIGH")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+            {
+                c.arg(format!("--property=MemoryHigh={mem_high}"));
+            }
+            c.arg(nsenter);
+            c
+        } else {
+            Command::new(nsenter)
+        };
         cmd.args([
             "--target", leader, "--mount", "--uts", "--ipc", "--net", "--pid",
         ]);

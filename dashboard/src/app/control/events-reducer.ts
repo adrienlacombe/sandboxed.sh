@@ -1,5 +1,8 @@
 import type { Mission, SharedFile, StoredEvent } from "@/lib/api";
-import { isStreamContinuation } from "@/lib/stream-continuation";
+import {
+  isStreamContinuation,
+  mergeStreamFragment,
+} from "@/lib/stream-continuation";
 
 export type CostSource = "actual" | "estimated" | "unknown";
 
@@ -10,6 +13,25 @@ export type ChatItem =
       content: string;
       timestamp: number;
       queued?: boolean;
+      /**
+       * Optimistic-send lifecycle (client-only; never set from server
+       * events). `sending` = POST in flight, `sent` = backend acked,
+       * `failed` = never reached the backend. Drives the bubble's opacity
+       * and the inline "Sending…" / "Retry" affordances.
+       */
+      sendStatus?: "sending" | "sent" | "failed";
+      /** When `sendStatus === "failed"`: drives copy + auto-retry eligibility. */
+      failedReason?: "network" | "rejected";
+      /** Locked agent for this message, preserved so a retry re-applies it. */
+      agent?: string;
+      /**
+       * Mission this row was created for (client-only). Stamped on
+       * live/optimistic rows so a row created while viewing mission A can
+       * never be reconciled into, or rendered under, mission B during a
+       * switch race. Unset for server-history rows (already loaded per
+       * mission, so correct by construction).
+       */
+      missionId?: string;
     }
   | {
       kind: "assistant";
@@ -58,6 +80,11 @@ export type ChatItem =
       isUiTool: boolean;
       startTime: number;
       endTime?: number;
+      lazy?: boolean;
+      loading?: boolean;
+      hasResult?: boolean;
+      contentBytes?: number;
+      resultBytes?: number;
     }
   | {
       kind: "system";
@@ -132,6 +159,24 @@ export function parseCostMetadata(
   };
 }
 
+function normalizeStreamComparisonText(text: string): string {
+  return text.replace(/\s+/g, " ").trim();
+}
+
+function streamDuplicatesAssistant(stream: string, assistant: string): boolean {
+  const streamText = normalizeStreamComparisonText(stream);
+  const assistantText = normalizeStreamComparisonText(assistant);
+  if (!streamText || !assistantText) return false;
+  if (streamText === assistantText) return true;
+  const minOverlapLen = 80;
+  return (
+    (streamText.length >= minOverlapLen &&
+      assistantText.startsWith(streamText)) ||
+    (assistantText.length >= minOverlapLen &&
+      streamText.startsWith(assistantText))
+  );
+}
+
 export function eventsToItemsImpl(
   events: StoredEvent[],
   mission?: Mission | null,
@@ -146,6 +191,7 @@ export function eventsToItemsImpl(
     timestamp: number;
   } | null = null;
   let lastAssistantTimestamp = 0;
+  let lastAssistantContent = "";
   const missionActive = mission?.status === "active";
   const isGoalMode = mission?.goal_mode === true;
 
@@ -253,15 +299,19 @@ export function eventsToItemsImpl(
           resumable,
         });
         lastAssistantTimestamp = timestamp;
+        lastAssistantContent = event.content;
         break;
       }
 
       case "text_delta": {
         const content = event.content || "";
         if (content.trim().length === 0) break;
+        const mergedContent: string = lastTextDelta
+          ? mergeStreamFragment(lastTextDelta.content, content)
+          : content;
         lastTextDelta = {
           id: event.event_id ?? `text-delta-${event.id}`,
-          content,
+          content: mergedContent,
           timestamp,
         };
         break;
@@ -432,6 +482,49 @@ export function eventsToItemsImpl(
         break;
       }
 
+      case "tool_stub": {
+        finalizePendingThinking(timestamp);
+        lastTextDelta = null;
+        const toolCallId = event.tool_call_id || `unknown-${event.id}`;
+        const name = event.tool_name || "unknown";
+        const isUiTool =
+          name.startsWith("ui_") ||
+          name === "question" ||
+          name === "AskUserQuestion";
+        const resultTimestamp =
+          typeof event.metadata?.result_timestamp === "string"
+            ? new Date(event.metadata.result_timestamp).getTime()
+            : undefined;
+        const toolItem: ChatItem = {
+          kind: "tool",
+          id: `tool-${toolCallId}`,
+          toolCallId,
+          name,
+          args: undefined,
+          isUiTool,
+          startTime: timestamp,
+          result: undefined,
+          endTime:
+            typeof resultTimestamp === "number" &&
+            Number.isFinite(resultTimestamp)
+              ? resultTimestamp
+              : undefined,
+          lazy: true,
+          hasResult: event.metadata?.has_result === true,
+          contentBytes:
+            typeof event.metadata?.call_content_bytes === "number"
+              ? event.metadata.call_content_bytes
+              : undefined,
+          resultBytes:
+            typeof event.metadata?.result_content_bytes === "number"
+              ? event.metadata.result_content_bytes
+              : undefined,
+        };
+        toolCallMap.set(toolCallId, items.length);
+        items.push(toolItem);
+        break;
+      }
+
       case "tool_result": {
         const toolCallId = event.tool_call_id || "";
         const idx = toolCallMap.get(toolCallId);
@@ -447,6 +540,9 @@ export function eventsToItemsImpl(
             ...toolItem,
             result,
             endTime: timestamp,
+            lazy: false,
+            loading: false,
+            hasResult: true,
           };
         }
         break;
@@ -458,18 +554,25 @@ export function eventsToItemsImpl(
     finalizePendingThinking(Date.now());
   }
 
-  if (lastTextDelta && lastTextDelta.timestamp > lastAssistantTimestamp) {
+  if (
+    lastTextDelta &&
+    !streamDuplicatesAssistant(lastTextDelta.content, lastAssistantContent)
+  ) {
     const staleThresholdMs = 5 * 60 * 1000;
     const isStale =
       missionActive && Date.now() - lastTextDelta.timestamp > staleThresholdMs;
-    const isDone = !missionActive || isStale;
+    const assistantArrivedAfterStream =
+      lastAssistantTimestamp >= lastTextDelta.timestamp;
+    const isDone = assistantArrivedAfterStream || !missionActive || isStale;
     items.push({
       kind: "stream",
       id: lastTextDelta.id,
       content: lastTextDelta.content,
       done: isDone,
       startTime: lastTextDelta.timestamp,
-      endTime: isDone ? lastTextDelta.timestamp : undefined,
+      endTime: isDone
+        ? Math.max(lastTextDelta.timestamp, lastAssistantTimestamp)
+        : undefined,
     });
   }
 

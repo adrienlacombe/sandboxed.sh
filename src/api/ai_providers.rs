@@ -24,10 +24,11 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, Mutex as StdMutex};
+use std::time::Instant;
 use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use tokio::process::Command as TokioCommand;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex as AsyncMutex};
 use tokio::time::{timeout, Duration};
 
 use crate::ai_providers::{AuthMethod, PendingOAuth, ProviderType};
@@ -256,6 +257,9 @@ const GOOGLE_SCOPES: &str =
     "https://www.googleapis.com/auth/cloud-platform https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/userinfo.profile";
 const GROK_OAUTH_CLIENT_KEY: &str = "https://auth.x.ai::b1a00492-073a-47ea-816f-4c329264a828";
 const GROK_OAUTH_CLIENT_ID: &str = "b1a00492-073a-47ea-816f-4c329264a828";
+const GROK_CLI_RECONCILE_INTERVAL: Duration = Duration::from_secs(30);
+static GROK_CLI_RECONCILE_LAST_CHECK: LazyLock<StdMutex<Option<Instant>>> =
+    LazyLock::new(|| StdMutex::new(None));
 
 fn google_client_id() -> &'static str {
     GOOGLE_CLIENT_ID
@@ -279,9 +283,21 @@ fn grok_auth_paths() -> Vec<PathBuf> {
 }
 
 fn read_grok_auth_entry() -> Option<serde_json::Value> {
-    let contents = std::fs::read_to_string(grok_auth_path()).ok()?;
-    let auth: serde_json::Value = serde_json::from_str(&contents).ok()?;
-    auth.get(GROK_OAUTH_CLIENT_KEY).cloned()
+    // Try every candidate path (home-based AND the service path
+    // `/var/lib/opencode/.grok/auth.json`) — `home_dir()` for the service
+    // process doesn't always resolve to where the Grok CLI wrote its auth.
+    for path in grok_auth_paths() {
+        let Ok(contents) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(auth) = serde_json::from_str::<serde_json::Value>(&contents) else {
+            continue;
+        };
+        if let Some(entry) = auth.get(GROK_OAUTH_CLIENT_KEY) {
+            return Some(entry.clone());
+        }
+    }
+    None
 }
 
 async fn wait_for_grok_auth_entry() -> Option<serde_json::Value> {
@@ -356,9 +372,11 @@ fn parse_grok_device_auth_line(line: &str) -> (Option<String>, Option<String>) {
 #[cfg(test)]
 mod grok_oauth_tests {
     use super::{
-        get_xai_api_key_for_grok, grok_auth_expires_at_millis, parse_grok_device_auth_line,
+        get_xai_api_key_for_grok, grok_auth_expires_at_millis, grok_cli_reconcile_due,
+        parse_grok_device_auth_line, GROK_CLI_RECONCILE_INTERVAL,
     };
     use crate::ai_providers::{AIProvider, OAuthCredentials, ProviderType};
+    use std::time::{Duration as StdDuration, Instant};
 
     #[test]
     fn parses_device_auth_url_and_user_code_from_stderr_line() {
@@ -396,6 +414,22 @@ mod grok_oauth_tests {
         });
 
         assert_eq!(grok_auth_expires_at_millis(&entry), 1779172231759);
+    }
+
+    #[test]
+    fn grok_cli_reconcile_throttles_recent_checks() {
+        let now = Instant::now();
+
+        assert!(grok_cli_reconcile_due(None, now));
+        assert!(!grok_cli_reconcile_due(Some(now), now));
+        assert!(!grok_cli_reconcile_due(
+            Some(now - GROK_CLI_RECONCILE_INTERVAL + StdDuration::from_millis(1)),
+            now,
+        ));
+        assert!(grok_cli_reconcile_due(
+            Some(now - GROK_CLI_RECONCILE_INTERVAL),
+            now,
+        ));
     }
 
     #[test]
@@ -532,6 +566,7 @@ async fn upsert_grok_oauth_provider(
     state: &super::routes::AppState,
     entry: &serde_json::Value,
     use_for_backends: Option<Vec<String>>,
+    target_id: Option<uuid::Uuid>,
 ) -> Result<ProviderResponse, (StatusCode, String)> {
     let access_token = entry
         .get("key")
@@ -556,12 +591,13 @@ async fn upsert_grok_oauth_provider(
     let account_email = grok_auth_email(entry);
     let backends = use_for_backends.unwrap_or_else(|| vec!["grok".to_string()]);
 
-    let mut provider = state
-        .ai_providers
-        .get_all_by_type(ProviderType::Xai)
-        .await
-        .into_iter()
-        .find(|p| p.has_oauth())
+    // When reconnect targets a specific row (UUID), update *that* row so the
+    // health probe checks the same id the user clicked. Otherwise fall back to
+    // the first OAuth row, or create a new one.
+    let existing_xai = state.ai_providers.get_all_by_type(ProviderType::Xai).await;
+    let mut provider = target_id
+        .and_then(|tid| existing_xai.iter().find(|p| p.id == tid).cloned())
+        .or_else(|| existing_xai.iter().find(|p| p.has_oauth()).cloned())
         .unwrap_or_else(|| {
             crate::ai_providers::AIProvider::new(
                 ProviderType::Xai,
@@ -1992,6 +2028,7 @@ fn write_codex_chatgpt_auth_file(
     access_token: &str,
     refresh_token: &str,
     source_label: &str,
+    include_refresh_token: bool,
 ) -> Result<(), String> {
     if access_token.trim().is_empty() {
         return Err("OAuth access_token is empty".to_string());
@@ -2011,15 +2048,24 @@ fn write_codex_chatgpt_auth_file(
     let tmp_path = config_dir.join("auth.json.tmp");
 
     let now = chrono::Utc::now().to_rfc3339();
+    let mut tokens = serde_json::json!({
+        "id_token": id_token_value,
+        "access_token": access_token,
+        "account_id": account_id,
+    });
+    if include_refresh_token {
+        if let Some(obj) = tokens.as_object_mut() {
+            obj.insert(
+                "refresh_token".to_string(),
+                serde_json::Value::String(refresh_token.to_string()),
+            );
+        }
+    }
+
     let payload = serde_json::json!({
         "auth_mode": "chatgpt",
         "OPENAI_API_KEY": null,
-        "tokens": {
-            "id_token": id_token_value,
-            "access_token": access_token,
-            "refresh_token": refresh_token,
-            "account_id": account_id,
-        },
+        "tokens": tokens,
         "last_refresh": now,
     });
     let contents = serde_json::to_string_pretty(&payload)
@@ -2052,6 +2098,7 @@ fn write_codex_auth_json_chatgpt(config_dir: &std::path::Path) -> Result<(), Str
         &entry.access_token,
         &entry.refresh_token,
         "credential_store",
+        true,
     )
 }
 
@@ -2138,17 +2185,26 @@ fn update_provider_oauth_for_chatgpt_account(
 
     let mut updated = false;
     for provider in items.iter_mut() {
-        let matches = provider
+        let is_openai = provider
             .get("provider_type")
             .and_then(|v| v.as_str())
             .map(|s| s == "openai")
-            .unwrap_or(false)
-            && provider
-                .get("oauth")
-                .and_then(|o| o.get("chatgpt_account_id"))
-                .and_then(|v| v.as_str())
-                .map(|s| s == account_id)
-                .unwrap_or(false);
+            .unwrap_or(false);
+        if !is_openai {
+            continue;
+        }
+
+        let oauth = provider.get("oauth");
+        let stored_account_id = oauth
+            .and_then(|o| o.get("chatgpt_account_id"))
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        let decoded_account_id = oauth
+            .and_then(|o| o.get("access_token"))
+            .and_then(|v| v.as_str())
+            .and_then(extract_chatgpt_account_id);
+        let matches = stored_account_id.as_deref() == Some(account_id)
+            || decoded_account_id.as_deref() == Some(account_id);
         if !matches {
             continue;
         }
@@ -2170,6 +2226,10 @@ fn update_provider_oauth_for_chatgpt_account(
             oauth_obj.insert(
                 "expires_at".to_string(),
                 serde_json::Value::from(expires_at_ms),
+            );
+            oauth_obj.insert(
+                "chatgpt_account_id".to_string(),
+                serde_json::Value::String(account_id.to_string()),
             );
             updated = true;
         }
@@ -2358,6 +2418,238 @@ pub struct CodexOAuthAccount {
     pub priority: u32,
 }
 
+static CODEX_OAUTH_REFRESH_LOCKS: LazyLock<StdMutex<HashMap<String, Arc<AsyncMutex<()>>>>> =
+    LazyLock::new(|| StdMutex::new(HashMap::new()));
+
+fn codex_oauth_refresh_lock(account_id: &str) -> Arc<AsyncMutex<()>> {
+    let mut locks = CODEX_OAUTH_REFRESH_LOCKS
+        .lock()
+        .expect("Codex OAuth refresh lock map poisoned");
+    locks
+        .entry(account_id.to_string())
+        .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+        .clone()
+}
+
+fn sanitize_codex_oauth_account_id(account_id: &str) -> String {
+    account_id
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+pub(crate) fn shared_codex_oauth_home_for_account(account_id: &str) -> PathBuf {
+    let root = std::env::var("SANDBOXED_SH_CODEX_OAUTH_HOME_ROOT")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(home_dir())
+                .join(".sandboxed-sh")
+                .join("codex-oauth-accounts")
+        });
+    root.join(sanitize_codex_oauth_account_id(account_id))
+}
+
+fn find_openai_oauth_account_by_chatgpt_account_id(
+    working_dir: &Path,
+    chatgpt_account_id: &str,
+) -> Option<CodexOAuthAccount> {
+    let providers = load_ai_providers(working_dir);
+
+    for p in providers {
+        if p.get("provider_type").and_then(|v| v.as_str()) != Some("openai")
+            || !p.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true)
+        {
+            continue;
+        }
+
+        let Some(oauth) = p.get("oauth").and_then(|o| o.as_object()) else {
+            continue;
+        };
+        let refresh = oauth
+            .get("refresh_token")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let access = oauth
+            .get("access_token")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if refresh.is_empty() || access.is_empty() {
+            continue;
+        }
+
+        let account_id = match extract_chatgpt_account_id(access) {
+            Some(id) => id,
+            None => continue,
+        };
+        if account_id != chatgpt_account_id {
+            continue;
+        }
+
+        let expires_at = extract_jwt_exp_ms(access)
+            .or_else(|| oauth.get("expires_at").and_then(|v| v.as_i64()))
+            .unwrap_or(i64::MAX);
+        return Some(CodexOAuthAccount {
+            provider_id: p
+                .get("id")
+                .and_then(|v| v.as_str())
+                .and_then(|s| uuid::Uuid::parse_str(s).ok())
+                .unwrap_or_else(uuid::Uuid::new_v4),
+            chatgpt_account_id: account_id,
+            refresh_token: refresh.to_string(),
+            access_token: access.to_string(),
+            expires_at,
+            account_email: p
+                .get("account_email")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+            priority: p.get("priority").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+        });
+    }
+
+    None
+}
+
+fn sync_shared_codex_oauth_auth(account: &CodexOAuthAccount) -> Result<PathBuf, String> {
+    let codex_home = shared_codex_oauth_home_for_account(&account.chatgpt_account_id);
+    write_codex_auth_json_chatgpt_with_tokens(
+        &codex_home,
+        &account.access_token,
+        &account.refresh_token,
+    )?;
+    Ok(codex_home)
+}
+
+/// Return a launch-ready ChatGPT OAuth account for Codex.
+///
+/// The backend re-reads the latest stored tokens under a per-account lock and
+/// refreshes only when the access token is close to expiry. The resulting token
+/// pair is also mirrored into the shared per-account Codex auth home, so any
+/// Codex-managed auth fallback starts from the same current refresh token.
+pub async fn prepare_codex_oauth_account_for_launch(
+    working_dir: &Path,
+    selected: &CodexOAuthAccount,
+) -> Result<CodexOAuthAccount, String> {
+    const MIN_ACCESS_TOKEN_TTL_MS: i64 = 10 * 60 * 1000;
+
+    let lock = codex_oauth_refresh_lock(&selected.chatgpt_account_id);
+    let _guard = lock.lock().await;
+
+    let current = get_all_openai_oauth_accounts(working_dir)
+        .into_iter()
+        .find(|account| account.chatgpt_account_id == selected.chatgpt_account_id)
+        .unwrap_or_else(|| selected.clone());
+
+    let now = chrono::Utc::now().timestamp_millis();
+    if current.expires_at > now + MIN_ACCESS_TOKEN_TTL_MS {
+        let _ = sync_shared_codex_oauth_auth(&current);
+        return Ok(current);
+    }
+
+    let client = reqwest::Client::new();
+    let (access, refresh, expires_at, _id_token) =
+        refresh_openai_oauth_tokens(&client, &current.refresh_token).await?;
+    let refreshed_account_id =
+        extract_chatgpt_account_id(&access).unwrap_or_else(|| current.chatgpt_account_id.clone());
+
+    if refreshed_account_id != current.chatgpt_account_id {
+        tracing::warn!(
+            expected_account_id = %current.chatgpt_account_id,
+            refreshed_account_id = %refreshed_account_id,
+            "OpenAI OAuth refresh returned a different ChatGPT account id"
+        );
+    }
+
+    let updated = update_provider_oauth_for_chatgpt_account(
+        working_dir,
+        &current.chatgpt_account_id,
+        &access,
+        &refresh,
+        expires_at,
+    );
+    if !updated {
+        tracing::warn!(
+            account_id = %current.chatgpt_account_id,
+            "Refreshed Codex OAuth account but could not update ai_providers.json"
+        );
+    }
+
+    let refreshed = CodexOAuthAccount {
+        access_token: access,
+        refresh_token: refresh,
+        expires_at,
+        ..current
+    };
+    let _ = sync_shared_codex_oauth_auth(&refreshed);
+    Ok(refreshed)
+}
+
+pub async fn refresh_codex_oauth_account_for_app_server(
+    working_dir: &Path,
+    previous_account_id: Option<&str>,
+    fallback_account_id: Option<&str>,
+) -> Result<CodexOAuthAccount, String> {
+    let account_id = previous_account_id
+        .filter(|id| !id.trim().is_empty())
+        .or(fallback_account_id)
+        .ok_or_else(|| "Codex requested OAuth refresh without an account id".to_string())?;
+
+    let lock = codex_oauth_refresh_lock(account_id);
+    let _guard = lock.lock().await;
+
+    let current = find_openai_oauth_account_by_chatgpt_account_id(working_dir, account_id)
+        .ok_or_else(|| {
+            format!(
+                "No OpenAI OAuth account found for ChatGPT account {}",
+                account_id
+            )
+        })?;
+
+    let client = reqwest::Client::new();
+    let (access, refresh, expires_at, _id_token) =
+        refresh_openai_oauth_tokens(&client, &current.refresh_token).await?;
+    let refreshed_account_id =
+        extract_chatgpt_account_id(&access).unwrap_or_else(|| current.chatgpt_account_id.clone());
+
+    if refreshed_account_id != current.chatgpt_account_id {
+        tracing::warn!(
+            expected_account_id = %current.chatgpt_account_id,
+            refreshed_account_id = %refreshed_account_id,
+            "OpenAI OAuth app-server refresh returned a different ChatGPT account id"
+        );
+    }
+
+    let updated = update_provider_oauth_for_chatgpt_account(
+        working_dir,
+        &current.chatgpt_account_id,
+        &access,
+        &refresh,
+        expires_at,
+    );
+    if !updated {
+        tracing::warn!(
+            account_id = %current.chatgpt_account_id,
+            "Refreshed Codex OAuth account for app-server but could not update ai_providers.json"
+        );
+    }
+
+    let refreshed = CodexOAuthAccount {
+        access_token: access,
+        refresh_token: refresh,
+        expires_at,
+        ..current
+    };
+    let _ = sync_shared_codex_oauth_auth(&refreshed);
+    Ok(refreshed)
+}
+
 /// Per-attempt credential override passed to `write_codex_credentials_for_workspace`.
 /// The runner builds one of these for each rotation attempt; the legacy
 /// "process-global creds.json" path is the fallback when the override is `None`.
@@ -2405,11 +2697,21 @@ pub fn get_all_openai_oauth_accounts(working_dir: &Path) -> Vec<CodexOAuthAccoun
             .get("access_token")
             .and_then(|v| v.as_str())
             .unwrap_or("");
-        let expires_at = oauth
-            .get("expires_at")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(0);
+        let stored_expires_at = oauth.get("expires_at").and_then(|v| v.as_i64());
         if refresh.is_empty() || access.is_empty() {
+            continue;
+        }
+        let decoded_expires_at = extract_jwt_exp_ms(access);
+        let expires_at = decoded_expires_at.or(stored_expires_at).unwrap_or(i64::MAX);
+        if (stored_expires_at.is_some() || decoded_expires_at.is_some())
+            && oauth_token_expired(expires_at)
+        {
+            tracing::warn!(
+                provider_id = p.get("id").and_then(|v| v.as_str()).unwrap_or("<unknown>"),
+                account_email = p.get("account_email").and_then(|v| v.as_str()),
+                expires_at,
+                "Skipping expired OpenAI OAuth provider entry for Codex rotation"
+            );
             continue;
         }
         let chatgpt_account_id = match extract_chatgpt_account_id(access) {
@@ -2458,7 +2760,16 @@ pub(crate) fn write_codex_auth_json_chatgpt_with_tokens(
     access_token: &str,
     refresh_token: &str,
 ) -> Result<(), String> {
-    write_codex_chatgpt_auth_file(config_dir, access_token, refresh_token, "rotation_override")
+    // The current Codex app-server requires the ChatGPT refresh_token to be
+    // present in auth.json. Access-token-only auth can leave the responses
+    // client with no bearer header, producing 401s from the OpenAI API.
+    write_codex_chatgpt_auth_file(
+        config_dir,
+        access_token,
+        refresh_token,
+        "rotation_override",
+        true,
+    )
 }
 
 /// Write Codex credentials to a workspace.
@@ -2650,6 +2961,12 @@ pub struct UpdateProviderRequest {
     pub enabled: Option<bool>,
     /// Which backends this provider is used for (e.g., ["opencode", "claudecode"])
     pub use_for_backends: Option<Vec<String>>,
+    /// Custom models for custom providers
+    pub custom_models: Option<Vec<crate::ai_providers::CustomModel>>,
+    /// Custom environment variable name for API key (for custom providers)
+    pub custom_env_var: Option<Option<String>>,
+    /// NPM package for custom provider
+    pub npm_package: Option<Option<String>>,
     /// Account identifier (email) — set by frontend when server-side userinfo fails
     pub account_email: Option<String>,
 }
@@ -2820,7 +3137,16 @@ fn build_response_from_store(provider: &crate::ai_providers::AIProvider) -> Prov
     let pt = provider.provider_type;
     let has_api_key = provider.api_key.is_some();
     let has_oauth = provider.oauth.is_some();
-    let status = if has_api_key || has_oauth || provider.base_url.is_some() {
+    let oauth_expired = provider
+        .oauth
+        .as_ref()
+        .is_some_and(|oauth| oauth_token_expired(oauth.expires_at));
+    let status = if pt == ProviderType::Xai && has_oauth && !has_api_key && oauth_expired {
+        ProviderStatusResponse::NeedsReauth {
+            reason: "xAI OAuth token expired; reconnect Grok Build".to_string(),
+            auth_url: None,
+        }
+    } else if has_api_key || has_oauth || provider.base_url.is_some() {
         ProviderStatusResponse::Connected
     } else {
         ProviderStatusResponse::NeedsAuth { auth_url: None }
@@ -3242,7 +3568,7 @@ fn sync_to_opencode_auth(
     Ok(())
 }
 
-fn write_grok_oauth_auth_file(
+pub(crate) fn write_grok_oauth_auth_file(
     refresh_token: &str,
     access_token: &str,
     expires_at: i64,
@@ -5550,11 +5876,86 @@ async fn list_provider_types() -> Json<Vec<ProviderTypeInfo>> {
 }
 
 /// GET /api/ai/providers - List all providers.
+/// Reconcile the stored xAI OAuth token from the Grok CLI's own auth file.
+///
+/// The Grok Build CLI refreshes `~/.grok/auth.json` on its own schedule. When
+/// it does, sandboxed's stored copy goes stale and the dashboard wrongly shows
+/// the xAI provider as "needs reauth" (NeedsReauth keys off the stored
+/// `expires_at`) even though the CLI's token is still valid. Adopt the CLI's
+/// token whenever it is fresher so the dashboard reflects reality and later
+/// runs reuse the freshest credential.
+pub async fn reconcile_xai_store_from_grok_cli(
+    ai_providers: &crate::ai_providers::AIProviderStore,
+) {
+    let Some(entry) = read_grok_auth_entry() else {
+        return;
+    };
+    let access = entry
+        .get("key")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty());
+    let refresh = entry
+        .get("refresh_token")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty());
+    let (Some(access), Some(refresh)) = (access, refresh) else {
+        return;
+    };
+    let cli_expires_at = grok_auth_expires_at_millis(&entry);
+    for account in ai_providers.get_all_by_type(ProviderType::Xai).await {
+        if !account.has_oauth() {
+            continue;
+        }
+        let stored_expires = account.oauth.as_ref().map(|o| o.expires_at).unwrap_or(0);
+        if cli_expires_at > stored_expires {
+            let mut updated = account.clone();
+            updated.oauth = Some(crate::ai_providers::OAuthCredentials {
+                access_token: access.to_string(),
+                refresh_token: refresh.to_string(),
+                expires_at: cli_expires_at,
+            });
+            ai_providers.update(account.id, updated).await;
+            tracing::info!(
+                account_id = %account.id,
+                cli_expires_at,
+                "Reconciled xAI OAuth token from Grok CLI auth file"
+            );
+        }
+    }
+}
+
+fn grok_cli_reconcile_due(last_check: Option<Instant>, now: Instant) -> bool {
+    last_check
+        .map(|last| now.duration_since(last) >= GROK_CLI_RECONCILE_INTERVAL)
+        .unwrap_or(true)
+}
+
+async fn maybe_reconcile_xai_store_from_grok_cli(
+    ai_providers: &crate::ai_providers::AIProviderStore,
+) {
+    let now = Instant::now();
+    {
+        let mut last_check = GROK_CLI_RECONCILE_LAST_CHECK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !grok_cli_reconcile_due(*last_check, now) {
+            return;
+        }
+        *last_check = Some(now);
+    }
+
+    reconcile_xai_store_from_grok_cli(ai_providers).await;
+}
+
 async fn list_providers(
     State(state): State<Arc<super::routes::AppState>>,
 ) -> Result<Json<Vec<ProviderResponse>>, (StatusCode, String)> {
     // Migrate any standard providers from opencode.json to the store on first call
     migrate_opencode_providers_to_store(&state.ai_providers, &state.config.working_dir).await;
+
+    // Keep the xAI provider's stored token in sync with the Grok CLI's own
+    // refreshed auth file so it doesn't show a false "needs reauth".
+    maybe_reconcile_xai_store_from_grok_cli(&state.ai_providers).await;
 
     // All providers live in AIProviderStore now
     let store_providers = state.ai_providers.list().await;
@@ -5786,7 +6187,7 @@ async fn check_provider_health(
             (
                 "https://api.minimax.io/v1/chat/completions",
                 serde_json::json!({
-                    "model": "MiniMax-M2",
+                    "model": "MiniMax-M3",
                     "messages": [{"role": "user", "content": "test"}],
                     "max_tokens": 1
                 }),
@@ -6471,7 +6872,7 @@ async fn get_provider_usage(
                         .header("Authorization", format!("Bearer {}", key))
                         .header("Content-Type", "application/json")
                         .json(&serde_json::json!({
-                            "model": "MiniMax-M2",
+                            "model": "MiniMax-M3",
                             "max_tokens": 1,
                             "messages": [{"role": "user", "content": "hi"}]
                         }))
@@ -6608,6 +7009,40 @@ async fn get_provider_usage(
                     serde_json::json!("No credentials configured"),
                 );
             }
+            info
+        }
+        ProviderType::Xai => {
+            let mut info = serde_json::json!({
+                "provider_type": "xai",
+                "provider_name": provider_name,
+                "account_email": account_email,
+            });
+
+            if api_key_opt.is_some() {
+                info.as_object_mut()
+                    .unwrap()
+                    .insert("status".to_string(), serde_json::json!("connected"));
+            } else if let Some(ref o) = oauth {
+                if oauth_token_expired(o.expires_at) {
+                    info.as_object_mut()
+                        .unwrap()
+                        .insert("status".to_string(), serde_json::json!("needs_reauth"));
+                    info.as_object_mut().unwrap().insert(
+                        "error".to_string(),
+                        serde_json::json!("xAI OAuth token expired; reconnect Grok Build"),
+                    );
+                } else {
+                    info.as_object_mut()
+                        .unwrap()
+                        .insert("status".to_string(), serde_json::json!("connected"));
+                }
+            } else {
+                info.as_object_mut().unwrap().insert(
+                    "error".to_string(),
+                    serde_json::json!("No credentials configured"),
+                );
+            }
+
             info
         }
         _ => {
@@ -6837,7 +7272,12 @@ async fn create_provider(
     }
 
     // Refresh metadata LLM config so new API keys are picked up for title generation
-    super::metadata_llm::refresh_metadata_llm_config(&state.ai_providers).await;
+    super::metadata_llm::refresh_metadata_llm_config(
+        &state.ai_providers,
+        &state.chain_store,
+        state.settings.get().await.metadata_model,
+    )
+    .await;
 
     let response = build_response_from_store(&provider);
     Ok(Json(response))
@@ -6923,6 +7363,15 @@ async fn update_provider(
     if let Some(ref backends) = req.use_for_backends {
         updated.use_for_backends = Some(backends.clone());
     }
+    if let Some(custom_models) = req.custom_models {
+        updated.custom_models = Some(custom_models);
+    }
+    if let Some(custom_env_var) = req.custom_env_var {
+        updated.custom_env_var = custom_env_var;
+    }
+    if let Some(npm_package) = req.npm_package {
+        updated.npm_package = npm_package;
+    }
     if let Some(ref email) = req.account_email {
         updated.account_email = Some(email.clone());
         // Also persist to provider_accounts.json for list endpoint
@@ -6966,7 +7415,12 @@ async fn update_provider(
     let response = build_response_from_store(&result);
 
     // Refresh metadata LLM config so updated API keys are picked up for title generation
-    super::metadata_llm::refresh_metadata_llm_config(&state.ai_providers).await;
+    super::metadata_llm::refresh_metadata_llm_config(
+        &state.ai_providers,
+        &state.chain_store,
+        state.settings.get().await.metadata_model,
+    )
+    .await;
 
     tracing::info!(
         "Updated {} provider: {} ({})",
@@ -7026,7 +7480,12 @@ async fn delete_provider(
     }
 
     // Refresh metadata LLM config in case the deleted provider was being used
-    super::metadata_llm::refresh_metadata_llm_config(&state.ai_providers).await;
+    super::metadata_llm::refresh_metadata_llm_config(
+        &state.ai_providers,
+        &state.chain_store,
+        state.settings.get().await.metadata_model,
+    )
+    .await;
 
     Ok((
         StatusCode::OK,
@@ -7381,14 +7840,33 @@ async fn oauth_callback(
     let provider_type_id = id.clone();
     match oauth_callback_inner(State(state.clone()), AxumPath(id), Json(req)).await {
         Ok(json) => {
-            if ProviderType::from_id(&provider_type_id) == Some(ProviderType::Xai) {
+            // Resolve the provider type. The add-provider flow passes a
+            // provider-type id ("anthropic", ...); the reconnect button passes
+            // the stored provider's *UUID*, which `ProviderType::from_id` does
+            // not recognize. Look the UUID up in the store so reconnect still
+            // mirrors the fresh OAuth into the row instead of leaving it with
+            // expired tokens.
+            let resolved_type_and_uuid = match ProviderType::from_id(&provider_type_id) {
+                Some(pt) => Some((pt, None)),
+                None => match uuid::Uuid::parse_str(&provider_type_id) {
+                    Ok(uuid) => state
+                        .ai_providers
+                        .get(uuid)
+                        .await
+                        .map(|existing| (existing.provider_type, Some(uuid))),
+                    Err(_) => None,
+                },
+            };
+
+            if resolved_type_and_uuid.map(|(pt, _)| pt) == Some(ProviderType::Xai) {
+                // xAI tracks creds in auth.json only; don't mirror to the store.
                 return json.into_response();
             }
 
             // After successful OAuth, upsert the provider in AIProviderStore.
             // The OAuth callback already synced creds to auth.json; now mirror that
             // into the store so multiple accounts of the same type are tracked.
-            if let Some(provider_type) = ProviderType::from_id(&provider_type_id) {
+            if let Some((provider_type, existing_uuid)) = resolved_type_and_uuid {
                 let backends = use_for_backends
                     .unwrap_or_else(|| default_backends_for_provider(provider_type));
 
@@ -7446,6 +7924,51 @@ async fn oauth_callback(
                     }
                 }
 
+                // If the caller referenced an existing provider by UUID (the
+                // reconnect button passes the stored provider's id), refresh
+                // that row in place. We must NEVER fall through to `add` here:
+                // inserting a second account for the same OAuth completion would
+                // leave the targeted row stale and duplicate the credential. Any
+                // failure path returns an explicit error instead.
+                if let Some(uuid) = existing_uuid {
+                    let Some(mut existing) = state.ai_providers.get(uuid).await else {
+                        // The OAuth creds are already synced to auth.json; the
+                        // targeted row just vanished. Report rather than insert
+                        // a duplicate.
+                        return (
+                            axum::http::StatusCode::NOT_FOUND,
+                            "Provider to reconnect no longer exists".to_string(),
+                        )
+                            .into_response();
+                    };
+                    // Only replace the stored credentials when the callback
+                    // actually produced fresh ones. If `read_opencode_auth`
+                    // returned nothing (e.g. a failed auth.json sync that still
+                    // reported success), keep the existing creds rather than
+                    // wiping a row the user just re-authorized.
+                    if provider.api_key.is_some() || provider.oauth.is_some() {
+                        existing.api_key = provider.api_key.clone();
+                        existing.oauth = provider.oauth.clone();
+                    }
+                    existing.use_for_backends = provider.use_for_backends.clone();
+                    existing.enabled = true;
+                    // Only overwrite the display name/email when the new
+                    // credentials carry an identity; otherwise keep what the
+                    // user already had.
+                    if provider.account_email.is_some() {
+                        existing.account_email = provider.account_email.clone();
+                        existing.name = provider.name.clone();
+                    }
+                    return match state.ai_providers.update(uuid, existing).await {
+                        Some(stored) => Json(build_response_from_store(&stored)).into_response(),
+                        None => (
+                            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                            "Failed to persist reconnected provider".to_string(),
+                        )
+                            .into_response(),
+                    };
+                }
+
                 let store_id = state.ai_providers.add(provider.clone()).await;
                 // Return a response with the store UUID so the frontend can reference it
                 let stored = state.ai_providers.get(store_id).await.unwrap_or(provider);
@@ -7492,8 +8015,12 @@ async fn oauth_callback_inner(
                     .to_string(),
             )
         })?;
+        // Reconnect passes the row's UUID as the path id; thread it through so
+        // we update that exact row instead of the first OAuth xAI account.
+        let target_id = uuid::Uuid::parse_str(&id).ok();
         let response =
-            upsert_grok_oauth_provider(&state, &entry, req.use_for_backends.clone()).await?;
+            upsert_grok_oauth_provider(&state, &entry, req.use_for_backends.clone(), target_id)
+                .await?;
         return Ok(Json(response));
     }
 
@@ -8421,6 +8948,29 @@ pub fn sync_oauth_to_all_tiers(
         }
     }
 
+    if matches!(provider_type, ProviderType::OpenAI) {
+        if let Some(account_id) = extract_chatgpt_account_id(access_token) {
+            let working_dir = PathBuf::from(home_dir());
+            if update_provider_oauth_for_chatgpt_account(
+                &working_dir,
+                &account_id,
+                access_token,
+                refresh_token,
+                expires_at,
+            ) {
+                tracing::info!(
+                    account_id = %account_id,
+                    "Synced OpenAI OAuth token to ai_providers.json"
+                );
+            } else {
+                tracing::debug!(
+                    account_id = %account_id,
+                    "No matching OpenAI provider row found while syncing OAuth token"
+                );
+            }
+        }
+    }
+
     tracing::info!(
         provider = ?provider_type,
         "Successfully synced OAuth token to all storage tiers"
@@ -8529,4 +9079,67 @@ pub async fn refresh_oauth_token_with_lock(
 
     Ok((new_access, new_refresh, expires_at))
     // _lock is dropped here, releasing the file lock
+}
+
+/// Refresh OAuth tokens for **store-backed** accounts (AIProviderStore) of
+/// `provider_type` that expire within `refresh_threshold_ms`, writing the new
+/// tokens back to the store (and credential tiers).
+///
+/// The file-based [`oauth_token_refresher_loop`] only sees tokens written to
+/// `auth.json`/`credentials.json`. Providers connected via the dashboard live
+/// in the store (e.g. xAI/Grok), so without this their short-lived access
+/// token silently expires and `resolve_chain` drops the provider until the
+/// user reconnects. Returns `(found, refreshed)`.
+pub async fn refresh_due_store_oauth(
+    ai_providers: &crate::ai_providers::AIProviderStore,
+    provider_type: ProviderType,
+    refresh_threshold_ms: i64,
+) -> (u32, u32) {
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let mut found = 0u32;
+    let mut refreshed = 0u32;
+    for account in ai_providers.get_all_by_type(provider_type).await {
+        let Some(oauth) = account.oauth.as_ref() else {
+            continue;
+        };
+        if oauth.refresh_token.trim().is_empty() {
+            continue;
+        }
+        found += 1;
+        if oauth.expires_at - now_ms > refresh_threshold_ms {
+            continue;
+        }
+        // Serialize with the file-based refresher to avoid racing a rotating
+        // refresh token (best-effort — proceed unlocked if contended).
+        let _lock = acquire_oauth_refresh_lock(provider_type).ok();
+        match refresh_oauth_token_internal(&provider_type, &oauth.refresh_token).await {
+            Ok((access, refresh, expires_at)) => {
+                let mut updated = account.clone();
+                updated.oauth = Some(crate::ai_providers::OAuthCredentials {
+                    access_token: access.clone(),
+                    refresh_token: refresh.clone(),
+                    expires_at,
+                });
+                ai_providers.update(account.id, updated).await;
+                // Keep the credential tiers consistent too (best-effort).
+                let _ = sync_oauth_to_all_tiers(provider_type, &refresh, &access, expires_at);
+                refreshed += 1;
+                tracing::info!(
+                    provider = ?provider_type,
+                    account_id = %account.id,
+                    new_expires_at = expires_at,
+                    "Refreshed store-backed OAuth token"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    provider = ?provider_type,
+                    account_id = %account.id,
+                    error = ?e,
+                    "Failed to refresh store-backed OAuth token (account may need reconnect)"
+                );
+            }
+        }
+    }
+    (found, refreshed)
 }

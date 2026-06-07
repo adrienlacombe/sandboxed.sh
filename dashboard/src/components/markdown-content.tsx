@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useCallback, useEffect, useMemo, useRef, memo } from "react";
+import { useState, useCallback, useEffect, useLayoutEffect, useMemo, useRef, memo } from "react";
 import { createRoot } from "react-dom/client";
 import Markdown, { Components, defaultUrlTransform } from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -139,12 +139,31 @@ function releaseImageUrl(path: string): void {
   }
 }
 
+// Rendered dimensions of inline images, keyed by resolved path. Inline
+// previews live inside a virtualized timeline: rows unmount as the user
+// scrolls away and remount on the way back, and every remount that paints
+// a placeholder whose height differs from the final image shifts all rows
+// below it (the virtualizer re-measures both states). Recording the
+// laid-out size on first load lets remounts (and the loading skeleton)
+// reserve the exact final box, so re-measures are no-ops and the scroll
+// position stays put.
+const imageDimsCache = new Map<string, { width: number; height: number }>();
+
 function isFilePath(str: string): boolean {
   const hasExtension = FILE_EXTENSIONS.some(ext => str.toLowerCase().endsWith(ext));
   if (!hasExtension) return false;
   const looksLikePath = str.includes("/") || str.startsWith("./") || str.startsWith("../") || str.startsWith("~") || /^[a-zA-Z]:/.test(str);
   const isSimpleFilename = /^[\w\-_.]+\.[a-z0-9]+$/i.test(str);
   return looksLikePath || isSimpleFilename;
+}
+
+function isRichFileLinkHref(href: string): boolean {
+  if (!href || href.startsWith("#")) return false;
+  if (href.startsWith("sandboxed-file://")) return true;
+  if (/^[a-z][a-z0-9+.-]*:/i.test(href)) {
+    return /^[a-zA-Z]:/.test(href);
+  }
+  return isFilePath(href.split(/[?#]/, 1)[0]);
 }
 
 function getFileIcon(path: string) {
@@ -154,6 +173,50 @@ function getFileIcon(path: string) {
   if (path.toLowerCase().endsWith(".txt") || path.toLowerCase().endsWith(".md") || path.toLowerCase().endsWith(".log")) return FileText;
   return File;
 }
+
+// Sentinel class applied by `rehypeMarkStandaloneLinks` to links that are the
+// sole content of their paragraph/list-item. Only such "standalone" file links
+// render as the full download card; file links mentioned mid-prose render as a
+// compact inline chip so they don't break the surrounding text flow.
+const STANDALONE_LINK_CLASS = "__standalone-link";
+
+/* eslint-disable @typescript-eslint/no-explicit-any */
+function rehypeMarkStandaloneLinks() {
+  return (tree: any) => {
+    const walk = (node: any) => {
+      if (!node || !Array.isArray(node.children)) return;
+      for (const child of node.children) {
+        if (
+          child.type === "element" &&
+          (child.tagName === "p" || child.tagName === "li")
+        ) {
+          const meaningful = (child.children ?? []).filter(
+            (c: any) => !(c.type === "text" && String(c.value ?? "").trim() === "")
+          );
+          if (
+            meaningful.length === 1 &&
+            meaningful[0].type === "element" &&
+            meaningful[0].tagName === "a"
+          ) {
+            const link = meaningful[0];
+            link.properties = link.properties ?? {};
+            const existing = link.properties.className;
+            const classes = Array.isArray(existing)
+              ? existing.slice()
+              : typeof existing === "string"
+                ? [existing]
+                : [];
+            classes.push(STANDALONE_LINK_CLASS);
+            link.properties.className = classes;
+          }
+        }
+        walk(child);
+      }
+    };
+    walk(tree);
+  };
+}
+/* eslint-enable @typescript-eslint/no-explicit-any */
 
 function resolvePath(path: string, basePath?: string): string {
   if (path.startsWith("/") || /^[a-zA-Z]:/.test(path)) {
@@ -423,16 +486,21 @@ function FilePreviewModalContent({
 
   return (
     <div
-      className="fixed inset-0 z-50 flex items-center justify-center p-4"
+      className="fixed inset-0 z-50 flex items-center justify-center p-4 md:p-8"
       onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}
     >
-      <div className="absolute inset-0 bg-black/60 backdrop-blur-sm pointer-events-none" />
+      <div className="absolute inset-0 bg-black/70 backdrop-blur-sm pointer-events-none" />
       <div
         onClick={(e) => e.stopPropagation()}
         className={cn(
           "relative rounded-2xl bg-[#1a1a1a] border border-white/[0.06] shadow-xl",
           "animate-in fade-in zoom-in-95 duration-200",
-          isImage || canTextPreview ? "max-w-4xl w-full" : "max-w-md w-full"
+          // Previewable files open as a full-page reader (the whole viewport
+          // minus padding) so the document clearly sits over the page rather
+          // than reading as a chat-width inline expansion.
+          isImage || canTextPreview
+            ? "flex h-full w-full max-w-6xl flex-col"
+            : "max-w-md w-full"
         )}
       >
         <div className="flex items-center justify-between px-5 py-4 border-b border-white/[0.06]">
@@ -464,10 +532,15 @@ function FilePreviewModalContent({
           </div>
         </div>
 
-        <div className="p-5">
+        <div
+          className={cn(
+            "p-5",
+            (isImage || canTextPreview) && "flex min-h-0 flex-1 flex-col"
+          )}
+        >
           {isImage ? (
-            <div className="space-y-4">
-              <div className="relative min-h-[200px] rounded-xl overflow-hidden bg-black/20 flex items-center justify-center">
+            <div className="flex min-h-0 flex-1 flex-col gap-4">
+              <div className="relative min-h-[200px] flex-1 rounded-xl overflow-hidden bg-black/20 flex items-center justify-center">
                 {loading && (
                   <div className="absolute inset-0 flex flex-col items-center justify-center gap-3">
                     <div className="w-full max-w-[300px] h-[200px] rounded-lg bg-white/[0.03] animate-pulse" />
@@ -484,7 +557,7 @@ function FilePreviewModalContent({
                 )}
                 {imageUrl && !loading && (
                   /* eslint-disable-next-line @next/next/no-img-element */
-                  <img src={imageUrl} alt={fileName} className="max-w-full max-h-[60vh] object-contain" />
+                  <img src={imageUrl} alt={fileName} className="max-w-full max-h-full object-contain" />
                 )}
               </div>
               <div className="flex items-center justify-between pt-2 border-t border-white/[0.06]">
@@ -504,8 +577,8 @@ function FilePreviewModalContent({
               </div>
             </div>
           ) : canTextPreview ? (
-            <div className="space-y-4">
-              <div className="relative rounded-xl overflow-hidden bg-black/20 border border-white/[0.06]">
+            <div className="flex min-h-0 flex-1 flex-col gap-4">
+              <div className="relative min-h-0 flex-1 rounded-xl overflow-hidden bg-black/20 border border-white/[0.06]">
                 {textLoading && (
                   <div className="p-4">
                     <div className="h-4 w-2/3 rounded bg-white/[0.04] animate-pulse mb-2" />
@@ -523,7 +596,7 @@ function FilePreviewModalContent({
                   </div>
                 )}
                 {textContent != null && !textLoading && (
-                  <div className="max-h-[60vh] overflow-auto p-4">
+                  <div className="h-full overflow-auto p-4">
                     {isMarkdown ? (
                       <div className="prose-glass text-sm [&_p]:my-2">
                         <Markdown
@@ -548,7 +621,7 @@ function FilePreviewModalContent({
                                     customStyle={{
                                       padding: "1rem",
                                       borderRadius: "0.5rem",
-                                      background: "rgba(0, 0, 0, 0.3)",
+                                      background: "rgb(var(--code-background))",
                                     }}
                                   >
                                     {codeString}
@@ -683,8 +756,17 @@ function InlineImagePreview({
   const [imageUrl, setImageUrl] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  // Bumped in `onLoad` after recording the image's dimensions so the
+  // render below re-reads `imageDimsCache` and swaps the pre-decode
+  // reservation for the exact final box.
+  const [, setDimsVersion] = useState(0);
 
-  useEffect(() => {
+  // Layout effect (not useEffect): the cached-URL path is synchronous, so
+  // running before paint means a remounted preview (virtualized row
+  // scrolled back into view) commits the real `<img>` without ever
+  // painting the loading skeleton — the timeline virtualizer never sees
+  // the intermediate (shorter) box and rows below don't jump.
+  useLayoutEffect(() => {
     // Reset between effect runs so a previous error/blob doesn't leak when
     // `resolvedPath` changes (e.g. `basePath` resolves after first paint).
     setImageUrl(null);
@@ -754,9 +836,19 @@ function InlineImagePreview({
   // the skeleton. `<span>` (not `<div>`) keeps this valid inside the `<p>`
   // that react-markdown wraps around `![alt](url)` so hydration doesn't
   // tear the subtree.
+  //
+  // When this image has rendered before, reserve its exact laid-out box so
+  // the skeleton → image swap is layout-neutral (critical inside the
+  // virtualized timeline — see `imageDimsCache`). Otherwise default to
+  // 300px: `max-h-[300px]` makes that the final height for any screenshot
+  // taller than 300px, which is the overwhelmingly common case, so the
+  // first-load shift is usually zero instead of +100px per image.
+  const knownDims = resolvedPath ? imageDimsCache.get(resolvedPath) : undefined;
   const placeholderClass =
     "my-2 block rounded-xl overflow-hidden border border-white/[0.06] bg-white/[0.03]";
-  const placeholderStyle = { maxWidth: 400, height: 200 } as const;
+  const placeholderStyle = knownDims
+    ? { width: knownDims.width, height: knownDims.height, maxWidth: "100%" as const }
+    : ({ maxWidth: 400, height: 300 } as const);
 
   if (error) {
     return (
@@ -784,6 +876,33 @@ function InlineImagePreview({
         src={imageUrl}
         alt={alt}
         className="max-h-[300px] rounded-xl border border-white/[0.06] cursor-pointer hover:border-white/[0.12] transition-colors"
+        // Pin the box to the remembered size so the row's height is stable
+        // from the very first commit, even before the blob is decoded
+        // (an `<img>` has no intrinsic size until decode completes, which
+        // is async even for cached blob URLs). Without remembered dims —
+        // e.g. the URL is cached but the row unmounted before `onLoad`
+        // ever fired — reserve the 300px fallback height instead of
+        // letting the box collapse to its (zero) pre-decode size; `onLoad`
+        // then records the real dims and re-renders with the exact box.
+        style={
+          knownDims
+            ? { width: knownDims.width, height: knownDims.height, maxWidth: "100%" }
+            : { height: 300, maxWidth: "100%" }
+        }
+        onLoad={(e) => {
+          const img = e.currentTarget;
+          // Derive the final box from the intrinsic size and the
+          // max-h-[300px] rule rather than offsetWidth/offsetHeight: the
+          // pre-decode `height: 300` pin is still applied at this point,
+          // so the laid-out box of a shorter image would read as
+          // (stretched) 300px and get cached wrong.
+          if (resolvedPath && img.naturalWidth > 0 && img.naturalHeight > 0) {
+            const height = Math.min(300, img.naturalHeight);
+            const width = Math.round((img.naturalWidth / img.naturalHeight) * height);
+            imageDimsCache.set(resolvedPath, { width, height });
+            setDimsVersion((v) => v + 1);
+          }
+        }}
         onClick={() => showFilePreviewModal(path, resolvedPath ?? path, workspaceId, missionId)}
       />
     </span>
@@ -894,7 +1013,7 @@ function InlineFileCard({
   }
 
   return (
-    <div
+    <span
       className={cn(
         "my-2 inline-flex items-center gap-3 px-4 py-3 rounded-xl",
         "bg-white/[0.04] border border-white/[0.06] hover:bg-white/[0.06] hover:border-white/[0.1]",
@@ -902,16 +1021,18 @@ function InlineFileCard({
       )}
       onClick={() => showFilePreviewModal(path, resolvedPath, workspaceId, missionId)}
     >
-      <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-indigo-500/10">
+      <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-indigo-500/10">
         <FileIcon className="h-4 w-4 text-indigo-400" />
-      </div>
-      <div className="min-w-0 flex-1">
-        <div className="text-sm font-medium text-white/80 truncate">{displayName}</div>
-        <div className="text-xs text-white/40">
+      </span>
+      <span className="min-w-0 flex-1">
+        <span className="block text-sm font-medium text-white/80 truncate">
+          {displayName}
+        </span>
+        <span className="block text-xs text-white/40">
           {ext && <span className="mr-2">{ext}</span>}
           {metadata?.size != null && <span>{formatFileSize(metadata.size)}</span>}
-        </div>
-      </div>
+        </span>
+      </span>
       <button
         onClick={handleDownload}
         disabled={downloading}
@@ -920,7 +1041,50 @@ function InlineFileCard({
       >
         <Download className={cn("h-4 w-4", downloading && "animate-pulse")} />
       </button>
-    </div>
+    </span>
+  );
+}
+
+// Compact, text-flowing reference for a file linked mid-prose. Unlike
+// InlineFileCard this stays on the baseline and does no metadata fetch — it is
+// just a clickable filename that opens the preview modal.
+function InlineFileChip({
+  path,
+  displayName,
+  basePath,
+  workspaceId,
+  missionId,
+}: {
+  path: string;
+  displayName: string;
+  basePath?: string;
+  workspaceId?: string;
+  missionId?: string;
+}) {
+  const isAbsolute = path.startsWith("/") || /^[a-zA-Z]:/.test(path);
+  const canResolve = isAbsolute || !!basePath;
+  const resolvedPath = canResolve ? resolvePath(path, basePath) : path;
+  const FileIcon = getFileIcon(path);
+  return (
+    <button
+      type="button"
+      title="Click to preview"
+      onClick={(e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        showFilePreviewModal(path, resolvedPath, workspaceId, missionId);
+      }}
+      className={cn(
+        "inline-flex items-center gap-1 align-middle rounded px-1.5 py-0.5",
+        "bg-indigo-500/[0.12] text-indigo-300 hover:bg-indigo-500/20 hover:text-indigo-200",
+        "font-mono text-[0.85em] leading-none cursor-pointer transition-colors"
+      )}
+    >
+      {/* getFileIcon returns a stable module-level lucide component, not a new one. */}
+      {/* eslint-disable-next-line react-hooks/static-components */}
+      <FileIcon className="h-3 w-3 shrink-0 opacity-70" />
+      <span className="truncate max-w-[16rem]">{displayName}</span>
+    </button>
   );
 }
 
@@ -970,14 +1134,27 @@ export const MarkdownContent = memo(function MarkdownContent({
       // eslint-disable-next-line @next/next/no-img-element
       return <img src={srcStr} alt={alt} {...props} className="max-w-full rounded" />;
     },
-    a({ href, children, ...props }) {
-      // Handle sandboxed-file:// protocol for rich file tags
-      if (href?.startsWith("sandboxed-file://")) {
-        const path = decodeURIComponent(href.replace("sandboxed-file://", ""));
+    a({ href, children, className, ...props }) {
+      if (href && isRichFileLinkHref(href)) {
+        const path = href.startsWith("sandboxed-file://")
+          ? decodeURIComponent(href.replace("sandboxed-file://", ""))
+          : decodeURIComponent(href.split(/[?#]/, 1)[0]);
         const childText = Array.isArray(children) ? children.join("") : String(children || "");
         const displayName = childText || path.split("/").pop() || "file";
-        return (
+        const standalone =
+          typeof className === "string" && className.includes(STANDALONE_LINK_CLASS);
+        // Standalone (own paragraph/list-item) → full download card; a file
+        // mentioned mid-prose → compact inline chip so text keeps flowing.
+        return standalone ? (
           <InlineFileCard
+            path={path}
+            displayName={displayName}
+            basePath={basePath}
+            workspaceId={workspaceId}
+            missionId={missionId}
+          />
+        ) : (
+          <InlineFileChip
             path={path}
             displayName={displayName}
             basePath={basePath}
@@ -1008,8 +1185,8 @@ export const MarkdownContent = memo(function MarkdownContent({
           return (
             <code
               className={cn(
-                "px-1.5 py-0.5 rounded bg-white/[0.06] text-indigo-300 text-xs font-mono",
-                "cursor-pointer hover:bg-white/[0.1] hover:text-indigo-200 transition-colors"
+                "code-inline text-xs font-mono",
+                "cursor-pointer transition-colors"
               )}
               onClick={(e) => {
                 e.preventDefault();
@@ -1028,7 +1205,7 @@ export const MarkdownContent = memo(function MarkdownContent({
           );
         }
         return (
-          <code className="px-1.5 py-0.5 rounded bg-white/[0.06] text-indigo-300 text-xs font-mono" {...props}>
+          <code className="code-inline text-xs font-mono" {...props}>
             {children}
           </code>
         );
@@ -1043,18 +1220,18 @@ export const MarkdownContent = memo(function MarkdownContent({
               customStyle={{
                 padding: "1rem",
                 borderRadius: "0.5rem",
-                background: "rgba(0, 0, 0, 0.3)",
+                background: "rgb(var(--code-background))",
               }}
             >
               {codeString}
             </LazyCodeBlock>
           ) : (
-            <pre className="p-4 bg-black/30 rounded-lg overflow-x-auto">
-              <code className="text-xs font-mono text-white/80">{codeString}</code>
+            <pre className="code-block p-4 overflow-x-auto">
+              <code className="text-xs font-mono">{codeString}</code>
             </pre>
           )}
           {match && (
-            <div className="absolute left-3 top-2 text-[10px] text-white/30 uppercase tracking-wider">{match[1]}</div>
+            <div className="absolute left-3 top-2 text-[10px] muted-text uppercase tracking-wider">{match[1]}</div>
           )}
         </div>
       );
@@ -1066,6 +1243,7 @@ export const MarkdownContent = memo(function MarkdownContent({
 
   // Memoize remarkPlugins array to prevent recreation
   const plugins = useMemo(() => [remarkGfm], []);
+  const rehypePlugins = useMemo(() => [rehypeMarkStandaloneLinks], []);
 
   // Allow our placeholder protocols through react-markdown's URL sanitizer.
   // Everything else should continue to use the default sanitizer behavior.
@@ -1093,7 +1271,7 @@ export const MarkdownContent = memo(function MarkdownContent({
             Render markdown
           </button>
         </div>
-        <pre className="max-h-[60vh] overflow-auto whitespace-pre-wrap break-words rounded bg-white/5 p-3 text-xs leading-relaxed">
+        <pre className="code-block max-h-[60vh] overflow-auto whitespace-pre-wrap break-words p-3 text-xs leading-relaxed">
           {content}
         </pre>
       </div>
@@ -1102,7 +1280,7 @@ export const MarkdownContent = memo(function MarkdownContent({
 
   return (
     <div className={cn("prose-glass text-sm [&_p]:my-2", className)}>
-      <Markdown remarkPlugins={plugins} components={components} urlTransform={urlTransform}>
+      <Markdown remarkPlugins={plugins} rehypePlugins={rehypePlugins} components={components} urlTransform={urlTransform}>
         {processedContent}
       </Markdown>
     </div>
@@ -1178,7 +1356,7 @@ export function LazyMarkdownContent(props: MarkdownContentProps) {
       ref={ref}
       className={cn("prose-glass text-sm [&_p]:my-2", props.className)}
     >
-      <pre className="whitespace-pre-wrap break-words text-sm leading-relaxed text-white/80">
+      <pre className="code-block whitespace-pre-wrap break-words text-sm leading-relaxed">
         {props.content}
       </pre>
     </div>

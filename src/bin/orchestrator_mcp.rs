@@ -13,8 +13,8 @@ use chrono::Utc;
 use jsonwebtoken::{EncodingKey, Header};
 use sandboxed_sh::ai_providers::ProviderType;
 use sandboxed_sh::api::ai_providers::{
-    default_backends_for_provider, get_openai_api_key_for_codex_default, provider_targets_backend,
-    read_oauth_token_entry,
+    default_backends_for_provider, get_all_openai_oauth_accounts,
+    get_openai_api_key_for_codex_default, provider_targets_backend, read_oauth_token_entry,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -170,6 +170,29 @@ struct BackendAuthStatusParams {
 }
 
 #[derive(Debug, Deserialize)]
+struct DurableJobStartParams {
+    command: String,
+    #[serde(default)]
+    cwd: Option<String>,
+    #[serde(default)]
+    env: std::collections::HashMap<String, String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DurableJobIdParams {
+    job_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct DurableJobLogsParams {
+    job_id: String,
+    #[serde(default)]
+    tail_bytes: Option<usize>,
+    #[serde(default)]
+    stream: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct CreateWorktreeParams {
     /// Path relative to the workspace root where the worktree will be created
     path: String,
@@ -219,6 +242,10 @@ fn default_poll_interval() -> u64 {
 
 #[derive(Deserialize, Default)]
 struct DeploySandboxedShParams {
+    /// Optional explicit Sandboxed.sh environment to deploy. When omitted, the
+    /// tool deploys the API environment this mission is connected to.
+    #[serde(default)]
+    target_environment: Option<String>,
     /// Bypass self-protection + debounce safety rails.
     #[serde(default)]
     force: bool,
@@ -292,6 +319,32 @@ struct OrchestratorMcp {
     boss_workspace_id: OnceCell<Option<String>>,
 }
 
+struct DeployTarget {
+    api_url: &'static str,
+    expected_service: Option<&'static str>,
+}
+
+fn resolve_deploy_target(target_environment: Option<&str>) -> Result<DeployTarget, String> {
+    match target_environment {
+        None => Ok(DeployTarget {
+            api_url: "",
+            expected_service: None,
+        }),
+        Some("dev") => Ok(DeployTarget {
+            api_url: "http://127.0.0.1:3002",
+            expected_service: Some("sandboxed-sh-dev.service"),
+        }),
+        Some("prod") => Ok(DeployTarget {
+            api_url: "http://127.0.0.1:3000",
+            expected_service: Some("sandboxed-sh-prod.service"),
+        }),
+        Some(other) => Err(format!(
+            "Invalid target_environment {:?}; expected \"dev\" or \"prod\"",
+            other
+        )),
+    }
+}
+
 impl OrchestratorMcp {
     fn new(mission_id: Uuid, api_url: String, api_token: Option<String>) -> Self {
         Self {
@@ -354,6 +407,55 @@ impl OrchestratorMcp {
                             "description": "Optional single backend to inspect. If omitted, returns all common backends."
                         }
                     }
+                }),
+            },
+            ToolDefinition {
+                name: "durable_job_start".to_string(),
+                description: "Start a long-running server-managed background command that survives ephemeral agent session cleanup. Use this for multi-hour builds, large test suites, image builds, and similar work.".to_string(),
+                input_schema: json!({
+                    "type": "object",
+                    "required": ["command"],
+                    "properties": {
+                        "command": {"type": "string", "description": "Shell command to run."},
+                        "cwd": {"type": "string", "description": "Working directory. Relative paths resolve from the server working directory."},
+                        "env": {"type": "object", "additionalProperties": {"type": "string"}, "description": "Environment variables to add."}
+                    }
+                }),
+            },
+            ToolDefinition {
+                name: "durable_job_list".to_string(),
+                description: "List durable background jobs with current status, pid, command, cwd, and log paths.".to_string(),
+                input_schema: json!({"type": "object", "properties": {}}),
+            },
+            ToolDefinition {
+                name: "durable_job_status".to_string(),
+                description: "Get current status for a durable background job.".to_string(),
+                input_schema: json!({
+                    "type": "object",
+                    "required": ["job_id"],
+                    "properties": {"job_id": {"type": "string", "description": "Durable job UUID."}}
+                }),
+            },
+            ToolDefinition {
+                name: "durable_job_logs".to_string(),
+                description: "Read the tail of stdout and/or stderr logs for a durable background job.".to_string(),
+                input_schema: json!({
+                    "type": "object",
+                    "required": ["job_id"],
+                    "properties": {
+                        "job_id": {"type": "string", "description": "Durable job UUID."},
+                        "tail_bytes": {"type": "integer", "description": "Maximum bytes to return from each selected stream. Defaults to 16384."},
+                        "stream": {"type": "string", "enum": ["stdout", "stderr"], "description": "Optional single stream to return. Omit for both."}
+                    }
+                }),
+            },
+            ToolDefinition {
+                name: "durable_job_cancel".to_string(),
+                description: "Cancel a running durable background job by terminating its process group.".to_string(),
+                input_schema: json!({
+                    "type": "object",
+                    "required": ["job_id"],
+                    "properties": {"job_id": {"type": "string", "description": "Durable job UUID."}}
                 }),
             },
             ToolDefinition {
@@ -633,8 +735,13 @@ impl OrchestratorMcp {
             ToolDefinition {
                 name: "deploy_sandboxed_sh".to_string(),
                 description:
-                    "Build and hot-swap the sandboxed.sh binary on the host this mission's API \
-                     runs on, with safety rails:\n\
+                    "Build and hot-swap one Sandboxed.sh backend with safety rails.\n\
+                     Targeting is explicit:\n\
+                     • Omit target_environment to deploy the backend API this mission is connected to.\n\
+                     • Set target_environment=\"dev\" to deploy sandboxed-sh-dev via localhost:3002.\n\
+                     • Set target_environment=\"prod\" to deploy sandboxed-sh-prod via localhost:3000.\n\
+                     The backend refuses if the request reaches a service different from the \
+                     requested target.\n\
                      • Self-protection: refuses by default if your own mission lives on the \
                        service being restarted (passing force=true acknowledges that your turn \
                        will be SIGTERM'd).\n\
@@ -650,6 +757,11 @@ impl OrchestratorMcp {
                 input_schema: json!({
                     "type": "object",
                     "properties": {
+                        "target_environment": {
+                            "type": "string",
+                            "enum": ["dev", "prod"],
+                            "description": "Explicit environment to deploy. Omit to deploy the backend API this mission is connected to. Use dev for sandboxed-sh-dev on localhost:3002 and prod for sandboxed-sh-prod on localhost:3000."
+                        },
                         "force": {
                             "type": "boolean",
                             "description": "Bypass self-protection AND debounce. Only set this when you've explicitly decided the restart is worth killing your own turn / breaking the cooldown.",
@@ -686,7 +798,16 @@ impl OrchestratorMcp {
     }
 
     async fn api_post(&self, path: &str, body: Value) -> Result<reqwest::Response, String> {
-        let url = format!("{}{}", self.api_url, path);
+        self.api_post_to(&self.api_url, path, body).await
+    }
+
+    async fn api_post_to(
+        &self,
+        api_url: &str,
+        path: &str,
+        body: Value,
+    ) -> Result<reqwest::Response, String> {
+        let url = format!("{}{}", api_url, path);
         let mut req = self.client.post(&url).json(&body);
         if let Some((k, v)) = self.auth_header() {
             req = req.header(k, v);
@@ -954,7 +1075,6 @@ impl OrchestratorMcp {
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|| data_dir.clone());
         let auth_json_path = opencode_auth_json_path();
-        let codex_auth_path = codex_auth_json_path();
 
         let statuses: Vec<Value> = backends
             .into_iter()
@@ -969,10 +1089,7 @@ impl OrchestratorMcp {
                     None,
                 ),
                 "codex" => {
-                    let has_oauth = read_oauth_token_entry(ProviderType::OpenAI).is_some();
-                    let has_api_key =
-                        get_openai_api_key_for_codex_default(&workspace_root).is_some();
-                    let has_host_auth = looks_like_json_file(&codex_auth_path);
+                    let codex_auth = codex_auth_status(&workspace_root);
                     let targeted =
                         provider_targets_backend(&workspace_root, ProviderType::OpenAI, "codex");
                     backend_auth_entry(
@@ -980,12 +1097,16 @@ impl OrchestratorMcp {
                         ProviderType::OpenAI,
                         &workspace_root,
                         targeted,
-                        has_oauth || has_api_key || has_host_auth,
-                        has_host_auth,
+                        codex_auth.has_credentials(),
+                        codex_auth.has_valid_auth_json,
                         Some(json!({
-                            "has_api_key": has_api_key,
-                            "has_oauth": has_oauth,
-                            "has_host_auth_json": has_host_auth,
+                            "has_api_key": codex_auth.has_api_key,
+                            "has_oauth": codex_auth.has_oauth,
+                            "has_oauth_account": codex_auth.has_oauth_account,
+                            "has_host_auth_json": codex_auth.has_valid_auth_json,
+                            "auth_json_path": codex_auth.auth_json_path,
+                            "auth_json_mode": codex_auth.auth_json_mode,
+                            "auth_json_candidates": codex_auth.auth_json_candidates,
                         })),
                     )
                 }
@@ -1028,6 +1149,96 @@ impl OrchestratorMcp {
             "statuses": statuses,
             "note": "Shell env vars and CLI login status inside a worker shell are not authoritative for backend auth.",
         })
+    }
+
+    async fn durable_job_start(&self, params: DurableJobStartParams) -> Result<Value, String> {
+        let cwd = params.cwd.or_else(|| {
+            std::env::var("WORKING_DIR")
+                .ok()
+                .or_else(|| std::env::var("SANDBOXED_SH_WORKSPACE").ok())
+        });
+        let body = json!({
+            "command": params.command,
+            "cwd": cwd,
+            "env": params.env,
+            "started_by_mission_id": self.mission_id,
+        });
+        let response = self.api_post("/api/durable-jobs", body).await?;
+        if !response.status().is_success() {
+            let text = response.text().await.unwrap_or_default();
+            return Err(format!("Failed to start durable job: {}", text));
+        }
+        response
+            .json()
+            .await
+            .map_err(|e| format!("Failed to parse durable job response: {}", e))
+    }
+
+    async fn durable_job_list(&self) -> Result<Value, String> {
+        let response = self.api_get("/api/durable-jobs").await?;
+        if !response.status().is_success() {
+            return Err(format!(
+                "Failed to list durable jobs: {}",
+                response.status()
+            ));
+        }
+        response
+            .json()
+            .await
+            .map_err(|e| format!("Failed to parse durable job list: {}", e))
+    }
+
+    async fn durable_job_status(&self, params: DurableJobIdParams) -> Result<Value, String> {
+        let id = Uuid::parse_str(&params.job_id)
+            .map_err(|_| "Invalid durable job ID format".to_string())?;
+        let response = self.api_get(&format!("/api/durable-jobs/{}", id)).await?;
+        if !response.status().is_success() {
+            let text = response.text().await.unwrap_or_default();
+            return Err(format!("Durable job not found: {}", text));
+        }
+        response
+            .json()
+            .await
+            .map_err(|e| format!("Failed to parse durable job status: {}", e))
+    }
+
+    async fn durable_job_logs(&self, params: DurableJobLogsParams) -> Result<Value, String> {
+        let id = Uuid::parse_str(&params.job_id)
+            .map_err(|_| "Invalid durable job ID format".to_string())?;
+        let mut path = format!(
+            "/api/durable-jobs/{}/logs?tail_bytes={}",
+            id,
+            params.tail_bytes.unwrap_or(16 * 1024)
+        );
+        if let Some(stream) = params.stream {
+            path.push_str("&stream=");
+            path.push_str(&urlencoding::encode(&stream));
+        }
+        let response = self.api_get(&path).await?;
+        if !response.status().is_success() {
+            let text = response.text().await.unwrap_or_default();
+            return Err(format!("Failed to read durable job logs: {}", text));
+        }
+        response
+            .json()
+            .await
+            .map_err(|e| format!("Failed to parse durable job logs: {}", e))
+    }
+
+    async fn durable_job_cancel(&self, params: DurableJobIdParams) -> Result<Value, String> {
+        let id = Uuid::parse_str(&params.job_id)
+            .map_err(|_| "Invalid durable job ID format".to_string())?;
+        let response = self
+            .api_post(&format!("/api/durable-jobs/{}/cancel", id), json!({}))
+            .await?;
+        if !response.status().is_success() {
+            let text = response.text().await.unwrap_or_default();
+            return Err(format!("Failed to cancel durable job: {}", text));
+        }
+        response
+            .json()
+            .await
+            .map_err(|e| format!("Failed to parse durable job cancellation: {}", e))
     }
 
     fn create_worktree(&self, params: CreateWorktreeParams) -> Result<Value, String> {
@@ -1384,15 +1595,24 @@ impl OrchestratorMcp {
     /// consumed eagerly until we see a `deployed` event or the stream
     /// closes (the new binary takes over and our connection drops).
     async fn deploy_sandboxed_sh(&self, params: DeploySandboxedShParams) -> Result<Value, String> {
+        let target = resolve_deploy_target(params.target_environment.as_deref())?;
+        let api_url = if target.api_url.is_empty() {
+            self.api_url.as_str()
+        } else {
+            target.api_url
+        };
         let body = json!({
             "calling_mission_id": self.mission_id,
             "force": params.force,
             "git_ref": params.git_ref,
             "skip_build": params.skip_build,
             "repo_path": params.repo_path,
+            "expected_service": target.expected_service,
         });
 
-        let response = self.api_post("/api/system/deploy", body).await?;
+        let response = self
+            .api_post_to(api_url, "/api/system/deploy", body)
+            .await?;
         let status = response.status();
         if !status.is_success() {
             let text = response.text().await.unwrap_or_default();
@@ -1463,6 +1683,27 @@ impl OrchestratorMcp {
                 let params: BackendAuthStatusParams =
                     serde_json::from_value(params).map_err(|e| format!("Invalid params: {}", e))?;
                 Ok(self.get_backend_auth_status(params))
+            }
+            "durable_job_start" => {
+                let params: DurableJobStartParams =
+                    serde_json::from_value(params).map_err(|e| format!("Invalid params: {}", e))?;
+                self.durable_job_start(params).await
+            }
+            "durable_job_list" => self.durable_job_list().await,
+            "durable_job_status" => {
+                let params: DurableJobIdParams =
+                    serde_json::from_value(params).map_err(|e| format!("Invalid params: {}", e))?;
+                self.durable_job_status(params).await
+            }
+            "durable_job_logs" => {
+                let params: DurableJobLogsParams =
+                    serde_json::from_value(params).map_err(|e| format!("Invalid params: {}", e))?;
+                self.durable_job_logs(params).await
+            }
+            "durable_job_cancel" => {
+                let params: DurableJobIdParams =
+                    serde_json::from_value(params).map_err(|e| format!("Invalid params: {}", e))?;
+                self.durable_job_cancel(params).await
             }
             "create_worker_mission" => {
                 let params: CreateWorkerParams =
@@ -2048,11 +2289,117 @@ fn codex_auth_json_path() -> std::path::PathBuf {
     std::path::PathBuf::from("/var/lib/opencode/.codex/auth.json")
 }
 
-fn looks_like_json_file(path: &std::path::Path) -> bool {
-    std::fs::read_to_string(path)
-        .ok()
-        .and_then(|contents| serde_json::from_str::<serde_json::Value>(&contents).ok())
-        .is_some()
+#[derive(Debug, Clone)]
+struct CodexAuthStatus {
+    has_api_key: bool,
+    has_oauth: bool,
+    has_oauth_account: bool,
+    has_valid_auth_json: bool,
+    auth_json_path: Option<String>,
+    auth_json_mode: Option<String>,
+    auth_json_candidates: Vec<String>,
+}
+
+impl CodexAuthStatus {
+    fn has_credentials(&self) -> bool {
+        self.has_api_key || self.has_oauth || self.has_oauth_account || self.has_valid_auth_json
+    }
+}
+
+fn codex_auth_status(workspace_root: &std::path::Path) -> CodexAuthStatus {
+    let has_api_key = get_openai_api_key_for_codex_default(workspace_root).is_some();
+    let has_oauth = read_oauth_token_entry(ProviderType::OpenAI).is_some();
+    let has_oauth_account = !get_all_openai_oauth_accounts(workspace_root).is_empty();
+
+    let auth_json_candidates = codex_auth_json_candidates(workspace_root);
+    let auth_json_candidates_display = auth_json_candidates
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>();
+    let valid_auth_json = auth_json_candidates
+        .iter()
+        .filter_map(|path| codex_auth_json_status(path).map(|mode| (path, mode)))
+        .next();
+
+    let (auth_json_path, auth_json_mode) = valid_auth_json
+        .map(|(path, mode)| (Some(path.display().to_string()), Some(mode)))
+        .unwrap_or((None, None));
+
+    CodexAuthStatus {
+        has_api_key,
+        has_oauth,
+        has_oauth_account,
+        has_valid_auth_json: auth_json_path.is_some(),
+        auth_json_path,
+        auth_json_mode,
+        auth_json_candidates: auth_json_candidates_display,
+    }
+}
+
+fn codex_auth_json_candidates(workspace_root: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut candidates = Vec::new();
+
+    if let Ok(home) = std::env::var("HOME") {
+        candidates.push(std::path::PathBuf::from(home).join(".codex/auth.json"));
+    }
+
+    // In container workspaces Codex runs as root and reads /root/.codex/auth.json.
+    candidates.push(std::path::PathBuf::from("/root/.codex/auth.json"));
+
+    // Host-side view of a container workspace: write_codex_credentials_for_workspace
+    // writes <workspace_root>/root/.codex/auth.json.
+    candidates.push(workspace_root.join("root/.codex/auth.json"));
+
+    // Legacy isolated OpenCode home fallback.
+    candidates.push(std::path::PathBuf::from(
+        "/var/lib/opencode/.codex/auth.json",
+    ));
+
+    let legacy = codex_auth_json_path();
+    candidates.push(legacy);
+
+    let mut deduped = Vec::new();
+    for candidate in candidates {
+        if !deduped.iter().any(|existing| existing == &candidate) {
+            deduped.push(candidate);
+        }
+    }
+    deduped
+}
+
+fn codex_auth_json_status(path: &std::path::Path) -> Option<String> {
+    let contents = std::fs::read_to_string(path).ok()?;
+    let value = serde_json::from_str::<serde_json::Value>(&contents).ok()?;
+    codex_auth_json_mode(&value)
+}
+
+fn codex_auth_json_mode(value: &serde_json::Value) -> Option<String> {
+    let mode = value.get("auth_mode").and_then(|v| v.as_str())?;
+    match mode {
+        "apikey" => {
+            let has_key = value
+                .get("tokens")
+                .and_then(|v| v.get("api_key"))
+                .or_else(|| value.get("api_key"))
+                .or_else(|| value.get("OPENAI_API_KEY"))
+                .and_then(|v| v.as_str())
+                .is_some_and(|token| !token.trim().is_empty());
+            has_key.then(|| mode.to_string())
+        }
+        "chatgpt" => {
+            let tokens = value.get("tokens")?;
+            let has_access = tokens
+                .get("access_token")
+                .and_then(|v| v.as_str())
+                .is_some_and(|token| !token.trim().is_empty());
+            let has_refresh = tokens
+                .get("refresh_token")
+                .and_then(|v| v.as_str())
+                .is_some_and(|token| !token.trim().is_empty());
+            (has_access && has_refresh).then(|| mode.to_string())
+        }
+        _ => None,
+    }
 }
 
 fn opencode_auth_has_provider(path: &std::path::Path, provider: &str) -> bool {
@@ -2281,6 +2628,66 @@ mod working_directory_tests {
                 .expect_err("sibling path with prefix match should be rejected");
             assert!(err.contains("not be visible to the worker"));
         });
+    }
+}
+
+#[cfg(test)]
+mod codex_auth_status_tests {
+    use super::{codex_auth_json_mode, CodexAuthStatus};
+    use serde_json::json;
+
+    #[test]
+    fn codex_auth_json_mode_accepts_apikey_payload() {
+        let value = json!({
+            "auth_mode": "apikey",
+            "OPENAI_API_KEY": "sk-test",
+        });
+
+        assert_eq!(codex_auth_json_mode(&value), Some("apikey".to_string()));
+    }
+
+    #[test]
+    fn codex_auth_json_mode_accepts_chatgpt_payload_with_refresh() {
+        let value = json!({
+            "auth_mode": "chatgpt",
+            "OPENAI_API_KEY": null,
+            "tokens": {
+                "access_token": "access",
+                "refresh_token": "refresh",
+                "id_token": "access",
+                "account_id": "acct"
+            },
+            "last_refresh": "2026-06-04T16:01:00Z",
+        });
+
+        assert_eq!(codex_auth_json_mode(&value), Some("chatgpt".to_string()));
+    }
+
+    #[test]
+    fn codex_auth_json_mode_rejects_chatgpt_payload_without_refresh() {
+        let value = json!({
+            "auth_mode": "chatgpt",
+            "tokens": {
+                "access_token": "access"
+            }
+        });
+
+        assert_eq!(codex_auth_json_mode(&value), None);
+    }
+
+    #[test]
+    fn codex_auth_status_counts_oauth_account_as_credentials() {
+        let status = CodexAuthStatus {
+            has_api_key: false,
+            has_oauth: false,
+            has_oauth_account: true,
+            has_valid_auth_json: false,
+            auth_json_path: None,
+            auth_json_mode: None,
+            auth_json_candidates: Vec::new(),
+        };
+
+        assert!(status.has_credentials());
     }
 }
 

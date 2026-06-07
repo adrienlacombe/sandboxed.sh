@@ -287,76 +287,6 @@ fn assistant_reply_is_successful(content: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn is_terminal_mission_status(status: &MissionStatus) -> bool {
-    matches!(
-        status,
-        MissionStatus::Completed
-            | MissionStatus::Acknowledged
-            | MissionStatus::Failed
-            | MissionStatus::Interrupted
-            | MissionStatus::Blocked
-            | MissionStatus::NotFeasible
-            | MissionStatus::AwaitingUser
-    )
-}
-
-fn should_persist_synthetic_thought(candidate: &str, assistant_content: &str) -> bool {
-    let candidate = candidate.trim();
-    if candidate.is_empty() {
-        return false;
-    }
-
-    let assistant_content = assistant_content.trim();
-    if assistant_content.is_empty() {
-        return true;
-    }
-
-    assistant_content != candidate && !assistant_content.starts_with(candidate)
-}
-
-fn merge_pending_text_delta(existing: &mut String, content: &str) {
-    if content.starts_with(existing.as_str()) {
-        existing.clear();
-        existing.push_str(content);
-    } else {
-        existing.push_str(content);
-    }
-}
-
-fn synthetic_thought_from_text_delta(
-    pending_text_deltas: &mut HashMap<Uuid, String>,
-    mission_id: Uuid,
-    event: &AgentEvent,
-) -> Option<String> {
-    match event {
-        AgentEvent::TextDelta { content, .. } => {
-            if content.trim().is_empty() {
-                pending_text_deltas.remove(&mission_id);
-            } else {
-                pending_text_deltas
-                    .entry(mission_id)
-                    .and_modify(|existing| merge_pending_text_delta(existing, content))
-                    .or_insert_with(|| content.clone());
-            }
-            None
-        }
-        AgentEvent::Thinking { .. } => {
-            pending_text_deltas.remove(&mission_id);
-            None
-        }
-        AgentEvent::ToolCall { .. } | AgentEvent::UserMessage { .. } | AgentEvent::Error { .. } => {
-            pending_text_deltas.remove(&mission_id)
-        }
-        AgentEvent::AssistantMessage { content, .. } => pending_text_deltas
-            .remove(&mission_id)
-            .filter(|candidate| should_persist_synthetic_thought(candidate, content)),
-        AgentEvent::MissionStatusChanged { status, .. } if is_terminal_mission_status(status) => {
-            pending_text_deltas.remove(&mission_id)
-        }
-        _ => None,
-    }
-}
-
 fn extract_short_description_from_content(content: &str, max_len: usize) -> Option<String> {
     let lines: Vec<&str> = content.lines().collect();
     let mut inside_fenced_block: Option<char> = None;
@@ -573,6 +503,115 @@ fn clear_mission_metadata_refresh_state(mission_id: Uuid) {
         .lock()
         .expect("metadata refresh baseline lock poisoned");
     baselines.remove(&mission_id);
+}
+
+/// Build a one-time "backend handoff" context message used when a mission's
+/// backend is switched (e.g. claudecode ↔ codex) via run-settings.
+///
+/// Each backend keeps its own session/reasoning format (Claude's signed
+/// thinking blocks vs Codex reasoning), and on a switch the new backend starts
+/// a fresh session — so without this the prior *reasoning* is silently lost
+/// (the reconstructed history only carries user/assistant text, not `thinking`
+/// events). This carries the recent reasoning forward as plain text, which any
+/// backend can consume. The workspace files and user/assistant transcript carry
+/// over on their own. Returns `None` when there's nothing worth carrying.
+async fn build_backend_handoff_context(
+    mission_store: &Arc<dyn MissionStore>,
+    mission_id: Uuid,
+    old_backend: &str,
+    new_backend: &str,
+) -> Option<String> {
+    const MAX_TRACES: usize = 6;
+    const MAX_TRACE_CHARS: usize = 1500;
+    const MAX_BODY_CHARS: usize = 6000;
+
+    // Scan recent events for the latest reasoning. Prefer `thinking` traces;
+    // fall back to recent assistant messages when a backend produced none.
+    let events = mission_store
+        .get_latest_events(mission_id, 600)
+        .await
+        .ok()?;
+    let pick = |event_type: &str, limit: usize| -> Vec<String> {
+        let mut picked: Vec<String> = events
+            .iter()
+            .rev()
+            .filter(|e| e.event_type == event_type && !e.content.trim().is_empty())
+            .take(limit)
+            .map(|e| e.content.trim().to_string())
+            .collect();
+        picked.reverse();
+        picked
+    };
+
+    let (label, traces) = {
+        let thinking = pick("thinking", MAX_TRACES);
+        if !thinking.is_empty() {
+            ("most recent reasoning", thinking)
+        } else {
+            ("most recent progress notes", pick("assistant_message", 4))
+        }
+    };
+    if traces.is_empty() {
+        return None;
+    }
+
+    let mut body = String::new();
+    for trace in traces {
+        let idx = safe_truncate_index(&trace, MAX_TRACE_CHARS);
+        let snippet = if idx < trace.len() {
+            format!("{}…", &trace[..idx])
+        } else {
+            trace
+        };
+        if body.len() + snippet.len() > MAX_BODY_CHARS && !body.is_empty() {
+            break;
+        }
+        if !body.is_empty() {
+            body.push_str("\n\n---\n\n");
+        }
+        body.push_str(&snippet);
+    }
+
+    // The reconstructed content is prior agent/user output, so treat it as
+    // untrusted: neutralize any closing `</prior_reasoning>` so it can't break
+    // out of the framing tag (prompt injection). Case-insensitive.
+    let mut safe_body = body;
+    for variant in [
+        "</prior_reasoning",
+        "</PRIOR_REASONING",
+        "</Prior_reasoning",
+    ] {
+        safe_body = safe_body.replace(variant, "<\u{200b}/prior_reasoning");
+    }
+
+    // Backend names come from run-settings input; render only a sanitized
+    // identifier (alphanumeric/-/_) so a crafted value can't inject prompt
+    // text or break the markdown.
+    let sanitize_backend = |s: &str| -> String {
+        let cleaned: String = s
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+            .take(40)
+            .collect();
+        if cleaned.is_empty() {
+            "backend".to_string()
+        } else {
+            cleaned
+        }
+    };
+    let new_label = sanitize_backend(new_backend);
+    let old_label = sanitize_backend(old_backend);
+
+    Some(format!(
+        "## Backend handoff: now continuing on `{new_label}` (was `{old_label}`)\n\n\
+         The previous backend's session is not carried over (different reasoning \
+         format), but your work is intact in the workspace and the conversation \
+         above is preserved. To keep continuity, here is your {label} from the \
+         `{old_label}` session:\n\n\
+         <prior_reasoning>\n{safe_body}\n</prior_reasoning>\n\n\
+         Pick up exactly where you left off and continue toward the goal. \
+         Re-orient by checking the current workspace state first, then proceed."
+    ))
 }
 
 async fn clear_stale_mission_metadata_refresh_state(mission_store: &Arc<dyn MissionStore>) {
@@ -2258,7 +2297,7 @@ pub(crate) async fn resolve_claudecode_default_model(
 ) -> Option<String> {
     // Keep this fallback aligned with Anthropic's model catalog:
     // https://docs.anthropic.com/en/docs/about-claude/models/overview
-    const CLAUDECODE_DEFAULT_MODEL: &str = "claude-opus-4-7";
+    const CLAUDECODE_DEFAULT_MODEL: &str = "claude-opus-4-8";
 
     let lib = {
         let guard = library.read().await;
@@ -2314,10 +2353,20 @@ pub(crate) fn resolve_gemini_default_model() -> String {
 /// grok missions from inheriting the global `DEFAULT_MODEL`
 /// (e.g. `anthropic/claude-opus-4-6`) which grok rejects as "unknown model id".
 pub(crate) fn resolve_grok_default_model() -> String {
-    // Grok Build CLI currently advertises this coding model alias. xAI API
-    // model IDs live in the provider catalog instead:
-    // https://docs.x.ai/docs/models
-    "grok-build".to_string()
+    // Allow ops to override without a rebuild (e.g. when xAI renames the coding
+    // model again).
+    if let Ok(model) = std::env::var("GROK_DEFAULT_MODEL") {
+        let trimmed = model.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    // The Grok Build CLI's coding model id. NOTE: the bare `grok-build` alias is
+    // rejected by current CLIs ("unknown model id"); `grok models` lists
+    // `grok-build-0.1`. Passing an invalid id makes the very first turn fail, so
+    // keep this in sync with the CLI. xAI *API* model IDs (for the API-key
+    // provider catalog) live separately: https://docs.x.ai/docs/models
+    "grok-build-0.1".to_string()
 }
 
 async fn close_mission_desktop_sessions(
@@ -2959,6 +3008,23 @@ impl AgentEvent {
     }
 }
 
+/// Outcome of a [`ControlCommand::UserMessage`], acknowledged on its
+/// `respond` channel. Distinguishes "delivered, a turn is starting" from
+/// "dropped" — both used to be `false`, which made drops invisible to
+/// callers that need delivery guarantees (e.g. the Copilot's steering tool).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UserMessageAck {
+    /// The target is busy mid-turn; the message was queued and will be
+    /// picked up at the next turn boundary.
+    Queued,
+    /// The message was delivered and a turn is starting now.
+    Delivered,
+    /// The message was dropped (parallel cap reached, mission load failure,
+    /// rejected goal kickoff, …). An `AgentEvent::Error` with details was
+    /// emitted on the event stream.
+    Dropped,
+}
+
 /// Internal control commands (queued and processed by the actor).
 #[derive(Debug)]
 pub enum ControlCommand {
@@ -2969,8 +3035,8 @@ pub enum ControlCommand {
         agent: Option<String>,
         /// Target mission ID - if provided and differs from running mission, start in parallel
         target_mission_id: Option<Uuid>,
-        /// Respond with whether the message was queued (true = waiting to be processed)
-        respond: oneshot::Sender<bool>,
+        /// Respond with the delivery outcome (queued / delivered / dropped).
+        respond: oneshot::Sender<UserMessageAck>,
     },
     ToolResult {
         tool_call_id: String,
@@ -3069,8 +3135,11 @@ pub enum ControlCommand {
         message_id: Uuid,
         respond: oneshot::Sender<bool>, // true if removed, false if not found
     },
-    /// Clear all messages from the queue
+    /// Clear queued messages. When `mission_id` is set, only messages
+    /// targeting that mission are cleared (main queue entries targeting it +
+    /// that mission's parallel-runner queue); otherwise every queue is wiped.
     ClearQueue {
+        mission_id: Option<Uuid>,
         respond: oneshot::Sender<usize>, // number of messages cleared
     },
 }
@@ -3124,6 +3193,10 @@ pub struct DesktopSessionInfo {
     pub display: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resolution: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_server: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compositor: Option<String>,
     pub started_at: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stopped_at: Option<String>,
@@ -3452,7 +3525,7 @@ async fn set_and_emit_status(
     });
 }
 
-async fn control_for_user(state: &Arc<AppState>, user: &AuthUser) -> ControlState {
+pub(crate) async fn control_for_user(state: &Arc<AppState>, user: &AuthUser) -> ControlState {
     state.control.get_or_spawn(user).await
 }
 
@@ -3495,7 +3568,10 @@ pub async fn post_message(
         .await
         .map_err(session_unavailable)?;
     let queued = match queued_rx.await {
-        Ok(value) => value,
+        // The wire response keeps its historical bool shape: `queued` is true
+        // only when the message is waiting for the next turn boundary.
+        // Dropped messages surface as an `AgentEvent::Error` on the stream.
+        Ok(ack) => ack == UserMessageAck::Queued,
         Err(_) => {
             let status = control.status.read().await;
             status.state != ControlRunState::Idle
@@ -3600,16 +3676,30 @@ pub async fn remove_from_queue(
     }
 }
 
-/// Clear all messages from the queue.
+/// Query parameters for `clear_queue`.
+#[derive(Debug, Default, Deserialize)]
+pub struct ClearQueueQuery {
+    /// When set, only clear messages targeting this mission instead of
+    /// wiping every mission's queue.
+    #[serde(default)]
+    pub mission_id: Option<Uuid>,
+}
+
+/// Clear queued messages (optionally scoped to a single mission via
+/// `?mission_id=`).
 pub async fn clear_queue(
     State(state): State<Arc<AppState>>,
     Extension(user): Extension<AuthUser>,
+    Query(query): Query<ClearQueueQuery>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let control = control_for_user(&state, &user).await;
     let (tx, rx) = oneshot::channel();
     control
         .cmd_tx
-        .send(ControlCommand::ClearQueue { respond: tx })
+        .send(ControlCommand::ClearQueue {
+            mission_id: query.mission_id,
+            respond: tx,
+        })
         .await
         .map_err(session_unavailable)?;
     let cleared = rx.await.map_err(|_| {
@@ -3624,14 +3714,27 @@ pub async fn clear_queue(
 // ==================== Mission Endpoints ====================
 
 /// List all missions.
+#[derive(Debug, Default, Deserialize)]
+pub struct ListMissionsQuery {
+    #[serde(default)]
+    pub limit: Option<usize>,
+    #[serde(default)]
+    pub offset: Option<usize>,
+}
+
 pub async fn list_missions(
     State(state): State<Arc<AppState>>,
     Extension(user): Extension<AuthUser>,
+    Query(query): Query<ListMissionsQuery>,
 ) -> Result<Json<Vec<Mission>>, (StatusCode, String)> {
     let control = control_for_user(&state, &user).await;
+    // Default to the most recent 50; honor an explicit limit so callers (e.g.
+    // the assistant MCP) can request more, capped to keep the response bounded.
+    let limit = query.limit.unwrap_or(50).clamp(1, 200);
+    let offset = query.offset.unwrap_or(0);
     let mut missions = control
         .mission_store
-        .list_missions(50, 0)
+        .list_missions(limit, offset)
         .await
         .map_err(internal_error)?;
     populate_workspace_names(&state, &mut missions).await;
@@ -4639,9 +4742,26 @@ pub struct GetEventsQuery {
     /// when provided.
     #[serde(default)]
     pub before_seq: Option<i64>,
+    /// Whether to include total/count headers. Delta polling only needs
+    /// `X-Max-Sequence`; skipping counts avoids an extra indexed DB scan.
+    #[serde(default = "default_include_event_counts")]
+    pub include_counts: bool,
+    /// Optional response profile. `conversation` keeps the recent transcript
+    /// hydrated while collapsing older tool payloads into lazy stubs.
+    #[serde(default)]
+    pub profile: Option<String>,
+    /// Number of recent tool call/result pairs to keep fully hydrated for
+    /// `profile=conversation`.
+    #[serde(default)]
+    pub trace_tail: Option<usize>,
+}
+
+fn default_include_event_counts() -> bool {
+    true
 }
 
 const INACTIVE_EVENT_SUMMARY_AFTER: chrono::Duration = chrono::Duration::minutes(5);
+const CONVERSATION_PROFILE_TRACE_TAIL: usize = 10;
 
 #[derive(Debug, Clone)]
 struct EventSummary {
@@ -4718,6 +4838,115 @@ fn summarize_inactive_stream_events(events: Vec<mission_store::StoredEvent>) -> 
     }
 }
 
+fn conversation_profile_enabled(profile: Option<&str>) -> bool {
+    matches!(profile, Some("conversation"))
+}
+
+fn project_conversation_events(
+    events: Vec<mission_store::StoredEvent>,
+    keep_full_tool_call_ids: &HashSet<String>,
+    tool_summaries: &HashMap<String, mission_store::ToolCallSummary>,
+) -> Vec<mission_store::StoredEvent> {
+    if events.is_empty() {
+        return events;
+    }
+
+    #[derive(Default)]
+    struct ToolPair {
+        latest_sequence: i64,
+        has_result: bool,
+        result_sequence: Option<i64>,
+        result_timestamp: Option<String>,
+        call_content_bytes: usize,
+        result_content_bytes: usize,
+    }
+
+    let mut pairs: HashMap<String, ToolPair> = HashMap::new();
+    for event in &events {
+        if !matches!(event.event_type.as_str(), "tool_call" | "tool_result") {
+            continue;
+        }
+        let Some(tool_call_id) = event.tool_call_id.as_ref() else {
+            continue;
+        };
+        let pair = pairs.entry(tool_call_id.clone()).or_default();
+        pair.latest_sequence = pair.latest_sequence.max(event.sequence);
+        if event.event_type == "tool_call" {
+            pair.call_content_bytes = event.content.len();
+        } else {
+            pair.has_result = true;
+            pair.result_sequence = Some(event.sequence);
+            pair.result_timestamp = Some(event.timestamp.clone());
+            pair.result_content_bytes = event.content.len();
+        }
+    }
+
+    let mut projected = Vec::with_capacity(events.len());
+    for mut event in events {
+        if !matches!(event.event_type.as_str(), "tool_call" | "tool_result") {
+            projected.push(event);
+            continue;
+        }
+        let Some(tool_call_id) = event.tool_call_id.clone() else {
+            projected.push(event);
+            continue;
+        };
+        if keep_full_tool_call_ids.contains(&tool_call_id) {
+            projected.push(event);
+            continue;
+        }
+        if event.event_type == "tool_result" {
+            continue;
+        }
+
+        if let Some(pair) = pairs.get(&tool_call_id) {
+            let persisted = tool_summaries.get(&tool_call_id);
+            let has_result = persisted.map_or(pair.has_result, |summary| summary.has_result);
+            if !has_result {
+                projected.push(event);
+                continue;
+            }
+            event.event_type = "tool_stub".to_string();
+            event.content.clear();
+            let mut metadata = event.metadata.as_object().cloned().unwrap_or_default();
+            metadata.insert("lazy".to_string(), serde_json::json!(true));
+            metadata.insert("has_result".to_string(), serde_json::json!(has_result));
+            metadata.insert(
+                "call_sequence".to_string(),
+                serde_json::json!(event.sequence),
+            );
+            metadata.insert(
+                "result_sequence".to_string(),
+                serde_json::json!(persisted
+                    .and_then(|summary| summary.result_sequence)
+                    .or(pair.result_sequence)),
+            );
+            metadata.insert(
+                "result_timestamp".to_string(),
+                serde_json::json!(persisted
+                    .and_then(|summary| summary.result_timestamp.clone())
+                    .or_else(|| pair.result_timestamp.clone())),
+            );
+            metadata.insert(
+                "call_content_bytes".to_string(),
+                serde_json::json!(persisted.map_or(pair.call_content_bytes, |summary| {
+                    summary.call_content_bytes
+                })),
+            );
+            metadata.insert(
+                "result_content_bytes".to_string(),
+                serde_json::json!(persisted.map_or(pair.result_content_bytes, |summary| {
+                    summary.result_content_bytes
+                })),
+            );
+            event.metadata = serde_json::Value::Object(metadata);
+        }
+        projected.push(event);
+    }
+
+    projected
+}
+
 /// Get events for a mission (for debugging/replay).
 ///
 /// Response includes `X-Total-Events` (total count matching the type
@@ -4766,20 +4995,51 @@ pub async fn get_mission_events(
             .await
             .map_err(internal_error)?
     };
-    let summary = if should_summarize_events(&mission) {
+    let mut summary = if should_summarize_events(&mission) {
         summarize_inactive_stream_events(events)
     } else {
         EventSummary::unchanged(events)
     };
+    if conversation_profile_enabled(query.profile.as_deref()) {
+        let keep_full_tool_call_ids: HashSet<String> = control
+            .mission_store
+            .get_recent_tool_call_ids(
+                mission_id,
+                query.trace_tail.unwrap_or(CONVERSATION_PROFILE_TRACE_TAIL),
+            )
+            .await
+            .map_err(internal_error)?
+            .into_iter()
+            .collect();
+        let tool_call_ids = summary
+            .events
+            .iter()
+            .filter_map(|event| event.tool_call_id.clone())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let tool_summaries = control
+            .mission_store
+            .get_tool_call_summaries(mission_id, &tool_call_ids)
+            .await
+            .map_err(internal_error)?;
+        summary.events =
+            project_conversation_events(summary.events, &keep_full_tool_call_ids, &tool_summaries);
+        summary.summarized_count = summary.events.len();
+    }
 
     // Metadata headers let the client decide whether it's caught up
     // without a second round-trip. Failures here are non-fatal — we just
     // skip the header rather than breaking the whole response.
-    let total = control
-        .mission_store
-        .count_events(mission_id, types.as_deref())
-        .await
-        .ok();
+    let total = if query.include_counts {
+        control
+            .mission_store
+            .count_events(mission_id, types.as_deref())
+            .await
+            .ok()
+    } else {
+        None
+    };
     let max_seq = control
         .mission_store
         .max_event_sequence(mission_id)
@@ -4827,6 +5087,32 @@ pub async fn get_mission_events(
     Ok(response)
 }
 
+pub async fn get_mission_tool_call_events(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    Path((mission_id, tool_call_id)): Path<(Uuid, String)>,
+) -> Result<Json<Vec<mission_store::StoredEvent>>, (StatusCode, String)> {
+    let control = control_for_user(&state, &user).await;
+    let mission_exists = control
+        .mission_store
+        .get_mission(mission_id)
+        .await
+        .map_err(internal_error)?;
+    if mission_exists.is_none() {
+        return Err((StatusCode::NOT_FOUND, "Mission not found".to_string()));
+    }
+
+    let events = control
+        .mission_store
+        .get_events_for_tool_call(mission_id, &tool_call_id)
+        .await
+        .map_err(internal_error)?;
+    if events.is_empty() {
+        return Err((StatusCode::NOT_FOUND, "Tool call not found".to_string()));
+    }
+    Ok(Json(events))
+}
+
 const TRANSCRIPT_EVENT_TYPES: &[&str] = &[
     "user_message",
     "assistant_message",
@@ -4854,7 +5140,21 @@ const HISTORY_EVENT_TYPES: &[&str] = &[
     "goal_iteration",
     "goal_status",
 ];
-const SNAPSHOT_EVENT_LIMIT: usize = 200;
+/// Conversation message types used to anchor the snapshot tail. The snapshot
+/// guarantees the most recent `SNAPSHOT_CONVERSATIONAL_MESSAGES` of these are
+/// loaded (plus every tool call between them), so a tool-heavy mission opens
+/// on the actual conversation instead of a wall of tool output.
+const SNAPSHOT_ANCHOR_TYPES: &[&str] = &[
+    "user_message",
+    "assistant_message",
+    "assistant_message_canonical",
+];
+/// How many recent conversation messages the snapshot guarantees.
+const SNAPSHOT_CONVERSATIONAL_MESSAGES: usize = 10;
+/// Hard cap on snapshot size. Bounds payload if the recent conversation
+/// happens to span an unusually large number of tool calls; the rest stays
+/// reachable via backwards pagination ("Load older messages").
+const SNAPSHOT_MAX_EVENTS: usize = 1500;
 
 fn event_types_for_query(query: &GetEventsQuery) -> Option<Vec<String>> {
     if let Some(types) = query.types.as_ref() {
@@ -4907,12 +5207,21 @@ pub struct MissionSnapshotResponse {
     pub running: Option<super::mission_runner::RunningMissionInfo>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct SnapshotQuery {
+    #[serde(default)]
+    pub profile: Option<String>,
+    #[serde(default)]
+    pub trace_tail: Option<usize>,
+}
+
 /// Single first-paint payload for clients. It returns the latest visible event
 /// tail plus metadata needed to avoid the old transcript-then-trace redraw.
 pub async fn get_mission_snapshot(
     State(state): State<Arc<AppState>>,
     Extension(user): Extension<AuthUser>,
     Path(mission_id): Path<Uuid>,
+    axum::extract::Query(query): axum::extract::Query<SnapshotQuery>,
 ) -> Result<Json<MissionSnapshotResponse>, (StatusCode, String)> {
     let control = control_for_user(&state, &user).await;
     let mut mission = control
@@ -4926,21 +5235,98 @@ pub async fn get_mission_snapshot(
         mission.workspace_name = Some(workspace.name);
     }
 
-    let events = control
+    // Conversation-anchored snapshot tail: load everything from the
+    // Nth-most-recent conversation message to the head, so the recent
+    // back-and-forth is always present even when tool calls dominate the
+    // raw event stream. Falls back to a plain recent-events tail when the
+    // mission has fewer than N conversation messages, or (degenerate) when
+    // the anchored span would exceed the hard cap.
+    let anchor_seq = control
         .mission_store
-        .get_events_before(
+        .nth_recent_event_sequence(
             mission_id,
-            i64::MAX,
-            Some(HISTORY_EVENT_TYPES),
-            Some(SNAPSHOT_EVENT_LIMIT),
+            SNAPSHOT_ANCHOR_TYPES,
+            SNAPSHOT_CONVERSATIONAL_MESSAGES,
         )
         .await
         .map_err(internal_error)?;
-    let summary = if should_summarize_events(&mission) {
+    let events = match anchor_seq {
+        Some(anchor) => {
+            // `get_events_since` is `sequence > since`, so subtract one to
+            // include the anchor itself. Fetch one past the cap to detect
+            // overflow without a separate count query.
+            let anchored = control
+                .mission_store
+                .get_events_since(
+                    mission_id,
+                    anchor.saturating_sub(1),
+                    Some(HISTORY_EVENT_TYPES),
+                    Some(SNAPSHOT_MAX_EVENTS + 1),
+                )
+                .await
+                .map_err(internal_error)?;
+            if anchored.len() > SNAPSHOT_MAX_EVENTS {
+                // The recent conversation spans more than the cap of tool
+                // calls. `get_events_since` returned the OLDEST events after
+                // the anchor (ASC), which would miss the newest — so fall
+                // back to the most-recent capped tail instead.
+                control
+                    .mission_store
+                    .get_events_before(
+                        mission_id,
+                        i64::MAX,
+                        Some(HISTORY_EVENT_TYPES),
+                        Some(SNAPSHOT_MAX_EVENTS),
+                    )
+                    .await
+                    .map_err(internal_error)?
+            } else {
+                anchored
+            }
+        }
+        None => control
+            .mission_store
+            .get_events_before(
+                mission_id,
+                i64::MAX,
+                Some(HISTORY_EVENT_TYPES),
+                Some(SNAPSHOT_MAX_EVENTS),
+            )
+            .await
+            .map_err(internal_error)?,
+    };
+    let mut summary = if should_summarize_events(&mission) {
         summarize_inactive_stream_events(events)
     } else {
         EventSummary::unchanged(events)
     };
+    if conversation_profile_enabled(query.profile.as_deref()) {
+        let keep_full_tool_call_ids: HashSet<String> = control
+            .mission_store
+            .get_recent_tool_call_ids(
+                mission_id,
+                query.trace_tail.unwrap_or(CONVERSATION_PROFILE_TRACE_TAIL),
+            )
+            .await
+            .map_err(internal_error)?
+            .into_iter()
+            .collect();
+        let tool_call_ids = summary
+            .events
+            .iter()
+            .filter_map(|event| event.tool_call_id.clone())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let tool_summaries = control
+            .mission_store
+            .get_tool_call_summaries(mission_id, &tool_call_ids)
+            .await
+            .map_err(internal_error)?;
+        summary.events =
+            project_conversation_events(summary.events, &keep_full_tool_call_ids, &tool_summaries);
+        summary.summarized_count = summary.events.len();
+    }
     let event_counts = control
         .mission_store
         .count_events_by_type(mission_id, Some(HISTORY_EVENT_TYPES))
@@ -5124,28 +5510,183 @@ pub async fn delete_mission(
     let control = control_for_user(&state, &user).await;
     let running = get_running_missions(&control).await?;
 
-    if running.iter().any(|m| m.mission_id == mission_id) {
+    let deleted_workspace_dirs = cleanup_mission_workspace_dirs_for_delete(
+        &control.mission_store,
+        &state.workspaces,
+        mission_id,
+        &running,
+    )
+    .await?;
+
+    let deleted_ids =
+        delete_mission_with_children(&control.mission_store, mission_id, &running).await?;
+
+    for id in &deleted_ids {
+        clear_mission_metadata_refresh_state(*id);
+    }
+
+    let deleted_workspace_dir_count = deleted_workspace_dirs.len();
+    Ok(Json(serde_json::json!({
+        "ok": true,
+        "deleted": mission_id,
+        "deleted_ids": deleted_ids,
+        "deleted_count": deleted_ids.len(),
+        "deleted_workspace_dirs": deleted_workspace_dirs,
+        "deleted_workspace_dir_count": deleted_workspace_dir_count
+    })))
+}
+
+async fn collect_child_mission_ids(
+    mission_store: &Arc<dyn MissionStore>,
+    parent_id: Uuid,
+) -> Result<Vec<Uuid>, (StatusCode, String)> {
+    let mut visited = HashSet::new();
+    let mut stack = vec![parent_id];
+    let mut child_ids = Vec::new();
+
+    while let Some(id) = stack.pop() {
+        let children = mission_store
+            .get_child_missions(id)
+            .await
+            .map_err(internal_error)?;
+
+        for child in children {
+            if visited.insert(child.id) {
+                child_ids.push(child.id);
+                stack.push(child.id);
+            }
+        }
+    }
+
+    Ok(child_ids)
+}
+
+async fn delete_mission_with_children(
+    mission_store: &Arc<dyn MissionStore>,
+    mission_id: Uuid,
+    running: &[super::mission_runner::RunningMissionInfo],
+) -> Result<Vec<Uuid>, (StatusCode, String)> {
+    let Some(_) = mission_store
+        .get_mission(mission_id)
+        .await
+        .map_err(internal_error)?
+    else {
+        return Err((StatusCode::NOT_FOUND, "Mission not found".to_string()));
+    };
+
+    let child_ids = collect_child_mission_ids(mission_store, mission_id).await?;
+    let mut ids_to_delete = Vec::with_capacity(child_ids.len() + 1);
+    ids_to_delete.push(mission_id);
+    ids_to_delete.extend(child_ids.iter().copied());
+
+    if let Some(running_mission) = running
+        .iter()
+        .find(|m| ids_to_delete.contains(&m.mission_id))
+    {
         return Err((
             StatusCode::CONFLICT,
-            "Cannot delete a running mission. Cancel it first.".to_string(),
+            format!(
+                "Cannot delete a running mission or worker ({}). Cancel it first.",
+                running_mission.mission_id
+            ),
         ));
     }
 
-    let deleted = control
-        .mission_store
+    for child_id in child_ids.iter().rev() {
+        mission_store
+            .delete_mission(*child_id)
+            .await
+            .map_err(internal_error)?;
+    }
+
+    let deleted = mission_store
         .delete_mission(mission_id)
         .await
         .map_err(internal_error)?;
-
-    if deleted {
-        clear_mission_metadata_refresh_state(mission_id);
-        Ok(Json(serde_json::json!({
-            "ok": true,
-            "deleted": mission_id
-        })))
-    } else {
-        Err((StatusCode::NOT_FOUND, "Mission not found".to_string()))
+    if !deleted {
+        return Err((StatusCode::NOT_FOUND, "Mission not found".to_string()));
     }
+
+    Ok(ids_to_delete)
+}
+
+async fn cleanup_mission_workspace_dirs_for_delete(
+    mission_store: &Arc<dyn MissionStore>,
+    workspaces: &workspace::SharedWorkspaceStore,
+    mission_id: Uuid,
+    running: &[super::mission_runner::RunningMissionInfo],
+) -> Result<Vec<String>, (StatusCode, String)> {
+    let Some(root_mission) = mission_store
+        .get_mission(mission_id)
+        .await
+        .map_err(internal_error)?
+    else {
+        return Err((StatusCode::NOT_FOUND, "Mission not found".to_string()));
+    };
+
+    let child_ids = collect_child_mission_ids(mission_store, mission_id).await?;
+    let mut ids_to_delete = Vec::with_capacity(child_ids.len() + 1);
+    ids_to_delete.push(mission_id);
+    ids_to_delete.extend(child_ids.iter().copied());
+
+    if let Some(running_mission) = running
+        .iter()
+        .find(|m| ids_to_delete.contains(&m.mission_id))
+    {
+        return Err((
+            StatusCode::CONFLICT,
+            format!(
+                "Cannot delete a running mission or worker ({}). Cancel it first.",
+                running_mission.mission_id
+            ),
+        ));
+    }
+
+    let mut missions = Vec::with_capacity(ids_to_delete.len());
+    missions.push(root_mission);
+    for child_id in child_ids {
+        if let Some(child) = mission_store
+            .get_mission(child_id)
+            .await
+            .map_err(internal_error)?
+        {
+            missions.push(child);
+        }
+    }
+
+    let mut deleted_dirs = Vec::new();
+    for mission in missions {
+        let Some(ws) = workspaces.get(mission.workspace_id).await else {
+            continue;
+        };
+        let dir = workspace::mission_workspace_dir_for_root(&ws.path, mission.id);
+        if !dir.exists() {
+            continue;
+        }
+        match tokio::fs::remove_dir_all(&dir).await {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => {
+                return Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!(
+                        "Failed to delete mission workspace directory {}: {}",
+                        dir.display(),
+                        err
+                    ),
+                ));
+            }
+        }
+        tracing::info!(
+            mission_id = %mission.id,
+            workspace_id = %mission.workspace_id,
+            path = %dir.display(),
+            "removed mission workspace directory during explicit delete",
+        );
+        deleted_dirs.push(dir.to_string_lossy().to_string());
+    }
+
+    Ok(deleted_dirs)
 }
 
 /// Delete all empty "Untitled" missions.
@@ -5198,6 +5739,42 @@ struct ControlWsHeartbeat {
     seq: i64,
 }
 
+fn suffix_prefix_overlap_len(existing: &str, incoming: &str) -> usize {
+    let max_overlap = existing.chars().count().min(incoming.chars().count());
+    for overlap_chars in (1..=max_overlap).rev() {
+        let existing_start = existing
+            .char_indices()
+            .nth(existing.chars().count() - overlap_chars)
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+        let incoming_end = incoming
+            .char_indices()
+            .nth(overlap_chars)
+            .map(|(idx, _)| idx)
+            .unwrap_or(incoming.len());
+        if existing[existing_start..] == incoming[..incoming_end] {
+            return incoming_end;
+        }
+    }
+    0
+}
+
+fn merge_text_stream_fragment(buffer: &mut String, fragment: &str) {
+    if fragment.is_empty() {
+        return;
+    }
+    if buffer.is_empty() || fragment.starts_with(buffer.as_str()) {
+        *buffer = fragment.to_string();
+        return;
+    }
+    if buffer.starts_with(fragment) {
+        return;
+    }
+
+    let overlap = suffix_prefix_overlap_len(buffer, fragment);
+    buffer.push_str(&fragment[overlap..]);
+}
+
 fn text_op_events_for_stream(
     ev: AgentEvent,
     text_buffers: &mut HashMap<Uuid, String>,
@@ -5209,18 +5786,20 @@ fn text_op_events_for_stream(
         } => {
             let previous = text_buffers.entry(mission_id).or_default();
             let previous_len = previous.chars().count();
+            let mut next = previous.clone();
+            merge_text_stream_fragment(&mut next, &content);
             let ops = if previous.is_empty() {
                 vec![TextOp::Insert {
                     pos: 0,
-                    text: content.clone(),
+                    text: next.clone(),
                 }]
             } else {
                 vec![TextOp::Replace {
                     range: (0, previous_len),
-                    text: content.clone(),
+                    text: next.clone(),
                 }]
             };
-            *previous = content;
+            *previous = next;
             vec![AgentEvent::TextOp {
                 mission_id,
                 bubble_id: "text_delta_latest".to_string(),
@@ -6078,26 +6657,11 @@ fn spawn_control_session(
         let store = Arc::clone(&state.mission_store);
         let mut event_rx = events_tx.subscribe();
         tokio::spawn(async move {
-            let mut pending_text_deltas: HashMap<Uuid, String> = HashMap::new();
             loop {
                 match event_rx.recv().await {
                     Ok(event) => {
                         // Extract mission_id from event
                         if let Some(mid) = event.mission_id() {
-                            if let Some(content) = synthetic_thought_from_text_delta(
-                                &mut pending_text_deltas,
-                                mid,
-                                &event,
-                            ) {
-                                let synthetic = AgentEvent::Thinking {
-                                    content,
-                                    done: true,
-                                    mission_id: Some(mid),
-                                };
-                                if let Err(e) = store.log_event(mid, &synthetic).await {
-                                    tracing::warn!("Failed to log synthetic thinking event: {}", e);
-                                }
-                            }
                             if let Err(e) = store.log_event(mid, &event).await {
                                 tracing::warn!("Failed to log event: {}", e);
                             }
@@ -7856,18 +8420,40 @@ async fn maybe_finalize_terminal_mission(
     match mission_store.get_mission(mission_id).await {
         Ok(Some(mission)) => {
             if mission.status == MissionStatus::Interrupted {
-                tracing::debug!(
+                // A turn that *succeeds* after the interruption marker was set
+                // (deploy restart mid-turn, then the drained turn completes)
+                // supersedes it: there is a fresh assistant answer, and leaving
+                // the mission "interrupted" makes the dashboard offer a resume
+                // that the still-registered runner rejects with "already
+                // running". Failure-shaped reasons keep the interrupted status
+                // (it is the more accurate cause).
+                let successful_turn = matches!(
+                    new_status,
+                    MissionStatus::AwaitingUser | MissionStatus::Completed
+                );
+                if !successful_turn {
+                    tracing::debug!(
+                        mission_id = %mission_id,
+                        reason = ?reason,
+                        context = log_context,
+                        "Skipping mission finalization because mission is already interrupted"
+                    );
+                    return;
+                }
+                tracing::info!(
                     mission_id = %mission_id,
                     reason = ?reason,
+                    new_status = ?new_status,
                     context = log_context,
-                    "Skipping mission finalization because mission is already interrupted"
+                    "Promoting interrupted mission: turn completed successfully after interruption"
                 );
-                return;
             }
 
+            // Interrupted is allowed through: the promotion check above already
+            // filtered it down to successful turns only.
             if !matches!(
                 mission.status,
-                MissionStatus::Active | MissionStatus::Pending
+                MissionStatus::Active | MissionStatus::Pending | MissionStatus::Interrupted
             ) {
                 tracing::debug!(
                     mission_id = %mission_id,
@@ -8469,7 +9055,11 @@ async fn control_actor_loop(
                     ControlCommand::UserMessage { id, content, agent: msg_agent, target_mission_id, respond } => {
                         if !accept_user_message_id(&mut accepted_user_message_ids, id) {
                             let status_snapshot = status.read().await;
-                            let _ = respond.send(status_snapshot.state != ControlRunState::Idle);
+                            let _ = respond.send(if status_snapshot.state != ControlRunState::Idle {
+                                UserMessageAck::Queued
+                            } else {
+                                UserMessageAck::Delivered
+                            });
                             continue;
                         }
 
@@ -8536,7 +9126,7 @@ async fn control_actor_loop(
                                     mission_id: goal_target_mission,
                                     resumable: true,
                                 });
-                                let _ = respond.send(false);
+                                let _ = respond.send(UserMessageAck::Dropped);
                                 continue;
                             }
                         }
@@ -8553,6 +9143,18 @@ async fn control_actor_loop(
                                         queued: was_running,
                                         mission_id: Some(tid),
                                     });
+                                    // Surface the parallel queue growth to all
+                                    // clients (Status events otherwise only
+                                    // carry the main queue length). Only when
+                                    // the message actually stays queued —
+                                    // otherwise start_next pops it right away.
+                                    if was_running {
+                                        let _ = events_tx.send(AgentEvent::Status {
+                                            state: ControlRunState::Running,
+                                            queue_len: runner.queue.len(),
+                                            mission_id: Some(tid),
+                                        });
+                                    }
                                     // Try to start if not already running
                                     if !runner.is_running() {
                                         runner.start_next(
@@ -8569,7 +9171,7 @@ async fn control_actor_loop(
                                             secrets.clone(),
                                         );
                                     }
-                                    let _ = respond.send(was_running);
+                                    let _ = respond.send(if was_running { UserMessageAck::Queued } else { UserMessageAck::Delivered });
                                     continue;
                                 }
                             }
@@ -8602,7 +9204,7 @@ async fn control_actor_loop(
                                         mission_id: Some(tid),
                                         resumable: true,
                                     });
-                                    let _ = respond.send(false);
+                                    let _ = respond.send(UserMessageAck::Dropped);
                                     continue;
                                 } else {
                                     // Load mission and start in parallel
@@ -8674,7 +9276,7 @@ async fn control_actor_loop(
                                             );
                                             tracing::info!("Auto-started mission {} in parallel", tid);
                                             parallel_runners.insert(tid, runner);
-                                            let _ = respond.send(false);
+                                            let _ = respond.send(UserMessageAck::Delivered);
                                             continue;
                                         }
                                         Err(e) => {
@@ -8691,7 +9293,7 @@ async fn control_actor_loop(
                                                 mission_id: Some(tid),
                                                 resumable: true,
                                             });
-                                            let _ = respond.send(false);
+                                            let _ = respond.send(UserMessageAck::Dropped);
                                             continue;
                                         }
                                     }
@@ -9009,7 +9611,7 @@ async fn control_actor_loop(
                                 set_and_emit_status(&status, &events_tx, ControlRunState::Idle, 0, None).await;
                             }
                         }
-                        let _ = respond.send(was_running);
+                        let _ = respond.send(if was_running { UserMessageAck::Queued } else { UserMessageAck::Delivered });
                     }
                     ControlCommand::ToolResult { tool_call_id, name, result } => {
                         // Deliver to the tool hub. resolve() caches the result if
@@ -9196,6 +9798,13 @@ async fn control_actor_loop(
                             continue;
                         }
 
+                        // Capture the backend before the update so we can detect
+                        // a switch and carry reasoning across (see below).
+                        let old_backend = load_mission_record(&mission_store, id)
+                            .await
+                            .ok()
+                            .map(|m| m.backend);
+
                         let result = mission_store
                             .update_mission_run_settings(
                                 id,
@@ -9219,6 +9828,50 @@ async fn control_actor_loop(
                                 session_id: updated.session_id.clone(),
                                 updated_at: updated.updated_at.clone(),
                             });
+
+                            // Backend switch handoff: the new backend starts a
+                            // fresh session and can't replay the old backend's
+                            // reasoning format, so carry the recent reasoning
+                            // forward as a plain-text context message. It lands
+                            // in the conversation history and is picked up by
+                            // the next turn (resume or message) on either
+                            // backend. Workspace + transcript carry over already.
+                            let backend_switched = old_backend
+                                .as_deref()
+                                .map(|prev| prev != updated.backend.as_str())
+                                .unwrap_or(false);
+                            if backend_switched {
+                                let prev = old_backend.as_deref().unwrap_or("the previous backend");
+                                if let Some(handoff) = build_backend_handoff_context(
+                                    &mission_store,
+                                    id,
+                                    prev,
+                                    &updated.backend,
+                                )
+                                .await
+                                {
+                                    let event = AgentEvent::UserMessage {
+                                        id: Uuid::new_v4(),
+                                        content: handoff,
+                                        queued: false,
+                                        mission_id: Some(id),
+                                    };
+                                    if let Err(e) = mission_store.log_event(id, &event).await {
+                                        tracing::warn!(
+                                            mission_id = %id,
+                                            error = %e,
+                                            "Failed to persist backend handoff context"
+                                        );
+                                    }
+                                    let _ = events_tx.send(event);
+                                    tracing::info!(
+                                        mission_id = %id,
+                                        old_backend = ?old_backend,
+                                        new_backend = %updated.backend,
+                                        "Injected backend-switch handoff context to preserve reasoning"
+                                    );
+                                }
+                            }
                         }
 
                         let _ = respond.send(result);
@@ -9927,41 +10580,137 @@ async fn control_actor_loop(
                             });
                         }
 
-                        // Also try to remove from parallel runner queues
+                        // Also try to remove from parallel runner queues.
+                        // Emit a Status event for each affected mission so
+                        // every client (other tabs, iOS) learns the queue
+                        // changed — without this, only the deleting client
+                        // ever updates its UI.
                         for (mid, runner) in parallel_runners.iter_mut() {
                             if runner.remove_from_queue(message_id) {
                                 removed = true;
                                 tracing::info!("Removed message {} from parallel mission {}", message_id, mid);
+                                let _ = events_tx.send(AgentEvent::Status {
+                                    state: if runner.is_running() {
+                                        ControlRunState::Running
+                                    } else {
+                                        ControlRunState::Idle
+                                    },
+                                    queue_len: runner.queue.len(),
+                                    mission_id: Some(*mid),
+                                });
                             }
                         }
 
                         let _ = respond.send(removed);
                     }
-                    ControlCommand::ClearQueue { respond } => {
-                        let mut cleared = queue.len();
-                        queue.clear();
+                    ControlCommand::ClearQueue { mission_id, respond } => {
+                        let main_mission_id = if running.is_some() {
+                            running_mission_id
+                        } else {
+                            *current_mission.read().await
+                        };
 
-                        // Also clear parallel runner queues
-                        for (_mid, runner) in parallel_runners.iter_mut() {
-                            cleared += runner.clear_queue();
+                        let mut cleared = 0usize;
+                        match mission_id {
+                            Some(target) => {
+                                // Scoped clear: only drop messages targeting
+                                // this mission (main queue entries + that
+                                // mission's parallel-runner queue). Clearing
+                                // from one mission's view must not wipe other
+                                // missions' queues.
+                                let before_len = queue.len();
+                                queue.retain(|(_, _, _, target_mid)| *target_mid != Some(target));
+                                let main_removed = before_len - queue.len();
+                                cleared += main_removed;
+                                if main_removed > 0 {
+                                    let _ = events_tx.send(AgentEvent::Status {
+                                        state: if running.is_some() {
+                                            ControlRunState::Running
+                                        } else {
+                                            ControlRunState::Idle
+                                        },
+                                        queue_len: queue.len(),
+                                        mission_id: main_mission_id,
+                                    });
+                                }
+                                // Clients filter Status events by the mission
+                                // they are viewing, so the main-queue event
+                                // above is invisible to a client focused on
+                                // `target` (unless target IS the main
+                                // mission). Emit a target-scoped Status
+                                // whenever anything was cleared for it.
+                                let mut target_status_sent = false;
+                                if let Some(runner) = parallel_runners.get_mut(&target) {
+                                    let runner_cleared = runner.clear_queue();
+                                    cleared += runner_cleared;
+                                    if runner_cleared > 0 || main_removed > 0 {
+                                        let _ = events_tx.send(AgentEvent::Status {
+                                            state: if runner.is_running() {
+                                                ControlRunState::Running
+                                            } else {
+                                                ControlRunState::Idle
+                                            },
+                                            queue_len: runner.queue.len(),
+                                            mission_id: Some(target),
+                                        });
+                                        target_status_sent = true;
+                                    }
+                                }
+                                if main_removed > 0
+                                    && !target_status_sent
+                                    && main_mission_id != Some(target)
+                                {
+                                    // No parallel runner for `target` and it
+                                    // is not the main mission: it cannot be
+                                    // running, but its viewers still need a
+                                    // scoped event to refresh their queue.
+                                    let _ = events_tx.send(AgentEvent::Status {
+                                        state: ControlRunState::Idle,
+                                        queue_len: 0,
+                                        mission_id: Some(target),
+                                    });
+                                }
+                                tracing::info!(
+                                    "Cleared {} queued messages for mission {}",
+                                    cleared, target
+                                );
+                            }
+                            None => {
+                                cleared = queue.len();
+                                queue.clear();
+
+                                // Also clear parallel runner queues, notifying
+                                // each affected mission's viewers.
+                                for (mid, runner) in parallel_runners.iter_mut() {
+                                    let runner_cleared = runner.clear_queue();
+                                    if runner_cleared > 0 {
+                                        cleared += runner_cleared;
+                                        let _ = events_tx.send(AgentEvent::Status {
+                                            state: if runner.is_running() {
+                                                ControlRunState::Running
+                                            } else {
+                                                ControlRunState::Idle
+                                            },
+                                            queue_len: 0,
+                                            mission_id: Some(*mid),
+                                        });
+                                    }
+                                }
+
+                                // Emit event to notify frontend (main queue)
+                                let _ = events_tx.send(AgentEvent::Status {
+                                    state: if running.is_some() {
+                                        ControlRunState::Running
+                                    } else {
+                                        ControlRunState::Idle
+                                    },
+                                    queue_len: 0,
+                                    mission_id: main_mission_id,
+                                });
+
+                                tracing::info!("Cleared {} total queued messages (main + parallel)", cleared);
+                            }
                         }
-
-                        // Emit event to notify frontend (main queue only)
-                        let _ = events_tx.send(AgentEvent::Status {
-                            state: if running.is_some() {
-                                ControlRunState::Running
-                            } else {
-                                ControlRunState::Idle
-                            },
-                            queue_len: 0,
-                            mission_id: if running.is_some() {
-                                running_mission_id
-                            } else {
-                                *current_mission.read().await
-                            },
-                        });
-
-                        tracing::info!("Cleared {} total queued messages (main + parallel)", cleared);
                         let _ = respond.send(cleared);
                     }
                 }
@@ -10857,7 +11606,7 @@ async fn control_actor_loop(
                                 // Desktop session detection from ToolCall.
                                 // Claude Code does not emit ToolResult for MCP tools,
                                 // so we detect the session start from the ToolCall and
-                                // spawn a background task to attribute Xvfb processes.
+                                // spawn a background task to attribute Wayland compositor processes.
                                 let is_desktop_start = matches!(
                                     name.as_str(),
                                     "desktop_start_session"
@@ -10867,16 +11616,16 @@ async fn control_actor_loop(
                                 if is_desktop_start {
                                     let store = mission_store.clone();
                                     let mid = *mid;
+                                    let working_dir = config.working_dir.clone();
                                     tokio::spawn(async move {
-                                        // Wait for Xvfb to start
+                                        // Wait for the compositor to start.
                                         tokio::time::sleep(std::time::Duration::from_secs(4)).await;
 
-                                        // Scan for running Xvfb displays
                                         let displays =
-                                            super::desktop::get_running_xvfb_displays().await;
+                                            super::desktop::get_running_wayland_displays(&working_dir).await;
                                         if displays.is_empty() {
                                             tracing::debug!(
-                                                "No Xvfb displays found for desktop attribution"
+                                                "No Wayland displays found for desktop attribution"
                                             );
                                             return;
                                         }
@@ -10896,6 +11645,8 @@ async fn control_actor_loop(
                                                 sessions.push(DesktopSessionInfo {
                                                     display: disp.clone(),
                                                     resolution: None,
+                                                    display_server: Some("wayland".to_string()),
+                                                    compositor: Some("sway-headless".to_string()),
                                                     started_at: now_string(),
                                                     stopped_at: None,
                                                     screenshots_dir: None,
@@ -11049,6 +11800,16 @@ async fn control_actor_loop(
                                 .get("screenshots_dir")
                                 .and_then(|v| v.as_str())
                                 .map(|v| v.to_string());
+                            let display_server = obj
+                                .get("display_server")
+                                .and_then(|v| v.as_str())
+                                .map(|v| v.to_string())
+                                .or_else(|| Some("wayland".to_string()));
+                            let compositor = obj
+                                .get("compositor")
+                                .and_then(|v| v.as_str())
+                                .map(|v| v.to_string())
+                                .or_else(|| Some("sway-headless".to_string()));
                             let browser = obj
                                 .get("browser")
                                 .and_then(|v| v.as_str())
@@ -11064,6 +11825,8 @@ async fn control_actor_loop(
                                 .find(|session| session.display == display && session.stopped_at.is_none())
                             {
                                 existing.resolution = resolution;
+                                existing.display_server = display_server;
+                                existing.compositor = compositor;
                                 existing.screenshots_dir = screenshots_dir;
                                 existing.browser = browser;
                                 existing.url = url;
@@ -11072,6 +11835,8 @@ async fn control_actor_loop(
                                 sessions.push(DesktopSessionInfo {
                                     display,
                                     resolution,
+                                    display_server,
+                                    compositor,
                                     started_at: now.clone(),
                                     stopped_at: None,
                                     screenshots_dir,
@@ -11329,10 +12094,11 @@ async fn run_single_control_turn(
     let history_context =
         build_history_context(history_for_prompt, config.context.max_history_total_chars);
     let mut convo = String::new();
-    convo.push_str(&history_context);
-    convo.push_str("User:\n");
-    convo.push_str(&user_message);
-    convo.push_str("\n\nInstructions:\n- Continue the conversation helpfully.\n- Use available tools as needed.\n- For large data processing tasks (>10KB), prefer executing scripts rather than inline processing.\n");
+    convo.push_str(&crate::util::frame_turn_prompt(
+        &history_context,
+        &user_message,
+    ));
+    convo.push_str("\n\nInstructions:\n- Respond to the CURRENT user request. The conversation history is context only: do not resume or continue earlier tasks from it unless the current request asks you to.\n- Use available tools as needed.\n- For large data processing tasks (>10KB), prefer executing scripts rather than inline processing.\n");
     let _task = match crate::task::Task::new(convo.clone(), Some(1000)) {
         Ok(t) => t,
         Err(e) => {
@@ -11700,7 +12466,14 @@ async fn run_single_control_turn(
                 convo.clone()
             };
             let codex_message: &str = codex_message_owned.as_str();
-            let mut result = Box::pin(super::mission_runner::run_codex_turn(
+            // Shared rotation wrapper: identical account rotation + usage-cap
+            // cooldown behaviour to the initial mission dispatch. Previously
+            // this path ran a single bare run_codex_turn with no credential
+            // override, so a follow-up/retry on a usage-capped ChatGPT
+            // account kept re-hitting the same cap instead of rotating to
+            // the next account. Fallback-model and tool-stall retries are
+            // handled inside the wrapper per attempted credential.
+            Box::pin(super::mission_runner::run_codex_turn_with_rotation(
                 exec_workspace,
                 &ctx.working_dir,
                 codex_message,
@@ -11712,62 +12485,8 @@ async fn run_single_control_turn(
                 cancel.clone(),
                 &config.working_dir,
                 session_id.as_deref(),
-                None,
             ))
-            .await;
-
-            if let Some(fallback_model) = super::mission_runner::codex_chatgpt_fallback_for_result(
-                requested_codex_model,
-                &result,
-            ) {
-                tracing::warn!(
-                    mission_id = %mid,
-                    requested_model = ?requested_codex_model,
-                    fallback_model,
-                    "Retrying Codex turn with fallback model for ChatGPT account compatibility (control path)"
-                );
-                result = Box::pin(super::mission_runner::run_codex_turn(
-                    exec_workspace,
-                    &ctx.working_dir,
-                    codex_message,
-                    Some(fallback_model),
-                    requested_model_effort.as_deref(),
-                    config.opencode_agent.as_deref(),
-                    mid,
-                    events_tx.clone(),
-                    cancel,
-                    &config.working_dir,
-                    session_id.as_deref(),
-                    None,
-                ))
-                .await;
-            } else if super::mission_runner::codex_tool_stall_should_retry_with_default_model(
-                requested_codex_model,
-                &result,
-            ) {
-                tracing::warn!(
-                    mission_id = %mid,
-                    requested_model = ?requested_codex_model,
-                    "Retrying Codex turn with CLI default model after generic GPT model stopped before tool use (control path)"
-                );
-                result = Box::pin(super::mission_runner::run_codex_turn(
-                    exec_workspace,
-                    &ctx.working_dir,
-                    codex_message,
-                    None,
-                    requested_model_effort.as_deref(),
-                    config.opencode_agent.as_deref(),
-                    mid,
-                    events_tx.clone(),
-                    cancel,
-                    &config.working_dir,
-                    session_id.as_deref(),
-                    None,
-                ))
-                .await;
-            }
-
-            result
+            .await
         }
         Some("gemini") => {
             let mid = match require_mission_id(mission_id, "Gemini CLI", &events_tx) {
@@ -11800,36 +12519,8 @@ async fn run_single_control_turn(
         _ => {
             // Default to opencode using per-workspace CLI execution
             let mid = mission_id.unwrap_or_else(Uuid::nil);
-            // Check profile's sandboxed config for the oh-my-opencode opt-in flag.
-            // Vanilla opencode is the default; oh-my-opencode is only used when the
-            // profile (or workspace config) explicitly enables it.
-            let mut opencode_workspace = exec_workspace.clone();
-            if let Some(ref profile) = effective_config_profile {
-                let lib_guard = library.read().await;
-                if let Some(lib) = lib_guard.as_ref() {
-                    if let Ok(profile_data) = lib.get_config_profile(profile).await {
-                        if profile_data.sandboxed_config.enable_oh_my_opencode {
-                            tracing::info!(
-                                mission_id = ?mission_id,
-                                profile = %profile,
-                                "Enabling oh-my-opencode wrapper from config profile"
-                            );
-                            let mut obj = opencode_workspace
-                                .config
-                                .as_object()
-                                .cloned()
-                                .unwrap_or_default();
-                            obj.insert(
-                                "enable_oh_my_opencode".to_string(),
-                                serde_json::json!(true),
-                            );
-                            opencode_workspace.config = serde_json::Value::Object(obj);
-                        }
-                    }
-                }
-            }
             Box::pin(super::mission_runner::run_opencode_turn(
-                &opencode_workspace,
+                exec_workspace,
                 &ctx.working_dir,
                 &user_message,
                 config.default_model.as_deref(),
@@ -14603,6 +15294,182 @@ mod tests {
         baselines.clear();
     }
 
+    fn stored_test_event(
+        mission_id: Uuid,
+        sequence: i64,
+        event_type: &str,
+        tool_call_id: Option<&str>,
+        content: &str,
+    ) -> mission_store::StoredEvent {
+        mission_store::StoredEvent {
+            id: sequence,
+            mission_id,
+            sequence,
+            event_type: event_type.to_string(),
+            timestamp: format!("2026-06-04T10:00:{sequence:02}Z"),
+            event_id: Some(format!("event-{sequence}")),
+            tool_call_id: tool_call_id.map(ToString::to_string),
+            tool_name: tool_call_id.map(|_| "bash".to_string()),
+            content: content.to_string(),
+            metadata: serde_json::json!({}),
+        }
+    }
+
+    #[test]
+    fn conversation_projection_stubs_older_tool_pairs() {
+        let mission_id = Uuid::new_v4();
+        let events = vec![
+            stored_test_event(mission_id, 1, "user_message", None, "start"),
+            stored_test_event(
+                mission_id,
+                2,
+                "tool_call",
+                Some("tool-1"),
+                "{\"cmd\":\"old\"}",
+            ),
+            stored_test_event(
+                mission_id,
+                3,
+                "tool_result",
+                Some("tool-1"),
+                "{\"ok\":true}",
+            ),
+            stored_test_event(
+                mission_id,
+                4,
+                "tool_call",
+                Some("tool-2"),
+                "{\"cmd\":\"new\"}",
+            ),
+            stored_test_event(
+                mission_id,
+                5,
+                "tool_result",
+                Some("tool-2"),
+                "{\"ok\":true}",
+            ),
+            stored_test_event(mission_id, 6, "assistant_message", None, "done"),
+        ];
+
+        let keep_full_tool_call_ids = HashSet::from(["tool-2".to_string()]);
+        let projected =
+            project_conversation_events(events, &keep_full_tool_call_ids, &HashMap::new());
+
+        assert_eq!(
+            projected
+                .iter()
+                .map(|event| event.event_type.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "user_message",
+                "tool_stub",
+                "tool_call",
+                "tool_result",
+                "assistant_message"
+            ]
+        );
+        let stub = projected
+            .iter()
+            .find(|event| event.event_type == "tool_stub")
+            .expect("older tool call should be stubbed");
+        assert_eq!(stub.tool_call_id.as_deref(), Some("tool-1"));
+        assert!(stub.content.is_empty());
+        assert_eq!(stub.metadata["lazy"], serde_json::json!(true));
+        assert_eq!(stub.metadata["has_result"], serde_json::json!(true));
+        assert_eq!(stub.metadata["result_sequence"], serde_json::json!(3));
+        assert_eq!(
+            stub.metadata["call_content_bytes"],
+            serde_json::json!("{\"cmd\":\"old\"}".len())
+        );
+    }
+
+    #[test]
+    fn conversation_projection_uses_global_keep_full_set() {
+        let mission_id = Uuid::new_v4();
+        let events = vec![
+            stored_test_event(mission_id, 20, "tool_call", Some("older-page-newest"), "{}"),
+            stored_test_event(
+                mission_id,
+                21,
+                "tool_result",
+                Some("older-page-newest"),
+                "{\"ok\":true}",
+            ),
+        ];
+
+        let projected = project_conversation_events(events, &HashSet::new(), &HashMap::new());
+
+        assert_eq!(projected.len(), 1);
+        assert_eq!(projected[0].event_type, "tool_stub");
+        assert_eq!(
+            projected[0].tool_call_id.as_deref(),
+            Some("older-page-newest")
+        );
+    }
+
+    #[test]
+    fn conversation_projection_uses_persisted_tool_summary_across_page_boundary() {
+        let mission_id = Uuid::new_v4();
+        let events = vec![stored_test_event(
+            mission_id,
+            10,
+            "tool_call",
+            Some("split-tool"),
+            "{}",
+        )];
+        let summaries = HashMap::from([(
+            "split-tool".to_string(),
+            mission_store::ToolCallSummary {
+                has_result: true,
+                result_sequence: Some(11),
+                result_timestamp: Some("2026-06-04T10:00:11Z".to_string()),
+                call_content_bytes: 2,
+                result_content_bytes: 14,
+            },
+        )]);
+
+        let projected = project_conversation_events(events, &HashSet::new(), &summaries);
+
+        assert_eq!(projected.len(), 1);
+        let stub = &projected[0];
+        assert_eq!(stub.event_type, "tool_stub");
+        assert_eq!(stub.metadata["has_result"], serde_json::json!(true));
+        assert_eq!(stub.metadata["result_sequence"], serde_json::json!(11));
+        assert_eq!(
+            stub.metadata["result_timestamp"],
+            serde_json::json!("2026-06-04T10:00:11Z")
+        );
+        assert_eq!(stub.metadata["result_content_bytes"], serde_json::json!(14));
+    }
+
+    #[test]
+    fn conversation_projection_keeps_inflight_tools_full() {
+        let mission_id = Uuid::new_v4();
+        let events = vec![stored_test_event(
+            mission_id,
+            10,
+            "tool_call",
+            Some("inflight-tool"),
+            "{\"cmd\":\"long\"}",
+        )];
+        let summaries = HashMap::from([(
+            "inflight-tool".to_string(),
+            mission_store::ToolCallSummary {
+                has_result: false,
+                result_sequence: None,
+                result_timestamp: None,
+                call_content_bytes: "{\"cmd\":\"long\"}".len(),
+                result_content_bytes: 0,
+            },
+        )]);
+
+        let projected = project_conversation_events(events, &HashSet::new(), &summaries);
+
+        assert_eq!(projected.len(), 1);
+        assert_eq!(projected[0].event_type, "tool_call");
+        assert_eq!(projected[0].content, "{\"cmd\":\"long\"}");
+    }
+
     fn test_automation_with_mode(
         fresh_session: mission_store::FreshSession,
         variables: HashMap<String, String>,
@@ -14656,33 +15523,6 @@ mod tests {
             &automation,
         );
         assert_eq!(target, source_mission_id);
-    }
-
-    #[test]
-    fn synthetic_thought_from_text_delta_flushes_before_tool_call() {
-        let mission_id = Uuid::new_v4();
-        let mut pending = HashMap::new();
-
-        let text_delta = AgentEvent::TextDelta {
-            content: "Now let me run the build to see how many errors remain.".to_string(),
-            mission_id: Some(mission_id),
-        };
-        assert_eq!(
-            synthetic_thought_from_text_delta(&mut pending, mission_id, &text_delta),
-            None
-        );
-
-        let tool_call = AgentEvent::ToolCall {
-            tool_call_id: "tool-1".to_string(),
-            name: "Bash".to_string(),
-            args: serde_json::json!({ "command": "lake build" }),
-            mission_id: Some(mission_id),
-        };
-        assert_eq!(
-            synthetic_thought_from_text_delta(&mut pending, mission_id, &tool_call),
-            Some("Now let me run the build to see how many errors remain.".to_string())
-        );
-        assert!(pending.is_empty());
     }
 
     #[test]
@@ -14746,6 +15586,76 @@ mod tests {
     }
 
     #[test]
+    fn text_op_stream_transform_merges_incremental_delta_fragments() {
+        let mission_id = Uuid::new_v4();
+        let mut buffers = HashMap::new();
+
+        let _ = text_op_events_for_stream(
+            AgentEvent::TextDelta {
+                content: "No, it is not actually enforced yet.".to_string(),
+                mission_id: Some(mission_id),
+            },
+            &mut buffers,
+        );
+
+        let second = text_op_events_for_stream(
+            AgentEvent::TextDelta {
+                content: "\n\nCurrent state:".to_string(),
+                mission_id: Some(mission_id),
+            },
+            &mut buffers,
+        );
+
+        match &second[0] {
+            AgentEvent::TextOp { ops, .. } => {
+                assert_eq!(
+                    ops,
+                    &vec![TextOp::Replace {
+                        range: (0, 36),
+                        text: "No, it is not actually enforced yet.\n\nCurrent state:".to_string(),
+                    }]
+                );
+            }
+            other => panic!("expected text_op, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn text_op_stream_transform_ignores_replayed_shorter_prefixes() {
+        let mission_id = Uuid::new_v4();
+        let mut buffers = HashMap::new();
+
+        let _ = text_op_events_for_stream(
+            AgentEvent::TextDelta {
+                content: "The docs are accurate about this current state.".to_string(),
+                mission_id: Some(mission_id),
+            },
+            &mut buffers,
+        );
+
+        let second = text_op_events_for_stream(
+            AgentEvent::TextDelta {
+                content: "The docs are accurate".to_string(),
+                mission_id: Some(mission_id),
+            },
+            &mut buffers,
+        );
+
+        match &second[0] {
+            AgentEvent::TextOp { ops, .. } => {
+                assert_eq!(
+                    ops,
+                    &vec![TextOp::Replace {
+                        range: (0, 47),
+                        text: "The docs are accurate about this current state.".to_string(),
+                    }]
+                );
+            }
+            other => panic!("expected text_op, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn text_op_stream_transform_finalizes_before_assistant_message() {
         let mission_id = Uuid::new_v4();
         let mut buffers = HashMap::new();
@@ -14793,122 +15703,97 @@ mod tests {
         assert!(buffers.is_empty());
     }
 
-    #[test]
-    fn synthetic_thought_from_text_delta_accumulates_incremental_fragments() {
-        let mission_id = Uuid::new_v4();
-        let mut pending = HashMap::new();
+    #[tokio::test]
+    async fn delete_mission_with_children_removes_worker_missions() {
+        let store: Arc<dyn MissionStore> = Arc::new(mission_store::InMemoryMissionStore::new());
+        let boss = store
+            .create_mission(Some("Boss mission"), None, None, None, None, None, None)
+            .await
+            .expect("boss mission should be created");
+        let worker = store
+            .create_mission_with_parent(
+                Some("Worker mission"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(boss.id),
+                None,
+            )
+            .await
+            .expect("worker mission should be created");
+        let nested_worker = store
+            .create_mission_with_parent(
+                Some("Nested worker mission"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(worker.id),
+                None,
+            )
+            .await
+            .expect("nested worker mission should be created");
 
-        let first = AgentEvent::TextDelta {
-            content: "Now let me run ".to_string(),
-            mission_id: Some(mission_id),
-        };
-        let second = AgentEvent::TextDelta {
-            content: "the build.".to_string(),
-            mission_id: Some(mission_id),
-        };
-        let tool_call = AgentEvent::ToolCall {
-            tool_call_id: "tool-1".to_string(),
-            name: "Bash".to_string(),
-            args: serde_json::json!({ "command": "cargo test" }),
-            mission_id: Some(mission_id),
-        };
+        let deleted_ids = delete_mission_with_children(&store, boss.id, &[])
+            .await
+            .expect("delete should cascade to workers");
 
-        let _ = synthetic_thought_from_text_delta(&mut pending, mission_id, &first);
-        let _ = synthetic_thought_from_text_delta(&mut pending, mission_id, &second);
-        assert_eq!(
-            synthetic_thought_from_text_delta(&mut pending, mission_id, &tool_call),
-            Some("Now let me run the build.".to_string())
-        );
+        assert_eq!(deleted_ids[0], boss.id);
+        assert!(deleted_ids.contains(&worker.id));
+        assert!(deleted_ids.contains(&nested_worker.id));
+        assert!(store.get_mission(boss.id).await.unwrap().is_none());
+        assert!(store.get_mission(worker.id).await.unwrap().is_none());
+        assert!(store.get_mission(nested_worker.id).await.unwrap().is_none());
     }
 
-    #[test]
-    fn synthetic_thought_from_text_delta_replaces_accumulated_fragments() {
-        let mission_id = Uuid::new_v4();
-        let mut pending = HashMap::new();
+    #[tokio::test]
+    async fn cleanup_mission_workspace_dirs_for_delete_removes_worker_dirs() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let workspaces = Arc::new(workspace::WorkspaceStore::new(temp.path().to_path_buf()).await);
+        let store: Arc<dyn MissionStore> = Arc::new(mission_store::InMemoryMissionStore::new());
+        let boss = store
+            .create_mission(Some("Boss mission"), None, None, None, None, None, None)
+            .await
+            .expect("boss mission should be created");
+        let worker = store
+            .create_mission_with_parent(
+                Some("Worker mission"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(boss.id),
+                None,
+            )
+            .await
+            .expect("worker mission should be created");
 
-        let first = AgentEvent::TextDelta {
-            content: "Now let me run".to_string(),
-            mission_id: Some(mission_id),
-        };
-        let second = AgentEvent::TextDelta {
-            content: "Now let me run the build".to_string(),
-            mission_id: Some(mission_id),
-        };
-        let tool_call = AgentEvent::ToolCall {
-            tool_call_id: "tool-1".to_string(),
-            name: "Bash".to_string(),
-            args: serde_json::json!({ "command": "cargo test" }),
-            mission_id: Some(mission_id),
-        };
+        let boss_dir = workspace::mission_workspace_dir_for_root(temp.path(), boss.id);
+        let worker_dir = workspace::mission_workspace_dir_for_root(temp.path(), worker.id);
+        tokio::fs::create_dir_all(&boss_dir)
+            .await
+            .expect("boss workspace dir should be created");
+        tokio::fs::create_dir_all(&worker_dir)
+            .await
+            .expect("worker workspace dir should be created");
 
-        let _ = synthetic_thought_from_text_delta(&mut pending, mission_id, &first);
-        let _ = synthetic_thought_from_text_delta(&mut pending, mission_id, &second);
-        assert_eq!(
-            synthetic_thought_from_text_delta(&mut pending, mission_id, &tool_call),
-            Some("Now let me run the build".to_string())
-        );
-    }
+        let deleted_dirs =
+            cleanup_mission_workspace_dirs_for_delete(&store, &workspaces, boss.id, &[])
+                .await
+                .expect("workspace cleanup should succeed");
 
-    #[test]
-    fn synthetic_thought_from_text_delta_skips_assistant_echoes() {
-        let mission_id = Uuid::new_v4();
-        let mut pending = HashMap::new();
-
-        let text_delta = AgentEvent::TextDelta {
-            content: "Here is the final answer".to_string(),
-            mission_id: Some(mission_id),
-        };
-        let assistant = AgentEvent::AssistantMessage {
-            id: Uuid::new_v4(),
-            content: "Here is the final answer with more detail".to_string(),
-            success: true,
-            cost_cents: 0,
-            cost_source: crate::agents::CostSource::Unknown,
-            usage: None,
-            model: None,
-            model_normalized: None,
-            mission_id: Some(mission_id),
-            shared_files: None,
-            resumable: false,
-            completion_evidence: None,
-        };
-
-        let _ = synthetic_thought_from_text_delta(&mut pending, mission_id, &text_delta);
-        assert_eq!(
-            synthetic_thought_from_text_delta(&mut pending, mission_id, &assistant),
-            None
-        );
-    }
-
-    #[test]
-    fn synthetic_thought_from_text_delta_keeps_tool_narration_before_assistant() {
-        let mission_id = Uuid::new_v4();
-        let mut pending = HashMap::new();
-
-        let text_delta = AgentEvent::TextDelta {
-            content: "I'll inspect the failing theorem before I answer.".to_string(),
-            mission_id: Some(mission_id),
-        };
-        let assistant = AgentEvent::AssistantMessage {
-            id: Uuid::new_v4(),
-            content: "I found the issue in the induction step.".to_string(),
-            success: true,
-            cost_cents: 0,
-            cost_source: crate::agents::CostSource::Unknown,
-            usage: None,
-            model: None,
-            model_normalized: None,
-            mission_id: Some(mission_id),
-            shared_files: None,
-            resumable: false,
-            completion_evidence: None,
-        };
-
-        let _ = synthetic_thought_from_text_delta(&mut pending, mission_id, &text_delta);
-        assert_eq!(
-            synthetic_thought_from_text_delta(&mut pending, mission_id, &assistant),
-            Some("I'll inspect the failing theorem before I answer.".to_string())
-        );
+        assert_eq!(deleted_dirs.len(), 2);
+        assert!(!boss_dir.exists());
+        assert!(!worker_dir.exists());
+        assert!(store.get_mission(boss.id).await.unwrap().is_some());
+        assert!(store.get_mission(worker.id).await.unwrap().is_some());
     }
 
     #[tokio::test]

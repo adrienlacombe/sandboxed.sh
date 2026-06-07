@@ -12,7 +12,6 @@ import {
   listAccountHealth,
   clearAccountCooldown,
   listFallbackEvents,
-  getRtkStats,
   type ModelChain,
   type ChainEntry,
   type ResolvedEntry,
@@ -22,12 +21,13 @@ import {
   listProxyApiKeys,
   createProxyApiKey,
   deleteProxyApiKey,
+  cleanupProxyApiKeys,
+  type ProxyApiKeySummary,
 } from '@/lib/api/proxy-keys';
 import {
   listProviders,
   type Provider,
 } from '@/lib/api/providers';
-import { getSettings } from '@/lib/api';
 import { getRuntimeApiBase } from '@/lib/settings';
 import {
   GitBranch,
@@ -49,9 +49,9 @@ import {
   Copy,
   Check,
   Pencil,
-  Zap,
+  Sparkles,
 } from 'lucide-react';
-import { cn } from '@/lib/utils';
+import { cn, formatRelativeTime } from '@/lib/utils';
 
 function ModelDropdown({
   value,
@@ -670,19 +670,6 @@ export default function ModelRoutingPage() {
     refreshInterval: 10000, // Poll events every 10s
   });
 
-  const {
-    data: rtkStats,
-    isLoading: rtkStatsLoading,
-  } = useSWR('rtk-stats', getRtkStats, {
-    revalidateOnFocus: false,
-    refreshInterval: 10000, // Poll RTK stats every 10s
-  });
-
-  const { data: settings } = useSWR('settings', getSettings, {
-    revalidateOnFocus: false,
-  });
-  const rtkEnabled = Boolean(settings?.rtk_enabled);
-
   const handleCreate = async () => {
     if (!createForm.id.trim() || !createForm.name.trim()) {
       toast.error('Chain ID and name are required');
@@ -811,6 +798,70 @@ export default function ModelRoutingPage() {
       setTimeout(() => setCopiedText(null), 2000);
     } catch {
       toast.error('Failed to copy to clipboard');
+    }
+  };
+
+  // ── Cleanup of unused proxy keys ──
+  const [showCleanup, setShowCleanup] = useState(false);
+  const [cleanupDays, setCleanupDays] = useState(7);
+  const [cleanupCandidates, setCleanupCandidates] = useState<ProxyApiKeySummary[] | null>(null);
+  const [cleanupSelected, setCleanupSelected] = useState<Set<string>>(new Set());
+  const [cleanupLoading, setCleanupLoading] = useState(false);
+  const [cleanupDeleting, setCleanupDeleting] = useState(false);
+
+  const loadCleanupCandidates = async (days: number) => {
+    setCleanupLoading(true);
+    try {
+      const result = await cleanupProxyApiKeys(days, true);
+      setCleanupCandidates(result.keys);
+      setCleanupSelected(new Set(result.keys.map((k) => k.id)));
+    } catch (err) {
+      toast.error(`Failed to preview cleanup: ${err instanceof Error ? err.message : 'Unknown error'}`);
+      setCleanupCandidates(null);
+    } finally {
+      setCleanupLoading(false);
+    }
+  };
+
+  const handleOpenCleanup = () => {
+    setShowCleanup(true);
+    setShowCreateKey(false);
+    void loadCleanupCandidates(cleanupDays);
+  };
+
+  const handleCleanupDaysChange = (days: number) => {
+    setCleanupDays(days);
+    if (days >= 1) void loadCleanupCandidates(days);
+  };
+
+  const toggleCleanupKey = (id: string) => {
+    setCleanupSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+
+  const handleConfirmCleanup = async () => {
+    const ids = [...cleanupSelected];
+    if (ids.length === 0) return;
+    setCleanupDeleting(true);
+    try {
+      // Delete the user's selection key-by-key rather than re-running the
+      // age criterion, so deselected keys are never touched.
+      const results = await Promise.allSettled(ids.map((id) => deleteProxyApiKey(id)));
+      const failed = results.filter((r) => r.status === 'rejected').length;
+      if (failed > 0) {
+        toast.error(`Deleted ${ids.length - failed} keys, ${failed} failed`);
+      } else {
+        toast.success(`Deleted ${ids.length} unused key${ids.length > 1 ? 's' : ''}`);
+      }
+      setShowCleanup(false);
+      setCleanupCandidates(null);
+      mutateApiKeys();
+    } finally {
+      setCleanupDeleting(false);
     }
   };
 
@@ -980,68 +1031,6 @@ export default function ModelRoutingPage() {
           />
         </div>
 
-        {/* ── RTK Token Savings Section ── */}
-        <div className="rounded-xl bg-white/[0.02] border border-white/[0.04] p-5 mt-6">
-          <div className="flex items-center gap-3 mb-4">
-            <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-purple-500/10">
-              <Zap className="h-5 w-5 text-purple-400" />
-            </div>
-            <div>
-              <h2 className="text-sm font-medium text-white">RTK Token Savings</h2>
-              <p className="text-xs text-white/40">
-                CLI output compression reduces LLM token consumption
-              </p>
-            </div>
-            {rtkStats && rtkStats.commands_processed > 0 && (
-              <span className="ml-auto text-xs text-emerald-400">
-                {rtkStats.savings_percent.toFixed(1)}% saved
-              </span>
-            )}
-          </div>
-
-          {rtkStatsLoading ? (
-            <div className="flex items-center justify-center py-6">
-              <Loader className="h-4 w-4 animate-spin text-white/30" />
-            </div>
-          ) : !rtkStats || rtkStats.commands_processed === 0 ? (
-            <div className="text-center py-4">
-              {rtkEnabled ? (
-                <>
-                  <p className="text-xs text-white/50">RTK is enabled and waiting for a wrapped command.</p>
-                  <p className="mt-1 text-[10px] text-white/30">
-                    Only commands run through the MCP terminal tool are wrapped. Claude Code and OpenCode
-                    default to built-in bash, which bypasses RTK.
-                  </p>
-                </>
-              ) : (
-                <p className="text-xs text-white/30">
-                  No RTK data yet. Enable RTK in <a href="/settings/data" className="text-white/50 underline">Settings</a>
-                </p>
-              )}
-            </div>
-          ) : (
-            <div className="grid grid-cols-4 gap-3">
-              <div className="rounded-lg border border-white/[0.06] bg-white/[0.01] px-3 py-2">
-                <div className="text-[10px] text-white/30 uppercase tracking-wider mb-1">Commands</div>
-                <div className="text-lg font-medium text-white">{rtkStats.commands_processed.toLocaleString()}</div>
-              </div>
-              <div className="rounded-lg border border-white/[0.06] bg-white/[0.01] px-3 py-2">
-                <div className="text-[10px] text-white/30 uppercase tracking-wider mb-1">Original</div>
-                <div className="text-lg font-medium text-white">{formatTokenCount(rtkStats.original_chars)}</div>
-              </div>
-              <div className="rounded-lg border border-white/[0.06] bg-white/[0.01] px-3 py-2">
-                <div className="text-[10px] text-white/30 uppercase tracking-wider mb-1">Compressed</div>
-                <div className="text-lg font-medium text-white">{formatTokenCount(rtkStats.compressed_chars)}</div>
-              </div>
-              <div className="rounded-lg border border-emerald-500/20 bg-emerald-500/5 px-3 py-2">
-                <div className="text-[10px] text-emerald-400/60 uppercase tracking-wider mb-1">Saved</div>
-                <div className="text-lg font-medium text-emerald-400">
-                  {formatTokenCount(rtkStats.chars_saved)} ({rtkStats.savings_percent.toFixed(0)}%)
-                </div>
-              </div>
-            </div>
-          )}
-        </div>
 
         {/* ── Fallback Events Section ── */}
         <div className="rounded-xl bg-white/[0.02] border border-white/[0.04] p-5 mt-6">
@@ -1144,13 +1133,23 @@ export default function ModelRoutingPage() {
                 </p>
               </div>
             </div>
-            <button
-              onClick={() => { setShowCreateKey(true); setCreatedKey(null); }}
-              className="flex items-center gap-1.5 rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-1.5 text-xs text-white/70 hover:bg-white/[0.04] transition-colors cursor-pointer"
-            >
-              <Plus className="h-3 w-3" />
-              New Key
-            </button>
+            <div className="flex items-center gap-2">
+              <button
+                onClick={handleOpenCleanup}
+                className="flex items-center gap-1.5 rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-1.5 text-xs text-white/70 hover:bg-white/[0.04] transition-colors cursor-pointer"
+                title="Find and revoke keys with no recent activity"
+              >
+                <Sparkles className="h-3 w-3" />
+                Clean Up
+              </button>
+              <button
+                onClick={() => { setShowCreateKey(true); setCreatedKey(null); setShowCleanup(false); }}
+                className="flex items-center gap-1.5 rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-1.5 text-xs text-white/70 hover:bg-white/[0.04] transition-colors cursor-pointer"
+              >
+                <Plus className="h-3 w-3" />
+                New Key
+              </button>
+            </div>
           </div>
 
           {/* Proxy endpoint URL */}
@@ -1219,6 +1218,76 @@ export default function ModelRoutingPage() {
             </div>
           )}
 
+          {/* Cleanup unused keys */}
+          {showCleanup && (
+            <div className="mb-4 rounded-lg border border-amber-500/20 bg-amber-500/[0.03] p-3 space-y-3">
+              <div className="flex items-center gap-2">
+                <span className="text-xs text-white/60">Revoke keys with no activity for</span>
+                <input
+                  type="number"
+                  min={1}
+                  value={cleanupDays}
+                  onChange={(e) => handleCleanupDaysChange(Number(e.target.value))}
+                  className="w-16 rounded-lg border border-white/[0.06] bg-white/[0.02] px-2 py-1 text-xs text-white focus:outline-none focus:border-amber-500/50"
+                />
+                <span className="text-xs text-white/60">days</span>
+              </div>
+              <p className="text-[10px] text-white/30">
+                Keys that never authenticated a request fall back to their creation date.
+                Usage tracking starts with this release, so older keys may show as never used.
+              </p>
+              {cleanupLoading ? (
+                <div className="flex items-center justify-center py-4">
+                  <Loader className="h-4 w-4 animate-spin text-white/30" />
+                </div>
+              ) : !cleanupCandidates || cleanupCandidates.length === 0 ? (
+                <p className="text-xs text-white/40 text-center py-2">
+                  No unused keys older than {cleanupDays} day{cleanupDays > 1 ? 's' : ''}.
+                </p>
+              ) : (
+                <div className="space-y-1">
+                  {cleanupCandidates.map((k) => (
+                    <label
+                      key={k.id}
+                      className="flex items-center gap-2.5 rounded-lg border border-white/[0.06] bg-white/[0.01] px-3 py-1.5 cursor-pointer hover:bg-white/[0.03] transition-colors"
+                    >
+                      <input
+                        type="checkbox"
+                        checked={cleanupSelected.has(k.id)}
+                        onChange={() => toggleCleanupKey(k.id)}
+                        className="accent-amber-500"
+                      />
+                      <span className="text-xs text-white/70 flex-1 min-w-0 truncate">{k.name}</span>
+                      <span className="text-[10px] text-white/30 font-mono flex-shrink-0">{k.key_prefix}...</span>
+                      <span className="text-[10px] text-white/30 flex-shrink-0">
+                        {k.last_used_at
+                          ? `last used ${formatRelativeTime(new Date(k.last_used_at))}`
+                          : `never used · created ${new Date(k.created_at).toLocaleDateString()}`}
+                      </span>
+                    </label>
+                  ))}
+                </div>
+              )}
+              <div className="flex justify-end gap-2">
+                <button
+                  onClick={() => { setShowCleanup(false); setCleanupCandidates(null); }}
+                  className="rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-1.5 text-xs text-white/50 hover:bg-white/[0.04] transition-colors cursor-pointer"
+                >
+                  Cancel
+                </button>
+                <button
+                  onClick={handleConfirmCleanup}
+                  disabled={cleanupDeleting || cleanupLoading || cleanupSelected.size === 0}
+                  className="rounded-lg bg-amber-600 px-3 py-1.5 text-xs text-white hover:bg-amber-700 transition-colors cursor-pointer disabled:opacity-50"
+                >
+                  {cleanupDeleting
+                    ? 'Revoking...'
+                    : `Revoke ${cleanupSelected.size} key${cleanupSelected.size === 1 ? '' : 's'}`}
+                </button>
+              </div>
+            </div>
+          )}
+
           {/* Key list */}
           {apiKeysLoading ? (
             <div className="flex items-center justify-center py-6">
@@ -1242,8 +1311,13 @@ export default function ModelRoutingPage() {
                   <span className="text-[10px] text-white/30 font-mono flex-shrink-0">
                     {k.key_prefix}...
                   </span>
-                  <span className="text-[10px] text-white/20 flex-shrink-0">
-                    {new Date(k.created_at).toLocaleDateString()}
+                  <span
+                    className="text-[10px] text-white/20 flex-shrink-0"
+                    title={k.last_used_at ? `Last used ${new Date(k.last_used_at).toLocaleString()}` : 'Never used'}
+                  >
+                    {k.last_used_at
+                      ? `used ${formatRelativeTime(new Date(k.last_used_at))}`
+                      : new Date(k.created_at).toLocaleDateString()}
                   </span>
                   <button
                     onClick={() => handleDeleteKey(k.id)}

@@ -20,9 +20,9 @@ use super::routes::AppState;
 use crate::ai_providers::{AIProvider, AIProviderStore, ProviderType};
 use crate::util::{auth_entry_has_credentials, home_dir, AI_PROVIDERS_PATH};
 
-/// Cached model lists fetched from provider APIs at startup.
-/// Maps provider ID (e.g. "anthropic") -> Vec<ProviderModel>
-pub type ModelCatalog = Arc<RwLock<HashMap<String, Vec<ProviderModel>>>>;
+/// Cached model catalog fetched from provider APIs and public catalogs at startup.
+/// Maps provider ID (e.g. "anthropic") -> Vec<CatalogEntry>.
+pub type ModelCatalog = Arc<RwLock<HashMap<String, Vec<CatalogEntry>>>>;
 
 #[derive(Debug, Clone)]
 struct CodexProbeCacheEntry {
@@ -46,6 +46,76 @@ pub const DEFAULT_CATALOG_PROVIDER_IDS: &[&str] = &[
     "zai",
     "minimax",
 ];
+
+/// Where a catalog entry came from.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CatalogSource {
+    ProviderApi,
+    ModelsDev,
+    Docs,
+    HardcodedFallback,
+    SmokeTest,
+}
+
+/// How confidently a model can be selected for the configured account.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CatalogAvailability {
+    /// Returned by the provider API or otherwise verified for this account.
+    Available,
+    /// Known from a public catalog, not confirmed for this account.
+    Known,
+    /// Discovered from docs or other weak signals and needs validation.
+    Candidate,
+    /// Previously tested and failed.
+    Failed,
+}
+
+/// Internal merged catalog entry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CatalogEntry {
+    pub id: String,
+    pub name: String,
+    pub provider_id: String,
+    pub sources: Vec<CatalogSource>,
+    pub availability: CatalogAvailability,
+    pub last_checked_at: chrono::DateTime<chrono::Utc>,
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
+impl CatalogEntry {
+    fn from_provider_model(
+        provider_id: impl Into<String>,
+        model: ProviderModel,
+        source: CatalogSource,
+        availability: CatalogAvailability,
+        last_checked_at: chrono::DateTime<chrono::Utc>,
+    ) -> Self {
+        Self {
+            id: model.id,
+            name: model.name,
+            provider_id: provider_id.into(),
+            sources: vec![source],
+            availability,
+            last_checked_at,
+            description: model.description,
+        }
+    }
+
+    fn to_provider_model(&self) -> ProviderModel {
+        ProviderModel {
+            id: self.id.clone(),
+            name: self.name.clone(),
+            description: self.description.clone(),
+        }
+    }
+
+    fn is_selectable_by_default(&self) -> bool {
+        self.availability == CatalogAvailability::Available
+    }
+}
 
 /// A model available from a provider.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -80,6 +150,9 @@ pub struct ProvidersQuery {
     /// Include providers even if they are not configured/authenticated.
     #[serde(default)]
     pub include_all: bool,
+    /// Include public-catalog models that have not been verified for this account.
+    #[serde(default)]
+    pub include_unverified: bool,
 }
 
 /// Response for the providers endpoint.
@@ -109,12 +182,39 @@ pub struct BackendModelOptionsResponse {
     pub backends: std::collections::HashMap<String, Vec<BackendModelOption>>,
 }
 
+/// One model in the full supported-model catalog, ready to drop into a
+/// model-routing chain (`value` is the provider-prefixed id, e.g. `xai/grok-4.3`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CatalogModelOption {
+    pub provider_id: String,
+    pub provider_name: String,
+    /// Bare model id (e.g. `grok-4.3`).
+    pub id: String,
+    /// Chain-ready value (`provider_id/model_id`).
+    pub value: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Whether this provider is currently configured/authenticated for this account.
+    pub configured: bool,
+}
+
+/// Response for the full model catalog endpoint.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FullCatalogResponse {
+    pub count: usize,
+    pub models: Vec<CatalogModelOption>,
+}
+
 /// Query parameters for backend models endpoint.
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct BackendModelsQuery {
     /// Include providers even if they are not configured/authenticated.
     #[serde(default)]
     pub include_all: bool,
+    /// Include public-catalog models that have not been verified for this account.
+    #[serde(default)]
+    pub include_unverified: bool,
 }
 
 /// Configuration file structure for providers.
@@ -176,13 +276,58 @@ fn merge_provider_models(
     }
 }
 
+fn normalize_model_id(id: &str) -> String {
+    id.trim().to_ascii_lowercase()
+}
+
+fn merge_catalog_entries(
+    catalog: &mut HashMap<String, Vec<CatalogEntry>>,
+    provider_id: &str,
+    incoming: impl IntoIterator<Item = CatalogEntry>,
+) {
+    let entries = catalog.entry(provider_id.to_string()).or_default();
+    for entry in incoming {
+        let normalized = normalize_model_id(&entry.id);
+        if let Some(existing) = entries
+            .iter_mut()
+            .find(|model| normalize_model_id(&model.id) == normalized)
+        {
+            if existing.availability != CatalogAvailability::Available
+                && entry.availability == CatalogAvailability::Available
+            {
+                existing.availability = CatalogAvailability::Available;
+                existing.last_checked_at = entry.last_checked_at;
+            }
+            if existing.description.is_none() {
+                existing.description = entry.description.clone();
+            }
+            if existing.name == existing.id && entry.name != entry.id {
+                existing.name = entry.name.clone();
+            }
+            for source in entry.sources {
+                if !existing.sources.contains(&source) {
+                    existing.sources.push(source);
+                }
+            }
+            continue;
+        }
+
+        entries.push(entry);
+    }
+}
+
 fn merge_cached_provider_models(
     config: &mut ProvidersConfig,
-    cached: &HashMap<String, Vec<ProviderModel>>,
+    cached: &HashMap<String, Vec<CatalogEntry>>,
+    include_unverified: bool,
 ) {
     for provider in &mut config.providers {
-        if let Some(models) = cached.get(&provider.id) {
-            merge_provider_models(&mut provider.models, models.iter().cloned());
+        if let Some(entries) = cached.get(&provider.id) {
+            let models = entries
+                .iter()
+                .filter(|entry| include_unverified || entry.is_selectable_by_default())
+                .map(CatalogEntry::to_provider_model);
+            merge_provider_models(&mut provider.models, models);
         }
     }
 }
@@ -414,11 +559,18 @@ fn default_providers_config() -> ProvidersConfig {
                     // Check Anthropic's current model IDs here:
                     // https://docs.anthropic.com/en/docs/about-claude/models/overview
                     ProviderModel {
-                        id: "claude-opus-4-7".to_string(),
-                        name: "Claude Opus 4.7".to_string(),
+                        id: "claude-opus-4-8".to_string(),
+                        name: "Claude Opus 4.8".to_string(),
                         description: Some(
                             "Latest Opus model, recommended for hard coding and agentic tasks"
                                 .to_string(),
+                        ),
+                    },
+                    ProviderModel {
+                        id: "claude-opus-4-7".to_string(),
+                        name: "Claude Opus 4.7".to_string(),
+                        description: Some(
+                            "Most capable, recommended for complex tasks".to_string(),
                         ),
                     },
                     ProviderModel {
@@ -426,6 +578,13 @@ fn default_providers_config() -> ProvidersConfig {
                         name: "Claude Opus 4.6".to_string(),
                         description: Some(
                             "Most capable, recommended for complex tasks".to_string(),
+                        ),
+                    },
+                    ProviderModel {
+                        id: "claude-sonnet-4-6".to_string(),
+                        name: "Claude Sonnet 4.6".to_string(),
+                        description: Some(
+                            "Latest Sonnet, balanced speed and capability".to_string(),
                         ),
                     },
                     ProviderModel {
@@ -463,46 +622,12 @@ fn default_providers_config() -> ProvidersConfig {
                 billing: "subscription".to_string(),
                 description: "ChatGPT Plus/Pro via OAuth".to_string(),
                 models: vec![
-                    // Keep this fallback list aligned with Codex upstream model IDs:
-                    // https://raw.githubusercontent.com/openai/codex/main/codex-rs/core/models.json
-                    // (authoritative source for Codex CLI model catalog).
-                    // Codex-optimized models (for Codex CLI)
-                    ProviderModel {
-                        id: "gpt-5-codex".to_string(),
-                        name: "GPT-5 Codex".to_string(),
-                        description: Some("Purpose-built for agentic coding".to_string()),
-                    },
-                    ProviderModel {
-                        id: "gpt-5-codex-mini".to_string(),
-                        name: "GPT-5 Codex Mini".to_string(),
-                        description: Some("Smaller, cost-effective variant".to_string()),
-                    },
-                    ProviderModel {
-                        id: "gpt-5.1-codex".to_string(),
-                        name: "GPT-5.1 Codex".to_string(),
-                        description: Some("Balanced capability and speed".to_string()),
-                    },
-                    ProviderModel {
-                        id: "gpt-5.1-codex-max".to_string(),
-                        name: "GPT-5.1 Codex Max".to_string(),
-                        description: Some("Highest reasoning capacity".to_string()),
-                    },
-                    ProviderModel {
-                        id: "gpt-5.1-codex-mini".to_string(),
-                        name: "GPT-5.1 Codex Mini".to_string(),
-                        description: Some("Fast and economical".to_string()),
-                    },
-                    ProviderModel {
-                        id: "gpt-5.2-codex".to_string(),
-                        name: "GPT-5.2 Codex".to_string(),
-                        description: Some("Smart and precise coding agent".to_string()),
-                    },
-                    ProviderModel {
-                        id: "gpt-5.3-codex".to_string(),
-                        name: "GPT-5.3 Codex".to_string(),
-                        description: Some("Newest Codex coding model".to_string()),
-                    },
-                    // Additional OpenAI models
+                    // Only current models. OpenAI's ChatGPT-account Codex keeps
+                    // a small recent set, so the older codex variants (gpt-5-codex
+                    // … gpt-5.3-codex) and stale generics (gpt-5.1/5.2/5.3) were
+                    // removed — gpt-5.3-codex now 404s ("model not supported when
+                    // using Codex with a ChatGPT account"), and everything older
+                    // than it is dead too. Newest first.
                     ProviderModel {
                         id: "gpt-5.5".to_string(),
                         name: "GPT-5.5".to_string(),
@@ -511,24 +636,14 @@ fn default_providers_config() -> ProvidersConfig {
                         ),
                     },
                     ProviderModel {
+                        id: "gpt-5.5-codex".to_string(),
+                        name: "GPT-5.5 Codex".to_string(),
+                        description: Some("Latest Codex-optimized coding model".to_string()),
+                    },
+                    ProviderModel {
                         id: "gpt-5.4".to_string(),
                         name: "GPT-5.4".to_string(),
                         description: Some("Previous frontier coding model in Codex".to_string()),
-                    },
-                    ProviderModel {
-                        id: "gpt-5.3".to_string(),
-                        name: "GPT-5.3".to_string(),
-                        description: Some("General-purpose GPT-5.3".to_string()),
-                    },
-                    ProviderModel {
-                        id: "gpt-5.2".to_string(),
-                        name: "GPT-5.2".to_string(),
-                        description: Some("General-purpose GPT-5.2".to_string()),
-                    },
-                    ProviderModel {
-                        id: "gpt-5.1".to_string(),
-                        name: "GPT-5.1".to_string(),
-                        description: Some("General-purpose GPT-5.1".to_string()),
                     },
                 ],
             },
@@ -575,17 +690,27 @@ fn default_providers_config() -> ProvidersConfig {
                 billing: "pay-per-token".to_string(),
                 description: "Grok models via xAI API key".to_string(),
                 models: vec![
-                    // Check xAI model IDs here:
-                    // https://docs.x.ai/docs/models
+                    // These IDs must match what the Grok Build CLI accepts
+                    // (`grok models`) — the bare `grok-build` alias is rejected
+                    // by current CLIs. xAI API model IDs: https://docs.x.ai/docs/models
+                    ProviderModel {
+                        id: "grok-build-0.1".to_string(),
+                        name: "Grok Build".to_string(),
+                        description: Some(
+                            "Grok Build coding model (xAI's \"Composer\"-class agent model; \
+                             marketing name \"Composer 2.5\" is NOT a valid API id)"
+                                .to_string(),
+                        ),
+                    },
                     ProviderModel {
                         id: "grok-4.3".to_string(),
                         name: "Grok 4.3".to_string(),
                         description: Some("Current flagship Grok model".to_string()),
                     },
                     ProviderModel {
-                        id: "grok-4.3-latest".to_string(),
-                        name: "Grok 4.3 Latest".to_string(),
-                        description: Some("Fast and economical".to_string()),
+                        id: "grok-4.20-0309-reasoning".to_string(),
+                        name: "Grok 4.20 (Reasoning)".to_string(),
+                        description: Some("Grok 4.20 reasoning model".to_string()),
                     },
                 ],
             },
@@ -595,15 +720,18 @@ fn default_providers_config() -> ProvidersConfig {
                 billing: "pay-per-token".to_string(),
                 description: "Ultra-fast inference via Cerebras".to_string(),
                 models: vec![
+                    // Keep aligned with the live catalog: GET /v1/models only
+                    // serves these two IDs now (Qwen and the `-cs` aliases are
+                    // retired).
                     ProviderModel {
-                        id: "gpt-oss-120b-cs".to_string(),
-                        name: "GPT-OSS 120B".to_string(),
-                        description: Some("Most capable Cerebras model".to_string()),
+                        id: "zai-glm-4.7".to_string(),
+                        name: "GLM-4.7 (Cerebras)".to_string(),
+                        description: Some("Most capable Cerebras-hosted model".to_string()),
                     },
                     ProviderModel {
-                        id: "zai-glm-4.6-cs".to_string(),
-                        name: "GLM-4.6 (Cerebras)".to_string(),
-                        description: Some("GLM-4.6 via Cerebras inference".to_string()),
+                        id: "gpt-oss-120b".to_string(),
+                        name: "GPT-OSS 120B".to_string(),
+                        description: Some("Open-weight reasoning model, ultra-fast".to_string()),
                     },
                 ],
             },
@@ -656,9 +784,16 @@ fn default_providers_config() -> ProvidersConfig {
                     // Check MiniMax text model IDs here:
                     // https://platform.minimaxi.com/document/ChatCompletion%20v2
                     ProviderModel {
+                        id: "MiniMax-M3".to_string(),
+                        name: "MiniMax M3".to_string(),
+                        description: Some(
+                            "Latest MiniMax coding and agentic model with 1M context".to_string(),
+                        ),
+                    },
+                    ProviderModel {
                         id: "MiniMax-M2.7".to_string(),
                         name: "MiniMax M2.7".to_string(),
-                        description: Some("Most capable MiniMax model".to_string()),
+                        description: Some("Previous flagship MiniMax model".to_string()),
                     },
                     ProviderModel {
                         id: "MiniMax-M2.5".to_string(),
@@ -817,6 +952,63 @@ pub async fn fetch_anthropic_models(api_key: &str) -> Result<Vec<ProviderModel>,
     Ok(models)
 }
 
+/// Fetch public model metadata from models.dev, which is the catalog used by
+/// OpenCode. These entries are useful for discovery, but are not account-
+/// verified, so they are marked as `known` rather than selectable by default.
+pub async fn fetch_models_dev_catalog() -> Result<HashMap<String, Vec<CatalogEntry>>, String> {
+    let client = reqwest::Client::new();
+    let resp = client
+        .get("https://models.dev/api.json")
+        .header("User-Agent", "Sandboxed.sh model catalog")
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await
+        .map_err(|e| format!("HTTP request failed: {}", e))?;
+
+    if !resp.status().is_success() {
+        return Err(format!("API returned status {}", resp.status()));
+    }
+
+    let body: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("Failed to parse JSON: {}", e))?;
+    let providers = body
+        .as_object()
+        .ok_or_else(|| "models.dev response was not an object".to_string())?;
+    let now = chrono::Utc::now();
+    let mut catalog: HashMap<String, Vec<CatalogEntry>> = HashMap::new();
+
+    for provider_id in DEFAULT_CATALOG_PROVIDER_IDS {
+        let Some(provider) = providers.get(*provider_id) else {
+            continue;
+        };
+        let Some(models) = provider.get("models").and_then(|m| m.as_object()) else {
+            continue;
+        };
+
+        let entries = models.iter().map(|(model_id, value)| {
+            let name = value
+                .get("name")
+                .and_then(|n| n.as_str())
+                .unwrap_or(model_id)
+                .to_string();
+            CatalogEntry {
+                id: model_id.clone(),
+                name,
+                provider_id: (*provider_id).to_string(),
+                sources: vec![CatalogSource::ModelsDev],
+                availability: CatalogAvailability::Known,
+                last_checked_at: now,
+                description: None,
+            }
+        });
+        merge_catalog_entries(&mut catalog, provider_id, entries);
+    }
+
+    Ok(catalog)
+}
+
 /// Resolve an API key for a given provider type.
 ///
 /// Checks three sources in order:
@@ -919,7 +1111,7 @@ pub fn get_api_key_for_provider(
 pub async fn fetch_model_catalog(
     ai_providers: &AIProviderStore,
     _working_dir: &Path,
-) -> HashMap<String, Vec<ProviderModel>> {
+) -> HashMap<String, Vec<CatalogEntry>> {
     let providers_list = ai_providers.list().await;
     let mut result = HashMap::new();
 
@@ -973,6 +1165,26 @@ pub async fn fetch_model_catalog(
             (t, key)
         })
         .collect();
+
+    // Fetch public catalog in parallel with provider APIs. These entries are
+    // not account-verified and are hidden unless include_unverified=true.
+    let models_dev_handle = tokio::spawn(async move {
+        match fetch_models_dev_catalog().await {
+            Ok(catalog) => {
+                let model_count: usize = catalog.values().map(Vec::len).sum();
+                tracing::info!(
+                    providers = catalog.len(),
+                    models = model_count,
+                    "Fetched public model metadata from models.dev"
+                );
+                Some(catalog)
+            }
+            Err(e) => {
+                tracing::warn!("Failed to fetch models.dev catalog: {}", e);
+                None
+            }
+        }
+    });
 
     // Fetch Anthropic (special format)
     let anthropic_handle = tokio::spawn(async move {
@@ -1032,11 +1244,28 @@ pub async fn fetch_model_catalog(
         }));
     }
 
-    // Collect results
+    if let Ok(Some(public_catalog)) = models_dev_handle.await {
+        for (provider_id, entries) in public_catalog {
+            merge_catalog_entries(&mut result, &provider_id, entries);
+        }
+    }
+
+    // Collect provider API results. These are account-verified and selectable
+    // by default.
+    let now = chrono::Utc::now();
     for handle in handles {
         if let Ok(Some((provider_id, models))) = handle.await {
             if !models.is_empty() {
-                result.insert(provider_id, models);
+                let entries = models.into_iter().map(|model| {
+                    CatalogEntry::from_provider_model(
+                        provider_id.clone(),
+                        model,
+                        CatalogSource::ProviderApi,
+                        CatalogAvailability::Available,
+                        now,
+                    )
+                });
+                merge_catalog_entries(&mut result, &provider_id, entries);
             }
         }
     }
@@ -1142,7 +1371,7 @@ pub async fn list_providers(
     // catalog probes can return only a currently-selected model, so replacing
     // the defaults would hide valid choices such as newly released Claude Opus.
     let cached = state.model_catalog.read().await;
-    merge_cached_provider_models(&mut config, &cached);
+    merge_cached_provider_models(&mut config, &cached, query.include_unverified);
     drop(cached);
 
     // Get the set of configured provider IDs
@@ -1165,7 +1394,60 @@ pub async fn list_providers(
     Json(ProvidersResponse { providers })
 }
 
-/// List model options grouped by backend (claudecode, codex, opencode).
+/// Full catalog of every supported model across all providers — configured or
+/// not, account-verified or public-catalog — as one flat list. Unlike
+/// `/api/providers/backend-models` (which filters/groups per harness), this is
+/// the complete "everything that is supported" view, intended for building
+/// model-routing chains. Each entry's `value` is chain-ready (`provider/model`).
+///
+/// GET /api/providers/catalog
+pub async fn list_full_model_catalog(
+    State(state): State<Arc<AppState>>,
+) -> Json<FullCatalogResponse> {
+    let working_dir = state.config.working_dir.to_string_lossy().to_string();
+    let mut config = load_providers_config(&working_dir);
+
+    // "Everything supported" => always include public-catalog (unverified)
+    // models and providers that aren't configured yet.
+    let cached = state.model_catalog.read().await;
+    merge_cached_provider_models(&mut config, &cached, true);
+    drop(cached);
+
+    let configured = get_configured_provider_ids(state.config.working_dir.as_path());
+
+    let mut providers = config.providers;
+    let store_providers = state.ai_providers.list().await;
+    merge_store_provider_models(&mut providers, &store_providers, true);
+
+    let mut models = Vec::new();
+    for provider in &providers {
+        let is_configured = configured.contains(&provider.id);
+        for model in &provider.models {
+            models.push(CatalogModelOption {
+                provider_id: provider.id.clone(),
+                provider_name: provider.name.clone(),
+                id: model.id.clone(),
+                value: format!("{}/{}", provider.id, model.id),
+                name: model.name.clone(),
+                description: model.description.clone(),
+                configured: is_configured,
+            });
+        }
+    }
+    // Stable order: provider, then model name.
+    models.sort_by(|a, b| {
+        a.provider_id
+            .cmp(&b.provider_id)
+            .then_with(|| a.name.cmp(&b.name))
+    });
+
+    Json(FullCatalogResponse {
+        count: models.len(),
+        models,
+    })
+}
+
+/// List model options grouped by backend.
 ///
 /// This is used by the frontend to power per-harness model override pickers.
 pub async fn list_backend_model_options(
@@ -1177,7 +1459,7 @@ pub async fn list_backend_model_options(
 
     // Extend hardcoded defaults with the dynamic catalog.
     let cached = state.model_catalog.read().await;
-    merge_cached_provider_models(&mut config, &cached);
+    merge_cached_provider_models(&mut config, &cached, query.include_unverified);
     drop(cached);
 
     let configured = get_configured_provider_ids(state.config.working_dir.as_path());
@@ -1250,15 +1532,8 @@ pub async fn list_backend_model_options(
     push_options("codex", Some(&["openai"]), false, Some(codex_filter));
     push_options("gemini", Some(&["google"]), false, None);
     push_options("opencode", None, true, None);
-    backends.insert(
-        "grok".to_string(),
-        vec![BackendModelOption {
-            value: "grok-build".to_string(),
-            label: "Grok Build".to_string(),
-            provider_id: Some("xai".to_string()),
-            description: Some("Default Grok Build CLI coding model".to_string()),
-        }],
-    );
+    let grok_filter: &dyn Fn(&str) -> bool = &|id: &str| is_grok_backend_model_id(id);
+    push_options("grok", Some(&["xai"]), false, Some(grok_filter));
 
     let codex_candidates: Vec<String> = backends
         .get("codex")
@@ -1319,7 +1594,7 @@ pub async fn validate_model_override(
 
     // Extend hardcoded defaults with the dynamic catalog.
     let cached = state.model_catalog.read().await;
-    merge_cached_provider_models(&mut config, &cached);
+    merge_cached_provider_models(&mut config, &cached, true);
     drop(cached);
 
     // Load all providers (including configured and non-default)
@@ -1482,12 +1757,12 @@ pub async fn validate_model_override(
             let xai = providers.iter().find(|p| p.id == "xai");
             if let Some(provider) = xai {
                 if provider.models.iter().any(|m| m.id == model_override)
-                    || model_override.starts_with("grok-")
+                    || is_custom_grok_model_id(model_override)
                 {
                     Ok(())
                 } else {
                     Err(format!(
-                        "Model '{}' not found in xAI catalog. Available models: {}. For custom Grok models, use format 'grok-*'",
+                        "Model '{}' not found in xAI catalog. Available models: {}. For custom Grok models, use the 'grok-*' id format (note: 'composer-*' / 'composer-2.5' is a product name, not a valid xAI API id)",
                         model_override,
                         provider
                             .models
@@ -1498,11 +1773,11 @@ pub async fn validate_model_override(
                             .join(", ")
                     ))
                 }
-            } else if model_override.starts_with("grok-") {
+            } else if is_custom_grok_model_id(model_override) {
                 Ok(())
             } else {
                 Err(format!(
-                    "xAI provider not configured. Expected a Grok model ID (e.g., 'grok-4.3'), got '{}'",
+                    "xAI provider not configured. Expected a Grok model ID (e.g., 'grok-4.3' or 'grok-build-0.1'), got '{}'",
                     model_override
                 ))
             }
@@ -1512,6 +1787,17 @@ pub async fn validate_model_override(
             Ok(())
         }
     }
+}
+
+fn is_custom_grok_model_id(model_id: &str) -> bool {
+    // Only `grok-*` ids are accepted by the xAI API. `composer-*` is a product
+    // name (Cursor / Grok Build "Composer 2.5") that the API rejects with
+    // "Model not found", so we don't treat it as a valid custom Grok id.
+    model_id.starts_with("grok-")
+}
+
+fn is_grok_backend_model_id(model_id: &str) -> bool {
+    is_custom_grok_model_id(model_id)
 }
 
 #[cfg(test)]
@@ -1544,6 +1830,49 @@ mod tests {
             .models
             .iter()
             .any(|model| model.id == "claude-opus-4-7"));
+    }
+
+    #[test]
+    fn default_xai_catalog_includes_grok_build_for_model_routing() {
+        let defaults = default_providers_config();
+        let xai = defaults
+            .providers
+            .iter()
+            .find(|provider| provider.id == "xai")
+            .expect("xai provider");
+        // The CLI-valid coding model id (bare `grok-build` is rejected by
+        // current CLIs). `composer-2.5` is intentionally NOT here: it's a
+        // product name, not a valid xAI API id, and the API rejects it.
+        assert!(xai.models.iter().any(|model| model.id == "grok-build-0.1"));
+        assert!(!xai.models.iter().any(|model| model.id == "composer-2.5"));
+    }
+
+    #[test]
+    fn grok_custom_model_prefixes_reject_composer() {
+        assert!(is_custom_grok_model_id("grok-4.3"));
+        assert!(is_custom_grok_model_id("grok-build-0.1"));
+        // `composer-*` is a product name the xAI API rejects ("Model not found").
+        assert!(!is_custom_grok_model_id("composer-2.5"));
+        assert!(!is_custom_grok_model_id("claude-opus-4-7"));
+    }
+
+    #[test]
+    fn grok_backend_model_options_exclude_composer() {
+        let defaults = default_providers_config();
+        let xai = defaults
+            .providers
+            .iter()
+            .find(|provider| provider.id == "xai")
+            .expect("xai provider");
+        let option_ids: Vec<&str> = xai
+            .models
+            .iter()
+            .map(|model| model.id.as_str())
+            .filter(|id| is_grok_backend_model_id(id))
+            .collect();
+
+        assert!(option_ids.contains(&"grok-build-0.1"));
+        assert!(!option_ids.contains(&"composer-2.5"));
     }
 
     #[test]
@@ -1581,14 +1910,20 @@ mod tests {
         let mut cached = HashMap::new();
         cached.insert(
             "anthropic".to_string(),
-            vec![ProviderModel {
-                id: "claude-opus-4-6".to_string(),
-                name: "Claude Opus 4.6".to_string(),
-                description: None,
-            }],
+            vec![CatalogEntry::from_provider_model(
+                "anthropic",
+                ProviderModel {
+                    id: "claude-opus-4-6".to_string(),
+                    name: "Claude Opus 4.6".to_string(),
+                    description: None,
+                },
+                CatalogSource::ProviderApi,
+                CatalogAvailability::Available,
+                chrono::Utc::now(),
+            )],
         );
 
-        merge_cached_provider_models(&mut config, &cached);
+        merge_cached_provider_models(&mut config, &cached, false);
 
         let anthropic = config
             .providers
@@ -1607,6 +1942,40 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn merge_cached_provider_models_hides_unverified_public_models_by_default() {
+        let mut config = ProvidersConfig {
+            providers: vec![Provider {
+                id: "zai".to_string(),
+                name: "Z.AI".to_string(),
+                billing: "pay-per-token".to_string(),
+                description: "GLM models".to_string(),
+                models: vec![],
+            }],
+        };
+        let mut cached = HashMap::new();
+        cached.insert(
+            "zai".to_string(),
+            vec![CatalogEntry::from_provider_model(
+                "zai",
+                ProviderModel {
+                    id: "glm-4.7-flash".to_string(),
+                    name: "GLM 4.7 Flash".to_string(),
+                    description: None,
+                },
+                CatalogSource::ModelsDev,
+                CatalogAvailability::Known,
+                chrono::Utc::now(),
+            )],
+        );
+
+        merge_cached_provider_models(&mut config, &cached, false);
+        assert!(config.providers[0].models.is_empty());
+
+        merge_cached_provider_models(&mut config, &cached, true);
+        assert_eq!(config.providers[0].models[0].id, "glm-4.7-flash");
     }
 
     /// Fetch models from all provider APIs that have credentials available,

@@ -31,6 +31,10 @@ import {
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { AddProviderModal } from '@/components/ui/add-provider-modal';
+import {
+  ReconnectProviderModal,
+  providerSupportsOAuthReconnect,
+} from '@/components/ui/reconnect-provider-modal';
 import { AsyncButton } from '@/components/ui/async-button';
 import { UsageOverview } from '@/components/ui/usage-overview';
 import type { UsageWindow } from '@/lib/api';
@@ -312,6 +316,7 @@ function UsageDetails({ usage, loading }: { usage: ProviderUsage | null; loading
 
 export default function ProvidersPage() {
   const [showAddModal, setShowAddModal] = useState(false);
+  const [reconnectProvider, setReconnectProvider] = useState<AIProvider | null>(null);
   const [authenticatingProviderId, setAuthenticatingProviderId] = useState<string | null>(null);
   const [editingProvider, setEditingProvider] = useState<string | null>(null);
   const [expandedProvider, setExpandedProvider] = useState<string | null>(null);
@@ -427,7 +432,57 @@ export default function ProvidersPage() {
     [expandedProvider, fetchUsage, cachedSeen]
   );
 
+  // After a fresh usage probe, surface the real provider health rather than a
+  // misleading "authenticated" message, and patch the cached snapshots so the
+  // status indicator doesn't revert to the stale error before the next poll.
+  const probeProviderHealth = async (providerId: string) => {
+    const fresh = await refreshProviderUsage(providerId);
+    setUsageData((prev) => ({ ...prev, [providerId]: fresh }));
+    mutateBulkUsage(
+      (current) =>
+        current
+          ? { ...current, entries: { ...current.entries, [providerId]: fresh } }
+          : current,
+      { revalidate: false }
+    );
+    return fresh;
+  };
+
+  const handleReconnectSuccess = async (providerId: string) => {
+    mutateProviders();
+    try {
+      const fresh = await probeProviderHealth(providerId);
+      const stillBroken =
+        !!fresh?.error ||
+        (typeof fresh?.status === 'string' &&
+          !['connected', 'ok'].includes(fresh.status));
+      if (stillBroken) {
+        toast.error(
+          `Reconnected, but provider check still fails: ${String(
+            fresh?.error || fresh?.status || 'unknown error'
+          )}`
+        );
+      } else {
+        toast.success('Provider reconnected');
+      }
+    } catch {
+      // Health probe is best-effort; the reconnect itself already succeeded, so
+      // still surface success rather than leaving the action without feedback.
+      toast.success('Provider reconnected');
+    }
+  };
+
   const handleAuthenticate = async (provider: AIProvider) => {
+    // OAuth-backed providers (e.g. xAI/Grok, Anthropic) must go through the real
+    // OAuth flow to mint fresh tokens. The /auth endpoint only checks whether
+    // credentials *exist* (expired tokens still count), so it would report
+    // success and never open the authorization link. Route them to the OAuth
+    // reconnect modal instead. API-key providers keep the legacy path below.
+    if (providerSupportsOAuthReconnect(provider)) {
+      setReconnectProvider(provider);
+      return;
+    }
+
     setAuthenticatingProviderId(provider.id);
     try {
       const result = await authenticateAIProvider(provider.id);
@@ -438,17 +493,7 @@ export default function ProvidersPage() {
         // red. Force a fresh usage probe so the status indicator reflects
         // reality instead of the stale cached error, then surface the real
         // outcome rather than a misleading "authenticated" message.
-        const fresh = await refreshProviderUsage(provider.id);
-        setUsageData((prev) => ({ ...prev, [provider.id]: fresh }));
-        // Patch the bulk snapshot too so the next periodic poll doesn't
-        // revert this row to the old cached error before its 60s tick.
-        mutateBulkUsage(
-          (current) =>
-            current
-              ? { ...current, entries: { ...current.entries, [provider.id]: fresh } }
-              : current,
-          { revalidate: false }
-        );
+        const fresh = await probeProviderHealth(provider.id);
         const stillBroken =
           !!fresh?.error ||
           (typeof fresh?.status === 'string' &&
@@ -555,6 +600,13 @@ export default function ProvidersPage() {
         providerTypes={providerTypes}
       />
 
+      <ReconnectProviderModal
+        provider={reconnectProvider}
+        open={reconnectProvider !== null}
+        onClose={() => setReconnectProvider(null)}
+        onSuccess={(id) => handleReconnectSuccess(id)}
+      />
+
       <div className="w-full max-w-4xl space-y-6">
         <header>
           <h1 className="text-xl font-semibold text-white">AI Providers</h1>
@@ -648,7 +700,7 @@ export default function ProvidersPage() {
                   : 'bg-red-400';
                 const statusTitle = usageIndicatesDisconnected
                   ? String(cachedUsage?.error || cachedUsage?.status || 'Provider usage check failed')
-                  : provider.status.message || provider.status.type;
+                  : provider.status.message || provider.status.reason || provider.status.type;
                 const isExpanded = expandedProvider === provider.id;
 
                 return (
@@ -806,19 +858,21 @@ export default function ProvidersPage() {
                                 )}
                               </button>
                             )}
-                            {(effectiveStatus === 'needs_auth' || effectiveStatus === 'error') && (
+                            {(effectiveStatus === 'needs_auth' || effectiveStatus === 'needs_reauth' || effectiveStatus === 'error') && (
                               <button
                                 onClick={() => handleAuthenticate(provider)}
                                 disabled={authenticatingProviderId === provider.id}
                                 className={cn(
                                   'p-1.5 rounded-md hover:bg-white/[0.04] transition-colors cursor-pointer disabled:opacity-50',
-                                  effectiveStatus === 'needs_auth'
+                                  effectiveStatus === 'needs_auth' || effectiveStatus === 'needs_reauth'
                                     ? 'text-amber-400'
                                     : 'text-red-400 hover:text-red-300'
                                 )}
                                 title={
                                   effectiveStatus === 'needs_auth'
                                     ? 'Connect'
+                                    : effectiveStatus === 'needs_reauth'
+                                    ? 'Reconnect'
                                     : `Reconnect (${
                                         provider.has_oauth
                                           ? 'OAuth'

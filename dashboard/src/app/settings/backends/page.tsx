@@ -16,6 +16,7 @@ import { Save, Loader, Check, Gauge, Bot } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { getRuntimeApiBase, writeSavedSettings } from '@/lib/settings';
 import { ServerConnectionCard } from '@/components/server-connection-card';
+import { ModelRoutingDebug } from '@/components/model-routing-debug';
 import { useBackendConfigs } from '@/lib/use-backend-configs';
 
 const SETTINGS_BACKEND_IDS = ['opencode', 'claudecode', 'grok'] as const;
@@ -452,7 +453,7 @@ export default function BackendsPage() {
                   onChange={(e) =>
                     setOpencodeForm((prev) => ({ ...prev, default_agent: e.target.value }))
                   }
-                  placeholder="Sisyphus"
+                  placeholder="build"
                   className="w-full rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2 text-sm text-white focus:outline-none focus:border-indigo-500/50"
                 />
               </div>
@@ -610,6 +611,8 @@ export default function BackendsPage() {
             </div>
           ) : null}
         </section>
+
+        <ModelRoutingDebug />
       </div>
     </div>
   );

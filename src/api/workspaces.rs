@@ -868,7 +868,7 @@ fn sanitize_env_vars(env_vars: HashMap<String, String>) -> HashMap<String, Strin
         .collect()
 }
 
-fn is_valid_env_name(key: &str) -> bool {
+pub(crate) fn is_valid_env_name(key: &str) -> bool {
     let mut chars = key.chars();
     match chars.next() {
         Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
@@ -1087,8 +1087,6 @@ pub struct ExecCommandRequest {
     pub timeout_secs: Option<u64>,
     /// Environment variables to set for the command
     pub env: Option<HashMap<String, String>>,
-    /// Optional input to pass to stdin
-    pub stdin: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1172,16 +1170,19 @@ pub struct RerunInitResponse {
 }
 
 /// POST /api/workspaces/:id/exec - Execute a command in a workspace.
+///
+/// Runs through [`crate::workspace_exec::WorkspaceExec`], the same execution
+/// layer missions use: the workspace `env_vars` are merged into the command
+/// environment, and container workspaces reuse a running container leader via
+/// nsenter instead of failing with "Directory tree … is currently busy" when
+/// a mission already holds the container. This is also how assistant gateways
+/// (Hermes `workspace_bash`) get mission-equivalent workspace access without
+/// copying secrets into their own service environment.
 async fn exec_workspace_command(
     State(state): State<Arc<super::routes::AppState>>,
     AxumPath(id): AxumPath<Uuid>,
     Json(req): Json<ExecCommandRequest>,
 ) -> Result<Json<ExecCommandResponse>, (StatusCode, String)> {
-    use std::process::Stdio;
-    use std::time::Duration;
-    use tokio::io::AsyncWriteExt;
-    use tokio::process::Command;
-
     let workspace = require_workspace(&state.workspaces, id).await?;
 
     // For container workspaces, ensure container is ready
@@ -1197,7 +1198,11 @@ async fn exec_workspace_command(
         ));
     }
 
-    let timeout = Duration::from_secs(req.timeout_secs.unwrap_or(300).min(600));
+    if req.command.trim().is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "Command is empty".to_string()));
+    }
+
+    let timeout_secs = req.timeout_secs.unwrap_or(300).clamp(1, 600);
 
     // Determine working directory
     let cwd = match &req.cwd {
@@ -1212,105 +1217,51 @@ async fn exec_workspace_command(
         None => workspace.path.clone(),
     };
 
-    let container_root = workspace.path.clone();
-    let rel_cwd = if cwd.starts_with(&container_root) {
-        let rel = cwd.strip_prefix(&container_root).unwrap_or(Path::new(""));
-        if rel.as_os_str().is_empty() {
-            "/".to_string()
-        } else {
-            format!("/{}", rel.to_string_lossy())
-        }
-    } else {
-        "/root/work".to_string()
-    };
+    // `timeout(1)` enforces the limit inside the workspace: TERM at expiry,
+    // escalating to KILL 5s later (`-k`) so TERM-ignoring commands still die
+    // in the right place — on outer-timeout the dropped future only kills the
+    // direct child (the timeout/nsenter wrapper), which would orphan the
+    // command itself. The outer tokio timeout is a belt-and-braces guard for
+    // exec-layer hangs (e.g. a wedged container boot).
+    let exec = crate::workspace_exec::WorkspaceExec::new(workspace);
+    let args = vec![
+        "-k".to_string(),
+        "5".to_string(),
+        timeout_secs.to_string(),
+        "/bin/bash".to_string(),
+        "-lc".to_string(),
+        req.command.clone(),
+    ];
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(timeout_secs + 15),
+        exec.output(&cwd, "timeout", &args, req.env.clone().unwrap_or_default()),
+    )
+    .await;
 
-    let (program, args) =
-        build_nspawn_command(&workspace, &req.command, req.env.as_ref(), Some(&rel_cwd));
-
-    let mut cmd = Command::new(&program);
-    cmd.args(&args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-
-    // Set environment for host workspaces
-    if workspace.workspace_type == WorkspaceType::Host {
-        cmd.current_dir(&cwd);
-        for (key, value) in &workspace.env_vars {
-            cmd.env(key, value);
-        }
-        if let Some(env) = &req.env {
-            for (key, value) in env {
-                cmd.env(key, value);
-            }
-        }
-    }
-
-    let mut child = cmd.spawn().map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Failed to spawn command: {}", e),
-        )
-    })?;
-
-    // Write stdin if provided
-    if let Some(input) = &req.stdin {
-        if let Some(mut stdin) = child.stdin.take() {
-            let _ = stdin.write_all(input.as_bytes()).await;
-        }
-    }
-
-    // Take stdout/stderr handles before waiting
-    let stdout_handle = child.stdout.take();
-    let stderr_handle = child.stderr.take();
-
-    // Wait with timeout
-    let wait_result = tokio::time::timeout(timeout, child.wait()).await;
-
-    match wait_result {
-        Ok(Ok(status)) => {
-            // Read output after process completes
-            let stdout = if let Some(mut handle) = stdout_handle {
-                use tokio::io::AsyncReadExt;
-                let mut buf = Vec::new();
-                let _ = handle.read_to_end(&mut buf).await;
-                String::from_utf8_lossy(&buf).to_string()
-            } else {
-                String::new()
-            };
-
-            let stderr = if let Some(mut handle) = stderr_handle {
-                use tokio::io::AsyncReadExt;
-                let mut buf = Vec::new();
-                let _ = handle.read_to_end(&mut buf).await;
-                String::from_utf8_lossy(&buf).to_string()
-            } else {
-                String::new()
-            };
-
-            let exit_code = status.code().unwrap_or(-1);
-
+    match result {
+        Ok(Ok(output)) => {
+            let exit_code = output.status.code().unwrap_or(-1);
             Ok(Json(ExecCommandResponse {
                 exit_code,
-                stdout,
-                stderr,
-                timed_out: false,
+                stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+                stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+                // timeout(1) exits 124 when the command was killed.
+                timed_out: exit_code == 124,
             }))
         }
         Ok(Err(e)) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("Command execution failed: {}", e),
         )),
-        Err(_) => {
-            // Timeout - try to kill the process
-            let _ = child.kill().await;
-            Ok(Json(ExecCommandResponse {
-                exit_code: -1,
-                stdout: String::new(),
-                stderr: format!("Command timed out after {} seconds", timeout.as_secs()),
-                timed_out: true,
-            }))
-        }
+        Err(_) => Ok(Json(ExecCommandResponse {
+            exit_code: -1,
+            stdout: String::new(),
+            stderr: format!(
+                "Command timed out after {} seconds (exec layer)",
+                timeout_secs
+            ),
+            timed_out: true,
+        })),
     }
 }
 

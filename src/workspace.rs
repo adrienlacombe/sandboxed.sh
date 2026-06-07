@@ -26,7 +26,6 @@ use crate::library::env_crypto::strip_encrypted_tags;
 use crate::library::LibraryStore;
 use crate::mcp::{McpRegistry, McpScope, McpServerConfig, McpTransport};
 use crate::nspawn::{self, NspawnDistro};
-use crate::tools::terminal::{rtk_binary_path, rtk_enabled};
 use crate::util::{env_var_bool, home_dir, strip_jsonc_comments, AI_PROVIDERS_PATH};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1126,6 +1125,7 @@ async fn write_opencode_config(
             "$schema".to_string(),
             json!("https://opencode.ai/config.json"),
         );
+        ensure_opencode_goal_plugin(base_obj);
         base_obj.insert("mcp".to_string(), serde_json::Value::Object(mcp_map));
         base_obj.insert(
             "permission".to_string(),
@@ -1241,12 +1241,9 @@ async fn write_opencode_config(
         write_commands_as_opencode_skills(workspace_dir, commands).await?;
     }
 
-    // Write Claude PreToolUse hooks for Claude Code (which oh-my-opencode wraps).
-    // These fix gh CLI hanging in PTY, optionally enable RTK compression for
-    // native Bash, and block oversized image Reads before provider submission.
-    // Since OpenCode wraps Claude Code,
-    // we need to write a minimal `.claude/settings.local.json` containing the
-    // hooks config so the underlying Claude Code process discovers the hook.
+    // Write Claude PreToolUse hooks for Claude-compatible execution.
+    // These fix gh CLI hanging in PTY and block oversized image Reads before
+    // provider submission.
     if let Some(hooks) =
         write_claude_pretool_hooks(workspace_dir, workspace_root, workspace_type).await?
     {
@@ -1262,10 +1259,50 @@ async fn write_opencode_config(
     Ok(())
 }
 
+fn ensure_opencode_goal_plugin(base_obj: &mut serde_json::Map<String, serde_json::Value>) {
+    const GOAL_PLUGIN: &str = "opencode-goal-plugin";
+
+    let plugin_entry = base_obj
+        .entry("plugin".to_string())
+        .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+    if !plugin_entry.is_array() {
+        *plugin_entry = serde_json::Value::Array(Vec::new());
+    }
+    if let Some(plugins) = plugin_entry.as_array_mut() {
+        let has_goal_plugin = plugins.iter().any(|entry| match entry {
+            serde_json::Value::String(spec) => spec == GOAL_PLUGIN,
+            serde_json::Value::Array(items) => items
+                .first()
+                .and_then(|value| value.as_str())
+                .map(|spec| spec == GOAL_PLUGIN)
+                .unwrap_or(false),
+            _ => false,
+        });
+        if !has_goal_plugin {
+            plugins.push(json!(GOAL_PLUGIN));
+        }
+    }
+
+    let command_entry = base_obj
+        .entry("command".to_string())
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    if !command_entry.is_object() {
+        *command_entry = serde_json::Value::Object(serde_json::Map::new());
+    }
+    if let Some(commands) = command_entry.as_object_mut() {
+        commands.entry("goal".to_string()).or_insert_with(|| {
+            json!({
+                "description": "Set a session-scoped goal and auto-continue until complete.",
+                "template": "$ARGUMENTS",
+                "agent": "build"
+            })
+        });
+    }
+}
+
 /// Write Claude Code `PreToolUse` hooks for workspace execution.
 ///
-/// The Bash hook always exists because it fixes `gh` hanging in PTY contexts,
-/// and optionally prefixes eligible commands with `rtk` when enabled.
+/// The Bash hook always exists because it fixes `gh` hanging in PTY contexts.
 ///
 /// The Read hook blocks oversized image reads before Claude Code serializes the
 /// image into the next model request. Anthropic applies a 2000px per-dimension
@@ -1275,57 +1312,23 @@ async fn write_opencode_config(
 /// Returns the `hooks` JSON value to embed in `.claude/settings.local.json`,
 /// or `None` when no hooks were written.
 ///
-/// For container workspaces, the RTK binary is copied from the host into
-/// the container's `/usr/local/bin/`, and paths in the hook config are
-/// translated to container-relative paths.
+/// For container workspaces, paths in the hook config are translated to
+/// container-relative paths.
 ///
-/// For the OpenCode backend this is also called so that the underlying Claude
-/// Code process (wrapped by oh-my-opencode) picks up the hook.
+/// For the OpenCode backend this also keeps Claude-compatible tool hooks available.
 async fn write_claude_pretool_hooks(
     workspace_dir: &Path,
     workspace_root: &Path,
     workspace_type: WorkspaceType,
 ) -> anyhow::Result<Option<serde_json::Value>> {
-    let use_rtk = rtk_enabled();
-
-    // For container workspaces, copy the RTK binary from host into the container
     let is_container = workspace_type == WorkspaceType::Container && nspawn::nspawn_available();
-    if use_rtk && is_container {
-        if let Some(host_rtk) = rtk_binary_path() {
-            let dest_dir = workspace_root.join("usr").join("local").join("bin");
-            std::fs::create_dir_all(&dest_dir).ok();
-            let dest = dest_dir.join("rtk");
-            if !dest.exists() {
-                if let Err(e) = std::fs::copy(&host_rtk, &dest) {
-                    tracing::warn!(
-                        src = %host_rtk.display(),
-                        dest = %dest.display(),
-                        "Failed to copy RTK binary into container: {}", e
-                    );
-                } else {
-                    #[cfg(unix)]
-                    {
-                        use std::os::unix::fs::PermissionsExt;
-                        let _ =
-                            std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755));
-                    }
-                    tracing::info!(
-                        dest = %dest.display(),
-                        "Copied RTK binary into container"
-                    );
-                }
-            }
-        } else {
-            tracing::warn!("RTK enabled but binary not found on host");
-        }
-    }
 
     // Write the Bash hook script to .claude/hooks/bash-pretool.sh.
     // See `render_bash_pretool_script` for the script body.
     let hooks_dir = workspace_dir.join(".claude").join("hooks");
     tokio::fs::create_dir_all(&hooks_dir).await?;
     let hook_path = hooks_dir.join("bash-pretool.sh");
-    let hook_script = render_bash_pretool_script(use_rtk);
+    let hook_script = render_bash_pretool_script();
     tokio::fs::write(&hook_path, &hook_script).await?;
     #[cfg(unix)]
     {
@@ -1347,7 +1350,6 @@ async fn write_claude_pretool_hooks(
     tracing::info!(
         hook_path = %hook_command,
         is_container = is_container,
-        use_rtk = use_rtk,
         "Bash PreToolUse hook written"
     );
 
@@ -1509,108 +1511,45 @@ PY
 
 /// Render the Claude Code Bash `PreToolUse` hook script.
 ///
-/// The hook has two responsibilities, independently toggleable:
-/// 1. **gh terminal fix** (always on): wraps `gh` commands with `env TERM=dumb`
-///    so lipgloss/glamour stops issuing terminal capability queries that hang
-///    forever in our PTY. This is a bugfix unrelated to RTK.
-/// 2. **RTK compression** (gated on `use_rtk`): when the dashboard RTK setting
-///    is enabled, rewrites eligible commands to their `rtk <sub>` equivalents.
-///    When disabled, the hook leaves commands alone even if `rtk` is installed.
-///
-/// The `use_rtk` flag is baked into the script at workspace preparation time,
-/// so toggling the dashboard setting only takes effect for workspaces prepared
-/// after the toggle.
-fn render_bash_pretool_script(use_rtk: bool) -> String {
-    let rtk_flag = if use_rtk { "true" } else { "false" };
-    format!(
-        r#"#!/bin/bash
+/// Its sole responsibility is the **gh terminal fix**: it wraps `gh` commands
+/// with `env TERM=dumb` so lipgloss/glamour stops issuing terminal capability
+/// queries (OSC 11, DSR, …) that never get a response in our PTY and hang
+/// forever. Compound commands are left untouched.
+fn render_bash_pretool_script() -> String {
+    r#"#!/bin/bash
 # PreToolUse hook for Bash commands.
-# 1. Fixes gh CLI hanging in PTY by setting TERM=dumb (prevents lipgloss terminal queries)
-# 2. Optionally rewrites commands to use RTK for token compression
+# Fixes gh CLI hanging in PTY by setting TERM=dumb (prevents lipgloss/glamour
+# terminal capability queries that never get a response in our PTY).
 set -euo pipefail
-
-# Baked in at workspace preparation time from the dashboard RTK setting.
-RTK_ENABLED={rtk_flag}
 
 INPUT=$(cat)
 COMMAND=$(echo "$INPUT" | jq -r '.tool_input.command // empty')
 
-# Skip if empty or already wrapped
 if [ -z "$COMMAND" ]; then exit 0; fi
-case "$COMMAND" in
-  rtk\ *|/*/rtk\ *) exit 0 ;;
-esac
-# Skip compound commands (pipes, chains, heredocs, subshells, semicolons)
+
+# Skip compound commands (pipes, chains, heredocs, subshells, semicolons).
 case "$COMMAND" in
   *"&&"*|*"||"*|*"|"*|*"<<"*|*"("*|*";"*|*'`'*|*'$('*) exit 0 ;;
 esac
 
-# Extract the base command (first word, ignoring path prefix)
-FIRST_WORD=$(echo "$COMMAND" | awk '{{print $1}}')
+# Extract the base command (first word, ignoring path prefix).
+FIRST_WORD=$(echo "$COMMAND" | awk '{print $1}')
 BASE_CMD=$(basename "$FIRST_WORD")
-REST=$(echo "$COMMAND" | sed "s|^[^ ]* *||")
 
-emit_rewrite() {{
-  jq -n --arg cmd "$1" '{{
-    hookSpecificOutput: {{
+emit_rewrite() {
+  jq -n --arg cmd "$1" '{
+    hookSpecificOutput: {
       hookEventName: "PreToolUse",
       permissionDecision: "allow",
-      updatedInput: {{ command: $cmd }}
-    }}
-  }}'
-}}
+      updatedInput: { command: $cmd }
+    }
+  }'
+}
 
-# Find rtk binary only when the dashboard setting is on.
-RTK_PATH=""
-if [ "$RTK_ENABLED" = "true" ]; then
-  for p in /usr/local/bin/rtk /usr/bin/rtk; do
-    if [ -x "$p" ]; then RTK_PATH="$p"; break; fi
-  done
-fi
-
-# Map base commands to RTK subcommands (only commands RTK natively supports)
-RTK_SUB=""
-if [ -n "$RTK_PATH" ]; then
-  case "$BASE_CMD" in
-    ls)        RTK_SUB="ls" ;;
-    tree)      RTK_SUB="tree" ;;
-    git)       RTK_SUB="git" ;;
-    gh)        RTK_SUB="gh" ;;
-    grep|rg)   RTK_SUB="grep" ;;
-    cargo)     RTK_SUB="cargo" ;;
-    npm)       RTK_SUB="npm" ;;
-    npx)       RTK_SUB="npx" ;;
-    bun)       RTK_SUB="npm" ;;
-    bunx)      RTK_SUB="npx" ;;
-    pnpm)      RTK_SUB="pnpm" ;;
-    docker)    RTK_SUB="docker" ;;
-    kubectl)   RTK_SUB="kubectl" ;;
-    vitest)    RTK_SUB="vitest" ;;
-    pytest)    RTK_SUB="pytest" ;;
-    go)        RTK_SUB="go" ;;
-    tsc)       RTK_SUB="tsc" ;;
-    eslint)    RTK_SUB="lint" ;;
-    ruff)      RTK_SUB="ruff" ;;
-    curl)      RTK_SUB="curl" ;;
-    pip|uv)    RTK_SUB="pip" ;;
-    diff)      RTK_SUB="diff" ;;
-  esac
-fi
-
-# If RTK supports this command, rewrite to use RTK (which pipes internally, fixing PTY too)
-if [ -n "$RTK_SUB" ]; then
-  if [ -n "$REST" ]; then
-    emit_rewrite "$RTK_PATH $RTK_SUB -- $REST"
-  else
-    emit_rewrite "$RTK_PATH $RTK_SUB"
-  fi
-  exit 0
-fi
-
-# No RTK available — still fix gh commands that hang in PTY environments.
-# The gh CLI (via lipgloss/glamour) sends terminal capability queries like
-# OSC 11 (background color) and DSR (cursor position) when TERM != dumb.
-# Our PTY has no terminal emulator to respond, causing indefinite hangs.
+# Fix gh commands that hang in PTY environments. The gh CLI (via
+# lipgloss/glamour) sends terminal capability queries like OSC 11 (background
+# color) and DSR (cursor position) when TERM != dumb; our PTY has no terminal
+# emulator to respond, causing indefinite hangs.
 case "$BASE_CMD" in
   gh)
     emit_rewrite "env TERM=dumb $COMMAND"
@@ -1620,7 +1559,7 @@ esac
 
 exit 0
 "#
-    )
+    .to_string()
 }
 
 /// Deep-merge `overlay` into `base`.
@@ -1716,7 +1655,7 @@ async fn write_claudecode_config(
         }
     });
 
-    // Add Claude PreToolUse hooks: Bash PTY/RTK handling plus image Read guard.
+    // Add Claude PreToolUse hooks: Bash gh-PTY fix plus image Read guard.
     if let Some(hooks) =
         write_claude_pretool_hooks(workspace_dir, workspace_root, workspace_type).await?
     {
@@ -1727,7 +1666,7 @@ async fn write_claudecode_config(
     }
 
     // Apply config profile settings: profile is the base, generated settings win on top.
-    // Arrays (e.g. hooks) are concatenated — profile hooks + RTK hooks both survive.
+    // Arrays (e.g. hooks) are concatenated — profile hooks + generated hooks both survive.
     if let Some(profile) = profile_overlay {
         let mut merged = profile.clone();
         merge_json(&mut merged, &settings);
@@ -1742,7 +1681,7 @@ async fn write_claudecode_config(
 
     // Write a dedicated MCP config for CLI flags like --mcp-config.
     // Use mcpServers from the merged settings (includes profile overlay MCPs)
-    // rather than only the RTK-generated MCPs.
+    // rather than only the generated MCPs.
     let final_mcp_servers = settings
         .get("mcpServers")
         .cloned()
@@ -1881,6 +1820,14 @@ async fn write_codex_config(
     }
 
     let config_payload = update_codex_mcp_config(&existing, &entries);
+    // Codex only streams reasoning summaries when the request asks for them.
+    // The CLI default (`model_reasoning_summary = "auto"`) yields zero
+    // summaries on ChatGPT-OAuth gpt-5.5 turns (verified 2026-06-04: 2770
+    // reasoning items across one day of rollouts, all `summary: []`), so no
+    // `item/reasoning/*` notifications stream, no Thinking events are
+    // emitted, and the Thoughts panel has nothing to persist or replay.
+    // Pin "detailed" unless the profile/operator already set a value.
+    let config_payload = ensure_codex_reasoning_summary(&config_payload);
     tokio::fs::write(&config_path, config_payload).await?;
 
     // Write skills to ~/.codex/skills using Codex's native skills format
@@ -2014,6 +1961,27 @@ fn codex_entry_from_mcp(
             })
         }
     }
+}
+
+/// Ensure the Codex config requests reasoning summaries. TOML top-level keys
+/// must precede the first `[section]`, so the key is prepended. A
+/// `model_reasoning_summary` already present in the top-level prelude (from a
+/// config profile or operator edit) wins — we only add the default when the
+/// key is absent.
+fn ensure_codex_reasoning_summary(config: &str) -> String {
+    let has_key = config
+        .lines()
+        .take_while(|line| !line.trim_start().starts_with('['))
+        .any(|line| {
+            line.split('=')
+                .next()
+                .map(|key| key.trim() == "model_reasoning_summary")
+                .unwrap_or(false)
+        });
+    if has_key {
+        return config.to_string();
+    }
+    format!("model_reasoning_summary = \"detailed\"\n\n{}", config)
 }
 
 fn update_codex_mcp_config(existing: &str, entries: &[CodexMcpEntry]) -> String {
@@ -3319,7 +3287,7 @@ pub async fn prepare_mission_workspace_with_skills_backend(
     }
 
     // Load Claude Code config profile settings (hooks, custom defaults).
-    // Profile is base; generated settings (MCPs, permissions, RTK) win on top.
+    // Profile is base; generated settings (MCPs, permissions) win on top.
     let claudecode_profile_overlay: Option<serde_json::Value> = if backend_id == "claudecode" {
         if let Some(lib) = library {
             let profile = config_profile.unwrap_or("default");
@@ -3436,99 +3404,8 @@ pub async fn prepare_mission_workspace_with_skills_backend(
     )
     .await?;
 
-    // Sync oh-my-opencode settings into the mission directory only when the
-    // workspace (or its profile) opts into the wrapper. Vanilla `opencode`
-    // doesn't read this file, so writing it on every mission would just leave
-    // stale config behind. Native `.opencode/agents/*.md` files are still
-    // synced below, regardless of the wrapper flag.
-    let oh_my_opencode_enabled = workspace
-        .config
-        .get("enable_oh_my_opencode")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    if backend_id == "opencode" && oh_my_opencode_enabled {
-        if let Some(lib) = library {
-            let profile = config_profile.unwrap_or("default");
-            tracing::info!(
-                mission = %mission_id,
-                workspace = %workspace.name,
-                profile = %profile,
-                "Loading oh-my-opencode settings from profile"
-            );
-            match lib.get_opencode_settings_for_profile(profile).await {
-                Ok(settings) => {
-                    if !settings.as_object().map(|o| o.is_empty()).unwrap_or(true) {
-                        let opencode_dir = dir.join(".opencode");
-                        if let Err(e) = tokio::fs::create_dir_all(&opencode_dir).await {
-                            tracing::warn!(
-                                mission = %mission_id,
-                                workspace = %workspace.name,
-                                error = %e,
-                                "Failed to create .opencode directory for OpenCode settings"
-                            );
-                        } else {
-                            let dest_path = opencode_dir.join("oh-my-opencode.json");
-                            match serde_json::to_string_pretty(&settings) {
-                                Ok(content) => {
-                                    // Patch agent models for Claude Code OAuth compatibility
-                                    let patched_content =
-                                        patch_opencode_agent_models_for_oauth(&content);
-
-                                    let jsonc_path = opencode_dir.join("oh-my-opencode.jsonc");
-                                    if jsonc_path.exists() {
-                                        if let Err(e) = tokio::fs::remove_file(&jsonc_path).await {
-                                            tracing::warn!(
-                                                mission = %mission_id,
-                                                workspace = %workspace.name,
-                                                error = %e,
-                                                "Failed to remove oh-my-opencode.jsonc"
-                                            );
-                                        }
-                                    }
-                                    if let Err(e) =
-                                        tokio::fs::write(&dest_path, &patched_content).await
-                                    {
-                                        tracing::warn!(
-                                            mission = %mission_id,
-                                            workspace = %workspace.name,
-                                            error = %e,
-                                            "Failed to write oh-my-opencode settings"
-                                        );
-                                    } else {
-                                        tracing::info!(
-                                            mission = %mission_id,
-                                            path = %dest_path.display(),
-                                            "Synced oh-my-opencode settings to mission directory"
-                                        );
-                                    }
-                                }
-                                Err(e) => {
-                                    tracing::warn!(
-                                        mission = %mission_id,
-                                        workspace = %workspace.name,
-                                        error = %e,
-                                        "Failed to serialize oh-my-opencode settings"
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        mission = %mission_id,
-                        workspace = %workspace.name,
-                        error = %e,
-                        "Failed to load oh-my-opencode settings from library"
-                    );
-                }
-            }
-        }
-    }
-
-    // Sync native opencode agents directory from profile (e.g.
-    // .opencode/agents/*.md). These are read by vanilla `opencode` directly
-    // and apply whether or not the oh-my-opencode wrapper is enabled.
+    // Sync native opencode agents from profile into the workspace path read by
+    // vanilla `opencode`.
     if backend_id == "opencode" {
         if let Some(lib) = library {
             let profile = config_profile.unwrap_or("default");
@@ -3792,8 +3669,7 @@ pub async fn write_runtime_workspace_state(
     let payload_str = serde_json::to_string_pretty(&payload)?;
     tokio::fs::write(&path, &payload_str).await?;
 
-    // Also write to current_workspace.json so SANDBOXED_SH_RUNTIME_WORKSPACE_FILE always works
-    // (that env var points to current_workspace.json, and oh-my-opencode reads it for container detection)
+    // Also write to current_workspace.json so SANDBOXED_SH_RUNTIME_WORKSPACE_FILE always works.
     if mission_id.is_some() {
         let current_path = runtime_dir.join("current_workspace.json");
         if let Err(e) = tokio::fs::write(&current_path, &payload_str).await {
@@ -4349,12 +4225,6 @@ if [ -n "$PKG_MGR" ]; then
       echo "[sandboxed] curl not found; skipping opencode install"
     fi
   fi
-  if [ "{install_opencode}" = "true" ] && ! command -v oh-my-opencode >/dev/null 2>&1; then
-    echo "[sandboxed] Installing oh-my-opencode via $PKG_MGR..."
-    if ! $PKG_MGR install -g oh-my-opencode@latest; then
-      echo "[sandboxed] OpenCode plugin install failed"
-    fi
-  fi
 fi
 
 if [ "{install_grok}" = "true" ] && ! command -v grok >/dev/null 2>&1; then
@@ -4582,34 +4452,6 @@ fn resolve_opencode_config_dir() -> std::path::PathBuf {
         .join("opencode")
 }
 
-/// Sync oh-my-opencode.json from Library to ~/.config/opencode/
-/// This makes Library-backed settings take effect for OpenCode.
-pub async fn sync_opencode_settings(library: &crate::library::LibraryStore) -> anyhow::Result<()> {
-    let settings = library.get_opencode_settings().await?;
-
-    // Don't sync empty settings
-    if settings.as_object().map(|o| o.is_empty()).unwrap_or(true) {
-        tracing::debug!("No opencode settings in Library to sync");
-        return Ok(());
-    }
-
-    let dest_dir = resolve_opencode_config_dir();
-    let dest_path = dest_dir.join("oh-my-opencode.json");
-
-    // Ensure directory exists
-    tokio::fs::create_dir_all(&dest_dir).await?;
-
-    let content = serde_json::to_string_pretty(&settings)?;
-    tokio::fs::write(&dest_path, content).await?;
-
-    tracing::info!(
-        path = %dest_path.display(),
-        "Synced oh-my-opencode settings from Library"
-    );
-
-    Ok(())
-}
-
 /// Sync sandboxed/config.json from Library to the working directory.
 /// This makes Library-backed agent visibility settings available.
 pub async fn sync_sandboxed_config(
@@ -4674,72 +4516,6 @@ pub async fn read_sandboxed_config(
     }
 }
 
-/// Patch oh-my-opencode.json agent models for Claude Code OAuth compatibility.
-///
-/// Claude Code OAuth tokens only work with specific models. This function:
-/// - Replaces `anthropic/claude-opus-4-5` with `anthropic/claude-sonnet-4-5`
-/// - Removes the "variant" field from Anthropic model agents (e.g., "max" for extended thinking)
-///
-/// This ensures agents like Prometheus work correctly when using Claude Code OAuth.
-fn patch_opencode_agent_models_for_oauth(content: &str) -> String {
-    let mut json: serde_json::Value = match serde_json::from_str(content) {
-        Ok(v) => v,
-        Err(_) => return content.to_string(),
-    };
-
-    let Some(agents) = json.get_mut("agents").and_then(|v| v.as_object_mut()) else {
-        return content.to_string();
-    };
-
-    let mut patched = false;
-
-    for (_name, agent) in agents.iter_mut() {
-        let Some(agent_obj) = agent.as_object_mut() else {
-            continue;
-        };
-
-        // Check if this agent uses an Anthropic model
-        let is_anthropic = agent_obj
-            .get("model")
-            .and_then(|v| v.as_str())
-            .map(|m| m.starts_with("anthropic/"))
-            .unwrap_or(false);
-
-        if is_anthropic {
-            // Replace claude-opus-4-5 with claude-sonnet-4-5
-            if let Some(model_str) = agent_obj
-                .get("model")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string())
-            {
-                if model_str.contains("claude-opus-4-5") {
-                    let new_model = model_str.replace("claude-opus-4-5", "claude-sonnet-4-5");
-                    agent_obj.insert("model".to_string(), serde_json::Value::String(new_model));
-                    patched = true;
-                    tracing::info!(
-                        "Patched oh-my-opencode agent model: {} -> claude-sonnet-4-5",
-                        model_str
-                    );
-                }
-            }
-
-            // Remove "variant" field (e.g., "max" for extended thinking) as it's not supported
-            if agent_obj.remove("variant").is_some() {
-                patched = true;
-                tracing::info!(
-                    "Removed 'variant' field from Anthropic agent for OAuth compatibility"
-                );
-            }
-        }
-    }
-
-    if patched {
-        serde_json::to_string_pretty(&json).unwrap_or_else(|_| content.to_string())
-    } else {
-        content.to_string()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4754,23 +4530,12 @@ mod tests {
     }
 
     #[test]
-    fn bash_pretool_script_bakes_rtk_flag() {
-        let on = render_bash_pretool_script(true);
-        let off = render_bash_pretool_script(false);
-        assert!(on.contains("RTK_ENABLED=true"));
-        assert!(off.contains("RTK_ENABLED=false"));
-    }
-
-    #[test]
-    fn bash_pretool_script_rtk_off_skips_rtk_binary_lookup() {
-        // When RTK_ENABLED=false the script must evaluate RTK_PATH to the
-        // empty string, so eligible commands fall through to the `gh` bugfix
-        // branch instead of being rewritten with rtk.
-        let script = render_bash_pretool_script(false);
+    fn bash_pretool_script_leaves_plain_commands_untouched() {
+        // Non-gh commands must pass through with no rewrite (empty stdout).
+        let script = render_bash_pretool_script();
         let tmp = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(tmp.path(), &script).unwrap();
 
-        // ls → when RTK is off, script must NOT rewrite (no output); exits 0 with no stdout.
         let out = std::process::Command::new("bash")
             .arg(tmp.path())
             .stdin(std::process::Stdio::piped())
@@ -4796,9 +4561,9 @@ mod tests {
     }
 
     #[test]
-    fn bash_pretool_script_gh_bugfix_runs_even_when_rtk_off() {
-        // The `gh` TERM=dumb fix is independent of RTK and must fire regardless.
-        let script = render_bash_pretool_script(false);
+    fn bash_pretool_script_applies_gh_pty_fix() {
+        // The `gh` TERM=dumb fix wraps gh commands so they don't hang in PTY.
+        let script = render_bash_pretool_script();
         let tmp = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(tmp.path(), &script).unwrap();
 
@@ -4908,45 +4673,38 @@ mod tests {
         assert!(!result.contains("[mcp_servers"));
     }
 
-    #[tokio::test]
-    async fn writes_same_skill_content_to_supported_native_harnesses() {
-        let temp = tempfile::tempdir().unwrap();
-        let skill = SkillContent {
-            name: "okx-security".to_string(),
-            description: Some("Read-only OKX security checks".to_string()),
-            content: "---\nname: okx-security\n---\n\n# OKX Security\n".to_string(),
-            files: vec![(
-                "references/read-only.md".to_string(),
-                "No signing, swaps, broadcasts, or approval changes.".to_string(),
-            )],
-        };
-        let skills = vec![skill];
+    #[test]
+    fn test_codex_reasoning_summary_added_before_sections() {
+        let config = "[mcp_servers.workspace]\ncommand = \"x\"\n";
+        let result = ensure_codex_reasoning_summary(config);
+        assert!(result.starts_with("model_reasoning_summary = \"detailed\"\n"));
+        // Top-level key must precede the first [section] header.
+        let key_pos = result.find("model_reasoning_summary").unwrap();
+        let section_pos = result.find('[').unwrap();
+        assert!(key_pos < section_pos);
+        assert!(result.contains("[mcp_servers.workspace]"));
+    }
 
-        write_skills_to_workspace(temp.path(), &skills)
-            .await
-            .unwrap();
-        write_claudecode_skills_to_workspace(temp.path(), &skills)
-            .await
-            .unwrap();
-        write_codex_skills_to_workspace(&temp.path().join(".codex"), &skills)
-            .await
-            .unwrap();
+    #[test]
+    fn test_codex_reasoning_summary_respects_profile_override() {
+        let config =
+            "model_reasoning_summary = \"concise\"\n\n[mcp_servers.workspace]\ncommand = \"x\"\n";
+        let result = ensure_codex_reasoning_summary(config);
+        assert_eq!(result, config);
+        assert!(!result.contains("detailed"));
+    }
 
-        assert!(temp
-            .path()
-            .join(".opencode/skill/okx-security/SKILL.md")
-            .exists());
-        assert!(temp
-            .path()
-            .join(".claude/skills/okx-security/SKILL.md")
-            .exists());
-        assert!(temp
-            .path()
-            .join(".codex/skills/okx-security/SKILL.md")
-            .exists());
-        assert!(temp
-            .path()
-            .join(".codex/skills/okx-security/references/read-only.md")
-            .exists());
+    #[test]
+    fn test_codex_reasoning_summary_ignores_key_inside_sections() {
+        // A same-named key inside an MCP env table is not a top-level override.
+        let config = "[mcp_servers.workspace.env]\nmodel_reasoning_summary = \"none\"\n";
+        let result = ensure_codex_reasoning_summary(config);
+        assert!(result.starts_with("model_reasoning_summary = \"detailed\"\n"));
+    }
+
+    #[test]
+    fn test_codex_reasoning_summary_on_empty_config() {
+        let result = ensure_codex_reasoning_summary("");
+        assert!(result.starts_with("model_reasoning_summary = \"detailed\"\n"));
     }
 }

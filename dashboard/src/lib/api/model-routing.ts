@@ -78,13 +78,6 @@ export interface FallbackEvent {
   chain_length: number;
 }
 
-export interface RtkStats {
-  commands_processed: number;
-  original_chars: number;
-  compressed_chars: number;
-  chars_saved: number;
-  savings_percent: number;
-}
 
 // ---------------------------------------------------------------------------
 // Chain Management
@@ -132,6 +125,24 @@ export async function resolveModelChain(id: string): Promise<ResolvedEntry[]> {
   );
 }
 
+export interface ChainTestResult {
+  ok: boolean;
+  status: number;
+  response: {
+    choices?: { message: { content: string | null } }[];
+    error?: { message?: string };
+    [key: string]: unknown;
+  };
+}
+
+export async function testModelChain(id: string): Promise<ChainTestResult> {
+  return apiPost(
+    `/api/model-routing/chains/${encodeURIComponent(id)}/test`,
+    undefined,
+    "Failed to test model chain"
+  );
+}
+
 // ---------------------------------------------------------------------------
 // Health Tracking
 // ---------------------------------------------------------------------------
@@ -154,12 +165,4 @@ export async function clearAccountCooldown(accountId: string): Promise<{ cleared
 
 export async function listFallbackEvents(): Promise<FallbackEvent[]> {
   return apiGet("/api/model-routing/events", "Failed to list fallback events");
-}
-
-// ---------------------------------------------------------------------------
-// RTK Stats
-// ---------------------------------------------------------------------------
-
-export async function getRtkStats(): Promise<RtkStats> {
-  return apiGet("/api/model-routing/rtk-stats", "Failed to get RTK stats");
 }

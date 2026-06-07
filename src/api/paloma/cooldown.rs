@@ -209,7 +209,7 @@ mod tests {
                 sent_at = now;
                 sends += 1;
             }
-            now = now + Duration::minutes(5);
+            now += Duration::minutes(5);
         }
 
         // Pre-fix behaviour was ~14 messages. We accept up to 4 (immediate,

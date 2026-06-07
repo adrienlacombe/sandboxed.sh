@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use axum::{
-    extract::{Extension, Path, State},
+    extract::{Extension, Path, Query, State},
     http::StatusCode,
     Json,
 };
@@ -63,12 +63,56 @@ pub async fn get_backend(
     }
 }
 
+/// Query parameters for listing backend agents.
+#[derive(Debug, Deserialize)]
+pub struct ListBackendAgentsQuery {
+    /// Library config profile to resolve native agents from (OpenCode only).
+    pub profile: Option<String>,
+}
+
 /// List agents for a specific backend
 pub async fn list_backend_agents(
     State(state): State<Arc<AppState>>,
     Extension(_user): Extension<AuthUser>,
     Path(id): Path<String>,
+    Query(query): Query<ListBackendAgentsQuery>,
 ) -> Result<Json<Vec<AgentResponse>>, (StatusCode, String)> {
+    if id == "opencode" {
+        let payload =
+            super::opencode::fetch_opencode_agents_for_profile(&state, query.profile.as_deref())
+                .await
+                .map_err(|e| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Failed to list agents: {}", e),
+                    )
+                })?;
+        let agents = payload
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|entry| match entry {
+                serde_json::Value::String(name) => Some(AgentResponse {
+                    id: name.clone(),
+                    name,
+                }),
+                serde_json::Value::Object(obj) => {
+                    let name = obj
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .or_else(|| obj.get("id").and_then(|v| v.as_str()))?;
+                    Some(AgentResponse {
+                        id: name.to_string(),
+                        name: name.to_string(),
+                    })
+                }
+                _ => None,
+            })
+            .collect();
+        return Ok(Json(agents));
+    }
+
     let registry = state.backend_registry.read().await;
     let backend = registry
         .get(&id)
