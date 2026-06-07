@@ -87,6 +87,10 @@ pub struct AskTurn {
     /// (`stop_agent` / `send_to_agent`). Same channel the dashboard's Stop
     /// button and composer use.
     pub control_cmd_tx: tokio::sync::mpsc::Sender<crate::api::control::ControlCommand>,
+    /// Event broadcast for the control session. Events sent here reach live
+    /// viewers AND the persistent event logger — used to leave a durable audit
+    /// record when the Copilot stops the working agent.
+    pub events_tx: tokio::sync::broadcast::Sender<crate::api::control::AgentEvent>,
 }
 
 /// Run one Ask turn: persist the operator message, drive the tool loop, persist
@@ -771,11 +775,15 @@ async fn execute_tool(turn: &AskTurn, name: &str, arguments: &str) -> String {
                 return "Error: a reason is required".to_string();
             }
             match cancel_working_agent(turn).await {
-                Ok(()) => format!(
-                    "Interrupted the working agent's current turn (reason: {reason}). The \
-                     mission will settle as interrupted/awaiting; use send_to_agent to \
-                     redirect it, or the operator can resume it from the dashboard."
-                ),
+                Ok(()) => {
+                    record_copilot_stop(turn, &reason).await;
+                    format!(
+                        "Interrupted the working agent's current turn (reason: {reason}). \
+                         The reason was recorded in the mission transcript. The mission \
+                         will settle as interrupted/awaiting; use send_to_agent to \
+                         redirect it, or the operator can resume it from the dashboard."
+                    )
+                }
                 Err(e) => format!("Error stopping the agent: {e}"),
             }
         }
@@ -785,14 +793,19 @@ async fn execute_tool(turn: &AskTurn, name: &str, arguments: &str) -> String {
                 return "Error: message is empty".to_string();
             }
             let interrupt = args["interrupt"].as_bool().unwrap_or(false);
+            // Track whether the requested interrupt actually landed — a failed
+            // cancel (timeout, control error) must not be reported as "delivered
+            // after interrupting" when the agent may still be mid-turn.
+            let mut interrupt_error: Option<String> = None;
             if interrupt {
                 if let Err(e) = cancel_working_agent(turn).await {
-                    // A failed cancel usually means nothing was running — the
-                    // steer below still applies, so report and continue.
                     tracing::info!(
                         mission_id = %turn.mission_id,
-                        "[Ask] interrupt before steer found nothing to cancel: {e}"
+                        "[Ask] interrupt before steer did not cancel anything: {e}"
                     );
+                    interrupt_error = Some(e);
+                } else {
+                    record_copilot_stop(turn, &format!("steering: {message}")).await;
                 }
             }
             let content = format_steer_message(&message);
@@ -812,18 +825,25 @@ async fn execute_tool(turn: &AskTurn, name: &str, arguments: &str) -> String {
             }
             use crate::api::control::UserMessageAck;
             match tokio::time::timeout(std::time::Duration::from_secs(15), rx).await {
-                Ok(Ok(UserMessageAck::Queued)) => {
-                    if interrupt {
+                Ok(Ok(UserMessageAck::Queued)) => match (interrupt, &interrupt_error) {
+                    (true, None) => {
                         "Steering message delivered after interrupting the current turn — \
                          the agent will act on it as soon as the cancellation settles."
                             .to_string()
-                    } else {
+                    }
+                    (true, Some(err)) => format!(
+                        "Steering message queued, but the requested interrupt FAILED \
+                         ({err}) — the agent may still be mid-turn and will only act on \
+                         the message at the next turn boundary. Verify with read_history; \
+                         retry stop_agent if it must stop now."
+                    ),
+                    (false, _) => {
                         "Steering message queued — the working agent is mid-turn and will \
                          act on it at the next turn boundary. Pass interrupt=true if it \
                          must take effect immediately."
                             .to_string()
                     }
-                }
+                },
                 Ok(Ok(UserMessageAck::Delivered)) => {
                     "Steering message delivered — a turn is starting on it now.".to_string()
                 }
@@ -886,6 +906,21 @@ async fn cancel_working_agent(turn: &AskTurn) -> Result<(), String> {
         Ok(Err(_)) => Err("the control session dropped the request".to_string()),
         Err(_) => Err("timed out waiting for the cancellation to be acknowledged".to_string()),
     }
+}
+
+/// Leave a durable audit record of a Copilot-initiated stop in the mission
+/// transcript. Broadcast on `events_tx` so live viewers see it AND the
+/// persistent event logger writes it to mission events.
+async fn record_copilot_stop(turn: &AskTurn, reason: &str) {
+    let _ = turn.events_tx.send(crate::api::control::AgentEvent::Error {
+        message: format!(
+            "⏹ The Copilot stopped the working agent's turn (operator-authorized). \
+                 Reason: {}",
+            truncate(reason, 400)
+        ),
+        mission_id: Some(turn.mission_id),
+        resumable: true,
+    });
 }
 
 /// Wrap a Copilot steering message so the working agent (and the mission

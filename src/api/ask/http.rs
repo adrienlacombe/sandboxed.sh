@@ -197,6 +197,7 @@ pub async fn ask_send(
         workspace_id,
         proxy_keys: Arc::clone(&state.proxy_api_keys),
         control_cmd_tx: control.cmd_tx.clone(),
+        events_tx: control.events_tx.clone(),
     };
 
     let answer_result = run_ask_turn(&turn, &req.content).await;
@@ -322,6 +323,7 @@ pub async fn ask_send_stream(
         workspace_id,
         proxy_keys: Arc::clone(&state.proxy_api_keys),
         control_cmd_tx: control.cmd_tx.clone(),
+        events_tx: control.events_tx.clone(),
     };
 
     let content = req.content.clone();
