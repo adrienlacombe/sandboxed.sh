@@ -6265,6 +6265,20 @@ async fn check_provider_health(
     }
 }
 
+/// Merge a Codex usage snapshot's `codex_*` fields into the base provider-usage
+/// JSON object the dashboard consumes.
+fn merge_codex_usage(
+    mut base: serde_json::Value,
+    snap: &crate::api::codex_usage::CodexUsageSnapshot,
+) -> serde_json::Value {
+    if let (Some(obj), serde_json::Value::Object(fields)) = (base.as_object_mut(), snap.to_json()) {
+        for (k, v) in fields {
+            obj.insert(k, v);
+        }
+    }
+    base
+}
+
 /// GET /api/ai/providers/:id/usage - Fetch live usage/rate-limit info from the provider API.
 ///
 /// Makes a minimal API call to the provider and captures rate-limit headers
@@ -6656,15 +6670,74 @@ async fn get_provider_usage(
                 if let Some(key) = get_openai_api_key_for_codex_default(&state.config.working_dir) {
                     key
                 } else {
-                    // No API key available. Validate OAuth token health before
-                    // returning status so expired sessions don't show as connected.
+                    // OAuth-only ChatGPT/Codex subscription account. There's no
+                    // sk- key and api.openai.com rejects the JWT, so the only
+                    // usage signal is the Codex backend's `x-codex-*` headers
+                    // (5h + weekly windows). Serve a cached snapshot when fresh,
+                    // else probe the Codex backend directly. Never probed by the
+                    // background loop (see spawn_usage_refresh_loop) — only here,
+                    // on dashboard demand, throttled by the store's TTL.
                     let token_ok = !oauth_token_expired(o.expires_at);
-                    return Ok(Json(serde_json::json!({
+                    let base = serde_json::json!({
                         "provider_type": "openai",
                         "provider_name": provider_name,
                         "account_email": account_email,
                         "status": if token_ok { "connected" } else { "needs_reauth" },
-                    })));
+                    });
+                    // The codex_usage store is keyed by the provider account
+                    // UUID so the proxy's passive `model_cooldown` capture
+                    // (which only knows `entry.account_id`) and this active
+                    // probe agree on the key. The probe REQUEST still needs the
+                    // ChatGPT account id, decoded from the token below.
+                    let store_key = match provider_uuid {
+                        Some(u) => u.to_string(),
+                        None => crate::api::codex_usage::account_id_from_token(&o.access_token)
+                            .unwrap_or_default(),
+                    };
+                    let chatgpt_account_id =
+                        crate::api::codex_usage::account_id_from_token(&o.access_token);
+                    let (Some(chatgpt_account_id), false) =
+                        (chatgpt_account_id, store_key.is_empty())
+                    else {
+                        return Ok(Json(base));
+                    };
+
+                    // Fresh cached snapshot (probe within TTL, or a recent
+                    // passive cooldown stamp) — serve without re-probing.
+                    if let Some(snap) = state.codex_usage.get_fresh(&store_key).await {
+                        return Ok(Json(merge_codex_usage(base, &snap)));
+                    }
+                    // Expired token: don't probe (would 401). Show last known.
+                    if !token_ok {
+                        if let Some(snap) = state.codex_usage.get_any(&store_key).await {
+                            return Ok(Json(merge_codex_usage(base, &snap)));
+                        }
+                        return Ok(Json(base));
+                    }
+                    // Active probe (A).
+                    match crate::api::codex_usage::probe(
+                        &state.http_client,
+                        &o.access_token,
+                        &chatgpt_account_id,
+                    )
+                    .await
+                    {
+                        Ok(snap) => {
+                            state
+                                .codex_usage
+                                .put_probe(store_key.clone(), snap.clone())
+                                .await;
+                            return Ok(Json(merge_codex_usage(base, &snap)));
+                        }
+                        Err(e) => {
+                            tracing::debug!("Codex usage probe failed: {}", e);
+                            // Fall back to any stale snapshot we still hold.
+                            if let Some(snap) = state.codex_usage.get_any(&store_key).await {
+                                return Ok(Json(merge_codex_usage(base, &snap)));
+                            }
+                            return Ok(Json(base));
+                        }
+                    }
                 }
             } else {
                 return Ok(Json(serde_json::json!({
@@ -7188,6 +7261,18 @@ pub fn spawn_usage_refresh_loop(state: Arc<super::routes::AppState>) {
         loop {
             let providers = state.ai_providers.list().await;
             for p in providers {
+                // Skip OpenAI OAuth-only (ChatGPT/Codex subscription) accounts:
+                // their only usage signal is an active Codex-backend probe that
+                // costs a message-quota unit, so we must never auto-poll it on
+                // the 2-min loop. It's refreshed on dashboard demand instead
+                // (get_provider_usage), throttled by the codex_usage TTL, and
+                // kept warm passively by the proxy's model_cooldown capture.
+                if p.provider_type == crate::ai_providers::ProviderType::OpenAI
+                    && p.api_key.is_none()
+                    && p.oauth.is_some()
+                {
+                    continue;
+                }
                 let id = p.id.to_string();
                 let bg_state = Arc::clone(&state);
                 if let Err(e) = live_fetch_and_cache(bg_state, id.clone()).await {

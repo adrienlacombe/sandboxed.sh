@@ -143,6 +143,10 @@ pub struct AppState {
     /// `/api/ai/providers/:id/usage` and refreshed in the background so the
     /// dashboard sees fresh values without paying a round-trip latency cost.
     pub provider_usage_cache: Arc<super::provider_usage_cache::ProviderUsageCache>,
+    /// Per-account Codex (ChatGPT subscription) usage snapshots — populated by
+    /// an active probe on dashboard demand and by passive `model_cooldown`
+    /// capture on the proxy path. See [`super::codex_usage`].
+    pub codex_usage: Arc<super::codex_usage::CodexUsageStore>,
 }
 
 /// Start the HTTP server.
@@ -502,6 +506,7 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         fido_hub: Arc::new(super::fido::FidoSigningHub::new()),
         control_metrics: Arc::new(super::control_metrics::ControlMetrics::new()),
         provider_usage_cache: super::provider_usage_cache::ProviderUsageCache::new(),
+        codex_usage: super::codex_usage::CodexUsageStore::new(),
     });
 
     // Start background refresh of provider rate-limit / usage info so the

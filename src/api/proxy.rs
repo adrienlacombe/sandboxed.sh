@@ -1370,6 +1370,26 @@ pub(crate) async fn chat_completions_inner(
         if status == StatusCode::TOO_MANY_REQUESTS || status.as_u16() == 529 {
             let elapsed_ms = request_start.elapsed().as_millis() as u64;
             let retry_after = parse_rate_limit_headers(upstream_resp.headers(), provider_type);
+            // Passive Codex usage capture (B): a 429 from the local CLIProxyAPI
+            // on the Codex path carries a `model_cooldown` body with the weekly
+            // (secondary) window reset. The cli-proxy strips the rich x-codex-*
+            // headers, so this exhaustion signal is all we can glean from real
+            // traffic — fold it into the same store the active probe writes, so
+            // the providers panel reflects "weekly limit reached" without a
+            // probe. Keyed by entry.account_id == the provider UUID the usage
+            // probe stores under. Only the codex path reads the body here.
+            if use_openai_oauth_cli_proxy_adapter {
+                let store_key = entry.account_id.to_string();
+                let codex_store = state.codex_usage.clone();
+                if let Ok(body) = upstream_resp.bytes().await {
+                    let now_unix = chrono::Utc::now().timestamp();
+                    if let Some(reset_at) =
+                        crate::api::codex_usage::parse_cooldown_reset(&body, now_unix)
+                    {
+                        codex_store.put_passive_cooldown(store_key, reset_at).await;
+                    }
+                }
+            }
             let reason = if status.as_u16() == 529 {
                 CooldownReason::Overloaded
             } else {

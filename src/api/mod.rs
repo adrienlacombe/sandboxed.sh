@@ -21,6 +21,7 @@ mod auth;
 pub mod automation_variables;
 pub mod backends;
 pub mod claudecode;
+pub mod codex_usage;
 mod console;
 pub mod control;
 pub mod control_metrics;
