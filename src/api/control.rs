@@ -7163,11 +7163,26 @@ async fn check_mission_oom_kills(
 ) {
     let mut live_units: std::collections::HashSet<String> = std::collections::HashSet::new();
 
+    // Scopes are workspace-level and shared by every mission running in the
+    // same container, while `oom_seen` is keyed by unit. Group missions by
+    // workspace so each unit's OOM delta is consumed once per tick and the
+    // alert fans out to *all* missions on that workspace — otherwise the
+    // first mission would absorb the delta and its siblings would never see
+    // the OOM signal.
+    let mut missions_by_workspace: std::collections::HashMap<Uuid, Vec<Uuid>> =
+        std::collections::HashMap::new();
     for mission in active_missions
         .iter()
         .filter(|m| running_ids.contains(&m.id))
     {
-        let Some(workspace) = workspaces.get(mission.workspace_id).await else {
+        missions_by_workspace
+            .entry(mission.workspace_id)
+            .or_default()
+            .push(mission.id);
+    }
+
+    for (workspace_id, mission_ids) in &missions_by_workspace {
+        let Some(workspace) = workspaces.get(*workspace_id).await else {
             continue;
         };
         let units = crate::api::workspaces::list_workspace_scope_units(&workspace).await;
@@ -7184,21 +7199,23 @@ async fn check_mission_oom_kills(
             if count > prev {
                 let killed = count - prev;
                 tracing::warn!(
-                    "Memory watchdog: {} OOM kill(s) in {} (mission {}, workspace {})",
+                    "Memory watchdog: {} OOM kill(s) in {} (workspace {}, {} mission(s))",
                     killed,
                     unit,
-                    mission.id,
-                    workspace.name
+                    workspace.name,
+                    mission_ids.len()
                 );
-                let _ = events_tx.send(AgentEvent::MissionActivity {
-                    label: format!(
-                        "⚠ Memory limit hit: kernel OOM-killed {killed} process(es) in this \
-                         mission's cgroup. Builds should lower parallelism, or raise the \
-                         workspace memory cap (Resources panel / MISSION_MEMORY_MAX)."
-                    ),
-                    tool_name: "memory_watchdog".to_string(),
-                    mission_id: Some(mission.id),
-                });
+                for mission_id in mission_ids {
+                    let _ = events_tx.send(AgentEvent::MissionActivity {
+                        label: format!(
+                            "⚠ Memory limit hit: kernel OOM-killed {killed} process(es) in this \
+                             mission's cgroup. Builds should lower parallelism, or raise the \
+                             workspace memory cap (Resources panel / MISSION_MEMORY_MAX)."
+                        ),
+                        tool_name: "memory_watchdog".to_string(),
+                        mission_id: Some(*mission_id),
+                    });
+                }
             }
             oom_seen.insert(unit, count);
         }
