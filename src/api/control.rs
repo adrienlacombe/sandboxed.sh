@@ -3042,6 +3042,9 @@ pub enum ControlCommand {
         tool_call_id: String,
         name: String,
         result: serde_json::Value,
+        /// Reports whether the result reached a live waiter (`true`) or had to
+        /// be cached because no mission was registered for it (`false`).
+        respond: oneshot::Sender<bool>,
     },
     Cancel,
     /// Load a mission (switch to it)
@@ -3238,6 +3241,15 @@ pub struct SetMissionTitleRequest {
 pub struct FrontendToolHub {
     pending: Mutex<HashMap<String, oneshot::Sender<serde_json::Value>>>,
     early_results: Mutex<HashMap<String, serde_json::Value>>,
+    /// Missions currently blocked awaiting a human-provided frontend tool
+    /// result (e.g. `AskUserQuestion`). Ref-counted so a mission with more
+    /// than one concurrent frontend tool call is only cleared once its last
+    /// wait ends. The stuck-mission watchdog consults this so a mission that
+    /// is legitimately waiting for the user is never auto-interrupted for
+    /// "inactivity" — humans routinely take longer than the stall threshold
+    /// to answer. A `std::sync::Mutex` (not tokio) so `WaitingGuard::drop`
+    /// can release the slot synchronously on the cancellation path.
+    waiting_missions: std::sync::Mutex<HashMap<Uuid, usize>>,
 }
 
 impl FrontendToolHub {
@@ -3245,6 +3257,7 @@ impl FrontendToolHub {
         Self {
             pending: Mutex::new(HashMap::new()),
             early_results: Mutex::new(HashMap::new()),
+            waiting_missions: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -3268,12 +3281,18 @@ impl FrontendToolHub {
     }
 
     /// Resolve a pending tool call by id.
-    /// If no one has registered yet, the result is cached for later pickup.
-    pub async fn resolve(&self, tool_call_id: &str, result: serde_json::Value) -> Result<(), ()> {
+    ///
+    /// Returns `true` if a live waiter was registered (the result reached the
+    /// running mission). Returns `false` if no waiter was registered and the
+    /// result had to be cached in `early_results` — which, for a
+    /// human-answered question, almost always means the mission is no longer
+    /// running and the answer was dropped on the floor (the rare benign case
+    /// is a resolve-before-register race, impossible for a human to win).
+    pub async fn resolve(&self, tool_call_id: &str, result: serde_json::Value) -> bool {
         let mut pending = self.pending.lock().await;
         if let Some(tx) = pending.remove(tool_call_id) {
             let _ = tx.send(result);
-            return Ok(());
+            return true;
         }
         drop(pending);
 
@@ -3289,13 +3308,57 @@ impl FrontendToolHub {
             }
         }
         early.insert(tool_call_id.to_string(), result);
-        Ok(())
+        false
+    }
+
+    /// Mark `mission_id` as blocked on user input. The returned guard clears
+    /// the mark when dropped, which covers both the answered path (the parked
+    /// task proceeds and drops the guard) and the cancelled path (the task
+    /// returns early and the guard drops during unwind).
+    pub fn begin_waiting(hub: &Arc<Self>, mission_id: Uuid) -> WaitingGuard {
+        {
+            let mut waiting = hub.waiting_missions.lock().unwrap();
+            *waiting.entry(mission_id).or_insert(0) += 1;
+        }
+        WaitingGuard {
+            hub: Arc::clone(hub),
+            mission_id,
+        }
+    }
+
+    /// True while a mission is parked awaiting a human-provided tool result.
+    pub fn is_waiting_for_input(&self, mission_id: Uuid) -> bool {
+        self.waiting_missions
+            .lock()
+            .unwrap()
+            .get(&mission_id)
+            .is_some_and(|count| *count > 0)
     }
 }
 
 impl Default for FrontendToolHub {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// RAII guard that keeps a mission marked as "waiting for user input" in the
+/// [`FrontendToolHub`] for as long as it is held. Created via
+/// [`FrontendToolHub::begin_waiting`].
+pub struct WaitingGuard {
+    hub: Arc<FrontendToolHub>,
+    mission_id: Uuid,
+}
+
+impl Drop for WaitingGuard {
+    fn drop(&mut self) {
+        let mut waiting = self.hub.waiting_missions.lock().unwrap();
+        if let Some(count) = waiting.get_mut(&self.mission_id) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                waiting.remove(&self.mission_id);
+            }
+        }
     }
 }
 
@@ -3597,17 +3660,26 @@ pub async fn post_tool_result(
     }
 
     let control = control_for_user(&state, &user).await;
+    let (tx, rx) = oneshot::channel();
     control
         .cmd_tx
         .send(ControlCommand::ToolResult {
             tool_call_id: req.tool_call_id,
             name: req.name,
             result: req.result,
+            respond: tx,
         })
         .await
         .map_err(session_unavailable)?;
 
-    Ok(ok_json())
+    // Surface whether the answer reached a live, parked mission. When it did
+    // not, the mission has already ended (e.g. interrupted by the watchdog)
+    // and the answer was dropped — the UI uses this to stop claiming success
+    // and offer a resume instead.
+    let delivered = rx.await.unwrap_or(false);
+    Ok(Json(
+        serde_json::json!({ "ok": true, "delivered": delivered }),
+    ))
 }
 
 /// Cancel the currently running control session task.
@@ -6596,7 +6668,7 @@ fn spawn_control_session(
         mission_cmd_tx,
         events_tx.clone(),
         events_rx,
-        tool_hub,
+        tool_hub.clone(),
         status,
         current_mission,
         current_tree,
@@ -6645,6 +6717,7 @@ fn spawn_control_session(
             Arc::clone(&state.mission_store),
             state.cmd_tx.clone(),
             events_tx.clone(),
+            Arc::clone(&tool_hub),
         ));
         tokio::spawn(ack_promotion_loop(
             Arc::clone(&state.mission_store),
@@ -6977,6 +7050,7 @@ async fn stuck_mission_watchdog_loop(
     mission_store: Arc<dyn MissionStore>,
     cmd_tx: mpsc::Sender<ControlCommand>,
     events_tx: broadcast::Sender<AgentEvent>,
+    tool_hub: Arc<FrontendToolHub>,
 ) {
     use std::collections::HashSet;
 
@@ -7024,6 +7098,20 @@ async fn stuck_mission_watchdog_loop(
         // the row Interrupted.
         for info in &running_list {
             if info.seconds_since_activity >= STUCK_SECONDS {
+                // A mission parked on a frontend tool (e.g. AskUserQuestion) is
+                // intentionally silent: its harness is killed while it awaits a
+                // human answer, so it emits no activity. Do not count that as a
+                // stall — humans routinely take longer than the threshold to
+                // reply. The wait is cleared the moment the answer arrives (or
+                // the mission is cancelled), so this can't pin a dead mission.
+                if tool_hub.is_waiting_for_input(info.mission_id) {
+                    tracing::debug!(
+                        mission_id = %info.mission_id,
+                        seconds_since_activity = info.seconds_since_activity,
+                        "Stuck-mission watchdog: skipping mission blocked on user input"
+                    );
+                    continue;
+                }
                 tracing::warn!(
                     "Stuck-mission watchdog: cancelling {} after {}s of inactivity",
                     info.mission_id,
@@ -9613,11 +9701,13 @@ async fn control_actor_loop(
                         }
                         let _ = respond.send(if was_running { UserMessageAck::Queued } else { UserMessageAck::Delivered });
                     }
-                    ControlCommand::ToolResult { tool_call_id, name, result } => {
+                    ControlCommand::ToolResult { tool_call_id, name, result, respond } => {
                         // Deliver to the tool hub. resolve() caches the result if
-                        // no one has registered yet (resolve-before-register).
-                        let _ = tool_hub.resolve(&tool_call_id, result).await;
-                        tracing::debug!(tool_call_id = %tool_call_id, name = %name, "ToolResult delivered to hub");
+                        // no one has registered yet (resolve-before-register), and
+                        // reports whether a live waiter actually received it.
+                        let delivered = tool_hub.resolve(&tool_call_id, result).await;
+                        let _ = respond.send(delivered);
+                        tracing::debug!(tool_call_id = %tool_call_id, name = %name, delivered, "ToolResult delivered to hub");
                     }
                     ControlCommand::Cancel => {
                         if let Some(token) = &running_cancel {

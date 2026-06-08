@@ -449,12 +449,15 @@ export async function postControlToolResult(payload: {
   tool_call_id: string;
   name: string;
   result: unknown;
-}): Promise<void> {
-  return apiPost(
+}): Promise<{ ok: boolean; delivered: boolean }> {
+  const res = await apiPost<{ ok?: boolean; delivered?: boolean } | undefined>(
     "/api/control/tool_result",
     payload,
     "Failed to post tool result",
   );
+  // Older backends returned a bare `{ ok: true }` with no delivery signal;
+  // treat a missing flag as delivered so we don't false-alarm against them.
+  return { ok: res?.ok ?? true, delivered: res?.delivered ?? true };
 }
 
 export async function cancelControl(): Promise<void> {

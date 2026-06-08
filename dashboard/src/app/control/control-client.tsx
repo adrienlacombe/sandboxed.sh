@@ -1128,7 +1128,10 @@ function QuestionToolItem({
   onSubmit,
 }: {
   item: ToolItem;
-  onSubmit: (toolCallId: string, answers: string[][]) => Promise<void>;
+  onSubmit: (
+    toolCallId: string,
+    answers: string[][],
+  ) => Promise<{ ok: boolean; delivered: boolean }>;
 }) {
   const parsedQuestions = useMemo(
     () => parseQuestionArgs(item.args),
@@ -1159,10 +1162,14 @@ function QuestionToolItem({
   );
   const [otherText, setOtherText] = useState<Record<number, string>>({});
   const [submitting, setSubmitting] = useState(false);
+  // Set when the backend reports the answer reached no live mission (the
+  // mission ended before the answer arrived, e.g. the watchdog interrupted it).
+  const [deliveryFailed, setDeliveryFailed] = useState(false);
 
   useEffect(() => {
     setAnswers(questions.map(() => []));
     setOtherText({});
+    setDeliveryFailed(false);
   }, [item.toolCallId, questions]);
 
   const hasResult = item.result !== undefined;
@@ -1217,7 +1224,8 @@ function QuestionToolItem({
           return label;
         });
       });
-      await onSubmit(item.toolCallId, payload);
+      const outcome = await onSubmit(item.toolCallId, payload);
+      setDeliveryFailed(outcome?.delivered === false);
     } finally {
       setSubmitting(false);
     }
@@ -1381,7 +1389,12 @@ function QuestionToolItem({
                 </div>
               );
             })}
-            {hasResult ? (
+            {deliveryFailed ? (
+              <div className="rounded-lg bg-amber-500/10 border border-amber-500/20 p-3 text-xs text-amber-400">
+                This mission is no longer running, so your answer wasn&apos;t
+                delivered. Resume the mission to continue.
+              </div>
+            ) : hasResult ? (
               <div className="text-xs text-green-400">Answer sent.</div>
             ) : (
               <button
@@ -3979,7 +3992,7 @@ type ChatItemRowProps = {
     toolCallId: string,
     name: string,
     result: unknown,
-  ) => Promise<void>;
+  ) => Promise<{ ok: boolean; delivered: boolean }>;
   onOptimisticToolResult: (toolCallId: string, result: unknown) => void;
   onRetryUserMessage: (msg: {
     id: string;
@@ -4268,7 +4281,7 @@ const ChatItemRow = memo(function ChatItemRow({
             item={item}
             onSubmit={async (toolCallId, answers) => {
               onOptimisticToolResult(toolCallId, { answers });
-              await onToolResult(toolCallId, item.name, { answers });
+              return onToolResult(toolCallId, item.name, { answers });
             }}
           />
         );
@@ -7823,7 +7836,7 @@ export default function ControlClient() {
 
   const handleToolResultCommit = useCallback(
     async (toolCallId: string, name: string, result: unknown) => {
-      await postControlToolResult({
+      return postControlToolResult({
         tool_call_id: toolCallId,
         name,
         result,

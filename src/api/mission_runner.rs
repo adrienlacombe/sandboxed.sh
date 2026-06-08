@@ -5524,6 +5524,13 @@ pub fn run_claudecode_turn<'a>(
                                                             )
                                                             .await;
                                                         }
+                                                        // Mark the mission as waiting on the user so the
+                                                        // stuck-mission watchdog does not interrupt it for
+                                                        // "inactivity" while it is parked here. The guard
+                                                        // clears the mark on every exit path (answered or
+                                                        // cancelled).
+                                                        let wait_guard =
+                                                            FrontendToolHub::begin_waiting(&hub, mission_id);
                                                         let rx = hub.register(id.clone()).await;
 
                                                         pty.kill();
@@ -5545,6 +5552,10 @@ pub fn run_claudecode_turn<'a>(
                                                                 }
                                                             }
                                                         };
+                                                        // Answer received — the mission is active again and
+                                                        // resumes emitting events, so release the watchdog
+                                                        // exemption before running the continuation turn.
+                                                        drop(wait_guard);
 
                                                         if let Some(ref status_ref) = status {
                                                             set_control_state_for_mission(
