@@ -7162,6 +7162,10 @@ async fn check_mission_oom_kills(
     events_tx: &broadcast::Sender<AgentEvent>,
 ) {
     let mut live_units: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // Whether we got a complete picture of live scopes this tick. A failed
+    // workspace lookup or `list-units` means some scopes couldn't be
+    // enumerated, so we must not prune `oom_seen` (see the retain below).
+    let mut enumeration_complete = true;
 
     // Scopes are workspace-level and shared by every mission running in the
     // same container, while `oom_seen` is keyed by unit. Group missions by
@@ -7183,6 +7187,7 @@ async fn check_mission_oom_kills(
 
     for (workspace_id, mission_ids) in &missions_by_workspace {
         let Some(workspace) = workspaces.get(*workspace_id).await else {
+            enumeration_complete = false;
             continue;
         };
         let units = match crate::api::workspaces::list_workspace_scope_units(&workspace).await {
@@ -7193,14 +7198,18 @@ async fn check_mission_oom_kills(
                     workspace.name,
                     e
                 );
+                enumeration_complete = false;
                 continue;
             }
         };
         for unit in units {
+            // The unit was listed, so it's alive: record it now so a transient
+            // `memory.events` read failure below doesn't drop its baseline and
+            // cause the cumulative oom_kill total to be re-reported as new.
+            live_units.insert(unit.clone());
             let Some(count) = read_scope_oom_kills(&unit).await else {
                 continue;
             };
-            live_units.insert(unit.clone());
             // Treat a never-seen scope as a baseline of 0 so the first kernel
             // OOM in a freshly-discovered cgroup is reported rather than
             // silently absorbed into the baseline (e.g. when the watchdog
@@ -7232,8 +7241,14 @@ async fn check_mission_oom_kills(
     }
 
     // Drop counters for scopes that no longer exist so the map can't grow
-    // unboundedly across weeks of uptime.
-    oom_seen.retain(|unit, _| live_units.contains(unit));
+    // unboundedly across weeks of uptime — but only when we fully enumerated
+    // live scopes this tick. If any workspace failed to enumerate, pruning
+    // would drop a still-live scope's baseline and re-emit its cumulative
+    // oom_kill total as new kills on the next successful read. Skip pruning
+    // for this tick; it self-heals on the next clean pass.
+    if enumeration_complete {
+        oom_seen.retain(|unit, _| live_units.contains(unit));
+    }
 }
 
 async fn stale_mission_cleanup_loop(
