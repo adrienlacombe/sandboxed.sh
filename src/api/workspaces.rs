@@ -1852,7 +1852,22 @@ fn valid_memory_size(value: &str) -> bool {
     let v = v
         .strip_suffix(['K', 'M', 'G', 'T', 'k', 'm', 'g', 't'])
         .unwrap_or(v);
-    !v.is_empty() && v.parse::<f64>().map(|n| n >= 0.0).unwrap_or(false)
+    // systemd accepts a plain decimal number here (e.g. "512", "1.5"). Validate
+    // that grammar directly instead of `f64::parse`, which also accepts forms
+    // systemd rejects — scientific notation ("1e10"), "inf"/"infinity"/"nan",
+    // and signs ("+5"). Such a value would pass here, get persisted to the
+    // workspace env, then make `MemoryMax=…` invalid on every subsequent
+    // container boot, permanently breaking the mission from a single API call.
+    let mut seen_dot = false;
+    let mut seen_digit = false;
+    for c in v.chars() {
+        match c {
+            '0'..='9' => seen_digit = true,
+            '.' if !seen_dot => seen_dot = true,
+            _ => return false,
+        }
+    }
+    seen_digit
 }
 
 /// POST /api/workspaces/:id/resources — adjust a workspace's memory caps.
@@ -2061,6 +2076,26 @@ mod tests {
     use super::*;
     use std::path::Path;
     use tempfile::TempDir;
+
+    #[test]
+    fn valid_memory_size_accepts_systemd_forms() {
+        for v in [
+            "512", "0", "100M", "1.5G", "2T", "50%", "infinity", "INFINITY",
+        ] {
+            assert!(valid_memory_size(v), "should accept {v}");
+        }
+    }
+
+    #[test]
+    fn valid_memory_size_rejects_f64_quirks_systemd_does_not_accept() {
+        // These all parse as f64 but systemd rejects them; accepting one and
+        // persisting it would break every future container boot.
+        for v in [
+            "1e10", "inf", "nan", "+5", "-5", "1.2.3", "", ".", "0x10", " ",
+        ] {
+            assert!(!valid_memory_size(v), "should reject {v:?}");
+        }
+    }
 
     #[test]
     fn test_path_within_rejects_parent_traversal() {
