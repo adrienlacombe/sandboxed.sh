@@ -1353,16 +1353,31 @@ fn truncate_snippet(text: &str, max: usize) -> String {
 
 /// Classify a free-form error/content string into the failure modes a mission
 /// babysitter cares about. Mirrors the server's `is_rate_limited_error` /
-/// `is_auth_error` / `is_capacity_limited_error` families but works on text we
-/// can see from the event stream.
+/// `is_auth_error` / `is_capacity_limited_error` families (see
+/// src/api/mission_runner.rs) but works on text we can see from the event
+/// stream.
 fn error_signals_in(text: &str) -> Vec<&'static str> {
     let lower = text.to_ascii_lowercase();
     let mut signals = Vec::new();
     if lower.contains("429")
+        || lower.contains("529")
         || lower.contains("rate limit")
         || lower.contains("rate-limit")
+        || lower.contains("rate_limit")
         || lower.contains("too many requests")
         || lower.contains("overloaded")
+        || lower.contains("overloaded_error")
+        || lower.contains("resource_exhausted")
+        || lower.contains("status code: 429")
+        || lower.contains("status code: 529")
+        || lower.contains("error: 429")
+        || lower.contains("error: 529")
+        || lower.contains("hit your limit")
+        || lower.contains("hit your usage limit")
+        || lower.contains("out of extra usage")
+        || lower.contains("out of regular usage")
+        || lower.contains("purchase more credits")
+        || lower.contains("settings/usage")
     {
         signals.push("rate_limited");
     }
@@ -1374,6 +1389,8 @@ fn error_signals_in(text: &str) -> Vec<&'static str> {
         || lower.contains("invalid_api_key")
         || lower.contains("authentication")
         || lower.contains("credential")
+        || lower.contains("refresh token was already used")
+        || lower.contains("refresh_token was already used")
     {
         signals.push("auth_error");
     }
@@ -1381,6 +1398,11 @@ fn error_signals_in(text: &str) -> Vec<&'static str> {
         || lower.contains("503")
         || lower.contains("service unavailable")
         || lower.contains("no capacity")
+        || lower.contains("already have five missions running")
+        || lower.contains("already have 5 missions running")
+        || lower.contains("concurrent mission limit")
+        || lower.contains("selected model is at capacity")
+        || lower.contains("model is at capacity")
     {
         signals.push("capacity_limited");
     }
@@ -1393,15 +1415,35 @@ fn error_signals_in(text: &str) -> Vec<&'static str> {
     {
         signals.push("context_limit");
     }
+    // Network / edge errors: be specific. Bare "timeout" or "idle timeout"
+    // (e.g. OpenCode "idle timeout: the model stopped producing output") are
+    // harness-level problems, not routing/edge issues. Only tag network_error
+    // for clear transport indicators.
+    let has_edge_code = lower.contains("502")
+        || lower.contains("520")
+        || lower.contains("521")
+        || lower.contains("522");
+    let is_transport_timeout = lower.contains("connection timed out")
+        || lower.contains("request timed out")
+        || lower.contains("read timeout")
+        || lower.contains("write timeout")
+        || (lower.contains("timed out")
+            && (lower.contains("connection")
+                || lower.contains("reset")
+                || lower.contains("cloudflare")
+                || lower.contains("peer")
+                || lower.contains("dns")))
+        || (lower.contains("timeout")
+            && (lower.contains("cloudflare")
+                || lower.contains("econn")
+                || lower.contains("reset by peer")
+                || lower.contains("dns")));
     if lower.contains("cloudflare")
         || lower.contains("connection reset")
         || lower.contains("econnreset")
-        || lower.contains("timed out")
-        || lower.contains("timeout")
-        || lower.contains("502")
-        || lower.contains("520")
-        || lower.contains("521")
-        || lower.contains("522")
+        || lower.contains("reset by peer")
+        || is_transport_timeout
+        || has_edge_code
         || lower.contains("dns")
     {
         signals.push("network_error");
@@ -1779,6 +1821,30 @@ mod tests {
         );
         assert!(error_signals_in("cloudflare 520: connection reset").contains(&"network_error"));
         assert!(error_signals_in("all good here").is_empty());
+
+        // 529 and "hit your limit" family (server-side rate limit markers)
+        assert!(error_signals_in("error: 529 overloaded").contains(&"rate_limited"));
+        assert!(error_signals_in("status code: 529").contains(&"rate_limited"));
+        assert!(
+            error_signals_in("You've hit your limit · resets Jun 10, 5pm (Europe/Berlin)")
+                .contains(&"rate_limited")
+        );
+        assert!(error_signals_in(
+            "You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage"
+        )
+        .contains(&"rate_limited"));
+
+        // Harness-level idle timeouts are NOT network errors (they are local model/harness stalls)
+        let idle = error_signals_in("OpenCode idle timeout: the model stopped producing output before finishing the turn. Partial output was discarded because it was incomplete.");
+        assert!(
+            !idle.contains(&"network_error"),
+            "idle timeout must not be misclassified as network_error: {idle:?}"
+        );
+        // But real transport timeouts still are
+        assert!(
+            error_signals_in("connection timed out while talking to provider")
+                .contains(&"network_error")
+        );
     }
 
     #[test]
