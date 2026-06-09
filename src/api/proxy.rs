@@ -640,15 +640,19 @@ pub(crate) async fn chat_completions_inner(
                     continue;
                 }
             };
-            let upstream_body =
-                match build_anthropic_upstream_request(&body, &entry.model_id, is_stream) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        tracing::error!("Failed to build Anthropic upstream request: {}", e);
-                        server_error_count += 1;
-                        continue;
-                    }
-                };
+            let upstream_body = match build_anthropic_upstream_request(
+                &body,
+                &entry.model_id,
+                is_stream,
+                entry.has_oauth,
+            ) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::error!("Failed to build Anthropic upstream request: {}", e);
+                    server_error_count += 1;
+                    continue;
+                }
+            };
             let headers = build_anthropic_proxy_headers(credential, entry.has_oauth);
             (
                 "https://api.anthropic.com/v1/messages".to_string(),
@@ -822,7 +826,12 @@ pub(crate) async fn chat_completions_inner(
                 let base = if use_anthropic_oauth_cli_proxy_adapter {
                     rewrite_model_for_anthropic_cli_proxy(&body, &entry.model_id)
                 } else {
-                    build_anthropic_upstream_request(&body, &entry.model_id, is_stream)
+                    build_anthropic_upstream_request(
+                        &body,
+                        &entry.model_id,
+                        is_stream,
+                        entry.has_oauth,
+                    )
                 };
                 base.and_then(|b| anthropic_body_drop_thinking_and_disable(&b))
                     .map_err(
@@ -2760,10 +2769,19 @@ fn build_anthropic_proxy_headers(credential: &str, has_oauth: bool) -> HeaderMap
     headers
 }
 
+/// First system block Anthropic requires on OAuth-subscription tokens. The
+/// `/v1/messages` endpoint rejects subscription (Claude Pro/Max) OAuth tokens
+/// with a misleading `429 rate_limit_error` unless the request identifies
+/// itself as Claude Code via this exact system line — even when the account
+/// has ample rate-limit budget. API-key requests don't need it. This mirrors
+/// what real Claude Code (and our own usage-probe in ai_providers.rs) sends.
+const CLAUDE_CODE_IDENTITY: &str = "You are Claude Code, Anthropic's official CLI for Claude.";
+
 fn build_anthropic_upstream_request(
     body: &[u8],
     model_id: &str,
     is_stream: bool,
+    force_claude_code_identity: bool,
 ) -> Result<bytes::Bytes, String> {
     let req: serde_json::Value =
         serde_json::from_slice(body).map_err(|e| format!("Invalid JSON: {}", e))?;
@@ -2813,6 +2831,19 @@ fn build_anthropic_upstream_request(
     if model_changed {
         strip_thinking_blocks(&mut messages);
     }
+    // OAuth-subscription tokens require the Claude Code identity as the first
+    // system block, else Anthropic returns a misleading 429. Prepend it unless
+    // the caller's own system prompt already leads with it (idempotent so a
+    // retry can't double it).
+    let system = if force_claude_code_identity && !system.starts_with(CLAUDE_CODE_IDENTITY) {
+        if system.is_empty() {
+            CLAUDE_CODE_IDENTITY.to_string()
+        } else {
+            format!("{CLAUDE_CODE_IDENTITY}\n\n{system}")
+        }
+    } else {
+        system
+    };
     if !system.is_empty() {
         out.insert("system".to_string(), serde_json::Value::String(system));
     }
@@ -2939,6 +2970,14 @@ fn anthropic_content_blocks_from_openai(
         return Vec::new();
     };
     if let Some(text) = content.as_str() {
+        // Anthropic rejects empty/whitespace-only text blocks ("text content
+        // blocks must be non-empty"). An OpenAI assistant message commonly
+        // carries content:"" alongside tool_calls (MiniMax/most OpenAI-style
+        // models do this); emitting an empty text block next to the tool_use
+        // blocks 400s the whole replay. Drop it.
+        if text.trim().is_empty() {
+            return Vec::new();
+        }
         return vec![serde_json::json!({ "type": "text", "text": text })];
     }
     let Some(parts) = content.as_array() else {
@@ -2949,7 +2988,10 @@ fn anthropic_content_blocks_from_openai(
         match part.get("type").and_then(|v| v.as_str()).unwrap_or("") {
             "text" => {
                 if let Some(text) = part.get("text").and_then(|v| v.as_str()) {
-                    out.push(serde_json::json!({ "type": "text", "text": text }));
+                    // Skip empty/whitespace-only text blocks (see above).
+                    if !text.trim().is_empty() {
+                        out.push(serde_json::json!({ "type": "text", "text": text }));
+                    }
                 }
             }
             "image_url" => {
@@ -4286,6 +4328,50 @@ mod tests {
     use futures::StreamExt;
 
     #[test]
+    fn anthropic_conversion_drops_empty_text_block_beside_tool_use() {
+        // OpenAI assistant turns routinely carry content:"" alongside
+        // tool_calls. Anthropic rejects empty text blocks, so the converted
+        // assistant message must contain ONLY the tool_use block — else the
+        // whole replay 400s (observed: MiniMax history replayed on Opus).
+        let messages = serde_json::json!([
+            { "role": "user", "content": "List files." },
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": { "name": "terminal", "arguments": "{\"cmd\":\"ls\"}" }
+                }]
+            },
+            { "role": "tool", "tool_call_id": "call_1", "content": "file1.txt" },
+            { "role": "user", "content": "Reply: pong" }
+        ]);
+        let (_system, out) =
+            anthropic_messages_from_openai(messages.as_array().unwrap().as_slice());
+        // The assistant message: exactly one block, the tool_use (no empty text).
+        let assistant = out
+            .iter()
+            .find(|m| m.get("role").and_then(|v| v.as_str()) == Some("assistant"))
+            .expect("assistant message present");
+        let blocks = assistant["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 1, "empty text block must be dropped");
+        assert_eq!(blocks[0]["type"], "tool_use");
+        assert_eq!(blocks[0]["name"], "terminal");
+        // No message anywhere carries an empty text block.
+        for m in &out {
+            for b in m["content"].as_array().unwrap() {
+                if b.get("type").and_then(|v| v.as_str()) == Some("text") {
+                    assert!(
+                        !b["text"].as_str().unwrap().trim().is_empty(),
+                        "no empty text blocks may survive conversion"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn parse_direct_model_entry_accepts_known_provider_prefix() {
         let e = parse_direct_model_entry("xai/grok-4.3").expect("known provider");
         assert_eq!(e.provider_id, "xai");
@@ -4725,6 +4811,7 @@ mod tests {
             serde_json::to_vec(&body).unwrap().as_slice(),
             "claude-opus-4-7",
             false,
+            false,
         )
         .unwrap();
         let payload: serde_json::Value = serde_json::from_slice(payload_bytes.as_ref()).unwrap();
@@ -4742,6 +4829,86 @@ mod tests {
                 "name": "echo"
             })
         );
+    }
+
+    #[test]
+    fn anthropic_oauth_request_prepends_claude_code_identity() {
+        // OAuth path (force_claude_code_identity = true): the Claude Code
+        // identity must lead the system prompt, else Anthropic 429s the
+        // subscription token.
+        let body = serde_json::json!({
+            "model": "claude-opus-4-8",
+            "messages": [
+                { "role": "system", "content": "Be brief." },
+                { "role": "user", "content": "hi" }
+            ],
+            "max_tokens": 16,
+        });
+        let bytes = build_anthropic_upstream_request(
+            serde_json::to_vec(&body).unwrap().as_slice(),
+            "claude-opus-4-8",
+            false,
+            true,
+        )
+        .unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(bytes.as_ref()).unwrap();
+        assert_eq!(
+            payload["system"],
+            "You are Claude Code, Anthropic's official CLI for Claude.\n\nBe brief."
+        );
+
+        // Idempotent: a system prompt already leading with the identity is not
+        // doubled (covers the thinking-strip retry re-running the builder).
+        let body2 = serde_json::json!({
+            "model": "claude-opus-4-8",
+            "messages": [
+                { "role": "system", "content": "You are Claude Code, Anthropic's official CLI for Claude.\n\nBe brief." },
+                { "role": "user", "content": "hi" }
+            ],
+            "max_tokens": 16,
+        });
+        let bytes2 = build_anthropic_upstream_request(
+            serde_json::to_vec(&body2).unwrap().as_slice(),
+            "claude-opus-4-8",
+            false,
+            true,
+        )
+        .unwrap();
+        let payload2: serde_json::Value = serde_json::from_slice(bytes2.as_ref()).unwrap();
+        assert_eq!(
+            payload2["system"],
+            "You are Claude Code, Anthropic's official CLI for Claude.\n\nBe brief."
+        );
+
+        // Empty system + OAuth: identity becomes the whole system prompt.
+        let body3 = serde_json::json!({
+            "model": "claude-opus-4-8",
+            "messages": [ { "role": "user", "content": "hi" } ],
+            "max_tokens": 16,
+        });
+        let bytes3 = build_anthropic_upstream_request(
+            serde_json::to_vec(&body3).unwrap().as_slice(),
+            "claude-opus-4-8",
+            false,
+            true,
+        )
+        .unwrap();
+        let payload3: serde_json::Value = serde_json::from_slice(bytes3.as_ref()).unwrap();
+        assert_eq!(
+            payload3["system"],
+            "You are Claude Code, Anthropic's official CLI for Claude."
+        );
+
+        // API-key path (force = false): system is untouched.
+        let bytes4 = build_anthropic_upstream_request(
+            serde_json::to_vec(&body).unwrap().as_slice(),
+            "claude-opus-4-8",
+            false,
+            false,
+        )
+        .unwrap();
+        let payload4: serde_json::Value = serde_json::from_slice(bytes4.as_ref()).unwrap();
+        assert_eq!(payload4["system"], "Be brief.");
     }
 
     #[test]
