@@ -11509,13 +11509,43 @@ pub async fn run_opencode_turn(
                                 let _ = sse_complete_tx.send(true);
                             } else if event_type == "error" {
                                 had_error = true;
+                                let mut extracted_err: Option<String> = None;
+                                // Try legacy path: properties.error (string)
                                 if let Some(props) = json.get("properties") {
                                     if let Some(err) = props.get("error").and_then(|e| e.as_str()) {
-                                        tracing::warn!(mission_id = %mission_id, error = %err, "OpenCode JSON error event");
-                                        if final_result.is_empty() {
-                                            final_result = err.to_string();
+                                        extracted_err = Some(err.to_string());
+                                    }
+                                }
+                                // Try current opencode path: error.data.message (string)
+                                if extracted_err.is_none() {
+                                    if let Some(err_obj) = json.get("error") {
+                                        if let Some(data) = err_obj.get("data") {
+                                            if let Some(msg) = data.get("message").and_then(|m| m.as_str()) {
+                                                extracted_err = Some(msg.to_string());
+                                            }
+                                        }
+                                        // Fallback: error.message (string)
+                                        if extracted_err.is_none() {
+                                            if let Some(msg) = err_obj.get("message").and_then(|m| m.as_str()) {
+                                                extracted_err = Some(msg.to_string());
+                                            }
+                                        }
+                                        // Last resort: include the error name
+                                        if extracted_err.is_none() {
+                                            if let Some(name) = err_obj.get("name").and_then(|n| n.as_str()) {
+                                                extracted_err = Some(format!("OpenCode error: {}", name));
+                                            }
                                         }
                                     }
+                                }
+                                if let Some(err) = extracted_err {
+                                    tracing::warn!(mission_id = %mission_id, error = %err, "OpenCode JSON error event");
+                                    if final_result.is_empty() {
+                                        final_result = err;
+                                    }
+                                } else if final_result.is_empty() {
+                                    // Absolute fallback - include the raw JSON type info
+                                    final_result = "OpenCode returned an error event with no parsable message".to_string();
                                 }
                             }
 

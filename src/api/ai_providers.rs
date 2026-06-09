@@ -52,7 +52,7 @@ fn should_warn_oauth(key: &str) -> bool {
     true
 }
 
-/// Anthropic OAuth client ID (from opencode-anthropic-auth plugin)
+/// Anthropic OAuth client ID (used for Anthropic OAuth flows)
 const ANTHROPIC_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 const ANTHROPIC_CONSOLE_REDIRECT_URI: &str = "https://console.anthropic.com/oauth/code/callback";
 
