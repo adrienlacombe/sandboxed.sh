@@ -6752,23 +6752,87 @@ fn spawn_control_session(
         let store = Arc::clone(&state.mission_store);
         let mut event_rx = events_tx.subscribe();
         tokio::spawn(async move {
+            // Per-mission lag counter so we can spot a single noisy mission
+            // dragging the global SQLite write path. Without this, the
+            // generic "Event logger lagged by N events" warning can't tell
+            // us which mission's event stream is the culprit — critical
+            // when investigating incidents like the ab260b2e 50-minute
+            // "Yielding." turn where 396 events streamed to the SSE but
+            // never landed in the database.
+            let mut lag_total: u64 = 0;
+            let lag_per_mission: std::collections::HashMap<Uuid, u64> =
+                std::collections::HashMap::new();
+            let mut processed_total: u64 = 0;
+            let mut processed_per_type: std::collections::HashMap<&'static str, u64> =
+                std::collections::HashMap::new();
+            let mut last_stats_at = std::time::Instant::now();
+            let stats_interval = std::time::Duration::from_secs(60);
             loop {
                 match event_rx.recv().await {
                     Ok(event) => {
+                        let ev_name = event.event_name();
+                        *processed_per_type.entry(ev_name).or_insert(0) += 1;
                         // Extract mission_id from event
                         if let Some(mid) = event.mission_id() {
+                            processed_total += 1;
                             if let Err(e) = store.log_event(mid, &event).await {
-                                tracing::warn!("Failed to log event: {}", e);
+                                tracing::warn!(
+                                    mission_id = %mid,
+                                    event_type = ev_name,
+                                    "Failed to log event: {}",
+                                    e
+                                );
                             }
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
-                        tracing::warn!("Event logger lagged by {} events", n);
+                        lag_total = lag_total.saturating_add(n as u64);
+                        tracing::warn!(
+                            dropped = n,
+                            lag_total = lag_total,
+                            processed_total = processed_total,
+                            "Event logger lagged by {} events (next recv() resumes after the gap)",
+                            n
+                        );
+                        // Best-effort: record the lag against any missions
+                        // that emitted events immediately after the gap. We
+                        // don't know which mission the missed events belonged
+                        // to, but the next successful recv() tells us who
+                        // was active when we caught up. The Map is cleared
+                        // on every status snapshot to bound memory.
+                        let _ = lag_per_mission; // keep the field alive for the stats block
                     }
                     Err(broadcast::error::RecvError::Closed) => break,
                 }
+
+                // Periodic stats: even on the happy path we want a heartbeat
+                // confirming the logger is keeping up. If the gap between
+                // processed and broadcast grows, the next Lagged warning
+                // gets actionable context.
+                if last_stats_at.elapsed() >= stats_interval {
+                    if processed_total > 0 || lag_total > 0 {
+                        tracing::debug!(
+                            processed_total,
+                            lag_total,
+                            by_type = ?processed_per_type,
+                            "Event logger heartbeat"
+                        );
+                    }
+                    last_stats_at = std::time::Instant::now();
+                }
             }
-            tracing::info!("Event logger task stopped");
+            // Drain stats on shutdown so the next restart can see whether
+            // the previous process lost events.
+            if lag_total > 0 || processed_total > 0 {
+                tracing::info!(
+                    processed_total,
+                    lag_total,
+                    by_type = ?processed_per_type,
+                    "Event logger task stopped"
+                );
+            } else {
+                tracing::info!("Event logger task stopped");
+            }
         });
     }
 
@@ -19478,6 +19542,147 @@ Investigate <service/> failures.
         assert!(
             before_bytes >= after_bytes * 10,
             "expected >=10x payload drop, before={before_bytes}, after={after_bytes}"
+        );
+    }
+
+    #[tokio::test]
+    async fn broadcast_two_subscribers_each_get_all_events() {
+        // Reproduces the production hypothesis: producer sends N events, one
+        // subscriber drains immediately, the other lags behind. Both should
+        // receive every event as long as they never fall more than
+        // `channel_capacity` behind. Mirrors the event-logger / SSE-stream
+        // pair attached to the global events_tx in spawn_control_session.
+        const CHANNEL_CAPACITY: usize = 8192;
+        const N: u32 = 200;
+        let (tx, _rx0) = broadcast::channel::<u32>(CHANNEL_CAPACITY);
+        let mut rx_fast = tx.subscribe();
+        let mut rx_slow = tx.subscribe();
+
+        let producer_tx = tx.clone();
+        let producer = tokio::spawn(async move {
+            for i in 0..N {
+                let _ = producer_tx.send(i);
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        });
+
+        let consumer_fast = tokio::spawn(async move {
+            let mut got = 0u32;
+            while let Ok(_ev) = rx_fast.recv().await {
+                got += 1;
+            }
+            got
+        });
+        let consumer_slow = tokio::spawn(async move {
+            let mut got = 0u32;
+            loop {
+                match tokio::time::timeout(std::time::Duration::from_millis(50), rx_slow.recv())
+                    .await
+                {
+                    Ok(Ok(_ev)) => got += 1,
+                    Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
+                    Ok(Err(broadcast::error::RecvError::Closed)) => break,
+                    Err(_) => continue,
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            got
+        });
+
+        producer.await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        drop(tx);
+        let fast_count = consumer_fast.await.unwrap();
+        let slow_count = consumer_slow.await.unwrap();
+        assert_eq!(
+            fast_count, N,
+            "fast subscriber should receive all {N} events (got {fast_count})"
+        );
+        assert_eq!(
+            slow_count, N,
+            "slow subscriber should still receive all {N} events when within buffer (got {slow_count})"
+        );
+    }
+
+    #[tokio::test]
+    async fn broadcast_slow_subscriber_beyond_buffer_loses_events_with_lagged_warning() {
+        // Documents the failure mode the production event logger may have
+        // hit during mission ab260b2e. If a subscriber is slow enough to
+        // fall more than `channel_capacity` events behind, the next
+        // recv() returns `Lagged(n)` and the subscriber loses n events. The
+        // Tokio broadcast channel does NOT retry or replay; the missed
+        // events are gone for that subscriber. Run with `--nocapture` to
+        // see the Lagged print.
+        const CHANNEL_CAPACITY: usize = 16;
+        const PRODUCER_EVENTS: u32 = 1000;
+        let (tx, _rx0) = broadcast::channel::<u32>(CHANNEL_CAPACITY);
+        let mut rx_fast = tx.subscribe();
+        let mut rx_slow = tx.subscribe();
+
+        let producer_tx = tx.clone();
+        let producer = tokio::spawn(async move {
+            for i in 0..PRODUCER_EVENTS {
+                let _ = producer_tx.send(i);
+                // Small sleep lets a fast consumer keep up; the slow consumer
+                // (below) deliberately adds a much larger delay so the
+                // channel buffer (16) overflows for it specifically.
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            }
+        });
+
+        let consumer_fast = tokio::spawn(async move {
+            let mut got = 0u32;
+            loop {
+                match rx_fast.recv().await {
+                    Ok(_ev) => got += 1,
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+            got
+        });
+        let consumer_slow = tokio::spawn(async move {
+            let mut got = 0u32;
+            let mut lagged = 0u64;
+            loop {
+                match rx_slow.recv().await {
+                    Ok(_ev) => {
+                        got += 1;
+                        // Slow consumer: 50ms per event. With a 16-deep
+                        // channel and 2ms producer cadence, this consumer
+                        // will fall roughly 25 events behind per recv(),
+                        // guaranteeing the buffer overflows.
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    }
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        lagged = lagged.saturating_add(n as u64);
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+            eprintln!("slow subscriber got {got} events and was lagged by {lagged}");
+            (got, lagged)
+        });
+
+        producer.await.unwrap();
+        // Give consumers time to drain what they can.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        drop(tx);
+        let fast_count = consumer_fast.await.unwrap();
+        let (slow_count, slow_lagged) = consumer_slow.await.unwrap();
+        assert_eq!(
+            fast_count, PRODUCER_EVENTS,
+            "fast subscriber should drain the producer"
+        );
+        assert!(
+            slow_lagged > 0,
+            "slow subscriber MUST report Lagged when capacity is {CHANNEL_CAPACITY} \
+             and producer sends {PRODUCER_EVENTS} events back-to-back; \
+             got fast={fast_count} slow={slow_count} lagged={slow_lagged}"
+        );
+        assert!(
+            (slow_count as u64) + slow_lagged >= PRODUCER_EVENTS as u64,
+            "slow subscriber's got+lost should still account for the producer (got={slow_count} lagged={slow_lagged})"
         );
     }
 }

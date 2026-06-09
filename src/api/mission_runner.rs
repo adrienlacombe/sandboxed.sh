@@ -970,6 +970,12 @@ enum ClaudeTransportFailureStage {
     AwaitingClaude,
     AwaitingToolResults,
     AwaitingTerminalResult,
+    /// The Claude Code stream emitted a long run of the same repeated
+    /// substring (e.g. "Yielding pending your choice." looped hundreds of
+    /// times) without ever producing a terminal result. The backend killed
+    /// the CLI to surface a clear failure to the user instead of waiting
+    /// for the model to hit max_tokens.
+    DegenerateStream,
 }
 
 fn claudecode_transport_failure_stage_for_wait_state(
@@ -1004,6 +1010,7 @@ fn claudecode_transport_failure_stage_label(stage: ClaudeTransportFailureStage) 
         ClaudeTransportFailureStage::AwaitingClaude => "awaiting_claude",
         ClaudeTransportFailureStage::AwaitingToolResults => "awaiting_tool_results",
         ClaudeTransportFailureStage::AwaitingTerminalResult => "awaiting_terminal_result",
+        ClaudeTransportFailureStage::DegenerateStream => "degenerate_stream",
     }
 }
 
@@ -1015,6 +1022,7 @@ fn claudecode_transport_failure_stage_from_label(
         "awaiting_claude" => Some(ClaudeTransportFailureStage::AwaitingClaude),
         "awaiting_tool_results" => Some(ClaudeTransportFailureStage::AwaitingToolResults),
         "awaiting_terminal_result" => Some(ClaudeTransportFailureStage::AwaitingTerminalResult),
+        "degenerate_stream" => Some(ClaudeTransportFailureStage::DegenerateStream),
         _ => None,
     }
 }
@@ -2905,6 +2913,15 @@ pub(crate) fn claudecode_transport_recovery_strategy(
             if has_session_id && !attempted_same_session_resume {
                 return ClaudeTransportRecoveryStrategy::ResumeCurrentSession;
             }
+            if !attempted_session_reset {
+                return ClaudeTransportRecoveryStrategy::ResetSessionFresh;
+            }
+        }
+        // Degenerate-stream is a self-induced failure: we killed the CLI on
+        // purpose because the model was looping. Resuming the same session
+        // would replay the same loop. Always start a fresh session so the
+        // next turn re-reads the project from a clean context.
+        Some(ClaudeTransportFailureStage::DegenerateStream) => {
             if !attempted_session_reset {
                 return ClaudeTransportRecoveryStrategy::ResetSessionFresh;
             }
@@ -5050,6 +5067,36 @@ pub fn run_claudecode_turn<'a>(
         let mut finalized_thinking_indices: std::collections::HashSet<u32> =
             std::collections::HashSet::new(); // Blocks already sent done:true during streaming
         let mut last_text_len: usize = 0; // Track last emitted text length for streaming text deltas
+                                          // Degenerate-stream detector state. When the model loops on the same
+                                          // substring for a long time (e.g. emitting "Yielding pending your
+                                          // choice." or "..." indefinitely) we want to cut the turn off
+                                          // ourselves rather than wait for the model to hit max_tokens or
+                                          // surface an unhelpful "Yielding." final answer. Tunables are env
+                                          // overrides so production can tighten/loosen without a code change.
+        let degenerate_min_duration = Duration::from_secs(
+            std::env::var("SANDBOXED_SH_CLAUDECODE_DEGENERATE_MIN_DURATION_SECS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(90),
+        );
+        let degenerate_min_repeats: usize =
+            std::env::var("SANDBOXED_SH_CLAUDECODE_DEGENERATE_MIN_REPEATS")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(3);
+        let degenerate_min_substring_len: usize =
+            std::env::var("SANDBOXED_SH_CLAUDECODE_DEGENERATE_MIN_SUBSTRING_LEN")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(40);
+        let degenerate_window_chars: usize =
+            std::env::var("SANDBOXED_SH_CLAUDECODE_DEGENERATE_WINDOW_CHARS")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(4096);
+        let mut first_text_delta_at: Option<Instant> = None;
+        let mut degenerate_stream_detected: bool = false;
+        let mut degenerate_stage_triggered: bool = false;
 
         let mut saw_non_init_event = false;
         let startup_timeout = Duration::from_secs(
@@ -5393,6 +5440,60 @@ pub fn run_claudecode_turn<'a>(
                                                                 content: accumulated,
                                                                 mission_id: Some(mission_id),
                                                             });
+                                                        }
+
+                                                        // Degenerate-stream detector. Some models enter a
+                                                        // tight loop emitting the same short string over
+                                                        // and over (e.g. "Yielding pending your choice.")
+                                                        // and never emit a terminal result. The per-turn
+                                                        // idle timer never fires because events keep
+                                                        // arriving, so the user is stuck watching a
+                                                        // streaming view that never finalises and is
+                                                        // billed for the full token burn. Once we see the
+                                                        // same meaningful substring repeated several
+                                                        // times in a sliding window past a minimum
+                                                        // streaming duration we kill the CLI, surface a
+                                                        // clear "model entered a degenerate loop"
+                                                        // failure, and let the user send a new turn.
+                                                        if !degenerate_stream_detected {
+                                                            if first_text_delta_at.is_none() {
+                                                                first_text_delta_at = Some(Instant::now());
+                                                            }
+                                                            let streaming_for = first_text_delta_at
+                                                                .map(|t| t.elapsed())
+                                                                .unwrap_or(Duration::ZERO);
+                                                            let total_acc: String = text_buffer
+                                                                .values()
+                                                                .cloned()
+                                                                .collect::<Vec<_>>()
+                                                                .join("");
+                                                            if streaming_for >= degenerate_min_duration
+                                                                && text_buffer_stream_looks_degenerate(
+                                                                    &total_acc,
+                                                                    degenerate_window_chars,
+                                                                    degenerate_min_substring_len,
+                                                                    degenerate_min_repeats,
+                                                                )
+                                                            {
+                                                                // Set both flags; `degenerate_stream_detected`
+                                                                // gates this whole `if` so we never fire twice,
+                                                                // and `degenerate_stage_triggered` is what
+                                                                // the post-loop failure path reads.
+                                                                degenerate_stream_detected = true;
+                                                                tracing::warn!(
+                                                                    mission_id = %mission_id,
+                                                                    streaming_for_secs = streaming_for.as_secs(),
+                                                                    total_text_chars = total_len,
+                                                                    window_chars = degenerate_window_chars,
+                                                                    min_substring_len = degenerate_min_substring_len,
+                                                                    min_repeats = degenerate_min_repeats,
+                                                                    "Claude Code stream looks degenerate (same substring repeated); killing CLI"
+                                                                );
+                                                                degenerate_stage_triggered = true;
+                                                                pty.kill();
+                                                                reader_handle.abort();
+                                                                break;
+                                                            }
                                                         }
                                                     }
                                                 }
@@ -5883,7 +5984,19 @@ pub fn run_claudecode_turn<'a>(
         if !cancelled && !had_error && !saw_terminal_result_event {
             had_error = true;
             let exit_summary = describe_pty_exit_status(&exit_status);
-            if !saw_non_init_event {
+            if degenerate_stage_triggered {
+                transport_failure_stage = Some(ClaudeTransportFailureStage::DegenerateStream);
+                tracing::warn!(
+                    mission_id = %mission_id,
+                    exit_status = %exit_summary,
+                    "Claude Code stream looked degenerate; killed CLI and treating as degenerate-stream failure"
+                );
+                let partial_chars = final_result.chars().count();
+                final_result = format!(
+                    "Claude Code entered a degenerate output loop (the same short string was repeated many times in the streamed response) and the turn was cut short to avoid a runaway 50-minute bill — see mission ab260b2e for the canonical example.\n\nThe model never produced a terminal result event. Partial output ({} chars) was preserved; resend your last message to try again.",
+                    partial_chars
+                );
+            } else if !saw_non_init_event {
                 transport_failure_stage = Some(ClaudeTransportFailureStage::Startup);
                 tracing::warn!(
                     mission_id = %mission_id,
@@ -6027,7 +6140,11 @@ pub fn run_claudecode_turn<'a>(
             } else {
                 format!("{}\n{}", final_result, non_json_output.join("\n"))
             };
-            let reason = if is_rate_limited_error(&combined_for_detection) {
+            let reason = if degenerate_stage_triggered {
+                // Degenerate-stream is its own failure mode; never let the
+                // account-rotation / auth-error inference override it.
+                TerminalReason::InfiniteLoop
+            } else if is_rate_limited_error(&combined_for_detection) {
                 TerminalReason::RateLimited
             } else if is_auth_error(&combined_for_detection) {
                 TerminalReason::AuthError
@@ -12321,6 +12438,116 @@ fn merge_stream_fragment(buffer: &mut String, fragment: &str) {
     buffer.push_str(&fragment[overlap..]);
 }
 
+/// Returns true if the streamed text in `accumulated` shows the same
+/// substring repeated at least `min_repeats` times in the last `window_chars`
+/// of content, where each repetition is at least `min_substring_len` characters
+/// long. Used by the degenerate-stream detector in `run_claudecode_turn` to
+/// short-circuit a model that has entered a tight "Yielding pending your
+/// choice." / "..." loop and will not emit a terminal result on its own.
+///
+/// This is intentionally conservative: a short repeated string is normal in
+/// list-style answers (e.g. "yes, yes, yes"), and so is a long literal-text
+/// quote (e.g. an LLM echoing a paragraph from a file). We only flag a
+/// substring that (a) is long enough, (b) repeats enough times, AND
+/// (c) contains at least two distinct substantive words (length >= 4) so
+/// the loop is on a meaningful phrase rather than on a single short token.
+/// Callers are also expected to gate the call on a minimum elapsed
+/// streaming duration.
+fn text_buffer_stream_looks_degenerate(
+    accumulated: &str,
+    window_chars: usize,
+    min_substring_len: usize,
+    min_repeats: usize,
+) -> bool {
+    if min_substring_len == 0 || min_repeats < 2 || window_chars == 0 {
+        return false;
+    }
+    let chars: Vec<char> = accumulated.chars().collect();
+    if chars.len() < min_substring_len.saturating_mul(min_repeats) {
+        return false;
+    }
+    let window_end = chars.len();
+    let window_start = window_end.saturating_sub(window_chars);
+    let window = &chars[window_start..window_end];
+
+    // Walk every starting offset in the window. For each offset, try
+    // candidate substring lengths in `min_substring_len..=2*min_substring_len`
+    // (anything longer would have been broken up by the LLM streaming
+    // cadence). Count non-overlapping occurrences; if we find >= min_repeats
+    // we have a degenerate loop.
+    //
+    // To keep this O(window_chars * substring_len_max) per delta we cap the
+    // candidate substring length at 256 and bail out early once we have a hit.
+    let max_candidate_len = min_substring_len.saturating_mul(2).min(256);
+    for start in 0..window.len().saturating_sub(min_substring_len) {
+        for len in min_substring_len..=max_candidate_len {
+            if start + len > window.len() {
+                break;
+            }
+            let needle: String = window[start..start + len].iter().collect();
+            // Skip "noise" candidates that are mostly whitespace or a single
+            // character repeated (e.g. "----").
+            if !needle.chars().any(|c| c.is_alphanumeric()) {
+                continue;
+            }
+            // Skip single-token loops (e.g. "yes, yes, yes" or
+            // "ok. ok. ok."). Require the substring to contain at least
+            // two distinct "substantive" words (length >= 4, alphabetic).
+            // This is the key differentiator between a legitimate
+            // short-token echo and a model that has lost the plot on a
+            // meaningful phrase.
+            let distinct_substantive = count_distinct_substantive_words(&needle);
+            if distinct_substantive < 2 {
+                continue;
+            }
+            let mut count = 0usize;
+            let mut idx = 0usize;
+            while let Some(found) = find_subslice(window, &needle, idx) {
+                count += 1;
+                if count >= min_repeats {
+                    return true;
+                }
+                idx = found + 1;
+            }
+        }
+    }
+    false
+}
+
+/// Count distinct "substantive" words in `s`: tokens that are at least 4
+/// characters long and made up of letters/digits. Used to differentiate a
+/// meaningful phrase like "Yielding pending your choice" (4 substantive
+/// words) from a single-token echo like "yes, yes, yes" (1 word) or
+/// "ok. ok. ok." (1 word).
+fn count_distinct_substantive_words(s: &str) -> usize {
+    let mut seen = std::collections::HashSet::new();
+    for token in s.split(|c: char| !c.is_alphanumeric()) {
+        if token.chars().count() >= 4 {
+            seen.insert(token.to_ascii_lowercase());
+        }
+    }
+    seen.len()
+}
+
+/// Find the next index in `haystack` (a Vec<char>) that begins a run equal to
+/// `needle`, starting the search at `from`. Avoids allocating a substring per
+/// comparison by indexing through `chars`.
+fn find_subslice(haystack: &[char], needle: &str, from: usize) -> Option<usize> {
+    let needle_chars: Vec<char> = needle.chars().collect();
+    if needle_chars.is_empty() || from + needle_chars.len() > haystack.len() {
+        return None;
+    }
+    'outer: for i in from..=haystack.len() - needle_chars.len() {
+        for j in 0..needle_chars.len() {
+            if haystack[i + j] != needle_chars[j] {
+                continue 'outer;
+            }
+        }
+        return Some(i);
+    }
+    None
+}
+
 /// Detect the Grok CLI's interactive sign-in prompt. The CLI prints these to
 /// stderr when it can't authenticate non-interactively, then blocks on a local
 /// OAuth callback that never arrives in a headless mission. Matching any of
@@ -14967,12 +15194,12 @@ mod tests {
         replace_filepath_artifact_with_tool_output, resolve_cost_cents_and_source, running_health,
         sanitized_opencode_stdout, set_codex_account_cooldown, stall_severity, strip_ansi_codes,
         strip_opencode_banner_lines, strip_think_tags, summarize_codex_usage_caps,
-        summarize_recent_opencode_stderr, thinking_overlaps_visible_answer,
-        use_thinking_only_fallback, utf8_safe_prefix, ClaudeIncompleteTurnContext,
-        ClaudeTransportFailureStage, ClaudeTransportRecoveryStrategy, ClaudeTurnWaitState,
-        MissionHealth, MissionRunState, MissionStallSeverity, OpencodeSseState,
-        CODEX_AUTH_ERROR_COOLDOWN, CODEX_CAPACITY_COOLDOWN, CODEX_RATE_LIMIT_COOLDOWN,
-        STALL_SEVERE_SECS, STALL_WARN_SECS,
+        summarize_recent_opencode_stderr, text_buffer_stream_looks_degenerate,
+        thinking_overlaps_visible_answer, use_thinking_only_fallback, utf8_safe_prefix,
+        ClaudeIncompleteTurnContext, ClaudeTransportFailureStage, ClaudeTransportRecoveryStrategy,
+        ClaudeTurnWaitState, MissionHealth, MissionRunState, MissionStallSeverity,
+        OpencodeSseState, CODEX_AUTH_ERROR_COOLDOWN, CODEX_CAPACITY_COOLDOWN,
+        CODEX_RATE_LIMIT_COOLDOWN, STALL_SEVERE_SECS, STALL_WARN_SECS,
     };
     use super::{
         extract_telegram_instructions, grok_event_reasoning, grok_event_text, grok_event_usage,
@@ -17706,5 +17933,66 @@ mod tests {
             localhost_api_base_url(Some(" 3000 ")).as_deref(),
             Some("http://127.0.0.1:3000")
         );
+    }
+
+    // ── Degenerate-stream detector ────────────────────────────────
+    //
+    // Reproduces the ab260b2e incident: Claude Code streamed "Yielding
+    // pending your choice." (or similar short repeated string) for 50+ min
+    // before the model hit max_tokens. The detector should fire on a loop
+    // large enough to matter, and NOT fire on a normal response that
+    // happens to contain repeated short strings (e.g. "yes, yes, yes").
+
+    #[test]
+    fn degenerate_detector_flags_long_repeated_phrase() {
+        let phrase = "Yielding pending your choice between the three options. ";
+        let mut s = String::new();
+        for _ in 0..50 {
+            s.push_str(phrase);
+        }
+        assert!(
+            text_buffer_stream_looks_degenerate(&s, 4096, 40, 3),
+            "should detect a 50x repetition of a 50-char phrase"
+        );
+    }
+
+    #[test]
+    fn degenerate_detector_does_not_flag_normal_paragraph() {
+        let s = "I'll first look at the file, then summarize the trade-offs, and finally \
+                 recommend a course of action. The first step is to read the relevant docs.";
+        assert!(
+            !text_buffer_stream_looks_degenerate(s, 4096, 40, 3),
+            "normal prose should not trigger the detector"
+        );
+    }
+
+    #[test]
+    fn degenerate_detector_does_not_flag_short_repetitions() {
+        // "yes, yes, yes" is too short (3 chars) to trigger the 40-char floor.
+        let s = "yes, ".repeat(200);
+        assert!(
+            !text_buffer_stream_looks_degenerate(&s, 4096, 40, 3),
+            "sub-threshold repetitions must not trigger the detector"
+        );
+    }
+
+    #[test]
+    fn degenerate_detector_does_not_flag_insufficient_repeats() {
+        // 40-char phrase repeated only 2x; min_repeats is 3.
+        let phrase = "Yielding pending your choice between the three. ";
+        let s = format!("{phrase}{phrase}{phrase}");
+        // Now 3x of a 50-char phrase, so should trigger.
+        assert!(text_buffer_stream_looks_degenerate(&s, 4096, 40, 3));
+        // But only 2x should not.
+        let s2 = format!("{phrase}{phrase}");
+        assert!(!text_buffer_stream_looks_degenerate(&s2, 4096, 40, 3));
+    }
+
+    #[test]
+    fn degenerate_detector_handles_partial_window() {
+        // Long, normal answer followed by a degenerate tail.
+        let mut s = String::from("Here is the plan: A, B, C. We should pick B. ");
+        s.push_str(&"Yielding pending your choice. ".repeat(20));
+        assert!(text_buffer_stream_looks_degenerate(&s, 4096, 40, 3));
     }
 }
