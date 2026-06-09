@@ -83,6 +83,11 @@ export {
   buildWorkspace,
   getWorkspaceDebug,
   getWorkspaceInitLog,
+  type WorkspaceMemoryStats,
+  getWorkspaceMemory,
+  type UpdateWorkspaceResourcesRequest,
+  type UpdateWorkspaceResourcesResponse,
+  updateWorkspaceResources,
 } from "./workspaces";
 
 // Providers

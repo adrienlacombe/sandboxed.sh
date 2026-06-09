@@ -6739,6 +6739,7 @@ fn spawn_control_session(
             state.cmd_tx.clone(),
             events_tx.clone(),
             Arc::clone(&tool_hub),
+            workspaces.clone(),
         ));
         tokio::spawn(ack_promotion_loop(
             Arc::clone(&state.mission_store),
@@ -7072,6 +7073,7 @@ async fn stuck_mission_watchdog_loop(
     cmd_tx: mpsc::Sender<ControlCommand>,
     events_tx: broadcast::Sender<AgentEvent>,
     tool_hub: Arc<FrontendToolHub>,
+    workspaces: workspace::SharedWorkspaceStore,
 ) {
     use std::collections::HashSet;
 
@@ -7082,6 +7084,11 @@ async fn stuck_mission_watchdog_loop(
         STUCK_SECONDS,
         CHECK_INTERVAL.as_secs()
     );
+
+    // Last seen `oom_kill` counter per scope unit; an increase means the
+    // kernel killed something inside a mission's memory cgroup since the
+    // previous tick. Entries for dead scopes are pruned each pass.
+    let mut oom_seen: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
 
     loop {
         tokio::time::sleep(CHECK_INTERVAL).await;
@@ -7113,6 +7120,20 @@ async fn stuck_mission_watchdog_loop(
         };
 
         let running_ids: HashSet<Uuid> = running_list.iter().map(|info| info.mission_id).collect();
+
+        // OOM surveillance: surface kernel `oom_kill` events from mission
+        // memory cgroups as mission activity. Without this, a build killed
+        // by its memory cap looks like a silent tool failure and agents
+        // retry it in a loop instead of adapting (lower parallelism) or
+        // requesting a cap boost.
+        check_mission_oom_kills(
+            &workspaces,
+            &active_missions,
+            &running_ids,
+            &mut oom_seen,
+            &events_tx,
+        )
+        .await;
 
         // Case 1 — actor reports the mission running but stalled past
         // threshold. Cancel via the actor (clean shutdown) and mark
@@ -7217,6 +7238,125 @@ async fn stuck_mission_watchdog_loop(
                 ),
             });
         }
+    }
+}
+
+/// Read the kernel `oom_kill` counter from a scope unit's `memory.events`.
+/// Returns `None` when the unit/cgroup is gone or unreadable.
+async fn read_scope_oom_kills(unit: &str) -> Option<u64> {
+    let output = tokio::process::Command::new("systemctl")
+        .args(["show", unit, "-p", "ControlGroup", "--value"])
+        .output()
+        .await
+        .ok()?;
+    let cgroup = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if cgroup.is_empty() {
+        return None;
+    }
+    let path = format!("/sys/fs/cgroup{cgroup}/memory.events");
+    let content = tokio::fs::read_to_string(path).await.ok()?;
+    content.lines().find_map(|line| {
+        line.strip_prefix("oom_kill ")
+            .and_then(|v| v.trim().parse::<u64>().ok())
+    })
+}
+
+/// Detect `oom_kill` increases in running missions' memory cgroups and
+/// surface them on the mission event stream. One pass per watchdog tick.
+async fn check_mission_oom_kills(
+    workspaces: &workspace::SharedWorkspaceStore,
+    active_missions: &[crate::api::mission_store::Mission],
+    running_ids: &std::collections::HashSet<Uuid>,
+    oom_seen: &mut std::collections::HashMap<String, u64>,
+    events_tx: &broadcast::Sender<AgentEvent>,
+) {
+    let mut live_units: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // Whether we got a complete picture of live scopes this tick. A failed
+    // workspace lookup or `list-units` means some scopes couldn't be
+    // enumerated, so we must not prune `oom_seen` (see the retain below).
+    let mut enumeration_complete = true;
+
+    // Scopes are workspace-level and shared by every mission running in the
+    // same container, while `oom_seen` is keyed by unit. Group missions by
+    // workspace so each unit's OOM delta is consumed once per tick and the
+    // alert fans out to *all* missions on that workspace — otherwise the
+    // first mission would absorb the delta and its siblings would never see
+    // the OOM signal.
+    let mut missions_by_workspace: std::collections::HashMap<Uuid, Vec<Uuid>> =
+        std::collections::HashMap::new();
+    for mission in active_missions
+        .iter()
+        .filter(|m| running_ids.contains(&m.id))
+    {
+        missions_by_workspace
+            .entry(mission.workspace_id)
+            .or_default()
+            .push(mission.id);
+    }
+
+    for (workspace_id, mission_ids) in &missions_by_workspace {
+        let Some(workspace) = workspaces.get(*workspace_id).await else {
+            enumeration_complete = false;
+            continue;
+        };
+        let units = match crate::api::workspaces::list_workspace_scope_units(&workspace).await {
+            Ok(units) => units,
+            Err(e) => {
+                tracing::warn!(
+                    "OOM watchdog: could not list scopes for {}: {}",
+                    workspace.name,
+                    e
+                );
+                enumeration_complete = false;
+                continue;
+            }
+        };
+        for unit in units {
+            // The unit was listed, so it's alive: record it now so a transient
+            // `memory.events` read failure below doesn't drop its baseline and
+            // cause the cumulative oom_kill total to be re-reported as new.
+            live_units.insert(unit.clone());
+            let Some(count) = read_scope_oom_kills(&unit).await else {
+                continue;
+            };
+            // Treat a never-seen scope as a baseline of 0 so the first kernel
+            // OOM in a freshly-discovered cgroup is reported rather than
+            // silently absorbed into the baseline (e.g. when the watchdog
+            // starts after a scope already accumulated kills).
+            let prev = oom_seen.get(&unit).copied().unwrap_or(0);
+            if count > prev {
+                let killed = count - prev;
+                tracing::warn!(
+                    "Memory watchdog: {} OOM kill(s) in {} (workspace {}, {} mission(s))",
+                    killed,
+                    unit,
+                    workspace.name,
+                    mission_ids.len()
+                );
+                for mission_id in mission_ids {
+                    let _ = events_tx.send(AgentEvent::MissionActivity {
+                        label: format!(
+                            "⚠ Memory limit hit: kernel OOM-killed {killed} process(es) in this \
+                             mission's cgroup. Builds should lower parallelism, or raise the \
+                             workspace memory cap (Resources panel / MISSION_MEMORY_MAX)."
+                        ),
+                        tool_name: "memory_watchdog".to_string(),
+                        mission_id: Some(*mission_id),
+                    });
+                }
+            }
+            oom_seen.insert(unit, count);
+        }
+    }
+
+    // Drop counters for scopes that no longer exist so the map can't grow
+    // unboundedly across weeks of uptime — but only when we fully enumerated
+    // live scopes this tick. If any workspace failed to enumerate, pruning
+    // would drop a still-live scope's baseline and re-emit its cumulative
+    // oom_kill total as new kills on the next successful read. Skip pruning
+    // for this tick; it self-heals on the next clean pass.
+    if enumeration_complete {
+        oom_seen.retain(|unit, _| live_units.contains(unit));
     }
 }
 
