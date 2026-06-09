@@ -967,22 +967,50 @@ impl AssistantMcp {
             .json()
             .await
             .map_err(|error| format!("Failed to parse resumed mission: {error}"))?;
-        if let Some(content) = hint {
-            self.send_message(SendMessageParams {
-                mission_id: id.to_string(),
-                content,
-            })
-            .await?;
-        }
-        Ok(json!({ "mission": compact_mission_summary(mission), "steered": has_hint }))
+        // If we have a steering hint, deliver it as the next turn. If the post
+        // fails, the mission is already active — surface that as a soft warning
+        // (not an error) so the caller knows resume succeeded but the hint did
+        // not land. They can retry the hint without re-resuming.
+        let steer_warning = if let Some(content) = hint {
+            match self
+                .send_message(SendMessageParams {
+                    mission_id: id.to_string(),
+                    content,
+                })
+                .await
+            {
+                Ok(_) => None,
+                Err(error) => Some(format!(
+                    "Mission resumed, but steering hint could not be delivered: {error}. \
+                     The mission is already active; retry send_message_to_mission to land \
+                     the hint."
+                )),
+            }
+        } else {
+            None
+        };
+        let response_body = json!({
+            "mission": compact_mission_summary(mission),
+            "steered": has_hint && steer_warning.is_none(),
+            "steer_warning": steer_warning,
+        });
+        Ok(response_body)
     }
 
     /// Fetch the live runner entry for one mission from `/api/control/running`,
     /// or `Value::Null` if the mission is not currently running (idle/finished).
+    ///
+    /// Network failures and 5xx responses are propagated as `Err` so callers can
+    /// surface them — masking them as "not running" would make a stalled but
+    /// still-active mission look healthy.
     async fn find_running_info(&self, mission_id: &Uuid) -> Result<Value, String> {
         let response = self.api_get("/api/control/running").await?;
         if !response.status().is_success() {
-            return Ok(Value::Null);
+            let status = response.status();
+            let text = response.text().await.unwrap_or_default();
+            return Err(format!(
+                "Failed to fetch live runner state ({status}): {text}"
+            ));
         }
         let running: Value = response
             .json()
@@ -1038,7 +1066,15 @@ impl AssistantMcp {
             .and_then(Value::as_str)
             .unwrap_or("unknown")
             .to_string();
-        let live = self.find_running_info(&id).await?;
+        // Live runner state is best-effort: a transient API error should not
+        // blind the babysitter to the rest of the health picture. Surface the
+        // error inline so the caller (and the recommendation) can see that
+        // stall/health data is unavailable, rather than silently reporting
+        // "no problems".
+        let (live, live_warning) = match self.find_running_info(&id).await {
+            Ok(live) => (live, None),
+            Err(error) => (Value::Null, Some(error)),
+        };
         let events = self
             .get_mission_events(MissionEventsParams {
                 mission_id: id.to_string(),
@@ -1052,7 +1088,11 @@ impl AssistantMcp {
         let events = events.as_array().unwrap_or(&empty);
         let analysis = analyze_trace_events(events);
         let last_assistant = self.last_assistant_message(&id).await;
-        let recommendation = build_recommendation(&status, &live, &analysis);
+        let mut recommendation = build_recommendation(&status, &live, &analysis);
+        if let Some(warning) = &live_warning {
+            recommendation =
+                format!("{recommendation} (Note: live runner state unavailable — {warning})");
+        }
         Ok(json!({
             "mission_id": id.to_string(),
             "title": mission.get("title").cloned().unwrap_or(Value::Null),
@@ -1061,6 +1101,7 @@ impl AssistantMcp {
             "model_override": mission.get("model_override").cloned().unwrap_or(Value::Null),
             "model_effort": mission.get("model_effort").cloned().unwrap_or(Value::Null),
             "live": live,
+            "live_warning": live_warning,
             "signals": analysis.signals_json(),
             "recent_errors": analysis.recent_errors,
             "suspected_loop": analysis.loop_json(),
@@ -1512,14 +1553,20 @@ fn build_recommendation(status: &str, live: &Value, analysis: &TraceAnalysis) ->
         );
     }
 
-    if matches!(
-        status,
-        "interrupted" | "blocked" | "failed" | "not_feasible"
-    ) {
+    // Only interrupted/blocked/failed are resumable server-side (see
+    // `mission_can_be_resumed` in src/api/control.rs). The other idle
+    // statuses need a different intervention.
+    if matches!(status, "interrupted" | "blocked" | "failed") {
         return format!(
             "Mission is idle in status '{status}'. If the goal isn't done, resume_mission with a \
              hint to keep going (e.g. 'you still have budget — continue until done, don't stop to ask')."
         );
+    }
+    if status == "not_feasible" {
+        return "Mission concluded the goal is not feasible as specified. This status is not \
+                resumable — review the last assistant message, adjust the prompt/goal, and start \
+                a new mission or send_message_to_mission once the task is reframed."
+            .to_string();
     }
     if matches!(status, "awaiting_user" | "acknowledged") {
         return "Mission finished its turn and is waiting. If the goal isn't fully done, nudge it \
@@ -1783,6 +1830,35 @@ mod tests {
         });
         let rec = build_recommendation("active", &live, &analysis);
         assert!(rec.contains("stalled"));
+    }
+
+    #[test]
+    fn recommendation_does_not_recommend_resume_for_not_feasible() {
+        // not_feasible is not resumable server-side (see mission_can_be_resumed
+        // in src/api/control.rs). The recommendation must steer the babysitter
+        // away from calling resume_mission, otherwise it gets a hard failure.
+        let analysis = TraceAnalysis::default();
+        let rec = build_recommendation("not_feasible", &Value::Null, &analysis);
+        assert!(
+            !rec.contains("resume_mission with a hint"),
+            "recommendation must not suggest resume_mission for not_feasible, got: {rec}"
+        );
+        assert!(
+            rec.contains("not feasible") || rec.contains("not_feasible"),
+            "recommendation should explain the status, got: {rec}"
+        );
+    }
+
+    #[test]
+    fn recommendation_still_recommends_resume_for_resumable_statuses() {
+        for status in ["interrupted", "blocked", "failed"] {
+            let analysis = TraceAnalysis::default();
+            let rec = build_recommendation(status, &Value::Null, &analysis);
+            assert!(
+                rec.contains("resume_mission"),
+                "expected resume_mission recommendation for status {status}, got: {rec}"
+            );
+        }
     }
 
     #[test]
