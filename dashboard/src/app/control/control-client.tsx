@@ -16,11 +16,7 @@ import { useVirtualizer } from "@tanstack/react-virtual";
 import dynamic from "next/dynamic";
 import { useSearchParams, useRouter } from "next/navigation";
 import { toast } from "@/components/toast";
-import {
-  MarkdownContent,
-  LazyMarkdownContent,
-} from "@/components/markdown-content";
-import { StreamingMarkdown } from "@/components/streaming-markdown";
+import { LazyMarkdownContent } from "@/components/markdown-content";
 import {
   EnhancedInput,
   type SubmitPayload,
@@ -51,18 +47,25 @@ import {
   controlAskStore,
   type StreamDiagnosticsState,
 } from "./control-stores";
-import { NowTickProvider, useNow } from "@/lib/now-tick";
+import { createMissionStream, streamLog } from "./transport/connection";
+import {
+  formatDuration,
+  LiveDuration,
+  Shimmer,
+  missionStatusLabel,
+  missionStatusDotClass,
+  type SidePanelItem,
+} from "./components/common";
+import { SharedFileCard } from "./components/SharedFiles";
+import { ThinkingGroupItem, ThinkingPanel } from "./components/ThinkingPanel";
+import { MissionWorkbenchPanel } from "./components/MissionWorkbenchPanel";
+import { NowTickProvider } from "@/lib/now-tick";
 import { startHealthBudgetWatcher } from "@/lib/health-budget";
-import { LazyCodeBlock } from "@/components/lazy-code-block";
 import { LazyJsonHighlighter } from "@/components/lazy-json-highlighter";
 import { cn } from "@/lib/utils";
 import { getMissionShortName } from "@/lib/mission-display";
 import { inferMissionRole } from "@/lib/mission-role";
-import {
-  getMissionDotColor,
-  getMissionTitle,
-  isFinishedStatus,
-} from "@/lib/mission-status";
+import { getMissionTitle, isFinishedStatus } from "@/lib/mission-status";
 import { getRuntimeApiBase } from "@/lib/settings";
 import { authHeader } from "@/lib/auth";
 import { stripRichFileTagsByName } from "@/lib/rich-tags";
@@ -71,7 +74,6 @@ import {
   cancelControl,
   postControlMessage,
   postControlToolResult,
-  streamControl,
   loadMission,
   markMissionOpened,
   getMission,
@@ -154,7 +156,6 @@ import {
   Wrench,
   Terminal,
   FileText,
-  Eye,
   Search,
   Globe,
   Code,
@@ -166,16 +167,11 @@ import {
   PanelRight,
   WifiOff,
   AlertTriangle,
-  Download,
   Image as ImageIcon,
-  FileArchive,
   File,
   ExternalLink,
   MessageSquare,
-  Clipboard,
   BriefcaseBusiness,
-  Inbox,
-  Flag,
   Pencil,
   MoreVertical,
   Sparkles,
@@ -377,31 +373,6 @@ function removeOutboxEntry(missionId: string, id: string): void {
   writeOutbox(map);
 }
 
-type StreamLogLevel = "debug" | "info" | "warn" | "error";
-
-function streamLog(
-  level: StreamLogLevel,
-  message: string,
-  meta?: Record<string, unknown>,
-) {
-  const prefix = "[control:sse]";
-  const args = meta ? [prefix, message, meta] : [prefix, message];
-  switch (level) {
-    case "debug":
-      console.debug(...args);
-      break;
-    case "info":
-      console.info(...args);
-      break;
-    case "warn":
-      console.warn(...args);
-      break;
-    case "error":
-      console.error(...args);
-      break;
-  }
-}
-
 function formatMissionDocumentTitle(mission: Mission | null | undefined) {
   if (!mission) return DEFAULT_DOCUMENT_TITLE;
   const title = getMissionTitle(mission, {
@@ -550,7 +521,6 @@ import {
 } from "@/components/mission-switcher";
 import { WorkersStrip } from "@/components/workers-strip";
 import type { SubagentEntry } from "@/components/subagents-panel";
-import { RelativeTime } from "@/components/ui/relative-time";
 
 const DesktopStream = dynamic(() =>
   import("@/components/desktop-stream").then((m) => m.DesktopStream),
@@ -571,7 +541,6 @@ const PerfOverlay = dynamic(() =>
 );
 
 type ToolItem = Extract<ChatItem, { kind: "tool" }>;
-type SidePanelItem = Extract<ChatItem, { kind: "thinking" | "stream" }>;
 
 /**
  * Merge a `getQueue()` snapshot into history items for one mission: mark
@@ -666,15 +635,6 @@ function anchorEventsToRecentConversation(
   return start === 0 ? events : events.slice(start);
 }
 
-// Module-level so all duration consumers share the same implementation.
-function formatDuration(seconds: number): string {
-  if (seconds <= 0) return "<1s";
-  if (seconds < 60) return `${seconds}s`;
-  const mins = Math.floor(seconds / 60);
-  const secs = seconds % 60;
-  return `${mins}m${secs > 0 ? ` ${secs}s` : ""}`;
-}
-
 // Wall-clock (ms) of when this item last "did something" — used to anchor the
 // inline "Agent is working" heartbeat at the most recent event so the timer
 // resets each time a new event lands (healthy agent) and climbs when nothing
@@ -693,23 +653,6 @@ function itemActivityTime(item: ChatItem): number | null {
       return null;
   }
 }
-
-// Renders a live-updating duration string anchored at `startTime`. ONLY this
-// component subscribes to `useNow()`, so the 1 Hz tick re-renders just the
-// active duration cell — not every visible done item/tool card. Wrapping a
-// parent in this child instead of calling `useNow()` directly avoids the
-// per-second commit storm we used to get on the thoughts panel (which can
-// hold hundreds of done items, each one of which was subscribing for a value
-// it never read).
-const LiveDuration = memo(function LiveDuration({
-  startTime,
-}: {
-  startTime: number;
-}) {
-  const nowMs = useNow();
-  const seconds = Math.max(0, Math.floor((nowMs - startTime) / 1000));
-  return <>{formatDuration(seconds)}</>;
-});
 
 /**
  * Returns the previous reference when `arr` is element-wise `Object.is` to
@@ -1442,64 +1385,6 @@ function statusLabel(state: ControlRunState): {
   return { label: "Idle", Icon: Clock, className: "text-white/40" };
 }
 
-function missionStatusLabel(
-  status: MissionStatus,
-  isRunning = false,
-): {
-  label: string;
-  className: string;
-} {
-  if (isRunning) {
-    return { label: "Running", className: "bg-indigo-500/20 text-indigo-400" };
-  }
-
-  switch (status) {
-    case "pending":
-      return { label: "Pending", className: "bg-zinc-500/20 text-zinc-400" };
-    case "active":
-      return { label: "Active", className: "bg-indigo-500/20 text-indigo-400" };
-    case "awaiting_user":
-      return {
-        label: "Needs You",
-        className: "bg-amber-500/20 text-amber-400",
-      };
-    case "acknowledged":
-      return {
-        label: "Acknowledged",
-        className: "bg-emerald-500/20 text-emerald-400",
-      };
-    case "completed":
-      return {
-        label: "Completed",
-        className: "bg-emerald-500/20 text-emerald-400",
-      };
-    case "failed":
-      return { label: "Failed", className: "bg-red-500/20 text-red-400" };
-    case "interrupted":
-      return {
-        label: "Interrupted",
-        className: "bg-amber-500/20 text-amber-400",
-      };
-    case "blocked":
-      return {
-        label: "Blocked",
-        className: "bg-orange-500/20 text-orange-400",
-      };
-    case "not_feasible":
-      return {
-        label: "Not Feasible",
-        className: "bg-rose-500/20 text-rose-400",
-      };
-  }
-}
-
-function missionStatusDotClass(
-  status: MissionStatus,
-  isRunning = false,
-): string {
-  return getMissionDotColor(status, isRunning);
-}
-
 // Copy button component
 function CopyButton({ text, className }: { text: string; className?: string }) {
   const [, copy] = useCopyToClipboard();
@@ -1533,17 +1418,6 @@ function CopyButton({ text, className }: { text: string; className?: string }) {
         <Copy className="h-3.5 w-3.5" />
       )}
     </button>
-  );
-}
-
-// Shimmer loading effect
-function Shimmer({ className }: { className?: string }) {
-  return (
-    <div className={cn("animate-pulse", className)}>
-      <div className="h-4 bg-white/[0.06] rounded w-3/4 mb-2" />
-      <div className="h-4 bg-white/[0.06] rounded w-1/2 mb-2" />
-      <div className="h-4 bg-white/[0.06] rounded w-5/6" />
-    </div>
   );
 }
 
@@ -1602,463 +1476,6 @@ function ChatLoadingSkeleton() {
   );
 }
 
-function isTextPreviewableSharedFile(file: SharedFile): boolean {
-  const name = (file.name || "").toLowerCase();
-  if (file.content_type.startsWith("text/")) return true;
-  if (
-    file.content_type.includes("json") ||
-    file.content_type.includes("yaml") ||
-    file.content_type.includes("xml")
-  ) {
-    return true;
-  }
-  return (
-    name.endsWith(".txt") ||
-    name.endsWith(".md") ||
-    name.endsWith(".markdown") ||
-    name.endsWith(".log") ||
-    name.endsWith(".json") ||
-    name.endsWith(".yaml") ||
-    name.endsWith(".yml") ||
-    name.endsWith(".toml") ||
-    name.endsWith(".xml") ||
-    name.endsWith(".csv") ||
-    name.endsWith(".tsv")
-  );
-}
-
-function getLanguageFromSharedFile(file: SharedFile): string {
-  const name = (file.name || "").toLowerCase();
-  if (
-    name.endsWith(".md") ||
-    name.endsWith(".markdown") ||
-    file.content_type.includes("markdown")
-  )
-    return "markdown";
-  if (name.endsWith(".json") || file.content_type.includes("json"))
-    return "json";
-  if (
-    name.endsWith(".yaml") ||
-    name.endsWith(".yml") ||
-    file.content_type.includes("yaml")
-  )
-    return "yaml";
-  if (name.endsWith(".xml") || file.content_type.includes("xml")) return "xml";
-  if (name.endsWith(".csv")) return "csv";
-  if (name.endsWith(".tsv")) return "tsv";
-  return "text";
-}
-
-function SharedFilePreviewModal({
-  file,
-  resolvedUrl,
-  isApiUrl,
-  onClose,
-  onDownload,
-}: {
-  file: SharedFile;
-  resolvedUrl: string;
-  isApiUrl: boolean;
-  onClose: () => void;
-  onDownload: () => void;
-}) {
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
-  const [text, setText] = useState<string>("");
-  const [copied, setCopied] = useState(false);
-  const [sizeBytes, setSizeBytes] = useState<number | null>(null);
-
-  const language = useMemo(() => getLanguageFromSharedFile(file), [file]);
-  const isMarkdown = language === "markdown";
-
-  useEffect(() => {
-    const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
-    };
-    document.addEventListener("keydown", onKeyDown);
-    return () => document.removeEventListener("keydown", onKeyDown);
-  }, [onClose]);
-
-  useEffect(() => {
-    let cancelled = false;
-    const run = async () => {
-      setLoading(true);
-      setError(null);
-      setText("");
-      setSizeBytes(null);
-      try {
-        const res = await fetch(resolvedUrl, {
-          headers: isApiUrl ? { ...authHeader() } : undefined,
-        });
-        if (!res.ok) throw new Error(`Failed to load (${res.status})`);
-        const blob = await res.blob();
-        const raw = await blob.text();
-        const limit = 500_000;
-        const finalText =
-          raw.length > limit
-            ? `${raw.slice(0, limit)}\n\n... (file truncated, too large to preview)`
-            : raw;
-        if (!cancelled) {
-          setSizeBytes(blob.size);
-          setText(finalText);
-        }
-      } catch (e) {
-        if (!cancelled) setError(e instanceof Error ? e.message : String(e));
-      } finally {
-        if (!cancelled) setLoading(false);
-      }
-    };
-    void run();
-    return () => {
-      cancelled = true;
-    };
-  }, [isApiUrl, resolvedUrl]);
-
-  const handleCopy = useCallback(async () => {
-    try {
-      await navigator.clipboard.writeText(text);
-      setCopied(true);
-      setTimeout(() => setCopied(false), 2000);
-    } catch {
-      // Ignore.
-    }
-  }, [text]);
-
-  return (
-    <div
-      className="fixed inset-0 z-50 flex items-center justify-center p-4 md:p-8"
-      onClick={(e) => {
-        if (e.target === e.currentTarget) onClose();
-      }}
-    >
-      <div className="absolute inset-0 bg-black/70 backdrop-blur-sm pointer-events-none" />
-      <div
-        onClick={(e) => e.stopPropagation()}
-        className={cn(
-          // Full-page reader (viewport minus padding) so the document clearly
-          // sits over the page instead of reading as a chat-width expansion.
-          "relative flex h-full w-full max-w-6xl flex-col rounded-2xl bg-[#1a1a1a] border border-white/[0.06] shadow-xl",
-          "animate-in fade-in zoom-in-95 duration-200",
-        )}
-      >
-        <div className="flex items-center justify-between px-5 py-4 border-b border-white/[0.06]">
-          <div className="min-w-0">
-            <h3 className="text-sm font-semibold text-white truncate">
-              {file.name}
-            </h3>
-            <p className="text-xs text-white/40 truncate">
-              {file.content_type}
-              {sizeBytes != null && (
-                <span className="ml-2">• {formatBytes(sizeBytes)}</span>
-              )}
-            </p>
-          </div>
-          <div className="flex items-center gap-2 shrink-0 ml-3">
-            {!loading && !error && text && (
-              <button
-                onClick={handleCopy}
-                className="p-1.5 rounded-lg text-white/40 hover:text-white/70 hover:bg-white/[0.08] transition-colors"
-                title={copied ? "Copied" : "Copy"}
-              >
-                {copied ? (
-                  <Check className="h-4 w-4 text-emerald-400" />
-                ) : (
-                  <Copy className="h-4 w-4" />
-                )}
-              </button>
-            )}
-            <button
-              onClick={onDownload}
-              className="p-1.5 rounded-lg text-white/40 hover:text-white/70 hover:bg-white/[0.08] transition-colors"
-              title="Download"
-            >
-              <Download className="h-4 w-4" />
-            </button>
-            <button
-              onClick={onClose}
-              className="p-1.5 rounded-lg text-white/40 hover:text-white/70 hover:bg-white/[0.08] transition-colors"
-              title="Close"
-            >
-              <X className="h-4 w-4" />
-            </button>
-          </div>
-        </div>
-
-        <div className="min-h-0 flex-1 overflow-auto">
-          {loading ? (
-            <div className="p-5">
-              <Shimmer />
-            </div>
-          ) : error ? (
-            <div className="p-5 text-sm text-red-400">{error}</div>
-          ) : isMarkdown ? (
-            <div className="p-5">
-              <MarkdownContent content={text} />
-            </div>
-          ) : (
-            <div className="text-sm">
-              <LazyCodeBlock
-                language={language}
-                showLineNumbers
-                customStyle={{
-                  padding: "1rem",
-                  background: "transparent",
-                  fontSize: "0.8125rem",
-                }}
-              >
-                {text}
-              </LazyCodeBlock>
-            </div>
-          )}
-        </div>
-      </div>
-    </div>
-  );
-}
-
-// Shared file card component - renders images inline and other files as download cards
-function SharedFileCard({ file }: { file: SharedFile }) {
-  const iconMap: Record<SharedFile["kind"], typeof File> = {
-    image: ImageIcon,
-    document: FileText,
-    archive: FileArchive,
-    code: Code,
-    other: File,
-  };
-  const FileIcon = iconMap[file.kind] || File;
-
-  // Format file size
-  const sizeLabel = file.size_bytes ? formatBytes(file.size_bytes) : null;
-
-  const apiBase = getRuntimeApiBase();
-  const isApiRelativeUrl = file.url.startsWith("/");
-  const isApiUrl = isApiRelativeUrl || file.url.startsWith(apiBase);
-  const resolvedUrl = isApiRelativeUrl ? `${apiBase}${file.url}` : file.url;
-  const canPreview = isTextPreviewableSharedFile(file);
-
-  const [blobUrl, setBlobUrl] = useState<string | null>(null);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [previewOpen, setPreviewOpen] = useState(false);
-
-  // If this is an API-protected image, fetch it with auth and render from an object URL.
-  useEffect(() => {
-    if (file.kind !== "image") return;
-    if (!isApiUrl) return; // External URLs can be loaded directly by the browser.
-
-    let cancelled = false;
-    let localUrl: string | null = null;
-
-    const run = async () => {
-      setLoading(true);
-      setError(null);
-      try {
-        const res = await fetch(resolvedUrl, { headers: { ...authHeader() } });
-        if (!res.ok) throw new Error(`Failed to load image (${res.status})`);
-        const blob = await res.blob();
-        localUrl = URL.createObjectURL(blob);
-        if (!cancelled) setBlobUrl(localUrl);
-      } catch (e) {
-        if (!cancelled) setError(e instanceof Error ? e.message : String(e));
-      } finally {
-        if (!cancelled) setLoading(false);
-      }
-    };
-
-    void run();
-    return () => {
-      cancelled = true;
-      if (localUrl) URL.revokeObjectURL(localUrl);
-    };
-  }, [file.kind, isApiUrl, resolvedUrl]);
-
-  const handleDownload = useCallback(async () => {
-    setLoading(true);
-    setError(null);
-    try {
-      // If URL is external, let the browser handle it.
-      if (!isApiUrl) {
-        window.open(resolvedUrl, "_blank", "noopener,noreferrer");
-        return;
-      }
-
-      const res = await fetch(resolvedUrl, { headers: { ...authHeader() } });
-      if (!res.ok) throw new Error(`Download failed (${res.status})`);
-      const blob = await res.blob();
-      const url = URL.createObjectURL(blob);
-      try {
-        const a = document.createElement("a");
-        a.href = url;
-        a.download = file.name || "download";
-        document.body.appendChild(a);
-        a.click();
-        document.body.removeChild(a);
-      } finally {
-        URL.revokeObjectURL(url);
-      }
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setLoading(false);
-    }
-  }, [file.name, isApiUrl, resolvedUrl]);
-
-  const handleOpen = useCallback(() => {
-    if (file.kind === "image" && blobUrl) {
-      window.open(blobUrl, "_blank", "noopener,noreferrer");
-      return;
-    }
-    if (!isApiUrl) {
-      window.open(resolvedUrl, "_blank", "noopener,noreferrer");
-      return;
-    }
-    // For API URLs we can't open directly without headers; download instead.
-    void handleDownload();
-  }, [blobUrl, file.kind, handleDownload, isApiUrl, resolvedUrl]);
-
-  if (file.kind === "image") {
-    // Render images inline (supports auth-protected API URLs).
-    return (
-      <div className="mt-3 rounded-lg overflow-hidden border border-white/[0.06] bg-black/20">
-        <button
-          type="button"
-          onClick={handleOpen}
-          className="block w-full text-left"
-        >
-          {loading && !blobUrl ? (
-            <div className="h-[240px] w-full animate-pulse bg-white/[0.03]" />
-          ) : (
-            <>
-              {/* eslint-disable-next-line @next/next/no-img-element */}
-              <img
-                src={blobUrl || resolvedUrl}
-                alt={file.name}
-                className="max-w-full max-h-[400px] object-contain"
-                loading="lazy"
-              />
-            </>
-          )}
-        </button>
-        <div className="flex items-center gap-2 px-3 py-2 text-xs text-white/40 border-t border-white/[0.06]">
-          <ImageIcon aria-hidden="true" className="h-3 w-3" />
-          <span className="truncate flex-1">{file.name}</span>
-          {sizeLabel && <span>{sizeLabel}</span>}
-          <button
-            type="button"
-            onClick={handleOpen}
-            className="text-indigo-400 hover:text-indigo-300 flex items-center gap-1"
-            title="Open"
-            aria-label="Open"
-          >
-            <ExternalLink className="h-3 w-3" />
-          </button>
-          <button
-            type="button"
-            onClick={handleDownload}
-            className="text-indigo-400 hover:text-indigo-300 flex items-center gap-1"
-            title="Download"
-            aria-label="Download"
-            disabled={loading}
-          >
-            <Download className={cn("h-3 w-3", loading && "animate-pulse")} />
-          </button>
-        </div>
-        {error && <div className="px-3 pb-2 text-xs text-red-400">{error}</div>}
-      </div>
-    );
-  }
-
-  // Render other files as cards (download always, preview for text/markdown)
-  return (
-    <>
-      <div
-        className={cn(
-          "mt-3 flex items-center gap-3 px-4 py-3 rounded-lg border border-white/[0.06] bg-white/[0.02] hover:bg-white/[0.04] transition-colors group",
-          canPreview && "cursor-pointer",
-        )}
-        onClick={() => {
-          if (canPreview) setPreviewOpen(true);
-        }}
-        role={canPreview ? "button" : undefined}
-        tabIndex={canPreview ? 0 : undefined}
-        onKeyDown={(e) => {
-          if (!canPreview) return;
-          if (e.key === "Enter" || e.key === " ") {
-            e.preventDefault();
-            setPreviewOpen(true);
-          }
-        }}
-      >
-        <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-indigo-500/10">
-          <FileIcon className="h-5 w-5 text-indigo-400" />
-        </div>
-        <div className="flex-1 min-w-0">
-          <div className="font-medium text-sm text-white/80 truncate">
-            {file.name}
-          </div>
-          <div className="text-xs text-white/40 flex items-center gap-2">
-            <span className="truncate">{file.content_type}</span>
-            {sizeLabel && (
-              <>
-                <span>•</span>
-                <span>{sizeLabel}</span>
-              </>
-            )}
-          </div>
-          {error && <div className="mt-1 text-xs text-red-400">{error}</div>}
-        </div>
-
-        {canPreview && (
-          <button
-            type="button"
-            onClick={(e) => {
-              e.stopPropagation();
-              setPreviewOpen(true);
-            }}
-            className="p-2 rounded-md text-white/30 group-hover:text-indigo-400 hover:bg-white/[0.06] transition-colors"
-            title="Preview"
-            aria-label="Preview"
-            disabled={loading}
-          >
-            <Eye className={cn("h-4 w-4", loading && "animate-pulse")} />
-          </button>
-        )}
-
-        <button
-          type="button"
-          onClick={(e) => {
-            e.stopPropagation();
-            void handleDownload();
-          }}
-          className="p-2 rounded-md text-white/30 group-hover:text-indigo-400 hover:bg-white/[0.06] transition-colors"
-          title="Download"
-          aria-label="Download"
-          disabled={loading}
-        >
-          <Download className={cn("h-4 w-4", loading && "animate-pulse")} />
-        </button>
-      </div>
-
-      {/* Portal to body: the card lives inside a virtualized row positioned
-          with transform:translateY, which would otherwise trap the modal's
-          position:fixed and render it inside the conversation. */}
-      {previewOpen &&
-        canPreview &&
-        typeof document !== "undefined" &&
-        createPortal(
-          <SharedFilePreviewModal
-            file={file}
-            resolvedUrl={resolvedUrl}
-            isApiUrl={isApiUrl}
-            onClose={() => setPreviewOpen(false)}
-            onDownload={() => void handleDownload()}
-          />,
-          document.body,
-        )}
-    </>
-  );
-}
-
 // Phase indicator - shows what the agent is doing during preparation
 function PhaseItem({ item }: { item: Extract<ChatItem, { kind: "phase" }> }) {
   const phaseLabels: Record<string, { label: string; icon: typeof Brain }> = {
@@ -2100,887 +1517,6 @@ function PhaseItem({ item }: { item: Extract<ChatItem, { kind: "phase" }> }) {
 }
 
 // Thinking group component - displays multiple thinking items merged with separators
-function ThinkingGroupItem({
-  items,
-  basePath,
-  workspaceId,
-  missionId,
-}: {
-  items: SidePanelItem[];
-  basePath?: string;
-  workspaceId?: string;
-  missionId?: string;
-}) {
-  // Filter out empty items for display
-  const nonEmptyItems = useMemo(
-    () => items.filter((item) => item.content.trim()),
-    [items],
-  );
-
-  const hasActiveItem = items.some((item) => !item.done);
-  // Collapsed by default, including while active: the transcript shows one
-  // compact pill ("Thinking for 12s") that matches the tool-call rows'
-  // height, instead of auto-expanding into a tall content card. Live
-  // reasoning is one click away here or in the Thinking side panel.
-  const [expanded, setExpanded] = useState(false);
-
-  // Get the earliest start time and latest end time
-  const startTime = Math.min(...items.map((item) => item.startTime));
-  const endTime = items.every((item) => item.done && item.endTime)
-    ? Math.max(...items.map((item) => item.endTime || item.startTime))
-    : undefined;
-
-  // Only the active branch ticks once per second via `<LiveDuration>`.
-  // When the group is fully done, we render a fixed string and never
-  // subscribe to `useNow()`.
-  const doneDuration =
-    !hasActiveItem && endTime
-      ? formatDuration(Math.floor((endTime - startTime) / 1000))
-      : null;
-
-  // Nothing to show only when there is no content AND nothing in flight.
-  // An active group with still-empty content keeps its liveness pill —
-  // previously it rendered nothing, which also suppressed the "Agent is
-  // working" pill and left a dead gap in the transcript.
-  if (nonEmptyItems.length === 0 && !hasActiveItem) {
-    return null;
-  }
-
-  const label = (() => {
-    const hasStream = nonEmptyItems.some((item) => item.kind === "stream");
-    const hasThinking = nonEmptyItems.some((item) => item.kind === "thinking");
-    if (hasStream && !hasThinking) {
-      return nonEmptyItems.length === 1 ? "Draft" : "Drafts";
-    }
-    return nonEmptyItems.length === 1 ? "Thought" : "Thoughts";
-  })();
-
-  const activeLabel = (() => {
-    if (items.some((item) => !item.done && item.kind === "thinking")) {
-      return "Thinking";
-    }
-    if (items.some((item) => !item.done && item.kind === "stream")) {
-      return "Streaming";
-    }
-    return "Thinking";
-  })();
-
-  return (
-    <div className="my-2">
-      {/* Compact header */}
-      <button
-        onClick={() => setExpanded(!expanded)}
-        className={cn(
-          "flex items-center gap-1.5 px-2.5 py-1 rounded-full",
-          "bg-white/[0.04] border border-white/[0.06]",
-          "text-white/40 hover:text-white/60 hover:bg-white/[0.06]",
-          "transition-all duration-200",
-        )}
-      >
-        <Brain
-          className={cn(
-            "h-3 w-3",
-            hasActiveItem && "animate-pulse text-indigo-400",
-          )}
-        />
-        <span className="text-xs">
-          {hasActiveItem ? (
-            <>
-              {activeLabel} for <LiveDuration startTime={startTime} />
-            </>
-          ) : (
-            `${label} for ${doneDuration ?? "<1s"}`
-          )}
-        </span>
-        {nonEmptyItems.length > 1 && (
-          <span className="text-xs text-white/30">
-            ({nonEmptyItems.length})
-          </span>
-        )}
-        <ChevronDown
-          className={cn(
-            "h-3 w-3 transition-transform duration-200",
-            expanded ? "rotate-0" : "-rotate-90",
-          )}
-        />
-      </button>
-
-      {/* Expandable content with animation */}
-      <div
-        className={cn(
-          "overflow-hidden transition-all duration-200 ease-out",
-          expanded ? "max-h-[50vh] opacity-100 mt-2" : "max-h-0 opacity-0",
-        )}
-      >
-        <div className="rounded-lg border border-white/[0.06] bg-white/[0.02] p-3">
-          <div className="overflow-y-auto max-h-[45vh] leading-relaxed space-y-2">
-            {nonEmptyItems.map((item, idx) => (
-              <div key={item.id}>
-                {idx > 0 && (
-                  <div className="border-t border-white/[0.06] my-2" />
-                )}
-                {/* Use StreamingMarkdown for efficient incremental rendering */}
-                <StreamingMarkdown
-                  content={item.content}
-                  isStreaming={!item.done}
-                  className="text-xs text-white/60 [&_p]:my-1 [&_ul]:my-1 [&_ol]:my-1"
-                  basePath={basePath}
-                  workspaceId={workspaceId}
-                  missionId={missionId}
-                />
-              </div>
-            ))}
-            {hasActiveItem && nonEmptyItems.length === 0 && (
-              <span className="italic text-white/30">Processing...</span>
-            )}
-          </div>
-        </div>
-      </div>
-    </div>
-  );
-}
-
-// Thinking panel item - simplified version for side panel
-// Threshold for collapsing long thoughts (in characters)
-const THOUGHT_COLLAPSE_THRESHOLD = 800;
-
-const ThinkingPanelItem = memo(function ThinkingPanelItem({
-  item,
-  isActive,
-  basePath,
-  workspaceId,
-  missionId,
-}: {
-  item: SidePanelItem;
-  isActive: boolean;
-  basePath?: string;
-  workspaceId?: string;
-  missionId?: string;
-}) {
-  // P1-#7 / re-render fix: only active items live-tick via `<LiveDuration>`.
-  // Done items render a fixed string and never subscribe to `useNow()`, so
-  // visible done cards no longer commit once per second forever.
-  const [isExpanded, setIsExpanded] = useState(!item.done);
-
-  const doneDuration =
-    item.done && item.endTime
-      ? formatDuration(Math.floor((item.endTime - item.startTime) / 1000))
-      : null;
-
-  const activeLabel = item.kind === "stream" ? "Streaming" : "Thinking";
-  const pastLabel = item.kind === "stream" ? "Draft" : "Thought";
-
-  // For completed items, check if content is long enough to collapse
-  const isLongContent =
-    !isActive && item.content.length > THOUGHT_COLLAPSE_THRESHOLD;
-  const shouldTruncate = isLongContent && !isExpanded;
-
-  // Get truncated content for display
-  const displayContent = shouldTruncate
-    ? item.content.slice(0, THOUGHT_COLLAPSE_THRESHOLD) + "..."
-    : item.content;
-
-  return (
-    <div
-      className={cn(
-        "rounded-lg border p-3",
-        // Unified styling - subtle border highlight for active, same base appearance
-        isActive
-          ? "border-indigo-500/30 bg-white/[0.02]"
-          : "border-white/[0.06] bg-white/[0.02]",
-      )}
-    >
-      <div className="flex items-center gap-2 mb-2">
-        <Brain
-          className={cn(
-            "h-3.5 w-3.5 shrink-0",
-            isActive ? "animate-pulse text-indigo-400" : "text-white/40",
-          )}
-        />
-        <span
-          className={cn(
-            "text-xs font-medium",
-            isActive ? "text-indigo-400" : "text-white/50",
-          )}
-        >
-          {isActive ? (
-            <>
-              {activeLabel} for <LiveDuration startTime={item.startTime} />
-            </>
-          ) : (
-            `${pastLabel} for ${doneDuration ?? "<1s"}`
-          )}
-        </span>
-      </div>
-      {/* Content area - no internal scroll, unified text color */}
-      <div className="text-xs leading-relaxed text-white/60">
-        {item.content ? (
-          <>
-            <StreamingMarkdown
-              content={displayContent}
-              isStreaming={isActive}
-              className="text-xs [&_p]:my-1 [&_ul]:my-1 [&_ol]:my-1"
-              basePath={basePath}
-              workspaceId={workspaceId}
-              missionId={missionId}
-            />
-            {/* Expand/collapse button for long content */}
-            {isLongContent && (
-              <button
-                onClick={() => setIsExpanded(!isExpanded)}
-                className="mt-2 text-[10px] text-indigo-400/70 hover:text-indigo-400 transition-colors flex items-center gap-1"
-              >
-                {isExpanded ? (
-                  <>
-                    <ChevronUp className="h-3 w-3" />
-                    Show less
-                  </>
-                ) : (
-                  <>
-                    <ChevronDown className="h-3 w-3" />
-                    Show more (
-                    {Math.round(
-                      (item.content.length - THOUGHT_COLLAPSE_THRESHOLD) / 100,
-                    ) * 100}
-                    + chars)
-                  </>
-                )}
-              </button>
-            )}
-          </>
-        ) : (
-          <span className="italic text-white/30">Processing...</span>
-        )}
-      </div>
-    </div>
-  );
-});
-
-// Thinking side panel component.
-//
-// `React.memo` short-circuits when props are reference-stable, so the panel
-// no longer re-renders on chat-only updates. The two non-trivial inputs:
-//   - `items`: kept reference-stable upstream via `useStableShallowArray`
-//   - `onClose`: already wrapped in `useCallback`
-// `className` is built from primitive string literals at the call site;
-// `basePath` and `missionId` come from memoized values / the store.
-const ThinkingPanel = memo(function ThinkingPanel({
-  items,
-  onClose,
-  className,
-  basePath,
-  missionId,
-}: {
-  items: SidePanelItem[];
-  onClose: () => void;
-  className?: string;
-  basePath?: string;
-  missionId?: string | null;
-}) {
-  const hasOpenModalOverlay = useCallback((): boolean => {
-    const overlays = Array.from(
-      document.querySelectorAll("body > div.fixed.inset-0"),
-    );
-    return overlays.some((overlay) => {
-      const classText = overlay.className;
-      if (
-        !classText.includes("items-center") &&
-        !classText.includes("items-start")
-      ) {
-        return false;
-      }
-      const zIndex = Number.parseInt(
-        window.getComputedStyle(overlay).zIndex || "0",
-        10,
-      );
-      return Number.isFinite(zIndex) && zIndex >= 50;
-    });
-  }, []);
-
-  const activeItems = useMemo(() => items.filter((t) => !t.done), [items]);
-  const hasActiveThinking = activeItems.some((i) => i.kind === "thinking");
-  const hasActiveStream = activeItems.some((i) => i.kind === "stream");
-
-  // Performance: limit visible thoughts, load more on demand
-  const scrollRef = useRef<HTMLDivElement>(null);
-  const panelRows = useMemo(() => {
-    const seenDoneContent = new Set<string>();
-    return items
-      .filter((item) => {
-        const trimmed = item.content.trim();
-        if (!item.done) return true;
-        if (!trimmed) return false;
-        if (seenDoneContent.has(trimmed)) return false;
-        seenDoneContent.add(trimmed);
-        return true;
-      })
-      .map((item) => ({ item }));
-  }, [items]);
-  const thoughtsAnchorKey = useMemo(
-    () =>
-      panelRows
-        .slice(-8)
-        .map(
-          ({ item }) =>
-            `${item.id}:${item.done ? "done" : "active"}:${item.content.length}`,
-        )
-        .join("|"),
-    [panelRows],
-  );
-  const thoughtsVirtualizer = useVirtualizer({
-    count: panelRows.length,
-    getScrollElement: () => scrollRef.current,
-    getItemKey: (index) => {
-      const row = panelRows[index];
-      if (!row) return index;
-      return row.item.id;
-    },
-    estimateSize: (index) => {
-      const row = panelRows[index];
-      if (!row) return 96;
-      return row.item.kind === "stream" ? 140 : 112;
-    },
-    overscan: 6,
-  });
-  // See `chatVirtualizer` below for rationale.
-  thoughtsVirtualizer.shouldAdjustScrollPositionOnItemSizeChange = () => false;
-  const {
-    isAtBottom: isThoughtsAtBottom,
-    scrollToBottom: scrollThoughtsToBottom,
-  } = useVirtualTimelineAnchor({
-    scrollElementRef: scrollRef,
-    virtualizer: thoughtsVirtualizer,
-    itemCount: panelRows.length,
-    changeKey: thoughtsAnchorKey,
-    resetKey: missionId ?? null,
-  });
-  useEffect(() => {
-    if (panelRows.length > 1) return;
-    const forceBottom = () => {
-      scrollThoughtsToBottom("auto");
-      const el = scrollRef.current;
-      if (el) el.scrollTop = el.scrollHeight;
-    };
-    const frame = requestAnimationFrame(forceBottom);
-    const timeout = window.setTimeout(forceBottom, 250);
-    return () => {
-      cancelAnimationFrame(frame);
-      window.clearTimeout(timeout);
-    };
-  }, [panelRows.length, scrollThoughtsToBottom, thoughtsAnchorKey]);
-
-  // Handle Escape key
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key === "Escape") {
-        if (hasOpenModalOverlay()) return;
-        onClose();
-      }
-    };
-    document.addEventListener("keydown", handleKeyDown);
-    return () => document.removeEventListener("keydown", handleKeyDown);
-  }, [hasOpenModalOverlay, onClose]);
-
-  return (
-    <div
-      className={cn(
-        "w-full h-full flex flex-col rounded-2xl glass-panel border border-white/[0.06] overflow-hidden animate-slide-in-right",
-        className,
-      )}
-    >
-      {/* Header */}
-      <div className="flex items-center justify-between border-b border-white/[0.06] px-4 py-3">
-        <div className="flex items-center gap-2">
-          <Brain
-            className={cn(
-              "h-4 w-4",
-              activeItems.length > 0
-                ? "animate-pulse text-indigo-400"
-                : "text-white/40",
-            )}
-          />
-          <span className="text-sm font-medium text-white">
-            {hasActiveThinking
-              ? "Thinking"
-              : hasActiveStream
-                ? "Streaming"
-                : "Thoughts"}
-          </span>
-          {panelRows.length > 0 && (
-            <span className="text-xs text-white/30">({panelRows.length})</span>
-          )}
-        </div>
-        <button
-          onClick={onClose}
-          className="flex h-6 w-6 items-center justify-center rounded-lg text-white/40 hover:bg-white/[0.04] hover:text-white transition-colors"
-        >
-          <X className="h-3.5 w-3.5" />
-        </button>
-      </div>
-
-      {/* Content - flex-col with overflow, scrolls up for history */}
-      <div
-        ref={scrollRef}
-        data-testid="thoughts-scroll-container"
-        className="relative flex-1 overflow-y-auto p-3"
-      >
-        {items.length === 0 ? (
-          <div className="flex flex-col items-center justify-center h-full text-center p-4">
-            <Brain className="h-8 w-8 text-white/20 mb-3" />
-            <p className="text-sm text-white/40">No thoughts yet</p>
-            <p className="text-xs text-white/30 mt-1">
-              Agent reasoning will appear here
-            </p>
-          </div>
-        ) : (
-          <>
-            <div
-              className="relative w-full"
-              style={{
-                height: `${thoughtsVirtualizer.getTotalSize()}px`,
-                minHeight: "100%",
-              }}
-            >
-              {thoughtsVirtualizer.getVirtualItems().map((virtualRow) => {
-                const row = panelRows[virtualRow.index];
-                if (!row) return null;
-                return (
-                  <div
-                    key={virtualRow.key}
-                    ref={thoughtsVirtualizer.measureElement}
-                    data-index={virtualRow.index}
-                    className="absolute left-0 top-0 w-full pb-3"
-                    style={{
-                      transform: `translateY(${virtualRow.start}px)`,
-                    }}
-                  >
-                    <ThinkingPanelItem
-                      item={row.item}
-                      isActive={!row.item.done}
-                      basePath={basePath}
-                      missionId={missionId ?? undefined}
-                    />
-                  </div>
-                );
-              })}
-            </div>
-            {!isThoughtsAtBottom && (
-              <button
-                type="button"
-                onClick={() => scrollThoughtsToBottom()}
-                className="absolute bottom-3 right-3 inline-flex items-center gap-2 rounded-full border border-white/[0.12] bg-white/90 px-3 py-2 text-xs font-medium text-slate-700 shadow-lg backdrop-blur transition-all hover:bg-white hover:text-slate-950 dark:border-white/[0.1] dark:bg-black/70 dark:text-white/65 dark:hover:bg-white/[0.1] dark:hover:text-white/90"
-                title="Scroll to bottom"
-              >
-                <ArrowDown className="h-4 w-4" />
-                Auto-scroll paused
-              </button>
-            )}
-          </>
-        )}
-      </div>
-    </div>
-  );
-});
-
-function MissionWorkbenchPanel({
-  mission,
-  workspaceLabel,
-  role,
-  isRunning,
-  childMissions,
-  queueLen,
-  onClose,
-  onResume,
-  onCancel,
-  onOpenAutomations,
-  onOpenSwitcher,
-  onViewMission,
-  onSetStatus,
-  onCopyDebug,
-  runSettingsSlot,
-  className,
-}: {
-  mission: Mission | null;
-  workspaceLabel?: string;
-  role: ReturnType<typeof inferMissionRole>;
-  isRunning: boolean;
-  childMissions: Mission[];
-  /** Pending message count, surfaced inline alongside status. */
-  queueLen?: number;
-  onClose: () => void;
-  onResume: () => void;
-  onCancel: (missionId: string) => void;
-  onOpenAutomations: () => void;
-  onOpenSwitcher: () => void;
-  onViewMission: (missionId: string) => void;
-  onSetStatus: (status: MissionStatus) => void | Promise<void>;
-  /** Copy a JSON debug snapshot (mission + stream phase) to the clipboard. */
-  onCopyDebug: () => void | Promise<void>;
-  /**
-   * Optional slot for the mission's run-settings editor (the
-   * `<NewMissionDialog mode="edit">` trigger). Rendered on its own row below
-   * the action grid so the dialog's larger button doesn't break the 2-col
-   * rhythm of the other actions.
-   */
-  runSettingsSlot?: React.ReactNode;
-  className?: string;
-}) {
-  const title =
-    mission?.title?.trim() ||
-    (mission ? getMissionShortName(mission.id) : "No mission selected");
-  const status = mission ? missionStatusLabel(mission.status, isRunning) : null;
-  const canResume =
-    mission &&
-    !isRunning &&
-    mission.resumable &&
-    (mission.status === "interrupted" ||
-      mission.status === "blocked" ||
-      mission.status === "failed");
-
-  // Effective model: an explicit per-mission override wins, otherwise fall
-  // back to the model recorded from the last run's metadata. Strip any
-  // `provider/` prefix for display (matching the assistant message badge) but
-  // keep the full value in the tooltip.
-  const modelOverride = mission?.model_override?.trim() || undefined;
-  const modelRecorded = mission?.metadata_model?.trim() || undefined;
-  const modelRaw = modelOverride || modelRecorded || null;
-  const modelEffort = mission?.model_effort?.trim() || undefined;
-  const modelDisplay = modelRaw
-    ? modelRaw.includes("/")
-      ? modelRaw.split("/").pop()
-      : modelRaw
-    : null;
-
-  const [markAsOpen, setMarkAsOpen] = useState(false);
-  const markAsRef = useRef<HTMLDivElement>(null);
-
-  useEffect(() => {
-    if (!markAsOpen) return;
-    function handlePointerDown(event: MouseEvent) {
-      if (
-        markAsRef.current &&
-        !markAsRef.current.contains(event.target as Node)
-      ) {
-        setMarkAsOpen(false);
-      }
-    }
-    function handleKey(event: KeyboardEvent) {
-      if (event.key === "Escape") setMarkAsOpen(false);
-    }
-    document.addEventListener("mousedown", handlePointerDown);
-    document.addEventListener("keydown", handleKey);
-    return () => {
-      document.removeEventListener("mousedown", handlePointerDown);
-      document.removeEventListener("keydown", handleKey);
-    };
-  }, [markAsOpen]);
-
-  useEffect(() => {
-    setMarkAsOpen(false);
-  }, [mission?.id]);
-
-  return (
-    <aside
-      className={cn(
-        "w-full h-full flex flex-col rounded-2xl glass-panel border border-white/[0.06] overflow-hidden animate-slide-in-right",
-        className,
-      )}
-      aria-label="Mission workbench"
-    >
-      <div className="flex items-center justify-between border-b border-white/[0.06] px-3 py-2">
-        <div className="flex min-w-0 items-center gap-2">
-          <BriefcaseBusiness className="h-3.5 w-3.5 shrink-0 text-indigo-400" />
-          <span className="truncate text-xs font-medium text-white/90">
-            Workbench
-          </span>
-        </div>
-        <button
-          onClick={onClose}
-          className="flex h-5 w-5 items-center justify-center rounded text-white/40 hover:bg-white/[0.04] hover:text-white transition-colors"
-          title="Close workbench"
-        >
-          <X className="h-3 w-3" />
-        </button>
-      </div>
-
-      <div className="min-h-0 flex-1 overflow-y-auto p-2.5 text-xs">
-        {!mission ? (
-          <div className="flex h-full flex-col items-center justify-center text-center">
-            <Inbox className="mb-3 h-8 w-8 text-white/20" />
-            <p className="text-sm text-white/40">
-              Select a mission to inspect.
-            </p>
-            <button
-              onClick={onOpenSwitcher}
-              className="mt-4 rounded-md border border-white/[0.06] bg-white/[0.02] px-2.5 py-1.5 text-xs text-white/70 hover:bg-white/[0.04]"
-            >
-              Open mission switcher
-            </button>
-          </div>
-        ) : (
-          <>
-            <p
-              className="line-clamp-2 text-xs font-medium leading-snug text-white/85"
-              title={title}
-            >
-              {title}
-            </p>
-
-            <dl className="mt-2 space-y-0.5 text-[11px]">
-              <Row label="Status">
-                <span className="flex items-center gap-1.5">
-                  <span
-                    className={cn(
-                      "h-1.5 w-1.5 rounded-full",
-                      missionStatusDotClass(mission.status, isRunning),
-                    )}
-                  />
-                  <span className={cn("font-medium", status?.className)}>
-                    {status?.label}
-                  </span>
-                </span>
-              </Row>
-              {queueLen !== undefined && queueLen > 0 && (
-                <Row label="Queue">
-                  <span
-                    className={cn(
-                      "font-mono tabular-nums",
-                      queueLen >= 3 ? "text-orange-300" : "text-amber-300",
-                    )}
-                  >
-                    {queueLen}
-                  </span>
-                </Row>
-              )}
-              <Row label="Role">
-                <span className="capitalize font-mono text-white/70">
-                  {role ?? "mission"}
-                </span>
-              </Row>
-              <Row label="Model">
-                <span className="flex min-w-0 items-center justify-end gap-1.5">
-                  {modelOverride && (
-                    <span className="shrink-0 text-[10px] font-medium uppercase tracking-wide text-indigo-300/80">
-                      override
-                    </span>
-                  )}
-                  <span
-                    className={cn(
-                      "max-w-[130px] truncate font-mono",
-                      modelDisplay ? "text-white/70" : "text-white/40",
-                    )}
-                    title={
-                      modelRaw
-                        ? modelEffort
-                          ? `${modelRaw} (${modelEffort} effort)`
-                          : modelRaw
-                        : undefined
-                    }
-                  >
-                    {modelDisplay ?? "Default"}
-                  </span>
-                </span>
-              </Row>
-              <Row label="Workspace">
-                <span
-                  className="truncate font-mono text-white/70 max-w-[160px]"
-                  title={workspaceLabel}
-                >
-                  {workspaceLabel ?? "Unassigned"}
-                </span>
-              </Row>
-              <Row label="Updated">
-                <RelativeTime
-                  date={mission.updated_at}
-                  className="font-mono text-white/70"
-                />
-              </Row>
-            </dl>
-
-            {mission.short_description && (
-              <p className="workbench-mission-description mt-2 rounded-md border border-white/[0.05] bg-white/[0.02] px-2 py-1.5 text-[11px] leading-relaxed text-white/50">
-                {mission.short_description}
-              </p>
-            )}
-
-            <div className="mt-3 border-t border-white/[0.06] pt-2.5">
-              <p className="mb-1.5 text-[10px] uppercase tracking-wide text-white/30">
-                Actions
-              </p>
-              <div className="grid grid-cols-2 gap-1.5">
-                {canResume && (
-                  <WorkbenchActionButton
-                    onClick={onResume}
-                    tone="emerald"
-                    icon={RotateCcw}
-                    label="Resume"
-                  />
-                )}
-                {isRunning && (
-                  <WorkbenchActionButton
-                    onClick={() => onCancel(mission.id)}
-                    tone="red"
-                    icon={Square}
-                    label="Stop"
-                  />
-                )}
-                <WorkbenchActionButton
-                  onClick={onOpenAutomations}
-                  icon={Clock}
-                  label="Automations"
-                />
-                <WorkbenchActionButton
-                  onClick={onOpenSwitcher}
-                  icon={Layers}
-                  label="Switch"
-                />
-                <div ref={markAsRef} className="relative">
-                  <button
-                    onClick={() => setMarkAsOpen((prev) => !prev)}
-                    aria-haspopup="menu"
-                    aria-expanded={markAsOpen}
-                    className={cn(
-                      "inline-flex h-7 w-full items-center justify-center gap-1 rounded-md border border-white/[0.06] bg-white/[0.02] px-2 text-[11px] font-medium text-white/70 hover:bg-white/[0.04]",
-                      markAsOpen && "bg-white/[0.06] text-white",
-                    )}
-                  >
-                    <Flag className="h-3 w-3" />
-                    Mark as
-                  </button>
-                  {markAsOpen && (
-                    <div
-                      role="menu"
-                      className="absolute right-0 top-full z-20 mt-1 w-36 overflow-hidden rounded-md border border-white/[0.08] bg-[#1a1a1a] shadow-xl"
-                    >
-                      {(
-                        ["completed", "blocked", "failed"] as MissionStatus[]
-                      ).map((nextStatus) => (
-                        <AsyncButton
-                          key={nextStatus}
-                          role="menuitem"
-                          onClick={async () => {
-                            try {
-                              await onSetStatus(nextStatus);
-                            } finally {
-                              setMarkAsOpen(false);
-                            }
-                          }}
-                          disabled={mission.status === nextStatus}
-                          spinnerClassName="h-3 w-3"
-                          className="flex w-full items-center justify-between gap-2 px-2.5 py-1.5 text-[11px] capitalize text-white/70 transition-colors hover:bg-white/[0.06] disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-transparent"
-                        >
-                          <span>{nextStatus.replace("_", " ")}</span>
-                          {mission.status === nextStatus && (
-                            <CheckCircle className="h-3 w-3 text-white/40" />
-                          )}
-                        </AsyncButton>
-                      ))}
-                    </div>
-                  )}
-                </div>
-                <WorkbenchActionButton
-                  onClick={onCopyDebug}
-                  icon={Clipboard}
-                  label="Copy debug"
-                  title="Copy mission + stream debug info as JSON"
-                />
-              </div>
-              {runSettingsSlot && (
-                <div className="mt-1.5 [&>div]:w-full [&>div>button]:w-full [&>div>button]:justify-center [&>div>button]:h-7 [&>div>button]:px-2 [&>div>button]:py-0 [&>div>button]:text-[11px] [&>div>button]:gap-1 [&>div>button>svg]:h-3 [&>div>button>svg]:w-3 [&>div>button>span]:!inline">
-                  {runSettingsSlot}
-                </div>
-              )}
-            </div>
-
-            {childMissions.length > 0 && (
-              <div className="mt-3 border-t border-white/[0.06] pt-2.5">
-                <div className="mb-1.5 flex items-center justify-between">
-                  <p className="text-[10px] uppercase tracking-wide text-white/30">
-                    Workers
-                  </p>
-                  <span className="text-[10px] tabular-nums text-white/30">
-                    {childMissions.length}
-                  </span>
-                </div>
-                <div className="space-y-0.5">
-                  {childMissions.slice(0, 8).map((child) => (
-                    <button
-                      key={child.id}
-                      onClick={() => onViewMission(child.id)}
-                      className="flex w-full items-center gap-2 rounded px-1.5 py-1 text-left hover:bg-white/[0.04]"
-                    >
-                      <span
-                        className={cn(
-                          "h-1.5 w-1.5 rounded-full shrink-0",
-                          missionStatusDotClass(child.status),
-                        )}
-                      />
-                      <span className="min-w-0 flex-1 truncate text-[11px] text-white/70">
-                        {child.title?.trim() || getMissionShortName(child.id)}
-                      </span>
-                      <ChevronRight className="h-3 w-3 shrink-0 text-white/30" />
-                    </button>
-                  ))}
-                </div>
-              </div>
-            )}
-          </>
-        )}
-      </div>
-    </aside>
-  );
-}
-
-function Row({
-  label,
-  children,
-}: {
-  label: string;
-  children: React.ReactNode;
-}) {
-  return (
-    <div className="flex items-center justify-between gap-2 py-0.5">
-      <dt className="text-white/40">{label}</dt>
-      <dd className="min-w-0">{children}</dd>
-    </div>
-  );
-}
-
-function WorkbenchActionButton({
-  onClick,
-  icon: Icon,
-  label,
-  tone,
-  title,
-}: {
-  onClick: () => void | Promise<void>;
-  icon: React.ComponentType<{ className?: string }>;
-  label: string;
-  tone?: "emerald" | "red";
-  title?: string;
-}) {
-  const toneClasses =
-    tone === "emerald"
-      ? "border-emerald-500/25 bg-emerald-500/10 text-emerald-400 hover:bg-emerald-500/15"
-      : tone === "red"
-        ? "border-red-500/25 bg-red-500/10 text-red-400 hover:bg-red-500/15"
-        : "border-white/[0.06] bg-white/[0.02] text-white/70 hover:bg-white/[0.04]";
-  return (
-    <button
-      type="button"
-      onClick={() => void onClick()}
-      title={title}
-      className={cn(
-        "inline-flex h-7 w-full items-center justify-center gap-1 rounded-md border px-2 text-[11px] font-medium transition-colors",
-        toneClasses,
-      )}
-    >
-      <Icon className="h-3 w-3" />
-      {label}
-    </button>
-  );
-}
-
 // Get icon for tool based on its name
 function ToolIcon({
   toolName,
@@ -6198,7 +4734,10 @@ export default function ControlClient() {
 
       markLoading(true);
       try {
-        const toolEvents = await getMissionToolCallEvents(missionId, toolCallId);
+        const toolEvents = await getMissionToolCallEvents(
+          missionId,
+          toolCallId,
+        );
         lazyToolDetailsRef.current.set(cacheKey, toolEvents);
         if (!applyToolEvents(toolEvents)) {
           markLoading(false);
@@ -7937,15 +6476,11 @@ export default function ControlClient() {
   );
   const streamFlushRafRef = useRef<number | null>(null);
 
-  // Auto-reconnecting stream with exponential backoff
+  // Auto-reconnecting stream with exponential backoff. The connection
+  // lifecycle (connect/teardown, backoff, generation guard) lives in
+  // ./transport/connection.ts; this effect owns event interpretation.
   useEffect(() => {
-    let cleanup: (() => void) | null = null;
-    let reconnectTimeout: ReturnType<typeof setTimeout> | null = null;
-    let reconnectAttempts = 0;
-    let connectionGeneration = 0;
     let mounted = true;
-    const maxReconnectDelay = 30000;
-    const baseDelay = 1000;
 
     // Fetch initial progress for refresh resilience
     getProgress()
@@ -8026,8 +6561,7 @@ export default function ControlClient() {
       }
 
       if (event.type === "status" && isRecord(data)) {
-        const wasReconnecting = reconnectAttempts > 0;
-        reconnectAttempts = 0;
+        const wasReconnecting = stream.markConnected();
 
         // Update connection state to connected
         setConnectionState("connected");
@@ -8910,7 +7444,7 @@ export default function ControlClient() {
           msg.includes("Stream connection failed") ||
           msg.includes("Stream ended")
         ) {
-          scheduleReconnect();
+          stream.scheduleReconnect();
         } else {
           setItems((prev) => [
             ...prev,
@@ -9354,71 +7888,29 @@ export default function ControlClient() {
       }
     };
 
-    const scheduleReconnect = () => {
-      if (!mounted) return;
-      const delay = Math.min(
-        baseDelay * Math.pow(2, reconnectAttempts),
-        maxReconnectDelay,
-      );
-      reconnectAttempts++;
-      streamLog("warn", "reconnect scheduled", {
-        attempt: reconnectAttempts,
-        delayMs: delay,
-      });
-      // Update connection state to show reconnecting indicator
-      setConnectionState("reconnecting");
-      setReconnectAttempt(reconnectAttempts);
-      reconnectTimeout = setTimeout(() => {
-        if (mounted) connect();
-      }, delay);
-    };
-
-    const connect = () => {
-      cleanup?.();
-      const generation = ++connectionGeneration;
-      const missionFilter = viewingMissionIdRef.current ?? undefined;
-      streamLog("info", "connecting stream", { missionFilter });
-      cleanup = streamControl(
-        (event) => {
-          if (generation !== connectionGeneration) return;
-          const data = event.data;
-          const eventMissionId =
-            isRecord(data) && data["mission_id"]
-              ? String(data["mission_id"])
-              : null;
-          if (!missionFilter && viewingMissionIdRef.current && eventMissionId) {
-            return;
-          }
-          handleEvent(event);
-        },
-        handleStreamDiagnostics,
-        {
-          missionId: missionFilter,
-          sinceSeq: missionFilter
-            ? missionMaxSeqRef.current.get(missionFilter)
-            : undefined,
-        },
-      );
-    };
-
-    const initialUrlMission =
-      typeof window !== "undefined"
-        ? new URLSearchParams(window.location.search).get("mission")
-        : null;
-    if (!initialUrlMission || viewingMissionIdRef.current) {
-      connect();
-      streamCleanupRef.current = cleanup;
-    }
+    // `handleEvent` above closes over `stream`; events only arrive
+    // asynchronously, so the handler never observes it unset.
+    const stream = createMissionStream({
+      getMissionFilter: () => viewingMissionIdRef.current,
+      getSinceSeq: (missionId) => missionMaxSeqRef.current.get(missionId),
+      onEvent: handleEvent,
+      onDiagnostics: handleStreamDiagnostics,
+      onReconnecting: (attempt) => {
+        // Update connection state to show reconnecting indicator
+        setConnectionState("reconnecting");
+        setReconnectAttempt(attempt);
+      },
+    });
+    streamCleanupRef.current = () => stream.closeConnection();
     // Expose the reconnect hook so the per-mission switcher effect (below)
     // can tear down the current SSE and open a new one filtered for the
     // freshly-viewed mission. Reading from a ref keeps this effect's deps
     // empty so we don't recycle the SSE on every unrelated render.
-    reconnectStreamRef.current = connect;
+    reconnectStreamRef.current = stream.connect;
 
     return () => {
       mounted = false;
-      if (reconnectTimeout) clearTimeout(reconnectTimeout);
-      cleanup?.();
+      stream.dispose();
       streamCleanupRef.current = null;
       // Clean up thinking debounce timeout
       if (thinkingFlushTimeoutRef.current) {
@@ -10020,9 +8512,7 @@ export default function ControlClient() {
             const missionQueuedMessages = queuedMessages.filter(
               (qm) => qm.mission_id === missionId,
             );
-            const queuedIds = new Set(
-              missionQueuedMessages.map((qm) => qm.id),
-            );
+            const queuedIds = new Set(missionQueuedMessages.map((qm) => qm.id));
             setItems((prev) => {
               let changed = false;
               const next = prev.map((item) => {
@@ -10865,7 +9355,10 @@ export default function ControlClient() {
 
             {/* Stream toggle with display selector - only shown when a streamable session is active */}
             {hasDesktopSession && (
-              <div className="relative flex items-center" data-testid="app-stream-toggle">
+              <div
+                className="relative flex items-center"
+                data-testid="app-stream-toggle"
+              >
                 <button
                   onClick={() => setShowDesktopStream(!showDesktopStream)}
                   className={cn(
@@ -10881,7 +9374,9 @@ export default function ControlClient() {
                   }
                 >
                   <AppWindow className="h-4 w-4" />
-                  <span className="hidden lg:inline">{selectedStreamLabel}</span>
+                  <span className="hidden lg:inline">
+                    {selectedStreamLabel}
+                  </span>
                   {showDesktopStream ? (
                     <PanelRightClose className="h-4 w-4" />
                   ) : (
@@ -10969,7 +9464,9 @@ export default function ControlClient() {
                                       {session.display}
                                     </span>
                                     {" - "}
-                                    {(session.display_server ?? "wayland").toUpperCase()}
+                                    {(
+                                      session.display_server ?? "wayland"
+                                    ).toUpperCase()}
                                     {session.compositor
                                       ? ` / ${session.compositor.toUpperCase()}`
                                       : ""}
@@ -11627,7 +10124,8 @@ export default function ControlClient() {
                       running={isTurnInFlight}
                       onExit={
                         activeMissionId
-                          ? (running) => handleExitGoal(activeMissionId, running)
+                          ? (running) =>
+                              handleExitGoal(activeMissionId, running)
                           : undefined
                       }
                     />
@@ -11806,9 +10304,7 @@ export default function ControlClient() {
             <AskPanel
               missionId={viewingMissionId}
               seed={askSlice.seed}
-              onSeedConsumed={() =>
-                setAskSlice((s) => ({ ...s, seed: null }))
-              }
+              onSeedConsumed={() => setAskSlice((s) => ({ ...s, seed: null }))}
               onClose={() => setShowAskPanel(false)}
               onSendToAgent={(text) => {
                 setInput((prev) => (prev ? `${prev}\n\n${text}` : text));

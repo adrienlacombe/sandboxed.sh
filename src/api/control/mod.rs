@@ -14,6 +14,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
+// Control event/command types (Phase 6 of the decomposition).
+pub mod events;
+pub use events::*;
+
 use axum::{
     body::Bytes,
     extract::{
@@ -34,6 +38,11 @@ use tokio::sync::{broadcast, mpsc, oneshot, Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+#[allow(unused_imports)]
+use super::supervision::{
+    ack_promotion_loop, cleanup_stale_active_missions_once, recover_server_shutdown_missions,
+    stale_mission_cleanup_loop, stuck_mission_watchdog_loop,
+};
 use crate::agents::{AgentContext, AgentRef, TerminalReason};
 use crate::config::Config;
 use crate::mcp::McpRegistry;
@@ -50,26 +59,27 @@ use super::mission_store::{
 };
 use super::routes::AppState;
 
-const SERVER_SHUTDOWN_AUTO_RESUME_MAX_AGE_HOURS: u64 = 48;
+pub(crate) const SERVER_SHUTDOWN_AUTO_RESUME_MAX_AGE_HOURS: u64 = 48;
 const INTERRUPTED_RESUME_PROMPT: &str = "You were interrupted, resume your work.";
 
 /// Silence threshold before declaring a mission stuck. Conservative so
 /// legitimately long codex turns (Lean compiles, CI polls) don't trigger
 /// false positives. Shared between the watchdog loop and the actor's
 /// CancelMission re-check to keep the two views of "stalled" consistent.
-const STUCK_SECONDS: u64 = 900;
+pub(crate) const STUCK_SECONDS: u64 = 900;
 
 /// Grace period after the user first opens an `AwaitingUser` mission before
 /// the ack-promotion tick auto-archives it to `Acknowledged` (Finished).
 /// Resets whenever the user sends a new message (status returns to Active and
 /// `first_viewed_at` is cleared).
-const ACK_GRACE_SECONDS: u64 = 3600;
+pub(crate) const ACK_GRACE_SECONDS: u64 = 3600;
 
 /// How often the ack-promotion tick scans for stale `AwaitingUser` missions.
-const ACK_PROMOTION_TICK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+pub(crate) const ACK_PROMOTION_TICK_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(60);
 
 /// Returns a safe index to truncate a string at, ensuring we don't cut UTF-8 characters.
-pub(super) fn safe_truncate_index(s: &str, max: usize) -> usize {
+pub(crate) fn safe_truncate_index(s: &str, max: usize) -> usize {
     if s.len() <= max {
         return s.len();
     }
@@ -2056,7 +2066,7 @@ fn status_requires_metadata_milestone_refresh(status: MissionStatus) -> bool {
     !matches!(status, MissionStatus::Pending | MissionStatus::Active)
 }
 
-fn maybe_schedule_mission_metadata_refresh_for_status(
+pub(crate) fn maybe_schedule_mission_metadata_refresh_for_status(
     mission_store: &Arc<dyn MissionStore>,
     events_tx: &broadcast::Sender<AgentEvent>,
     mission_id: Uuid,
@@ -2678,514 +2688,6 @@ async fn validate_rich_tags(
         files.push(SharedFile::new(display_name, url, content_type, size));
     }
     files
-}
-
-/// A structured event emitted by the control session.
-#[derive(Debug, Clone, Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum AgentEvent {
-    Status {
-        state: ControlRunState,
-        queue_len: usize,
-        /// Mission this status applies to (for parallel execution)
-        #[serde(skip_serializing_if = "Option::is_none")]
-        mission_id: Option<Uuid>,
-    },
-    UserMessage {
-        id: Uuid,
-        content: String,
-        /// Whether this message is queued (not yet being processed).
-        #[serde(default)]
-        queued: bool,
-        /// Mission this message belongs to (for parallel execution)
-        #[serde(skip_serializing_if = "Option::is_none")]
-        mission_id: Option<Uuid>,
-    },
-    AssistantMessage {
-        id: Uuid,
-        content: String,
-        success: bool,
-        cost_cents: u64,
-        cost_source: crate::agents::CostSource,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        usage: Option<crate::cost::TokenUsage>,
-        model: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        model_normalized: Option<String>,
-        /// Mission this message belongs to (for parallel execution)
-        #[serde(skip_serializing_if = "Option::is_none")]
-        mission_id: Option<Uuid>,
-        /// Files shared in this message (images, documents, etc.)
-        #[serde(skip_serializing_if = "Option::is_none")]
-        shared_files: Option<Vec<SharedFile>>,
-        /// Whether the mission can be resumed after this failure (only relevant when success=false)
-        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-        resumable: bool,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        completion_evidence: Option<crate::agents::CompletionEvidence>,
-    },
-    /// Agent thinking/reasoning (streaming)
-    Thinking {
-        /// Incremental thinking content
-        content: String,
-        /// Whether this is the final thinking chunk
-        done: bool,
-        /// Mission this thinking belongs to (for parallel execution)
-        #[serde(skip_serializing_if = "Option::is_none")]
-        mission_id: Option<Uuid>,
-    },
-    /// Text content delta (streaming assistant response)
-    TextDelta {
-        /// Accumulated text content so far
-        content: String,
-        /// Mission this text belongs to (for parallel execution)
-        #[serde(skip_serializing_if = "Option::is_none")]
-        mission_id: Option<Uuid>,
-    },
-    /// CRDT-style text operations for streaming assistant content.
-    TextOp {
-        mission_id: Uuid,
-        bubble_id: String,
-        ops: Vec<TextOp>,
-    },
-    ToolCall {
-        tool_call_id: String,
-        name: String,
-        args: serde_json::Value,
-        /// Mission this tool call belongs to (for parallel execution)
-        #[serde(skip_serializing_if = "Option::is_none")]
-        mission_id: Option<Uuid>,
-    },
-    ToolResult {
-        tool_call_id: String,
-        name: String,
-        result: serde_json::Value,
-        /// Mission this result belongs to (for parallel execution)
-        #[serde(skip_serializing_if = "Option::is_none")]
-        mission_id: Option<Uuid>,
-    },
-    Error {
-        message: String,
-        /// Mission this error belongs to (for parallel execution)
-        #[serde(skip_serializing_if = "Option::is_none")]
-        mission_id: Option<Uuid>,
-        /// Whether the mission can be resumed after this error
-        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-        resumable: bool,
-    },
-    /// Goal-mode iteration marker — fired once per turn while a codex
-    /// `/goal` continuation loop is active. UI renders as "iter N" pill.
-    GoalIteration {
-        iteration: u32,
-        objective: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        mission_id: Option<Uuid>,
-    },
-    /// Goal status transitioned. Carries the canonical status string from
-    /// codex's `thread/goal/updated`: `active`, `paused`, `budgetLimited`,
-    /// `complete`, or `cleared` when the goal was explicitly aborted.
-    GoalStatus {
-        status: String,
-        objective: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        mission_id: Option<Uuid>,
-    },
-    /// Mission status changed (by agent or user)
-    MissionStatusChanged {
-        mission_id: Uuid,
-        status: MissionStatus,
-        summary: Option<String>,
-    },
-    /// Mission title changed (by user)
-    MissionTitleChanged { mission_id: Uuid, title: String },
-    /// Mission metadata changed (title/short description refresh)
-    MissionMetadataUpdated {
-        mission_id: Uuid,
-        title: Option<String>,
-        short_description: Option<String>,
-        metadata_updated_at: Option<String>,
-        updated_at: Option<String>,
-        metadata_source: Option<String>,
-        metadata_model: Option<String>,
-        metadata_version: Option<String>,
-    },
-    /// Mission run settings changed (backend/model/agent/config profile)
-    MissionSettingsUpdated {
-        mission_id: Uuid,
-        backend: String,
-        agent: Option<String>,
-        model_override: Option<String>,
-        model_effort: Option<String>,
-        config_profile: Option<String>,
-        session_id: Option<String>,
-        updated_at: String,
-    },
-    /// Agent phase update (for showing preparation steps)
-    AgentPhase {
-        /// Phase name: "executing", "delegating", etc.
-        phase: String,
-        /// Optional details about what's happening
-        detail: Option<String>,
-        /// Agent name (for hierarchical display)
-        agent: Option<String>,
-        /// Mission this phase belongs to (for parallel execution)
-        #[serde(skip_serializing_if = "Option::is_none")]
-        mission_id: Option<Uuid>,
-    },
-    /// Agent tree update (for real-time tree visualization)
-    AgentTree {
-        /// The full agent tree structure
-        tree: AgentTreeNode,
-        /// Mission this tree belongs to (for parallel execution)
-        #[serde(skip_serializing_if = "Option::is_none")]
-        mission_id: Option<Uuid>,
-    },
-    /// Execution progress update (for progress indicator)
-    Progress {
-        /// Total number of subtasks
-        total_subtasks: usize,
-        /// Number of completed subtasks
-        completed_subtasks: usize,
-        /// Currently executing subtask description (if any)
-        current_subtask: Option<String>,
-        /// Current depth level (0=root, 1=subtask, 2=sub-subtask)
-        depth: u8,
-        /// Mission this progress belongs to (for parallel execution)
-        #[serde(skip_serializing_if = "Option::is_none")]
-        mission_id: Option<Uuid>,
-    },
-    /// Session ID update (for backends that generate their own session IDs)
-    SessionIdUpdate {
-        /// The new session ID to use for continuation
-        session_id: String,
-        /// Mission this session ID belongs to
-        mission_id: Uuid,
-    },
-    /// Live activity label derived from the current tool call
-    MissionActivity {
-        /// Human-readable activity label (e.g., "Reading: main.rs")
-        label: String,
-        /// Tool name that generated this activity
-        tool_name: String,
-        /// Mission this activity belongs to
-        #[serde(skip_serializing_if = "Option::is_none")]
-        mission_id: Option<Uuid>,
-    },
-    /// FIDO signing approval request forwarded to the mobile app
-    FidoSignRequest {
-        request_id: Uuid,
-        key_type: String,
-        key_fingerprint: String,
-        origin: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        hostname: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        workspace: Option<String>,
-        expires_at: String,
-    },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum TextOp {
-    Insert { pos: usize, text: String },
-    Replace { range: (usize, usize), text: String },
-    Finalize,
-}
-
-/// A node in the agent tree (for visualization)
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AgentTreeNode {
-    pub id: String,
-    #[serde(rename = "type")]
-    pub node_type: String, // e.g. "Root", "Worker"
-    pub name: String,
-    pub description: String,
-    pub status: String, // "pending", "running", "completed", "failed"
-    pub budget_allocated: u64,
-    pub budget_spent: u64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub complexity: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub selected_model: Option<String>,
-    #[serde(default)]
-    pub children: Vec<AgentTreeNode>,
-}
-
-impl AgentTreeNode {
-    pub fn new(id: &str, node_type: &str, name: &str, description: &str) -> Self {
-        Self {
-            id: id.to_string(),
-            node_type: node_type.to_string(),
-            name: name.to_string(),
-            description: description.to_string(),
-            status: "pending".to_string(),
-            budget_allocated: 0,
-            budget_spent: 0,
-            complexity: None,
-            selected_model: None,
-            children: Vec::new(),
-        }
-    }
-
-    pub fn with_budget(mut self, allocated: u64, spent: u64) -> Self {
-        self.budget_allocated = allocated;
-        self.budget_spent = spent;
-        self
-    }
-
-    pub fn with_status(mut self, status: &str) -> Self {
-        self.status = status.to_string();
-        self
-    }
-
-    pub fn with_complexity(mut self, complexity: f64) -> Self {
-        self.complexity = Some(complexity);
-        self
-    }
-
-    pub fn with_model(mut self, model: &str) -> Self {
-        self.selected_model = Some(model.to_string());
-        self
-    }
-
-    pub fn add_child(&mut self, child: AgentTreeNode) {
-        self.children.push(child);
-    }
-}
-
-impl AgentEvent {
-    pub fn event_name(&self) -> &'static str {
-        match self {
-            AgentEvent::Status { .. } => "status",
-            AgentEvent::UserMessage { .. } => "user_message",
-            AgentEvent::AssistantMessage { .. } => "assistant_message",
-            AgentEvent::Thinking { .. } => "thinking",
-            AgentEvent::TextDelta { .. } => "text_delta",
-            AgentEvent::TextOp { .. } => "text_op",
-            AgentEvent::ToolCall { .. } => "tool_call",
-            AgentEvent::ToolResult { .. } => "tool_result",
-            AgentEvent::Error { .. } => "error",
-            AgentEvent::MissionStatusChanged { .. } => "mission_status_changed",
-            AgentEvent::AgentPhase { .. } => "agent_phase",
-            AgentEvent::AgentTree { .. } => "agent_tree",
-            AgentEvent::Progress { .. } => "progress",
-            AgentEvent::SessionIdUpdate { .. } => "session_id_update",
-            AgentEvent::MissionActivity { .. } => "mission_activity",
-            AgentEvent::MissionTitleChanged { .. } => "mission_title_changed",
-            AgentEvent::MissionMetadataUpdated { .. } => "mission_metadata_updated",
-            AgentEvent::MissionSettingsUpdated { .. } => "mission_settings_updated",
-            AgentEvent::FidoSignRequest { .. } => "fido_sign_request",
-            AgentEvent::GoalIteration { .. } => "goal_iteration",
-            AgentEvent::GoalStatus { .. } => "goal_status",
-        }
-    }
-
-    pub fn mission_id(&self) -> Option<Uuid> {
-        match self {
-            AgentEvent::Status { mission_id, .. } => *mission_id,
-            AgentEvent::UserMessage { mission_id, .. } => *mission_id,
-            AgentEvent::AssistantMessage { mission_id, .. } => *mission_id,
-            AgentEvent::Thinking { mission_id, .. } => *mission_id,
-            AgentEvent::TextDelta { mission_id, .. } => *mission_id,
-            AgentEvent::TextOp { mission_id, .. } => Some(*mission_id),
-            AgentEvent::ToolCall { mission_id, .. } => *mission_id,
-            AgentEvent::ToolResult { mission_id, .. } => *mission_id,
-            AgentEvent::Error { mission_id, .. } => *mission_id,
-            AgentEvent::MissionStatusChanged { mission_id, .. } => Some(*mission_id),
-            AgentEvent::AgentPhase { mission_id, .. } => *mission_id,
-            AgentEvent::AgentTree { mission_id, .. } => *mission_id,
-            AgentEvent::Progress { mission_id, .. } => *mission_id,
-            AgentEvent::SessionIdUpdate { mission_id, .. } => Some(*mission_id),
-            AgentEvent::MissionActivity { mission_id, .. } => *mission_id,
-            AgentEvent::MissionTitleChanged { mission_id, .. } => Some(*mission_id),
-            AgentEvent::MissionMetadataUpdated { mission_id, .. } => Some(*mission_id),
-            AgentEvent::MissionSettingsUpdated { mission_id, .. } => Some(*mission_id),
-            AgentEvent::FidoSignRequest { .. } => None,
-            AgentEvent::GoalIteration { mission_id, .. } => *mission_id,
-            AgentEvent::GoalStatus { mission_id, .. } => *mission_id,
-        }
-    }
-}
-
-/// Outcome of a [`ControlCommand::UserMessage`], acknowledged on its
-/// `respond` channel. Distinguishes "delivered, a turn is starting" from
-/// "dropped" — both used to be `false`, which made drops invisible to
-/// callers that need delivery guarantees (e.g. the Copilot's steering tool).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum UserMessageAck {
-    /// The target is busy mid-turn; the message was queued and will be
-    /// picked up at the next turn boundary.
-    Queued,
-    /// The message was delivered and a turn is starting now.
-    Delivered,
-    /// The message was dropped (parallel cap reached, mission load failure,
-    /// rejected goal kickoff, …). An `AgentEvent::Error` with details was
-    /// emitted on the event stream.
-    Dropped,
-}
-
-/// Internal control commands (queued and processed by the actor).
-#[derive(Debug)]
-pub enum ControlCommand {
-    UserMessage {
-        id: Uuid,
-        content: String,
-        /// Optional agent override for this specific message
-        agent: Option<String>,
-        /// Target mission ID - if provided and differs from running mission, start in parallel
-        target_mission_id: Option<Uuid>,
-        /// Respond with the delivery outcome (queued / delivered / dropped).
-        respond: oneshot::Sender<UserMessageAck>,
-    },
-    ToolResult {
-        tool_call_id: String,
-        name: String,
-        result: serde_json::Value,
-        /// Reports whether the result reached a live waiter (`true`) or had to
-        /// be cached because no mission was registered for it (`false`).
-        respond: oneshot::Sender<bool>,
-    },
-    Cancel,
-    /// Load a mission (switch to it)
-    LoadMission {
-        id: Uuid,
-        respond: oneshot::Sender<Result<Mission, String>>,
-    },
-    /// Create a new mission
-    CreateMission {
-        title: Option<String>,
-        workspace_id: Option<Uuid>,
-        /// Agent name from library (e.g., "code-reviewer")
-        agent: Option<String>,
-        /// Optional model override (provider/model)
-        model_override: Option<String>,
-        /// Optional model effort override (e.g. low/medium/high/xhigh/max)
-        model_effort: Option<String>,
-        /// Backend to use for this mission ("opencode" or "claudecode")
-        backend: Option<String>,
-        /// Config profile to use for this mission
-        config_profile: Option<String>,
-        /// Parent mission ID (for orchestrated worker missions)
-        parent_mission_id: Option<Uuid>,
-        /// Working directory override (for git worktrees etc.)
-        working_directory: Option<String>,
-        respond: oneshot::Sender<Result<Mission, String>>,
-    },
-    /// Update mission status
-    SetMissionStatus {
-        id: Uuid,
-        status: MissionStatus,
-        respond: oneshot::Sender<Result<(), String>>,
-    },
-    /// Update mission title
-    SetMissionTitle {
-        id: Uuid,
-        title: String,
-        respond: oneshot::Sender<Result<(), String>>,
-    },
-    /// Update mission run settings
-    UpdateMissionSettings {
-        id: Uuid,
-        backend: Option<String>,
-        agent: Option<Option<String>>,
-        model_override: Option<Option<String>>,
-        model_effort: Option<Option<String>>,
-        config_profile: Option<Option<String>>,
-        session_id: String,
-        respond: oneshot::Sender<Result<Mission, String>>,
-    },
-    /// Start a mission in parallel (if slots available)
-    StartParallel {
-        mission_id: Uuid,
-        content: String,
-        respond: oneshot::Sender<Result<(), String>>,
-    },
-    /// Cancel a specific mission
-    CancelMission {
-        mission_id: Uuid,
-        /// If `Some(d)`, only cancel when the runner has been idle for at
-        /// least `d`. Race-protects watchdog/cleanup from killing a
-        /// mission that has already resumed activity in the time between
-        /// the caller's "stalled" observation and the actor processing
-        /// this command. User-initiated cancels pass `None`.
-        min_idle: Option<std::time::Duration>,
-        respond: oneshot::Sender<Result<(), String>>,
-    },
-    /// List currently running missions
-    ListRunning {
-        respond: oneshot::Sender<Vec<super::mission_runner::RunningMissionInfo>>,
-    },
-    /// Resume an interrupted mission
-    ResumeMission {
-        mission_id: Uuid,
-        /// If true, clean the mission's work directory before resuming
-        clean_workspace: bool,
-        /// If true, only update status without sending the automatic resume message
-        skip_message: bool,
-        respond: oneshot::Sender<Result<Mission, String>>,
-    },
-    /// Graceful shutdown - mark running missions as interrupted
-    GracefulShutdown {
-        respond: oneshot::Sender<Vec<Uuid>>,
-    },
-    /// Get the current message queue
-    GetQueue {
-        respond: oneshot::Sender<Vec<QueuedMessage>>,
-    },
-    /// Remove a message from the queue
-    RemoveFromQueue {
-        message_id: Uuid,
-        respond: oneshot::Sender<bool>, // true if removed, false if not found
-    },
-    /// Clear queued messages. When `mission_id` is set, only messages
-    /// targeting that mission are cleared (main queue entries targeting it +
-    /// that mission's parallel-runner queue); otherwise every queue is wiped.
-    ClearQueue {
-        mission_id: Option<Uuid>,
-        respond: oneshot::Sender<usize>, // number of messages cleared
-    },
-}
-
-// ==================== Mission Types ====================
-
-/// Mission status.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum MissionStatus {
-    /// Mission created but hasn't received any messages yet
-    Pending,
-    Active,
-    /// Agent's turn / automation cycle finished cleanly with no follow-up
-    /// queued; mission is parked waiting for the user to read it.
-    AwaitingUser,
-    /// User opened the mission while it was AwaitingUser and the ack grace
-    /// period elapsed without a new message — mission is auto-archived.
-    Acknowledged,
-    Completed,
-    Failed,
-    /// Mission was interrupted (server shutdown, cancellation, etc.)
-    Interrupted,
-    /// Mission blocked by external factors (type mismatch, access denied, etc.)
-    Blocked,
-    /// Mission not feasible as specified (wrong assumptions in request)
-    NotFeasible,
-}
-
-impl std::fmt::Display for MissionStatus {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Pending => write!(f, "pending"),
-            Self::Active => write!(f, "active"),
-            Self::AwaitingUser => write!(f, "awaiting_user"),
-            Self::Acknowledged => write!(f, "acknowledged"),
-            Self::Completed => write!(f, "completed"),
-            Self::Failed => write!(f, "failed"),
-            Self::Blocked => write!(f, "blocked"),
-            Self::NotFeasible => write!(f, "not_feasible"),
-            Self::Interrupted => write!(f, "interrupted"),
-        }
-    }
 }
 
 // Mission and MissionHistoryEntry are now defined in mission_store module
@@ -6936,587 +6438,6 @@ fn spawn_control_session(
     }
 
     state
-}
-
-async fn recover_server_shutdown_missions(
-    mission_store: Arc<dyn MissionStore>,
-    events_tx: broadcast::Sender<AgentEvent>,
-    cmd_tx: mpsc::Sender<ControlCommand>,
-) {
-    let mut to_resume = Vec::new();
-    let mut seen = HashSet::new();
-
-    match mission_store.get_all_active_missions().await {
-        Ok(active_missions) => {
-            for mission in active_missions {
-                if mission.mission_mode == super::mission_store::MissionMode::Assistant {
-                    tracing::debug!(
-                        mission_id = %mission.id,
-                        "Startup recovery: leaving assistant-mode active mission idle"
-                    );
-                    continue;
-                }
-
-                tracing::warn!(
-                    mission_id = %mission.id,
-                    title = %mission.title.as_deref().unwrap_or("Untitled"),
-                    updated_at = %mission.updated_at,
-                    "Startup recovery: active task mission survived restart; marking server_shutdown and auto-resuming"
-                );
-                if let Err(e) = mission_store
-                    .update_mission_status_with_reason(
-                        mission.id,
-                        MissionStatus::Interrupted,
-                        Some("server_shutdown"),
-                    )
-                    .await
-                {
-                    tracing::warn!(
-                        mission_id = %mission.id,
-                        "Startup recovery: failed to mark active mission interrupted: {}",
-                        e
-                    );
-                    continue;
-                }
-
-                maybe_schedule_mission_metadata_refresh_for_status(
-                    &mission_store,
-                    &events_tx,
-                    mission.id,
-                    MissionStatus::Interrupted,
-                );
-                let _ = events_tx.send(AgentEvent::MissionStatusChanged {
-                    mission_id: mission.id,
-                    status: MissionStatus::Interrupted,
-                    summary: Some(
-                        "Interrupted: server restarted while mission was active".to_string(),
-                    ),
-                });
-
-                if seen.insert(mission.id) {
-                    to_resume.push(mission.id);
-                }
-            }
-        }
-        Err(e) => {
-            tracing::warn!(
-                "Startup recovery: failed to check for active missions: {}",
-                e
-            );
-        }
-    }
-
-    match mission_store
-        .get_recent_server_shutdown_mission_ids(SERVER_SHUTDOWN_AUTO_RESUME_MAX_AGE_HOURS)
-        .await
-    {
-        Ok(mission_ids) => {
-            for mission_id in mission_ids {
-                if seen.insert(mission_id) {
-                    to_resume.push(mission_id);
-                }
-            }
-        }
-        Err(e) => {
-            tracing::warn!(
-                "Startup recovery: failed to check for server-shutdown missions: {}",
-                e
-            );
-        }
-    }
-
-    if to_resume.is_empty() {
-        tracing::debug!("Startup recovery: no server-shutdown missions to auto-resume");
-        return;
-    }
-
-    tracing::warn!(
-        count = to_resume.len(),
-        "Startup recovery: auto-resuming server-shutdown mission(s)"
-    );
-
-    for mission_id in to_resume {
-        let (tx, rx) = oneshot::channel();
-        if let Err(e) = cmd_tx
-            .send(ControlCommand::ResumeMission {
-                mission_id,
-                clean_workspace: false,
-                skip_message: false,
-                respond: tx,
-            })
-            .await
-        {
-            tracing::warn!(
-                mission_id = %mission_id,
-                "Startup recovery: failed to enqueue auto-resume: {}",
-                e
-            );
-            continue;
-        }
-
-        match rx.await {
-            Ok(Ok(_)) => {
-                tracing::info!(
-                    mission_id = %mission_id,
-                    "Startup recovery: auto-resume queued"
-                );
-            }
-            Ok(Err(e)) => {
-                tracing::warn!(
-                    mission_id = %mission_id,
-                    "Startup recovery: auto-resume failed: {}",
-                    e
-                );
-            }
-            Err(e) => {
-                tracing::warn!(
-                    mission_id = %mission_id,
-                    "Startup recovery: auto-resume response dropped: {}",
-                    e
-                );
-            }
-        }
-    }
-}
-
-/// Apply the stale-mission safety net once.
-///
-/// We intentionally do not infer "orphaned" from `MissionStatus::Active` alone here.
-/// Missions remain `active` between turns while waiting for the next user message or
-/// queued automation, so the periodic cleanup task cannot safely treat "not currently
-/// running" as an interruption without spuriously flipping healthy Claude missions to
-/// `interrupted`.
-async fn cleanup_stale_active_missions_once(
-    mission_store: &Arc<dyn MissionStore>,
-    stale_hours: u64,
-    events_tx: &broadcast::Sender<AgentEvent>,
-    cmd_tx: &mpsc::Sender<ControlCommand>,
-) {
-    match mission_store.get_stale_active_missions(stale_hours).await {
-        Ok(stale_missions) => {
-            for mission in stale_missions {
-                tracing::info!(
-                    "Auto-closing stale mission {}: '{}' (inactive since {})",
-                    mission.id,
-                    mission.title.as_deref().unwrap_or("Untitled"),
-                    mission.updated_at
-                );
-
-                // Ask the control actor to cancel any in-memory runner
-                // for this mission before we overwrite DB status. Without
-                // this, a frozen runner (e.g. stuck in `child.wait()` on
-                // an orphaned tool subprocess) would keep
-                // `running_mission_id` pinned and /api/control/running
-                // would keep reporting the mission as "running, stalled"
-                // until the daemon restarts. CancelMission is idempotent
-                // — it returns "not found" when there is no live runner,
-                // which is the common case for stale missions, and we
-                // ignore that error.
-                let (tx, rx) = oneshot::channel();
-                if cmd_tx
-                    .send(ControlCommand::CancelMission {
-                        mission_id: mission.id,
-                        min_idle: Some(std::time::Duration::from_secs(STUCK_SECONDS)),
-                        respond: tx,
-                    })
-                    .await
-                    .is_ok()
-                {
-                    let _ = rx.await;
-                }
-
-                if let Err(e) = mission_store
-                    .update_mission_status(mission.id, MissionStatus::Completed)
-                    .await
-                {
-                    tracing::warn!("Failed to auto-close stale mission {}: {}", mission.id, e);
-                } else {
-                    maybe_schedule_mission_metadata_refresh_for_status(
-                        mission_store,
-                        events_tx,
-                        mission.id,
-                        MissionStatus::Completed,
-                    );
-                    let _ = events_tx.send(AgentEvent::MissionStatusChanged {
-                        mission_id: mission.id,
-                        status: MissionStatus::Completed,
-                        summary: Some(format!(
-                            "Auto-closed after {} hours of inactivity",
-                            stale_hours
-                        )),
-                    });
-                }
-            }
-        }
-        Err(e) => {
-            tracing::warn!("Failed to check for stale missions: {}", e);
-        }
-    }
-}
-
-/// Background task that periodically cleans up stale missions.
-/// Periodic watchdog: marks missions interrupted when the runner has
-/// stalled for too long, even if the mission row is still `Active`.
-///
-/// Two cases this catches that the boot-time orphan recovery and the
-/// daily stale-mission cleanup miss:
-/// 1. mission_runner task died mid-flight (e.g. codex stdio EOF after
-///    one of our reconnect attempts). The mission row stays Active
-///    forever because nothing emits a terminal status; the codex
-///    process can survive in its container namespace.
-/// 2. codex itself hung — process alive but `futex_wait_queue` with no
-///    events. Observed live on prod after a deploy mid-mission: 70+
-///    minutes of silence, dashboard correctly flagged "may be stuck"
-///    but no path was forcing termination.
-///
-/// Threshold is intentionally generous (15 min) so a model in the
-/// middle of a slow API turn or a long shell command isn't false-killed.
-/// Periodic ack-promotion: scans `AwaitingUser` missions whose
-/// `first_viewed_at` is older than `ACK_GRACE_SECONDS` and flips them to
-/// `Acknowledged`. Broadcasts `MissionStatusChanged` so dashboard/iOS clients
-/// move the row from "Needs You" to "Finished" without a refresh.
-async fn ack_promotion_loop(
-    mission_store: Arc<dyn MissionStore>,
-    events_tx: broadcast::Sender<AgentEvent>,
-) {
-    tracing::info!(
-        "Ack-promotion loop started: grace {}s, tick {}s",
-        ACK_GRACE_SECONDS,
-        ACK_PROMOTION_TICK_INTERVAL.as_secs()
-    );
-    loop {
-        tokio::time::sleep(ACK_PROMOTION_TICK_INTERVAL).await;
-        match mission_store
-            .acknowledge_stale_awaiting_user_missions(ACK_GRACE_SECONDS)
-            .await
-        {
-            Ok(promoted) => {
-                for mission_id in promoted {
-                    let _ = events_tx.send(AgentEvent::MissionStatusChanged {
-                        mission_id,
-                        status: MissionStatus::Acknowledged,
-                        summary: None,
-                    });
-                }
-            }
-            Err(e) => {
-                tracing::warn!("Ack-promotion tick failed: {}", e);
-            }
-        }
-    }
-}
-
-async fn stuck_mission_watchdog_loop(
-    mission_store: Arc<dyn MissionStore>,
-    cmd_tx: mpsc::Sender<ControlCommand>,
-    events_tx: broadcast::Sender<AgentEvent>,
-    tool_hub: Arc<FrontendToolHub>,
-    workspaces: workspace::SharedWorkspaceStore,
-) {
-    use std::collections::HashSet;
-
-    const CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
-
-    tracing::info!(
-        "Stuck-mission watchdog started: threshold {}s, poll every {}s",
-        STUCK_SECONDS,
-        CHECK_INTERVAL.as_secs()
-    );
-
-    // Last seen `oom_kill` counter per scope unit; an increase means the
-    // kernel killed something inside a mission's memory cgroup since the
-    // previous tick. Entries for dead scopes are pruned each pass.
-    let mut oom_seen: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
-
-    loop {
-        tokio::time::sleep(CHECK_INTERVAL).await;
-
-        // Pull the in-memory running list from the actor — same source
-        // /api/control/running serves, includes seconds_since_activity.
-        let (resp_tx, resp_rx) = oneshot::channel();
-        if cmd_tx
-            .send(ControlCommand::ListRunning { respond: resp_tx })
-            .await
-            .is_err()
-        {
-            tracing::debug!("Stuck-mission watchdog: actor channel closed; exiting");
-            return;
-        }
-        let running_list = match resp_rx.await {
-            Ok(list) => list,
-            Err(_) => continue,
-        };
-
-        // Cross-check against DB: any mission Active in the store but
-        // not in `running_list` is an orphan from a runner death.
-        let active_missions = match mission_store.get_all_active_missions().await {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::warn!("Stuck-mission watchdog: list active failed: {}", e);
-                continue;
-            }
-        };
-
-        let running_ids: HashSet<Uuid> = running_list.iter().map(|info| info.mission_id).collect();
-
-        // OOM surveillance: surface kernel `oom_kill` events from mission
-        // memory cgroups as mission activity. Without this, a build killed
-        // by its memory cap looks like a silent tool failure and agents
-        // retry it in a loop instead of adapting (lower parallelism) or
-        // requesting a cap boost.
-        check_mission_oom_kills(
-            &workspaces,
-            &active_missions,
-            &running_ids,
-            &mut oom_seen,
-            &events_tx,
-        )
-        .await;
-
-        // Case 1 — actor reports the mission running but stalled past
-        // threshold. Cancel via the actor (clean shutdown) and mark
-        // the row Interrupted.
-        for info in &running_list {
-            if info.seconds_since_activity >= STUCK_SECONDS {
-                // A mission parked on a frontend tool (e.g. AskUserQuestion) is
-                // intentionally silent: its harness is killed while it awaits a
-                // human answer, so it emits no activity. Do not count that as a
-                // stall — humans routinely take longer than the threshold to
-                // reply. The wait is cleared the moment the answer arrives (or
-                // the mission is cancelled), so this can't pin a dead mission.
-                if tool_hub.is_waiting_for_input(info.mission_id) {
-                    tracing::debug!(
-                        mission_id = %info.mission_id,
-                        seconds_since_activity = info.seconds_since_activity,
-                        "Stuck-mission watchdog: skipping mission blocked on user input"
-                    );
-                    continue;
-                }
-                tracing::warn!(
-                    "Stuck-mission watchdog: cancelling {} after {}s of inactivity",
-                    info.mission_id,
-                    info.seconds_since_activity
-                );
-                let (cancel_tx, cancel_rx) = oneshot::channel();
-                if cmd_tx
-                    .send(ControlCommand::CancelMission {
-                        mission_id: info.mission_id,
-                        min_idle: Some(std::time::Duration::from_secs(STUCK_SECONDS)),
-                        respond: cancel_tx,
-                    })
-                    .await
-                    .is_ok()
-                {
-                    let _ = cancel_rx.await;
-                }
-                if let Err(e) = mission_store
-                    .update_mission_status_with_reason(
-                        info.mission_id,
-                        MissionStatus::Interrupted,
-                        Some("watchdog_stalled"),
-                    )
-                    .await
-                {
-                    tracing::warn!(
-                        "Stuck-mission watchdog: status update failed for {}: {}",
-                        info.mission_id,
-                        e
-                    );
-                    continue;
-                }
-                let _ = events_tx.send(AgentEvent::MissionStatusChanged {
-                    mission_id: info.mission_id,
-                    status: MissionStatus::Interrupted,
-                    summary: Some(format!(
-                        "Interrupted: no agent activity for {}s (>{}s threshold)",
-                        info.seconds_since_activity, STUCK_SECONDS
-                    )),
-                });
-            }
-        }
-
-        // Case 2 — Active in DB, not in actor's running list at all.
-        // This is the "mission_runner died, row never finalized" path.
-        for mission in &active_missions {
-            if running_ids.contains(&mission.id) {
-                continue;
-            }
-            if mission.mission_mode == super::mission_store::MissionMode::Assistant {
-                tracing::debug!(
-                    mission_id = %mission.id,
-                    "Stuck-mission watchdog: leaving idle assistant-mode mission active"
-                );
-                continue;
-            }
-            tracing::warn!(
-                "Stuck-mission watchdog: orphan {} (no live runner); marking interrupted",
-                mission.id
-            );
-            if let Err(e) = mission_store
-                .update_mission_status_with_reason(
-                    mission.id,
-                    MissionStatus::Interrupted,
-                    Some("orphan_no_runner"),
-                )
-                .await
-            {
-                tracing::warn!(
-                    "Stuck-mission watchdog: status update failed for {}: {}",
-                    mission.id,
-                    e
-                );
-                continue;
-            }
-            let _ = events_tx.send(AgentEvent::MissionStatusChanged {
-                mission_id: mission.id,
-                status: MissionStatus::Interrupted,
-                summary: Some(
-                    "Interrupted: mission runner exited without reporting a terminal status"
-                        .to_string(),
-                ),
-            });
-        }
-    }
-}
-
-/// Read the kernel `oom_kill` counter from a scope unit's `memory.events`.
-/// Returns `None` when the unit/cgroup is gone or unreadable.
-async fn read_scope_oom_kills(unit: &str) -> Option<u64> {
-    let output = tokio::process::Command::new("systemctl")
-        .args(["show", unit, "-p", "ControlGroup", "--value"])
-        .output()
-        .await
-        .ok()?;
-    let cgroup = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if cgroup.is_empty() {
-        return None;
-    }
-    let path = format!("/sys/fs/cgroup{cgroup}/memory.events");
-    let content = tokio::fs::read_to_string(path).await.ok()?;
-    content.lines().find_map(|line| {
-        line.strip_prefix("oom_kill ")
-            .and_then(|v| v.trim().parse::<u64>().ok())
-    })
-}
-
-/// Detect `oom_kill` increases in running missions' memory cgroups and
-/// surface them on the mission event stream. One pass per watchdog tick.
-async fn check_mission_oom_kills(
-    workspaces: &workspace::SharedWorkspaceStore,
-    active_missions: &[crate::api::mission_store::Mission],
-    running_ids: &std::collections::HashSet<Uuid>,
-    oom_seen: &mut std::collections::HashMap<String, u64>,
-    events_tx: &broadcast::Sender<AgentEvent>,
-) {
-    let mut live_units: std::collections::HashSet<String> = std::collections::HashSet::new();
-    // Whether we got a complete picture of live scopes this tick. A failed
-    // workspace lookup or `list-units` means some scopes couldn't be
-    // enumerated, so we must not prune `oom_seen` (see the retain below).
-    let mut enumeration_complete = true;
-
-    // Scopes are workspace-level and shared by every mission running in the
-    // same container, while `oom_seen` is keyed by unit. Group missions by
-    // workspace so each unit's OOM delta is consumed once per tick and the
-    // alert fans out to *all* missions on that workspace — otherwise the
-    // first mission would absorb the delta and its siblings would never see
-    // the OOM signal.
-    let mut missions_by_workspace: std::collections::HashMap<Uuid, Vec<Uuid>> =
-        std::collections::HashMap::new();
-    for mission in active_missions
-        .iter()
-        .filter(|m| running_ids.contains(&m.id))
-    {
-        missions_by_workspace
-            .entry(mission.workspace_id)
-            .or_default()
-            .push(mission.id);
-    }
-
-    for (workspace_id, mission_ids) in &missions_by_workspace {
-        let Some(workspace) = workspaces.get(*workspace_id).await else {
-            enumeration_complete = false;
-            continue;
-        };
-        let units = match crate::api::workspaces::list_workspace_scope_units(&workspace).await {
-            Ok(units) => units,
-            Err(e) => {
-                tracing::warn!(
-                    "OOM watchdog: could not list scopes for {}: {}",
-                    workspace.name,
-                    e
-                );
-                enumeration_complete = false;
-                continue;
-            }
-        };
-        for unit in units {
-            // The unit was listed, so it's alive: record it now so a transient
-            // `memory.events` read failure below doesn't drop its baseline and
-            // cause the cumulative oom_kill total to be re-reported as new.
-            live_units.insert(unit.clone());
-            let Some(count) = read_scope_oom_kills(&unit).await else {
-                continue;
-            };
-            // Treat a never-seen scope as a baseline of 0 so the first kernel
-            // OOM in a freshly-discovered cgroup is reported rather than
-            // silently absorbed into the baseline (e.g. when the watchdog
-            // starts after a scope already accumulated kills).
-            let prev = oom_seen.get(&unit).copied().unwrap_or(0);
-            if count > prev {
-                let killed = count - prev;
-                tracing::warn!(
-                    "Memory watchdog: {} OOM kill(s) in {} (workspace {}, {} mission(s))",
-                    killed,
-                    unit,
-                    workspace.name,
-                    mission_ids.len()
-                );
-                for mission_id in mission_ids {
-                    let _ = events_tx.send(AgentEvent::MissionActivity {
-                        label: format!(
-                            "⚠ Memory limit hit: kernel OOM-killed {killed} process(es) in this \
-                             mission's cgroup. Builds should lower parallelism, or raise the \
-                             workspace memory cap (Resources panel / MISSION_MEMORY_MAX)."
-                        ),
-                        tool_name: "memory_watchdog".to_string(),
-                        mission_id: Some(*mission_id),
-                    });
-                }
-            }
-            oom_seen.insert(unit, count);
-        }
-    }
-
-    // Drop counters for scopes that no longer exist so the map can't grow
-    // unboundedly across weeks of uptime — but only when we fully enumerated
-    // live scopes this tick. If any workspace failed to enumerate, pruning
-    // would drop a still-live scope's baseline and re-emit its cumulative
-    // oom_kill total as new kills on the next successful read. Skip pruning
-    // for this tick; it self-heals on the next clean pass.
-    if enumeration_complete {
-        oom_seen.retain(|unit, _| live_units.contains(unit));
-    }
-}
-
-async fn stale_mission_cleanup_loop(
-    mission_store: Arc<dyn MissionStore>,
-    stale_hours: u64,
-    cmd_tx: mpsc::Sender<ControlCommand>,
-    events_tx: broadcast::Sender<AgentEvent>,
-) {
-    // Check every 5 minutes; the stale timeout remains a safety net for missions that
-    // never receive an explicit terminal status.
-    let check_interval = std::time::Duration::from_secs(300);
-
-    tracing::info!(
-        "Mission cleanup task started: stale timeout {} hours",
-        stale_hours
-    );
-
-    loop {
-        tokio::time::sleep(check_interval).await;
-        cleanup_stale_active_missions_once(&mission_store, stale_hours, &events_tx, &cmd_tx).await;
-    }
 }
 
 /// Resolve an IANA timezone string to a chrono::FixedOffset at a given UTC instant.
@@ -12524,301 +11445,42 @@ async fn run_single_control_turn(
                 Ok(id) => id,
                 Err(r) => return r,
             };
-            // Check if this is a continuation turn (has prior assistant response).
-            // Note: history may include the current user message before the turn runs,
-            // so we check for assistant messages to determine if this is truly a continuation.
-            // Also use --resume if force_session_resume is set (e.g., for mission resume operations
-            // where the session exists but history may not have assistant messages yet).
+            // Continuation: prior assistant response in history, or an
+            // explicit resume request (e.g. mission resume operations where
+            // the session exists but history may not have assistant
+            // messages yet).
             let is_continuation =
                 force_session_resume || history.iter().any(|(role, _)| role == "assistant");
-            let mut effective_message = user_message.clone();
-            let mut effective_session_id = session_id.clone();
-            let mut attempted_same_session_resume = false;
-            let mut attempted_session_reset = false;
-            let mut result = Box::pin(super::mission_runner::run_claudecode_turn(
-                exec_workspace,
-                &ctx.working_dir,
-                &effective_message,
-                config.default_model.as_deref(),
-                requested_model_effort.as_deref(),
-                config.opencode_agent.as_deref(),
-                mid,
-                events_tx.clone(),
-                cancel.clone(),
-                None, // secrets - not available in control context
-                &config.working_dir,
-                effective_session_id.as_deref(),
-                is_continuation,
-                Some(tool_hub.clone()),
-                Some(status.clone()),
-                None, // override_auth
+            // Full recovery orchestration (transport retries, SIGKILL OAuth
+            // refresh, stale-credential retry, account rotation) is shared
+            // with the mission dispatch via the runners layer. This arm
+            // previously carried a near-duplicate copy that was missing the
+            // SIGKILL refresh and the initial auth retry.
+            use crate::api::runners::HarnessRunner as _;
+            Box::pin(crate::api::runners::ClaudeCodeRunner.run_turn(
+                crate::api::runners::TurnContext {
+                    workspace: exec_workspace,
+                    work_dir: &ctx.working_dir,
+                    message: &user_message,
+                    model: config.default_model.as_deref(),
+                    model_effort: requested_model_effort.as_deref(),
+                    agent: config.opencode_agent.as_deref(),
+                    mission_id: mid,
+                    events_tx: events_tx.clone(),
+                    cancel: cancel.clone(),
+                    app_working_dir: &config.working_dir,
+                    session_id: session_id.as_deref(),
+                    is_continuation,
+                    extras: crate::api::runners::TurnExtras::ClaudeCode {
+                        secrets: None, // not available in control context
+                        tool_hub: Some(tool_hub.clone()),
+                        status: Some(status.clone()),
+                        history: &history,
+                        max_history_total_chars: config.context.max_history_total_chars,
+                    },
+                },
             ))
-            .await;
-
-            loop {
-                if cancel.is_cancelled() || super::routes::is_shutdown_initiated() {
-                    tracing::debug!(
-                        mission_id = %mid,
-                        "Skipping Claude transport recovery because execution is cancelling or shutting down"
-                    );
-                    break;
-                }
-
-                match super::mission_runner::claudecode_transport_recovery_strategy(
-                    &result,
-                    effective_session_id.is_some(),
-                    attempted_same_session_resume,
-                    attempted_session_reset,
-                ) {
-                    super::mission_runner::ClaudeTransportRecoveryStrategy::None => break,
-                    super::mission_runner::ClaudeTransportRecoveryStrategy::ResumeCurrentSession => {
-                        attempted_same_session_resume = true;
-                        tracing::warn!(
-                            mission_id = %mid,
-                            session_id = ?effective_session_id,
-                            error = %result.output,
-                            "Incomplete Claude turn detected; retrying once by continuing the current session"
-                        );
-                        effective_message =
-                            super::mission_runner::claudecode_resume_current_session_message()
-                                .to_string();
-                        result = Box::pin(super::mission_runner::run_claudecode_turn(
-                            exec_workspace,
-                            &ctx.working_dir,
-                            &effective_message,
-                            config.default_model.as_deref(),
-                            requested_model_effort.as_deref(),
-                            config.opencode_agent.as_deref(),
-                            mid,
-                            events_tx.clone(),
-                            cancel.clone(),
-                            None,
-                            &config.working_dir,
-                            effective_session_id.as_deref(),
-                            true,
-                            Some(tool_hub.clone()),
-                            Some(status.clone()),
-                            None,
-                        ))
-                        .await;
-                    }
-                    super::mission_runner::ClaudeTransportRecoveryStrategy::ResetSessionFresh => {
-                        attempted_session_reset = true;
-                        let new_session_id = Uuid::new_v4().to_string();
-                        tracing::warn!(
-                            mission_id = %mid,
-                            old_session_id = ?effective_session_id,
-                            new_session_id = %new_session_id,
-                            attempted_same_session_resume,
-                            error = %result.output,
-                            "Session corruption detected; resetting session and retrying once"
-                        );
-
-                        let _ = events_tx.send(AgentEvent::SessionIdUpdate {
-                            mission_id: mid,
-                            session_id: new_session_id.clone(),
-                        });
-
-                        let session_marker = ctx.working_dir.join(".claude-session-initiated");
-                        if session_marker.exists() {
-                            let _ = std::fs::remove_file(&session_marker);
-                        }
-
-                        let history_for_retry = match history.last() {
-                            Some((role, content)) if role == "user" && content == &user_message => {
-                                &history[..history.len() - 1]
-                            }
-                            _ => history.as_slice(),
-                        };
-                        let retry_message = if history_for_retry.is_empty() {
-                            user_message.clone()
-                        } else {
-                            let history_ctx = build_history_context(
-                                history_for_retry,
-                                config.context.max_history_total_chars,
-                            );
-                            format!(
-                                "## Prior conversation (session was reset due to a transient error)\n\n\
-                                 {history_ctx}\
-                                 ## Current message\n\n\
-                                 {user_message}"
-                            )
-                        };
-
-                        effective_message = retry_message;
-                        effective_session_id = Some(new_session_id);
-
-                        result = Box::pin(super::mission_runner::run_claudecode_turn(
-                            exec_workspace,
-                            &ctx.working_dir,
-                            &effective_message,
-                            config.default_model.as_deref(),
-                            requested_model_effort.as_deref(),
-                            config.opencode_agent.as_deref(),
-                            mid,
-                            events_tx.clone(),
-                            cancel.clone(),
-                            None,
-                            &config.working_dir,
-                            effective_session_id.as_deref(),
-                            false,
-                            Some(tool_hub.clone()),
-                            Some(status.clone()),
-                            None,
-                        ))
-                        .await;
-                    }
-                }
-            }
-
-            // Auth error recovery: if the token was revoked server-side but the
-            // local expiry hadn't passed yet, invalidate stale credentials, force
-            // an OAuth refresh, and retry once.
-            if result.terminal_reason == Some(TerminalReason::AuthError) && !cancel.is_cancelled() {
-                tracing::warn!(
-                    mission_id = %mid,
-                    "Auth error detected — invalidating stale credentials and retrying"
-                );
-
-                super::mission_runner::refresh_claude_credentials_after_auth_error(
-                    &ctx.working_dir,
-                    "control_initial_auth_error",
-                )
-                .await;
-
-                // Retry with fresh credentials
-                result = Box::pin(super::mission_runner::run_claudecode_turn(
-                    exec_workspace,
-                    &ctx.working_dir,
-                    &effective_message,
-                    config.default_model.as_deref(),
-                    requested_model_effort.as_deref(),
-                    config.opencode_agent.as_deref(),
-                    mid,
-                    events_tx.clone(),
-                    cancel.clone(),
-                    None,
-                    &config.working_dir,
-                    effective_session_id.as_deref(),
-                    is_continuation,
-                    Some(tool_hub.clone()),
-                    Some(status.clone()),
-                    None,
-                ))
-                .await;
-            }
-
-            // Account rotation: if rate-limited, try alternate Anthropic credentials.
-            // The first entry in the list is the highest-priority credential, which
-            // is almost certainly what the initial (override_auth=None) call used.
-            // Skip it to avoid a guaranteed duplicate rate-limit failure.
-            let mut rotated_anthropic_account = false;
-            if result.terminal_reason == Some(TerminalReason::RateLimited) && !cancel.is_cancelled()
-            {
-                let rotation_accounts = super::mission_runner::anthropic_rotation_accounts(
-                    exec_workspace,
-                    &ctx.working_dir,
-                    &config.working_dir,
-                );
-                if !rotation_accounts.accounts.is_empty() {
-                    tracing::info!(
-                        mission_id = %mid,
-                        total_accounts = rotation_accounts.total_accounts,
-                        alternate_accounts = rotation_accounts.accounts.len(),
-                        skipped_current = rotation_accounts.skipped_current,
-                        "Rate limited on primary account; trying alternate Anthropic credentials"
-                    );
-                    for (idx, alt_auth) in rotation_accounts.accounts.into_iter().enumerate() {
-                        if cancel.is_cancelled() {
-                            break;
-                        }
-                        rotated_anthropic_account = true;
-                        tracing::info!(
-                            mission_id = %mid,
-                            rotation_attempt = idx + 1,
-                            auth_type = match &alt_auth {
-                                super::ai_providers::ClaudeCodeAuth::ApiKey(_) => "api_key",
-                                super::ai_providers::ClaudeCodeAuth::OAuthToken(_) =>
-                                    "oauth_token",
-                            },
-                            "Rotating to alternate Anthropic account"
-                        );
-                        result = Box::pin(super::mission_runner::run_claudecode_turn(
-                            exec_workspace,
-                            &ctx.working_dir,
-                            &effective_message,
-                            config.default_model.as_deref(),
-                            requested_model_effort.as_deref(),
-                            config.opencode_agent.as_deref(),
-                            mid,
-                            events_tx.clone(),
-                            cancel.clone(),
-                            None,
-                            &config.working_dir,
-                            effective_session_id.as_deref(),
-                            is_continuation,
-                            Some(tool_hub.clone()),
-                            Some(status.clone()),
-                            Some(alt_auth),
-                        ))
-                        .await;
-                        // Only continue rotating on rate-limit errors.
-                        match result.terminal_reason {
-                            Some(TerminalReason::RateLimited) => {
-                                tracing::info!(
-                                    mission_id = %mid,
-                                    rotation_attempt = idx + 1,
-                                    "Rate limited; rotating to next account"
-                                );
-                                continue;
-                            }
-                            _ => break,
-                        }
-                    }
-                }
-            }
-
-            // Account rotation can surface a revoked/expired alternate OAuth
-            // credential. Run the same stale-credential recovery after rotation
-            // so the mission retries with freshly refreshed host credentials
-            // instead of stopping on "Invalid authentication credentials".
-            if rotated_anthropic_account
-                && result.terminal_reason == Some(TerminalReason::AuthError)
-                && !cancel.is_cancelled()
-            {
-                tracing::warn!(
-                    mission_id = %mid,
-                    "Auth error detected after credential rotation - invalidating stale credentials and retrying"
-                );
-
-                super::mission_runner::refresh_claude_credentials_after_auth_error(
-                    &ctx.working_dir,
-                    "control_rotated_auth_error",
-                )
-                .await;
-
-                result = Box::pin(super::mission_runner::run_claudecode_turn(
-                    exec_workspace,
-                    &ctx.working_dir,
-                    &effective_message,
-                    config.default_model.as_deref(),
-                    requested_model_effort.as_deref(),
-                    config.opencode_agent.as_deref(),
-                    mid,
-                    events_tx.clone(),
-                    cancel.clone(),
-                    None,
-                    &config.working_dir,
-                    effective_session_id.as_deref(),
-                    is_continuation,
-                    Some(tool_hub.clone()),
-                    Some(status.clone()),
-                    None,
-                ))
-                .await;
-            }
-
-            result
+            .await
         }
         Some("grok") => {
             let mid = match require_mission_id(mission_id, "Grok Build", &events_tx) {
@@ -12832,20 +11494,26 @@ async fn run_single_control_turn(
             } else {
                 convo.clone()
             };
-            Box::pin(super::mission_runner::run_grok_turn(
-                exec_workspace,
-                &ctx.working_dir,
-                &grok_message_owned,
-                requested_model
-                    .as_deref()
-                    .or(config.default_model.as_deref()),
-                mid,
-                events_tx.clone(),
-                cancel,
-                &config.working_dir,
-                session_id.as_deref(),
-                is_continuation,
-            ))
+            use crate::api::runners::HarnessRunner as _;
+            Box::pin(
+                crate::api::runners::GrokRunner.run_turn(crate::api::runners::TurnContext {
+                    workspace: exec_workspace,
+                    work_dir: &ctx.working_dir,
+                    message: &grok_message_owned,
+                    model: requested_model
+                        .as_deref()
+                        .or(config.default_model.as_deref()),
+                    model_effort: None,
+                    agent: None,
+                    mission_id: mid,
+                    events_tx: events_tx.clone(),
+                    cancel,
+                    app_working_dir: &config.working_dir,
+                    session_id: session_id.as_deref(),
+                    is_continuation,
+                    extras: crate::api::runners::TurnExtras::None,
+                }),
+            )
             .await
         }
         Some("codex") => {
@@ -12873,19 +11541,24 @@ async fn run_single_control_turn(
             // account kept re-hitting the same cap instead of rotating to
             // the next account. Fallback-model and tool-stall retries are
             // handled inside the wrapper per attempted credential.
-            Box::pin(super::mission_runner::run_codex_turn_with_rotation(
-                exec_workspace,
-                &ctx.working_dir,
-                codex_message,
-                requested_codex_model,
-                requested_model_effort.as_deref(),
-                config.opencode_agent.as_deref(),
-                mid,
-                events_tx.clone(),
-                cancel.clone(),
-                &config.working_dir,
-                session_id.as_deref(),
-            ))
+            use crate::api::runners::HarnessRunner as _;
+            Box::pin(
+                crate::api::runners::CodexRunner.run_turn(crate::api::runners::TurnContext {
+                    workspace: exec_workspace,
+                    work_dir: &ctx.working_dir,
+                    message: codex_message,
+                    model: requested_codex_model,
+                    model_effort: requested_model_effort.as_deref(),
+                    agent: config.opencode_agent.as_deref(),
+                    mission_id: mid,
+                    events_tx: events_tx.clone(),
+                    cancel: cancel.clone(),
+                    app_working_dir: &config.working_dir,
+                    session_id: session_id.as_deref(),
+                    is_continuation: false,
+                    extras: crate::api::runners::TurnExtras::None,
+                }),
+            )
             .await
         }
         Some("gemini") => {
@@ -12893,18 +11566,24 @@ async fn run_single_control_turn(
                 Ok(id) => id,
                 Err(r) => return r,
             };
-            Box::pin(super::mission_runner::run_gemini_turn(
-                exec_workspace,
-                &ctx.working_dir,
-                &convo,
-                config.default_model.as_deref(),
-                config.opencode_agent.as_deref(),
-                mid,
-                events_tx.clone(),
-                cancel,
-                &config.working_dir,
-                session_id.as_deref(),
-            ))
+            use crate::api::runners::HarnessRunner as _;
+            Box::pin(
+                crate::api::runners::GeminiRunner.run_turn(crate::api::runners::TurnContext {
+                    workspace: exec_workspace,
+                    work_dir: &ctx.working_dir,
+                    message: &convo,
+                    model: config.default_model.as_deref(),
+                    model_effort: None,
+                    agent: config.opencode_agent.as_deref(),
+                    mission_id: mid,
+                    events_tx: events_tx.clone(),
+                    cancel,
+                    app_working_dir: &config.working_dir,
+                    session_id: session_id.as_deref(),
+                    is_continuation: false,
+                    extras: crate::api::runners::TurnExtras::None,
+                }),
+            )
             .await
         }
         Some(backend) if backend != "opencode" => {
@@ -12958,19 +11637,23 @@ async fn run_single_control_turn(
                 } else {
                     convo.clone()
                 };
-            Box::pin(super::mission_runner::run_opencode_turn(
-                exec_workspace,
-                &ctx.working_dir,
-                &opencode_message_owned,
-                config.default_model.as_deref(),
-                requested_model_effort.as_deref(),
-                config.opencode_agent.as_deref(),
-                mid,
-                events_tx.clone(),
-                cancel,
-                &config.working_dir,
-                session_id.as_deref(),
-                opencode_is_continuation,
+            use crate::api::runners::HarnessRunner as _;
+            Box::pin(crate::api::runners::OpenCodeRunner.run_turn(
+                crate::api::runners::TurnContext {
+                    workspace: exec_workspace,
+                    work_dir: &ctx.working_dir,
+                    message: &opencode_message_owned,
+                    model: config.default_model.as_deref(),
+                    model_effort: requested_model_effort.as_deref(),
+                    agent: config.opencode_agent.as_deref(),
+                    mission_id: mid,
+                    events_tx: events_tx.clone(),
+                    cancel,
+                    app_working_dir: &config.working_dir,
+                    session_id: session_id.as_deref(),
+                    is_continuation: opencode_is_continuation,
+                    extras: crate::api::runners::TurnExtras::None,
+                },
             ))
             .await
         }
