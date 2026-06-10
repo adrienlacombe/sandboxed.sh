@@ -1773,6 +1773,28 @@ fn handle_part_update(
     })
 }
 
+/// Build the block-final `Thinking` event for a completed thinking block.
+///
+/// All `done: true` thinking emissions must go through this helper: the
+/// finalizer is the only thinking event that gets persisted (incremental
+/// `done: false` deltas are broadcast-only), so it has to carry the full
+/// accumulated block content. An empty finalizer means a runner lost its
+/// buffer — warn so the regression is visible in logs instead of silently
+/// producing empty thought history again.
+fn thinking_final_event(content: String, mission_id: Uuid) -> AgentEvent {
+    if content.trim().is_empty() {
+        tracing::warn!(
+            mission_id = %mission_id,
+            "Finalizing a thinking block with empty content; thought history will miss this block"
+        );
+    }
+    AgentEvent::Thinking {
+        content,
+        done: true,
+        mission_id: Some(mission_id),
+    }
+}
+
 fn parse_opencode_stderr_text_part(line: &str) -> Option<String> {
     let marker = "message.part (text):";
     let idx = line.find(marker)?;
@@ -5172,6 +5194,10 @@ pub fn run_claudecode_turn<'a>(
         // This is needed because Claude sends incremental deltas that need to be accumulated
         let mut block_types: HashMap<u32, String> = HashMap::new();
         let mut thinking_buffer: HashMap<u32, String> = HashMap::new();
+        // Per-turn audit: catches thinking blocks whose deltas we can't
+        // decode (OAuth-encrypted / signature-only) so the turn end can
+        // surface a marker instead of a silently empty thoughts panel.
+        let mut thinking_audit = crate::backend::shared::ThinkingDeltaAudit::default();
         let mut text_buffer: HashMap<u32, String> = HashMap::new();
         let mut active_thinking_index: Option<u32> = None; // Track which thinking block is active
         let mut finalized_thinking_indices: std::collections::HashSet<u32> =
@@ -5503,11 +5529,16 @@ pub fn run_claudecode_turn<'a>(
                                                         // If a new thinking block started, finalize the previous one
                                                         if let Some(prev_idx) = active_thinking_index {
                                                             if prev_idx != index {
-                                                                let _ = events_tx.send(AgentEvent::Thinking {
-                                                                    content: String::new(),
-                                                                    done: true,
-                                                                    mission_id: Some(mission_id),
-                                                                });
+                                                                // The finalizer must carry the full block content:
+                                                                // it is the only thinking event that survives into
+                                                                // persisted history.
+                                                                let _ = events_tx.send(thinking_final_event(
+                                                                    thinking_buffer
+                                                                        .get(&prev_idx)
+                                                                        .cloned()
+                                                                        .unwrap_or_default(),
+                                                                    mission_id,
+                                                                ));
                                                                 finalized_thinking_indices.insert(prev_idx);
                                                             }
                                                         }
@@ -5520,6 +5551,7 @@ pub fn run_claudecode_turn<'a>(
                                                         merge_stream_fragment(buffer, &thinking_content);
 
                                                         // Send this block's accumulated content
+                                                        thinking_audit.note_emitted_thinking();
                                                         let _ = events_tx.send(AgentEvent::Thinking {
                                                             content: buffer.clone(),
                                                             done: false,
@@ -5602,7 +5634,13 @@ pub fn run_claudecode_turn<'a>(
                                                     }
                                                 }
                                             }
-                                            // Ignore other delta types (e.g., input_json_delta for tool use)
+                                            else if delta.delta_type != "input_json_delta" {
+                                                // Unknown delta type (e.g. signature_delta for
+                                                // encrypted thinking) — record it so the turn end
+                                                // can warn and surface a marker.
+                                                thinking_audit
+                                                    .note_undecoded_delta(&delta.delta_type);
+                                            }
                                         }
                                         StreamEvent::ContentBlockStart { index, content_block }
                                             if content_block.block_type == "tool_use" =>
@@ -5619,6 +5657,8 @@ pub fn run_claudecode_turn<'a>(
                                             }
                                         }
                                         StreamEvent::ContentBlockStart { index, content_block } => {
+                                            thinking_audit
+                                                .note_block_start(&content_block.block_type);
                                             block_types.insert(index, content_block.block_type);
                                         }
                                         _ => {}
@@ -5637,6 +5677,7 @@ pub fn run_claudecode_turn<'a>(
                                             usage.cache_read_input_tokens.unwrap_or(0);
                                     }
                                     let mut assistant_thinking_fallback = String::new();
+                                    let mut assistant_emitted_thinking_final = false;
                                     for (content_idx, block) in evt.message.content.into_iter().enumerate() {
                                         let content_idx = content_idx as u32;
                                         match block {
@@ -5818,11 +5859,10 @@ pub fn run_claudecode_turn<'a>(
                                                 // Earlier blocks were already finalized during streaming
                                                 // (via the block-transition mechanism) and re-sending them
                                                 // causes duplicate items in the frontend thinking panel.
-                                                let _ = events_tx.send(AgentEvent::Thinking {
-                                                    content: thinking,
-                                                    done: true,
-                                                    mission_id: Some(mission_id),
-                                                });
+                                                assistant_emitted_thinking_final = true;
+                                                thinking_audit.note_emitted_thinking();
+                                                let _ = events_tx
+                                                    .send(thinking_final_event(thinking, mission_id));
                                             }
                                             _ => {}
                                         }
@@ -5861,6 +5901,34 @@ pub fn run_claudecode_turn<'a>(
                                             "Using assistant thinking-only block as final result ({} chars, no text content in this turn)",
                                             final_result.len()
                                         );
+                                    }
+                                    // The last streaming thinking block has no block-transition
+                                    // finalizer, and OAuth/encrypted turns may carry no
+                                    // ContentBlock::Thinking in the Assistant event. Finalize it
+                                    // here from the streamed buffer so the block-final event
+                                    // (the only persisted one) is never lost.
+                                    if !assistant_emitted_thinking_final {
+                                        if let Some(idx) = active_thinking_index {
+                                            if !finalized_thinking_indices.contains(&idx) {
+                                                if let Some(buffer) = thinking_buffer.get(&idx) {
+                                                    if !buffer.trim().is_empty() {
+                                                        let _ = events_tx.send(thinking_final_event(
+                                                            buffer.clone(),
+                                                            mission_id,
+                                                        ));
+                                                        finalized_thinking_indices.insert(idx);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    // Encrypted/undecoded thinking: if a thinking block was
+                                    // opened but produced no decodable content this turn,
+                                    // surface a marker so the panel isn't silently empty
+                                    // (also warns once about unknown delta types).
+                                    if let Some(marker) = thinking_audit.finish_turn() {
+                                        let _ = events_tx
+                                            .send(thinking_final_event(marker, mission_id));
                                     }
                                     // Reset per-turn accumulation state so the next turn
                                     // starts fresh (block indices restart from 0 each turn)
@@ -11157,6 +11225,10 @@ pub async fn run_opencode_turn(
     // unlike stderr which truncates long content (fixes #158).
     let sse_text_buffer: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
     let sse_emitted_thinking = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // Latest cumulative thinking content streamed this session. The block-final
+    // Thinking event (the only persisted one) is built from this, including in
+    // the post-loop fallback where the reader task's parser state is gone.
+    let sse_last_thinking: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
     let sse_emitted_text = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let sse_done_sent = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let sse_error_message: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
@@ -11775,6 +11847,10 @@ pub async fn run_opencode_turn(
                                             {
                                                 state.last_emitted_thinking =
                                                     Some(thinking.clone());
+                                                *sse_last_thinking
+                                                    .lock()
+                                                    .unwrap_or_else(|e| e.into_inner()) =
+                                                    thinking.clone();
                                                 sse_emitted_thinking.store(
                                                     true,
                                                     std::sync::atomic::Ordering::SeqCst,
@@ -11955,7 +12031,12 @@ pub async fn run_opencode_turn(
                                             *guard = Some(message.clone());
                                         }
                                     }
-                                    if matches!(event, AgentEvent::Thinking { .. }) {
+                                    if let AgentEvent::Thinking { ref content, .. } = event {
+                                        if !content.trim().is_empty() {
+                                            *sse_last_thinking
+                                                .lock()
+                                                .unwrap_or_else(|e| e.into_inner()) = content.clone();
+                                        }
                                         sse_emitted_thinking.store(true, std::sync::atomic::Ordering::SeqCst);
                                         // New thinking content arrived; reset done flag so this
                                         // turn's thinking block will get its own done event.
@@ -12003,11 +12084,15 @@ pub async fn run_opencode_turn(
                                     if sse_emitted_thinking.load(std::sync::atomic::Ordering::SeqCst)
                                         && !sse_done_sent.load(std::sync::atomic::Ordering::SeqCst)
                                     {
-                                        let _ = events_tx.send(AgentEvent::Thinking {
-                                            content: String::new(),
-                                            done: true,
-                                            mission_id: Some(mission_id),
-                                        });
+                                        // Block-final event: carry the cumulative thinking so
+                                        // persisted history keeps the full block (incremental
+                                        // done:false deltas are not persisted).
+                                        let last_thinking = sse_last_thinking
+                                            .lock()
+                                            .unwrap_or_else(|e| e.into_inner())
+                                            .clone();
+                                        let _ = events_tx
+                                            .send(thinking_final_event(last_thinking, mission_id));
                                         sse_done_sent.store(true, std::sync::atomic::Ordering::SeqCst);
                                     }
                                     // Clear per-turn thinking buffers so each model turn
@@ -12322,10 +12407,11 @@ pub async fn run_opencode_turn(
         if !sse_emitted {
             if let Some(reasoning) = extract_reasoning(&message.parts) {
                 let _ = events_tx.send(AgentEvent::Thinking {
-                    content: reasoning,
+                    content: reasoning.clone(),
                     done: false,
                     mission_id: Some(mission_id),
                 });
+                *sse_last_thinking.lock().unwrap_or_else(|e| e.into_inner()) = reasoning;
                 emitted_thinking = true;
             }
         }
@@ -12333,11 +12419,12 @@ pub async fn run_opencode_turn(
 
     if emitted_thinking || (sse_emitted && !sse_done_sent.load(std::sync::atomic::Ordering::SeqCst))
     {
-        let _ = events_tx.send(AgentEvent::Thinking {
-            content: String::new(),
-            done: true,
-            mission_id: Some(mission_id),
-        });
+        // Block-final event with the full content — the only persisted form.
+        let last_thinking = sse_last_thinking
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let _ = events_tx.send(thinking_final_event(last_thinking, mission_id));
     }
 
     // Check for banner-only output BEFORE emitting TextDelta to avoid
@@ -13338,11 +13425,10 @@ pub async fn run_grok_turn(
                                 // dashboard collapses the reasoning panel
                                 // before streaming text deltas.
                                 if !reasoning_buffer.is_empty() {
-                                    let _ = events_tx.send(AgentEvent::Thinking {
-                                        content: std::mem::take(&mut reasoning_buffer),
-                                        done: true,
-                                        mission_id: Some(mission_id),
-                                    });
+                                    let _ = events_tx.send(thinking_final_event(
+                                        std::mem::take(&mut reasoning_buffer),
+                                        mission_id,
+                                    ));
                                     last_reasoning_len = 0;
                                 }
                                 if value
@@ -13417,11 +13503,10 @@ pub async fn run_grok_turn(
     // Emit done: true so the dashboard finalizes the thinking block in the
     // event store.
     if !reasoning_buffer.is_empty() {
-        let _ = events_tx.send(AgentEvent::Thinking {
-            content: std::mem::take(&mut reasoning_buffer),
-            done: true,
-            mission_id: Some(mission_id),
-        });
+        let _ = events_tx.send(thinking_final_event(
+            std::mem::take(&mut reasoning_buffer),
+            mission_id,
+        ));
     }
     let _ = last_reasoning_len;
 
@@ -14494,11 +14579,10 @@ pub async fn run_codex_turn(
                             _ => false,
                         };
                         if item_changed && !thinking_accumulated.is_empty() {
-                            let _ = events_tx.send(AgentEvent::Thinking {
-                                content: std::mem::take(&mut thinking_accumulated),
-                                done: true,
-                                mission_id: Some(mission_id),
-                            });
+                            let _ = events_tx.send(thinking_final_event(
+                                std::mem::take(&mut thinking_accumulated),
+                                mission_id,
+                            ));
                             thinking_done_emitted = true;
                         }
                         if item_id.is_some() {
@@ -14530,11 +14614,10 @@ pub async fn run_codex_turn(
                         // Flush accumulated thinking as done before tool call,
                         // so the event logger persists the full thought block.
                         if !thinking_accumulated.is_empty() {
-                            let _ = events_tx.send(AgentEvent::Thinking {
-                                content: std::mem::take(&mut thinking_accumulated),
-                                done: true,
-                                mission_id: Some(mission_id),
-                            });
+                            let _ = events_tx.send(thinking_final_event(
+                                std::mem::take(&mut thinking_accumulated),
+                                mission_id,
+                            ));
                             thinking_done_emitted = true;
                         }
                         thinking_item = None;
@@ -14690,11 +14773,7 @@ pub async fn run_codex_turn(
     // Flush any remaining accumulated thinking with full content so
     // the event logger persists it for replay/history.
     if thinking_emitted && !thinking_done_emitted {
-        let _ = events_tx.send(AgentEvent::Thinking {
-            content: thinking_accumulated,
-            done: true,
-            mission_id: Some(mission_id),
-        });
+        let _ = events_tx.send(thinking_final_event(thinking_accumulated, mission_id));
     }
 
     let no_output = assistant_message.trim().is_empty()
@@ -15104,11 +15183,10 @@ pub async fn run_gemini_turn(
                     ExecutionEvent::ToolCall { id, name, args } => {
                         // Flush accumulated thinking before tool call
                         if !thinking_accumulated.is_empty() {
-                            let _ = events_tx.send(AgentEvent::Thinking {
-                                content: std::mem::take(&mut thinking_accumulated),
-                                done: true,
-                                mission_id: Some(mission_id),
-                            });
+                            let _ = events_tx.send(thinking_final_event(
+                                std::mem::take(&mut thinking_accumulated),
+                                mission_id,
+                            ));
                             thinking_done_emitted = true;
                         }
                         pending_tools.insert(id.clone(), name.clone());
@@ -15185,11 +15263,7 @@ pub async fn run_gemini_turn(
 
     // Flush any remaining accumulated thinking with full content
     if thinking_emitted && !thinking_done_emitted {
-        let _ = events_tx.send(AgentEvent::Thinking {
-            content: thinking_accumulated,
-            done: true,
-            mission_id: Some(mission_id),
-        });
+        let _ = events_tx.send(thinking_final_event(thinking_accumulated, mission_id));
     }
 
     let no_output = assistant_message.trim().is_empty() && thinking_for_fallback.is_none();

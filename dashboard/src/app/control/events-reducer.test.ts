@@ -100,6 +100,40 @@ describe("eventsToItemsImpl text_delta replay", () => {
   });
 });
 
+describe("eventsToItemsImpl thinking replay", () => {
+  it("renders one item per block-final thinking event", () => {
+    const items = eventsToItemsImpl(
+      [
+        storedEvent(1, "thinking", "first block", undefined, { done: true }),
+        storedEvent(2, "thinking", "second block", undefined, { done: true }),
+        storedEvent(3, "assistant_message", "done", undefined, {
+          success: true,
+        }),
+      ],
+      { status: "awaiting_user" } as Mission,
+    );
+
+    const thinking = items.filter((item) => item.kind === "thinking");
+    expect(thinking).toHaveLength(2);
+    expect(thinking[0]).toMatchObject({ content: "first block", done: true });
+    expect(thinking[1]).toMatchObject({ content: "second block", done: true });
+  });
+
+  it("ignores legacy empty done finalizers with no open block", () => {
+    const items = eventsToItemsImpl(
+      [
+        storedEvent(1, "thinking", "", undefined, { done: true }),
+        storedEvent(2, "assistant_message", "done", undefined, {
+          success: true,
+        }),
+      ],
+      { status: "awaiting_user" } as Mission,
+    );
+
+    expect(items.filter((item) => item.kind === "thinking")).toHaveLength(0);
+  });
+});
+
 describe("eventsToItemsImpl lazy tool stubs", () => {
   it("renders a tool_stub as a lazy tool row", () => {
     const items = eventsToItemsImpl([

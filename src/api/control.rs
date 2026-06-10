@@ -4874,8 +4874,23 @@ impl EventSummary {
     }
 }
 
-fn is_stream_summary_event(event_type: &str) -> bool {
-    matches!(event_type, "thinking" | "text_delta")
+/// Gate for the event-logger task: which broadcast events get persisted.
+///
+/// Incremental thinking deltas (`done: false`) are broadcast-only — they
+/// exist for live streaming and each carries the cumulative block buffer, so
+/// persisting them is O(n²) in storage (some missions accumulated 100k+ rows).
+/// Only the block-final `done: true` event, which carries the full block
+/// content, is persisted.
+fn should_persist_event(event: &AgentEvent) -> bool {
+    !matches!(event, AgentEvent::Thinking { done: false, .. })
+}
+
+fn thinking_event_is_done(event: &mission_store::StoredEvent) -> bool {
+    event
+        .metadata
+        .get("done")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
 }
 
 fn should_summarize_events(mission: &Mission) -> bool {
@@ -4897,30 +4912,87 @@ fn summarize_inactive_stream_events(events: Vec<mission_store::StoredEvent>) -> 
 
     let original_count = events.len();
     let mut summarized = Vec::with_capacity(events.len());
-    let mut pending: Option<mission_store::StoredEvent> = None;
+    // text_delta keeps the legacy last-wins collapse: deltas are cumulative
+    // snapshots and only the latest matters.
+    let mut pending_text: Option<mission_store::StoredEvent> = None;
+    // Thinking collapses per *block*, not per run: a `done: true` row is a
+    // block boundary and rows are never merged across it. Within a block we
+    // keep one row carrying the last non-empty content (legacy data persisted
+    // cumulative snapshots followed by an empty `done: true` finalizer;
+    // current data persists exactly one full-content `done: true` row per
+    // block, which passes through unchanged).
+    let mut pending_thinking: Option<mission_store::StoredEvent> = None;
+    let mut thinking_last_nonempty: Option<String> = None;
+
+    fn flush_thinking(
+        pending: &mut Option<mission_store::StoredEvent>,
+        last_nonempty: &mut Option<String>,
+        out: &mut Vec<mission_store::StoredEvent>,
+    ) {
+        if let Some(mut event) = pending.take() {
+            if event.content.trim().is_empty() {
+                if let Some(content) = last_nonempty.take() {
+                    event.content = content;
+                } else {
+                    // A block that never produced content (legacy empty
+                    // finalizer with no preceding deltas) — drop it.
+                    return;
+                }
+            }
+            // Force the kept row to close its block so the frontend renders
+            // it as a finished thought.
+            event.metadata["done"] = serde_json::Value::Bool(true);
+            out.push(event);
+        }
+        *last_nonempty = None;
+    }
 
     for event in events {
-        if !is_stream_summary_event(&event.event_type) {
-            if let Some(pending) = pending.take() {
+        if event.event_type == "thinking" {
+            // Preserve interleaving: an open text_delta run ends here.
+            if let Some(pending) = pending_text.take() {
                 summarized.push(pending);
             }
-            summarized.push(event);
+            let is_boundary = thinking_event_is_done(&event);
+            if !event.content.trim().is_empty() {
+                thinking_last_nonempty = Some(event.content.clone());
+            }
+            pending_thinking = Some(event);
+            if is_boundary {
+                flush_thinking(
+                    &mut pending_thinking,
+                    &mut thinking_last_nonempty,
+                    &mut summarized,
+                );
+            }
             continue;
         }
 
-        match pending.as_mut() {
-            Some(existing) if existing.event_type == event.event_type => {
-                *existing = event;
-            }
-            Some(_) => {
-                summarized.push(pending.take().expect("pending checked above"));
-                pending = Some(event);
-            }
-            None => pending = Some(event),
+        // Any non-thinking event closes an open thinking run first to
+        // preserve ordering.
+        flush_thinking(
+            &mut pending_thinking,
+            &mut thinking_last_nonempty,
+            &mut summarized,
+        );
+
+        if event.event_type == "text_delta" {
+            pending_text = Some(event);
+            continue;
         }
+
+        if let Some(pending) = pending_text.take() {
+            summarized.push(pending);
+        }
+        summarized.push(event);
     }
 
-    if let Some(pending) = pending {
+    flush_thinking(
+        &mut pending_thinking,
+        &mut thinking_last_nonempty,
+        &mut summarized,
+    );
+    if let Some(pending) = pending_text {
         summarized.push(pending);
     }
 
@@ -6774,14 +6846,16 @@ fn spawn_control_session(
                         *processed_per_type.entry(ev_name).or_insert(0) += 1;
                         // Extract mission_id from event
                         if let Some(mid) = event.mission_id() {
-                            processed_total += 1;
-                            if let Err(e) = store.log_event(mid, &event).await {
-                                tracing::warn!(
-                                    mission_id = %mid,
-                                    event_type = ev_name,
-                                    "Failed to log event: {}",
-                                    e
-                                );
+                            if should_persist_event(&event) {
+                                processed_total += 1;
+                                if let Err(e) = store.log_event(mid, &event).await {
+                                    tracing::warn!(
+                                        mission_id = %mid,
+                                        event_type = ev_name,
+                                        "Failed to log event: {}",
+                                        e
+                                    );
+                                }
                             }
                         }
                     }
@@ -19559,6 +19633,119 @@ Investigate <service/> failures.
         assert_eq!(summary.events[3].event_type, "text_delta");
         assert_eq!(summary.events[3].sequence, 7);
         assert_eq!(summary.events[3].content, "draft final");
+        // The kept thinking row must close its block for the frontend.
+        assert_eq!(summary.events[1].metadata["done"], serde_json::json!(true));
+    }
+
+    fn thinking_test_event(
+        sequence: i64,
+        event_type: &str,
+        content: &str,
+        done: Option<bool>,
+    ) -> mission_store::StoredEvent {
+        mission_store::StoredEvent {
+            id: sequence,
+            mission_id: Uuid::nil(),
+            sequence,
+            event_type: event_type.to_string(),
+            timestamp: "2026-05-19T00:00:00Z".to_string(),
+            event_id: Some(format!("{event_type}-{sequence}")),
+            tool_call_id: None,
+            tool_name: None,
+            content: content.to_string(),
+            metadata: match done {
+                Some(done) => serde_json::json!({ "done": done }),
+                None => serde_json::json!({}),
+            },
+        }
+    }
+
+    #[test]
+    fn should_persist_event_skips_incremental_thinking() {
+        let mid = Some(Uuid::nil());
+        assert!(!should_persist_event(&AgentEvent::Thinking {
+            content: "partial".to_string(),
+            done: false,
+            mission_id: mid,
+        }));
+        assert!(should_persist_event(&AgentEvent::Thinking {
+            content: "full block".to_string(),
+            done: true,
+            mission_id: mid,
+        }));
+        assert!(should_persist_event(&AgentEvent::TextDelta {
+            content: "text".to_string(),
+            mission_id: mid,
+        }));
+    }
+
+    #[test]
+    fn inactive_stream_summary_recovers_content_from_empty_done_finalizer() {
+        // Legacy claudecode pattern: cumulative snapshots followed by an
+        // empty done:true finalizer. The collapsed row must carry the last
+        // non-empty content, not the empty finalizer.
+        let events = vec![
+            thinking_test_event(1, "thinking", "a", Some(false)),
+            thinking_test_event(2, "thinking", "ab", Some(false)),
+            thinking_test_event(3, "thinking", "", Some(true)),
+        ];
+
+        let summary = summarize_inactive_stream_events(events);
+
+        assert_eq!(summary.summarized_count, 1);
+        assert_eq!(summary.events[0].content, "ab");
+        assert_eq!(summary.events[0].metadata["done"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn inactive_stream_summary_keeps_separate_thinking_blocks() {
+        // New block-final format: one done:true row per block. Consecutive
+        // blocks must NOT be merged.
+        let events = vec![
+            thinking_test_event(1, "thinking", "first block", Some(true)),
+            thinking_test_event(2, "thinking", "second block", Some(true)),
+        ];
+
+        let summary = summarize_inactive_stream_events(events);
+
+        assert_eq!(summary.summarized_count, 2);
+        assert_eq!(summary.events[0].content, "first block");
+        assert_eq!(summary.events[1].content, "second block");
+    }
+
+    #[test]
+    fn inactive_stream_summary_collapses_legacy_multi_block_runs() {
+        // Legacy data with two blocks, each ending in an empty finalizer.
+        let events = vec![
+            thinking_test_event(1, "thinking", "a", Some(false)),
+            thinking_test_event(2, "thinking", "ab", Some(false)),
+            thinking_test_event(3, "thinking", "", Some(true)),
+            thinking_test_event(4, "thinking", "x", Some(false)),
+            thinking_test_event(5, "thinking", "xy", Some(false)),
+            thinking_test_event(6, "thinking", "", Some(true)),
+        ];
+
+        let summary = summarize_inactive_stream_events(events);
+
+        assert_eq!(summary.summarized_count, 2);
+        assert_eq!(summary.events[0].content, "ab");
+        assert_eq!(summary.events[1].content, "xy");
+    }
+
+    #[test]
+    fn inactive_stream_summary_drops_contentless_thinking_block() {
+        // A lone empty finalizer (legacy 5506 bug with no preceding deltas)
+        // must not produce an empty thought in history.
+        let events = vec![
+            thinking_test_event(1, "user_message", "hello", None),
+            thinking_test_event(2, "thinking", "", Some(true)),
+            thinking_test_event(3, "assistant_message", "done", None),
+        ];
+
+        let summary = summarize_inactive_stream_events(events);
+
+        assert_eq!(summary.summarized_count, 2);
+        assert!(summary.events.iter().all(|e| e.event_type != "thinking"));
     }
 
     #[test]
