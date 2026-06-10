@@ -9,6 +9,7 @@ import useSWR from 'swr';
 import { getVisibleAgents, getSandboxedConfig, listBackends, listBackendAgents, getClaudeCodeConfig, listBackendModelOptions, listProviders, type Backend, type BackendAgent, type BackendModelOption, type ModelEffort, type Provider } from '@/lib/api';
 import type { Workspace } from '@/lib/api';
 import { isBackendAvailable, useBackendConfigs } from '@/lib/use-backend-configs';
+import { toast } from '@/components/toast';
 
 const KNOWN_BACKEND_IDS = ['opencode', 'claudecode', 'codex', 'gemini', 'grok'] as const;
 
@@ -616,6 +617,7 @@ export function NewMissionDialog({
     if (newMissionWorkspace) {
       const ws = workspaces.find(w => w.id === newMissionWorkspace);
       if (ws && ws.status !== 'ready') {
+        toast.error(`Workspace "${ws.name}" is not ready (status: ${ws.status}). Please wait for it to finish provisioning.`);
         return;
       }
     }

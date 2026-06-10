@@ -6892,7 +6892,7 @@ fn sanitized_opencode_stdout(output: &str) -> Cow<'_, str> {
 fn truncate_garbled_output(text: &str) -> Option<String> {
     const MIN_LENGTH: usize = 2000;
     const MAX_REPETITION_RATIO: f64 = 0.70;
-    const MIN_UNIQUE_BLOCKS: usize = 5;
+    const MIN_UNIQUE_BLOCKS: usize = 1;
 
     if text.len() < MIN_LENGTH {
         return None;
