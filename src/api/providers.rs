@@ -559,6 +559,14 @@ fn default_providers_config() -> ProvidersConfig {
                     // Check Anthropic's current model IDs here:
                     // https://docs.anthropic.com/en/docs/about-claude/models/overview
                     ProviderModel {
+                        id: "claude-fable-5".to_string(),
+                        name: "Claude Fable 5".to_string(),
+                        description: Some(
+                            "Most capable widely released model, adaptive thinking, 1M context"
+                                .to_string(),
+                        ),
+                    },
+                    ProviderModel {
                         id: "claude-opus-4-8".to_string(),
                         name: "Claude Opus 4.8".to_string(),
                         description: Some(

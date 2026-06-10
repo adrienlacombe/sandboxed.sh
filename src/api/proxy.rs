@@ -1973,7 +1973,9 @@ fn rewrite_model(body: &[u8], new_model: &str) -> Result<bytes::Bytes, String> {
 /// Newer Opus models reject explicit sampling params (`temperature`, `top_p`,
 /// `top_k`) when extended thinking is active, so we strip them for these IDs.
 fn anthropic_model_omits_sampling_params(model_id: &str) -> bool {
-    model_id.contains("claude-opus-4-8") || model_id.contains("claude-opus-4-7")
+    model_id.contains("claude-fable-5")
+        || model_id.contains("claude-opus-4-8")
+        || model_id.contains("claude-opus-4-7")
 }
 
 /// Drop `thinking`/`redacted_thinking` blocks from assistant messages.
