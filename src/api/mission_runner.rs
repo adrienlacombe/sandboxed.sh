@@ -394,6 +394,23 @@ pub(super) fn localhost_api_base_url_from_env() -> Option<String> {
     localhost_api_base_url(std::env::var("PORT").ok().as_deref())
 }
 
+/// API base URL reachable from *inside* the workspace's network namespace.
+/// Identical to [`localhost_api_base_url_from_env`] except for
+/// private-network containers, where the host is only reachable via the
+/// veth gateway address (see `Workspace::host_ip_from_workspace`).
+fn workspace_api_base_url(workspace: &Workspace) -> Option<String> {
+    let port = std::env::var("PORT").ok()?;
+    let port = port.trim();
+    if port.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "http://{}:{}",
+        workspace.host_ip_from_workspace(),
+        port
+    ))
+}
+
 /// Claude Code's built-in `ScheduleWakeup` tool ends the agent's turn with a
 /// promise that "the harness re-invokes you when the wakeup fires" — but in
 /// `--print` mode, open_agent is the harness and would otherwise have no way
@@ -4957,9 +4974,11 @@ pub fn run_claudecode_turn<'a>(
                 env.insert("TELEGRAM_ACTION_TOKEN".to_string(), token);
             }
 
-            // Use localhost only — never fall back to a public URL for internal
-            // action endpoints (they use HMAC tokens, not bearer auth).
-            let internal_api_url = localhost_api_base_url_from_env();
+            // Use the internal host address only — never fall back to a public
+            // URL for internal action endpoints (they use HMAC tokens, not
+            // bearer auth). Workspace-aware: private-network containers reach
+            // the host via the veth gateway, not 127.0.0.1.
+            let internal_api_url = workspace_api_base_url(workspace);
             if let Some(api_url) = internal_api_url {
                 env.insert(
                     "TELEGRAM_ACTION_URL".to_string(),
@@ -7774,6 +7793,11 @@ fn ensure_opencode_provider_for_model(
     opencode_config_dir: &std::path::Path,
     app_working_dir: &std::path::Path,
     model_override: &str,
+    // Host address as seen from the workspace's network namespace.
+    // Private-network containers (Tailscale veth) cannot reach the host
+    // proxy on 127.0.0.1 — pointing builtin/* there made OpenCode exit
+    // banner-only until the 120s inactivity watchdog SIGKILLed it.
+    host_ip: &str,
 ) {
     let model_override = model_override.trim();
     if model_override.is_empty() {
@@ -7864,7 +7888,7 @@ fn ensure_opencode_provider_for_model(
                     model_id: { "name": model_id }
                 },
                 "options": {
-                    "baseURL": format!("http://127.0.0.1:{}/v1", port),
+                    "baseURL": format!("http://{}:{}/v1", host_ip, port),
                     "apiKey": proxy_key
                 }
             }))
@@ -10812,16 +10836,23 @@ pub async fn run_opencode_turn(
     }
     // Inject provider definitions into opencode.json for models not in
     // OpenCode's built-in snapshot.
+    let workspace_host_ip = workspace.host_ip_from_workspace();
     if let Some(model_override) = resolved_model.as_deref() {
         ensure_opencode_provider_for_model(
             &opencode_config_dir_host,
             app_working_dir,
             model_override,
+            &workspace_host_ip,
         );
     }
     if let Some(ref am) = agent_model {
         if resolved_model.as_deref() != Some(am) {
-            ensure_opencode_provider_for_model(&opencode_config_dir_host, app_working_dir, am);
+            ensure_opencode_provider_for_model(
+                &opencode_config_dir_host,
+                app_working_dir,
+                am,
+                &workspace_host_ip,
+            );
         }
     }
     if needs_google {
@@ -10885,6 +10916,7 @@ pub async fn run_opencode_turn(
             &opencode_config_dir_host,
             app_working_dir,
             opencode_model,
+            &workspace_host_ip,
         );
     }
 
@@ -10973,7 +11005,7 @@ pub async fn run_opencode_turn(
     env.insert("MISSION_ID".to_string(), mission_id.to_string());
     if let Some(public_url) = public_api_base_url_from_env() {
         env.insert("API_URL".to_string(), public_url);
-    } else if let Some(local_url) = localhost_api_base_url_from_env() {
+    } else if let Some(local_url) = workspace_api_base_url(workspace) {
         env.insert("API_URL".to_string(), local_url);
     }
 
@@ -11051,7 +11083,7 @@ pub async fn run_opencode_turn(
         {
             env.insert("TELEGRAM_ACTION_TOKEN".to_string(), token);
         }
-        let internal_api_url = localhost_api_base_url_from_env();
+        let internal_api_url = workspace_api_base_url(workspace);
         if let Some(api_url) = internal_api_url {
             env.insert(
                 "TELEGRAM_ACTION_URL".to_string(),
@@ -16883,7 +16915,12 @@ mod tests {
         )
         .expect("write provider store");
 
-        ensure_opencode_provider_for_model(&config_dir, &app_dir, "spark/qwen3.5-397b");
+        ensure_opencode_provider_for_model(
+            &config_dir,
+            &app_dir,
+            "spark/qwen3.5-397b",
+            "127.0.0.1",
+        );
 
         let opencode_json: serde_json::Value = serde_json::from_str(
             &fs::read_to_string(config_dir.join("opencode.json")).expect("opencode.json"),
@@ -16896,6 +16933,31 @@ mod tests {
         assert_eq!(
             opencode_json["provider"]["spark"]["options"]["baseURL"],
             "https://spark-de79.gazella-vector.ts.net/v1"
+        );
+    }
+
+    #[test]
+    fn ensure_opencode_provider_builtin_uses_workspace_host_ip() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let config_dir = temp.path().join("ws");
+        let app_dir = temp.path().join("app");
+        fs::create_dir_all(&config_dir).unwrap();
+        fs::create_dir_all(&app_dir).unwrap();
+
+        // Private-network container case: the proxy must be addressed via
+        // the veth gateway, not the container's own loopback.
+        ensure_opencode_provider_for_model(&config_dir, &app_dir, "builtin/smart", "10.88.0.1");
+
+        let opencode_json: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(config_dir.join("opencode.json")).expect("opencode.json"),
+        )
+        .expect("parse opencode.json");
+        let base_url = opencode_json["provider"]["builtin"]["options"]["baseURL"]
+            .as_str()
+            .expect("baseURL");
+        assert!(
+            base_url.starts_with("http://10.88.0.1:"),
+            "expected veth gateway baseURL, got {base_url}"
         );
     }
 
