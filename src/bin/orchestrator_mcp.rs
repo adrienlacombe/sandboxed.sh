@@ -169,7 +169,11 @@ struct SendMessageParams {
 /// waiting for the *same* answer without re-sending the question.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct AskWorkerBaseline {
-    history_len: usize,
+    /// Number of ASSISTANT entries in history at send time. Total history
+    /// length is not usable: the question itself appends a user entry, which
+    /// would read as "new answer" while the old assistant reply is still the
+    /// latest one.
+    assistant_count: usize,
     #[serde(default)]
     last_assistant: Option<String>,
 }
@@ -1105,18 +1109,18 @@ impl OrchestratorMcp {
                     );
                 }
 
-                // Cost guard before sending anything.
+                // Cost guard: check the cap up front, but only charge the
+                // quota after the message actually sends — a failed fetch or
+                // send must not consume one of the allowed questions.
                 {
-                    let mut counts = self.ask_counts.lock().await;
-                    let count = counts.entry(id).or_insert(0);
-                    if *count >= MAX_ASKS_PER_WORKER {
+                    let counts = self.ask_counts.lock().await;
+                    if counts.get(&id).copied().unwrap_or(0) >= MAX_ASKS_PER_WORKER {
                         return Err(format!(
                             "ask_worker limit reached for this worker ({MAX_ASKS_PER_WORKER} \
                              questions). Consolidate remaining questions or proceed with your \
                              own judgment."
                         ));
                     }
-                    *count += 1;
                 }
 
                 // Snapshot history BEFORE sending so a new answer is detectable.
@@ -1137,6 +1141,8 @@ impl OrchestratorMcp {
                     content: params.question.clone(),
                 })
                 .await?;
+                // Question is in flight — charge the quota now.
+                *self.ask_counts.lock().await.entry(id).or_insert(0) += 1;
                 baseline
             }
         };
@@ -2289,19 +2295,28 @@ fn last_assistant_message(mission: &Value) -> Option<String> {
 /// Fingerprint of a mission's conversation used by ask_worker to detect that
 /// a NEW assistant turn landed after the question was sent.
 fn history_fingerprint(mission: &Value) -> AskWorkerBaseline {
-    let history_len = mission
+    let assistant_count = mission
         .get("history")
         .and_then(Value::as_array)
-        .map(|h| h.len())
+        .map(|h| {
+            h.iter()
+                .filter(|entry| entry.get("role").and_then(Value::as_str) == Some("assistant"))
+                .count()
+        })
         .unwrap_or(0);
     AskWorkerBaseline {
-        history_len,
+        assistant_count,
         last_assistant: last_assistant_message(mission),
     }
 }
 
 /// True once the worker has produced a NEW answer since `baseline` AND its
 /// turn has settled (status is no longer mid-turn). Pure for testability.
+///
+/// "New answer" = an additional assistant entry, or the latest assistant
+/// content changed (history rewrites). The user message that ask_worker
+/// itself sends grows history without adding an assistant entry and must NOT
+/// count — that was returning the previous (stale) answer.
 fn ask_settled(status: &str, baseline: &AskWorkerBaseline, mission: &Value) -> bool {
     if matches!(status, "active" | "pending" | "acknowledged") {
         return false;
@@ -2310,7 +2325,8 @@ fn ask_settled(status: &str, baseline: &AskWorkerBaseline, mission: &Value) -> b
     let Some(answer) = current.last_assistant.as_deref() else {
         return false;
     };
-    current.history_len > baseline.history_len || baseline.last_assistant.as_deref() != Some(answer)
+    current.assistant_count > baseline.assistant_count
+        || baseline.last_assistant.as_deref() != Some(answer)
 }
 
 fn enrich_with_push_claims(mission: &mut Value) {
@@ -3057,11 +3073,23 @@ mod push_claim_tests {
             ]
         });
         let baseline = history_fingerprint(&before);
-        assert_eq!(baseline.history_len, 2);
+        assert_eq!(baseline.assistant_count, 1);
         assert_eq!(baseline.last_assistant.as_deref(), Some("a1"));
 
         // Unchanged history → not settled even when awaiting_user.
         assert!(!ask_settled("awaiting_user", &baseline, &before));
+
+        // The question ask_worker just sent appends a USER entry — history
+        // grew but no new assistant answer exists yet. Returning here was
+        // the stale-answer bug.
+        let question_sent = json!({
+            "history": [
+                { "role": "user", "content": "q1" },
+                { "role": "assistant", "content": "a1" },
+                { "role": "user", "content": "q2" }
+            ]
+        });
+        assert!(!ask_settled("awaiting_user", &baseline, &question_sent));
 
         // New assistant entry → settled once the status leaves mid-turn.
         let after = json!({
@@ -3085,7 +3113,7 @@ mod push_claim_tests {
         // message) without growing it; a changed last-assistant content
         // still counts as a new answer.
         let baseline = AskWorkerBaseline {
-            history_len: 2,
+            assistant_count: 1,
             last_assistant: Some("a1".to_string()),
         };
         let after = json!({
