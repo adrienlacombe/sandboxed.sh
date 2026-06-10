@@ -4802,7 +4802,6 @@ mod tests {
         }
     }
 
-
     #[test]
     fn parse_direct_model_entry_accepts_known_provider_prefix() {
         let e = parse_direct_model_entry("xai/grok-4.3").expect("known provider");

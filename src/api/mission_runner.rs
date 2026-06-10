@@ -12797,9 +12797,7 @@ pub async fn run_grok_turn(
 
     let workspace_exec = WorkspaceExec::new(workspace.clone());
 
-    if workspace.id == crate::workspace::DEFAULT_WORKSPACE_ID
-        && !work_dir.join(".git").exists()
-    {
+    if workspace.id == crate::workspace::DEFAULT_WORKSPACE_ID && !work_dir.join(".git").exists() {
         let file_count = std::fs::read_dir(work_dir)
             .map(|mut d| {
                 d.by_ref()
@@ -12829,11 +12827,20 @@ pub async fn run_grok_turn(
                  or clone the repo into the workspace first.",
             );
             let _ = events_tx.send(AgentEvent::AssistantMessage {
-                mission_id: Some(mission_id),
+                id: uuid::Uuid::new_v4(),
                 content: msg.clone(),
+                success: false,
+                cost_cents: 0,
+                cost_source: crate::agents::CostSource::Unknown,
+                usage: None,
+                model: None,
+                model_normalized: None,
+                mission_id: Some(mission_id),
+                shared_files: None,
+                resumable: false,
+                completion_evidence: None,
             });
-            return AgentResult::success(msg, 0)
-                .with_terminal_reason(TerminalReason::TurnComplete);
+            return AgentResult::success(msg, 0).with_terminal_reason(TerminalReason::TurnComplete);
         }
     }
 
