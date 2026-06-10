@@ -26,7 +26,6 @@ use crate::agents::{
     TurnOutcome,
 };
 use crate::config::Config;
-use crate::cost::resolve_cost_cents_and_source;
 use crate::mcp::McpRegistry;
 use crate::secrets::SecretsStore;
 use crate::task::{extract_deliverables, DeliverableSet};
@@ -8347,14 +8346,14 @@ mod tests {
         opencode_session_token_from_line, parse_opencode_goal_objective,
         parse_opencode_session_token, parse_opencode_sse_event, parse_opencode_stderr_text_part,
         preferred_model_for_cost, record_codex_error_message,
-        replace_filepath_artifact_with_tool_output, resolve_cost_cents_and_source, running_health,
-        sanitized_opencode_stdout, set_codex_account_cooldown, stall_severity, strip_ansi_codes,
-        strip_opencode_banner_lines, strip_think_tags, summarize_codex_usage_caps,
-        summarize_recent_opencode_stderr, text_buffer_stream_looks_degenerate,
-        thinking_overlaps_visible_answer, truncate_garbled_output, use_thinking_only_fallback,
-        utf8_safe_prefix, ClaudeIncompleteTurnContext, ClaudeTransportFailureStage,
-        ClaudeTransportRecoveryStrategy, ClaudeTurnWaitState, MissionHealth, MissionRunState,
-        MissionStallSeverity, OpencodeSseState, CODEX_AUTH_ERROR_COOLDOWN, CODEX_CAPACITY_COOLDOWN,
+        replace_filepath_artifact_with_tool_output, running_health, sanitized_opencode_stdout,
+        set_codex_account_cooldown, stall_severity, strip_ansi_codes, strip_opencode_banner_lines,
+        strip_think_tags, summarize_codex_usage_caps, summarize_recent_opencode_stderr,
+        text_buffer_stream_looks_degenerate, thinking_overlaps_visible_answer,
+        truncate_garbled_output, use_thinking_only_fallback, utf8_safe_prefix,
+        ClaudeIncompleteTurnContext, ClaudeTransportFailureStage, ClaudeTransportRecoveryStrategy,
+        ClaudeTurnWaitState, MissionHealth, MissionRunState, MissionStallSeverity,
+        OpencodeSseState, CODEX_AUTH_ERROR_COOLDOWN, CODEX_CAPACITY_COOLDOWN,
         CODEX_RATE_LIMIT_COOLDOWN, STALL_SEVERE_SECS, STALL_WARN_SECS,
     };
     use super::{
@@ -8363,6 +8362,7 @@ mod tests {
         localhost_api_base_url, merge_stream_fragment, public_api_base_url,
     };
     use crate::agents::{AgentResult, CostSource, TerminalReason};
+    use crate::cost::resolve_cost_cents_and_source;
     use crate::library::types::CommandParam;
     use serde_json::json;
     use std::borrow::Cow;
