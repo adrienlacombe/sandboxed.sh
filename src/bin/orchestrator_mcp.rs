@@ -3,6 +3,7 @@
 //! Provides boss agents with tools to create, monitor, and manage worker missions.
 //! Communicates over stdio using JSON-RPC 2.0.
 
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::process::Command;
 use std::sync::Arc;
@@ -163,6 +164,36 @@ struct SendMessageParams {
     content: String,
 }
 
+/// Snapshot of the worker's history taken when an `ask_worker` question is
+/// sent. Returned to the caller on timeout so a continuation re-call can keep
+/// waiting for the *same* answer without re-sending the question.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AskWorkerBaseline {
+    /// Number of ASSISTANT entries in history at send time. Total history
+    /// length is not usable: the question itself appends a user entry, which
+    /// would read as "new answer" while the old assistant reply is still the
+    /// latest one.
+    assistant_count: usize,
+    #[serde(default)]
+    last_assistant: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AskWorkerParams {
+    /// UUID of the (advisor) worker mission to ask
+    mission_id: String,
+    /// The question to send (ignored on continuation re-calls)
+    #[serde(default)]
+    question: String,
+    /// Maximum seconds to wait for the answer (default 600; internally
+    /// clamped per call — re-call with the returned baseline to keep waiting)
+    #[serde(default = "default_timeout")]
+    timeout_seconds: u64,
+    /// Continuation token from a previous timed-out ask_worker call
+    #[serde(default)]
+    baseline: Option<AskWorkerBaseline>,
+}
+
 #[derive(Debug, Deserialize)]
 struct BackendAuthStatusParams {
     #[serde(default)]
@@ -317,7 +348,15 @@ struct OrchestratorMcp {
     // Cached lookup of the boss mission's workspace_id, so workers default to the
     // same workspace instead of silently falling back to the host (Uuid::nil).
     boss_workspace_id: OnceCell<Option<String>>,
+    // Fresh ask_worker questions sent per worker mission this MCP lifetime.
+    // Cost guard: a cheap executor looping questions at an expensive advisor
+    // is the failure mode this caps. Continuation re-calls don't count.
+    ask_counts: tokio::sync::Mutex<HashMap<Uuid, u32>>,
 }
+
+/// Max fresh ask_worker questions per worker for one MCP process (≈ one
+/// mission). High enough for real consultations, low enough to stop loops.
+const MAX_ASKS_PER_WORKER: u32 = 20;
 
 struct DeployTarget {
     api_url: &'static str,
@@ -353,6 +392,7 @@ impl OrchestratorMcp {
             api_token,
             client: reqwest::Client::new(),
             boss_workspace_id: OnceCell::new(),
+            ask_counts: tokio::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -593,6 +633,41 @@ impl OrchestratorMcp {
                         "content": {
                             "type": "string",
                             "description": "Message content to send to the worker"
+                        }
+                    }
+                }),
+            },
+            ToolDefinition {
+                name: "ask_worker".to_string(),
+                description: "Ask a worker mission a question and wait for its answer in one \
+                    call (send + wait + extract). Designed for consulting a persistent advisor \
+                    worker: the worker keeps its session context between questions, so it does \
+                    not re-read the repository each time. Returns {answered: true, answer} on \
+                    success. If the result has answer_pending: true, the worker is still \
+                    thinking — call ask_worker again with the SAME mission_id, an empty \
+                    question, and the returned `baseline` object exactly as given (this \
+                    continues waiting; it does not re-send the question). Include in every \
+                    question: what you tried, the exact error, and relevant file paths."
+                    .to_string(),
+                input_schema: json!({
+                    "type": "object",
+                    "required": ["mission_id"],
+                    "properties": {
+                        "mission_id": {
+                            "type": "string",
+                            "description": "UUID of the worker mission to ask"
+                        },
+                        "question": {
+                            "type": "string",
+                            "description": "The question to send. Required on a fresh ask; leave empty when passing `baseline` to continue waiting."
+                        },
+                        "timeout_seconds": {
+                            "type": "number",
+                            "description": "Max seconds to wait for the answer (default 600; long waits are split into multiple calls via the baseline mechanism)"
+                        },
+                        "baseline": {
+                            "type": "object",
+                            "description": "Continuation token returned by a previous ask_worker call that ended with answer_pending: true. Pass it back unchanged."
                         }
                     }
                 }),
@@ -1009,6 +1084,123 @@ impl OrchestratorMcp {
             .map_err(|e| format!("Failed to parse response: {}", e))?;
 
         Ok(result)
+    }
+
+    /// Synchronous question→answer round-trip with a (persistent) worker.
+    ///
+    /// Sends `question` as a user message, polls until a NEW assistant turn
+    /// lands and the worker settles, and returns that answer. On internal
+    /// timeout it returns `answer_pending: true` plus a `baseline` token —
+    /// the caller re-invokes ask_worker with the same mission_id and that
+    /// baseline (question is ignored) to keep waiting without re-asking.
+    async fn ask_worker(&self, params: AskWorkerParams) -> Result<Value, String> {
+        let id = Uuid::parse_str(&params.mission_id)
+            .map_err(|_| "Invalid mission ID format".to_string())?;
+
+        let baseline = match params.baseline {
+            Some(baseline) => baseline,
+            None => {
+                let question = params.question.trim();
+                if question.is_empty() {
+                    return Err(
+                        "question must not be empty (pass `baseline` only to continue waiting \
+                         for a previous ask)"
+                            .to_string(),
+                    );
+                }
+
+                // Cost guard: check the cap up front, but only charge the
+                // quota after the message actually sends — a failed fetch or
+                // send must not consume one of the allowed questions.
+                {
+                    let counts = self.ask_counts.lock().await;
+                    if counts.get(&id).copied().unwrap_or(0) >= MAX_ASKS_PER_WORKER {
+                        return Err(format!(
+                            "ask_worker limit reached for this worker ({MAX_ASKS_PER_WORKER} \
+                             questions). Consolidate remaining questions or proceed with your \
+                             own judgment."
+                        ));
+                    }
+                }
+
+                // Snapshot history BEFORE sending so a new answer is detectable.
+                let response = self
+                    .api_get(&format!("/api/control/missions/{}", id))
+                    .await?;
+                if !response.status().is_success() {
+                    return Err(format!("Worker mission not found: {}", response.status()));
+                }
+                let mission: Value = response
+                    .json()
+                    .await
+                    .map_err(|e| format!("Failed to parse response: {}", e))?;
+                let baseline = history_fingerprint(&mission);
+
+                self.send_message(SendMessageParams {
+                    mission_id: params.mission_id.clone(),
+                    content: params.question.clone(),
+                })
+                .await?;
+                // Question is in flight — charge the quota now.
+                *self.ask_counts.lock().await.entry(id).or_insert(0) += 1;
+                baseline
+            }
+        };
+
+        let effective_timeout_secs = params.timeout_seconds.min(MAX_INTERNAL_TIMEOUT_SECS);
+        let timeout = std::time::Duration::from_secs(effective_timeout_secs);
+        let interval = std::time::Duration::from_secs(5);
+        let start = std::time::Instant::now();
+
+        loop {
+            let response = self
+                .api_get(&format!("/api/control/missions/{}", id))
+                .await?;
+            if !response.status().is_success() {
+                return Err(format!("Worker mission not found: {}", response.status()));
+            }
+            let mission: Value = response
+                .json()
+                .await
+                .map_err(|e| format!("Failed to parse response: {}", e))?;
+            let status = mission["status"].as_str().unwrap_or("").to_string();
+
+            if ask_settled(&status, &baseline, &mission) {
+                return Ok(json!({
+                    "answered": true,
+                    "answer": last_assistant_message(&mission),
+                    "status": status,
+                    "elapsed_seconds": start.elapsed().as_secs(),
+                }));
+            }
+
+            // Worker died without producing a new answer — surface it.
+            if matches!(status.as_str(), "failed" | "interrupted" | "not_feasible") {
+                return Ok(json!({
+                    "answered": false,
+                    "status": status,
+                    "error": format!(
+                        "Worker reached status '{status}' without a new answer. \
+                         Inspect it with get_worker_status or recover with resume_worker."
+                    ),
+                }));
+            }
+
+            if start.elapsed() > timeout {
+                return Ok(json!({
+                    "answered": false,
+                    "answer_pending": true,
+                    "status": status,
+                    "elapsed_seconds": start.elapsed().as_secs(),
+                    "baseline": baseline,
+                    "hint": "The worker is still thinking. Call ask_worker again with the \
+                             same mission_id, an empty question, and this exact `baseline` \
+                             object to continue waiting (the question is NOT re-sent).",
+                }));
+            }
+
+            tokio::time::sleep(interval).await;
+        }
     }
 
     async fn resume_worker(&self, params: SendMessageParams) -> Result<Value, String> {
@@ -1732,6 +1924,11 @@ impl OrchestratorMcp {
                     serde_json::from_value(params).map_err(|e| format!("Invalid params: {}", e))?;
                 self.send_message(params).await
             }
+            "ask_worker" => {
+                let params: AskWorkerParams =
+                    serde_json::from_value(params).map_err(|e| format!("Invalid params: {}", e))?;
+                self.ask_worker(params).await
+            }
             "resume_worker" => {
                 let params: SendMessageParams =
                     serde_json::from_value(params).map_err(|e| format!("Invalid params: {}", e))?;
@@ -2081,6 +2278,57 @@ fn path_is_within(candidate: &str, root: &str) -> bool {
 ///
 /// Best-effort: never fails. Synchronous git operations with a short timeout.
 /// If the worker did not push, the field is omitted.
+/// Latest assistant message content from a mission JSON's `history` array.
+fn last_assistant_message(mission: &Value) -> Option<String> {
+    mission
+        .get("history")
+        .and_then(Value::as_array)
+        .and_then(|h| {
+            h.iter()
+                .rev()
+                .find(|entry| entry.get("role").and_then(Value::as_str) == Some("assistant"))
+                .and_then(|entry| entry.get("content").and_then(Value::as_str))
+                .map(|s| s.to_string())
+        })
+}
+
+/// Fingerprint of a mission's conversation used by ask_worker to detect that
+/// a NEW assistant turn landed after the question was sent.
+fn history_fingerprint(mission: &Value) -> AskWorkerBaseline {
+    let assistant_count = mission
+        .get("history")
+        .and_then(Value::as_array)
+        .map(|h| {
+            h.iter()
+                .filter(|entry| entry.get("role").and_then(Value::as_str) == Some("assistant"))
+                .count()
+        })
+        .unwrap_or(0);
+    AskWorkerBaseline {
+        assistant_count,
+        last_assistant: last_assistant_message(mission),
+    }
+}
+
+/// True once the worker has produced a NEW answer since `baseline` AND its
+/// turn has settled (status is no longer mid-turn). Pure for testability.
+///
+/// "New answer" = an additional assistant entry, or the latest assistant
+/// content changed (history rewrites). The user message that ask_worker
+/// itself sends grows history without adding an assistant entry and must NOT
+/// count — that was returning the previous (stale) answer.
+fn ask_settled(status: &str, baseline: &AskWorkerBaseline, mission: &Value) -> bool {
+    if matches!(status, "active" | "pending" | "acknowledged") {
+        return false;
+    }
+    let current = history_fingerprint(mission);
+    let Some(answer) = current.last_assistant.as_deref() else {
+        return false;
+    };
+    current.assistant_count > baseline.assistant_count
+        || baseline.last_assistant.as_deref() != Some(answer)
+}
+
 fn enrich_with_push_claims(mission: &mut Value) {
     let status = mission
         .get("status")
@@ -2091,18 +2339,7 @@ fn enrich_with_push_claims(mission: &mut Value) {
         return;
     }
 
-    let last_assistant = mission
-        .get("history")
-        .and_then(Value::as_array)
-        .and_then(|h| {
-            h.iter()
-                .rev()
-                .find(|entry| entry.get("role").and_then(Value::as_str) == Some("assistant"))
-                .and_then(|entry| entry.get("content").and_then(Value::as_str))
-                .map(|s| s.to_string())
-        });
-
-    let Some(content) = last_assistant else {
+    let Some(content) = last_assistant_message(mission) else {
         return;
     };
 
@@ -2694,8 +2931,8 @@ mod codex_auth_status_tests {
 #[cfg(test)]
 mod push_claim_tests {
     use super::{
-        enrich_with_push_claims, extract_branch_candidates, is_plausible_branch,
-        looks_like_push_claim,
+        ask_settled, enrich_with_push_claims, extract_branch_candidates, history_fingerprint,
+        is_plausible_branch, last_assistant_message, looks_like_push_claim, AskWorkerBaseline,
     };
     use serde_json::json;
 
@@ -2808,5 +3045,83 @@ mod push_claim_tests {
             .expect("push_claims should be present");
         assert_eq!(claims.len(), 1);
         assert_eq!(claims[0]["branch"], "fix/final");
+    }
+
+    #[test]
+    fn last_assistant_message_extracts_latest() {
+        let m = json!({
+            "history": [
+                { "role": "assistant", "content": "first" },
+                { "role": "user", "content": "follow-up" },
+                { "role": "assistant", "content": "second" }
+            ]
+        });
+        assert_eq!(last_assistant_message(&m).as_deref(), Some("second"));
+        assert_eq!(last_assistant_message(&json!({})), None);
+        assert_eq!(
+            last_assistant_message(&json!({ "history": [{ "role": "user", "content": "hi" }] })),
+            None
+        );
+    }
+
+    #[test]
+    fn history_fingerprint_detects_new_turn() {
+        let before = json!({
+            "history": [
+                { "role": "user", "content": "q1" },
+                { "role": "assistant", "content": "a1" }
+            ]
+        });
+        let baseline = history_fingerprint(&before);
+        assert_eq!(baseline.assistant_count, 1);
+        assert_eq!(baseline.last_assistant.as_deref(), Some("a1"));
+
+        // Unchanged history → not settled even when awaiting_user.
+        assert!(!ask_settled("awaiting_user", &baseline, &before));
+
+        // The question ask_worker just sent appends a USER entry — history
+        // grew but no new assistant answer exists yet. Returning here was
+        // the stale-answer bug.
+        let question_sent = json!({
+            "history": [
+                { "role": "user", "content": "q1" },
+                { "role": "assistant", "content": "a1" },
+                { "role": "user", "content": "q2" }
+            ]
+        });
+        assert!(!ask_settled("awaiting_user", &baseline, &question_sent));
+
+        // New assistant entry → settled once the status leaves mid-turn.
+        let after = json!({
+            "history": [
+                { "role": "user", "content": "q1" },
+                { "role": "assistant", "content": "a1" },
+                { "role": "user", "content": "q2" },
+                { "role": "assistant", "content": "a2" }
+            ]
+        });
+        assert!(ask_settled("awaiting_user", &baseline, &after));
+        assert!(ask_settled("completed", &baseline, &after));
+        // Still actively producing the turn → keep waiting.
+        assert!(!ask_settled("active", &baseline, &after));
+        assert!(!ask_settled("pending", &baseline, &after));
+    }
+
+    #[test]
+    fn ask_settled_handles_replaced_answer_without_length_change() {
+        // Some backends rewrite history (e.g. canonicalized assistant
+        // message) without growing it; a changed last-assistant content
+        // still counts as a new answer.
+        let baseline = AskWorkerBaseline {
+            assistant_count: 1,
+            last_assistant: Some("a1".to_string()),
+        };
+        let after = json!({
+            "history": [
+                { "role": "user", "content": "q1" },
+                { "role": "assistant", "content": "rewritten answer" }
+            ]
+        });
+        assert!(ask_settled("awaiting_user", &baseline, &after));
     }
 }

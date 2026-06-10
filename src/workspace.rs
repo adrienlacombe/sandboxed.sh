@@ -191,6 +191,35 @@ pub struct Workspace {
 }
 
 impl Workspace {
+    /// True when this workspace runs in its own network namespace — a
+    /// container with `shared_network = false` and Tailscale veth networking
+    /// (the only path that passes `--network-veth` to systemd-nspawn).
+    pub fn has_private_network(&self) -> bool {
+        self.workspace_type == WorkspaceType::Container
+            && !self.shared_network.unwrap_or(true)
+            && crate::nspawn::tailscale_enabled(&self.env_vars)
+    }
+
+    /// Host address reachable from inside this workspace.
+    ///
+    /// `127.0.0.1` works for host workspaces and shared-network containers.
+    /// Private-network containers have their own loopback; there the host is
+    /// reachable on the veth gateway, which carries a fixed address on every
+    /// container link (`10.88.0.1/24`, configured by
+    /// `/etc/systemd/network/80-openagent-veth.network` in the native
+    /// install). Override with `SANDBOXED_SH_CONTAINER_HOST_IP` if the
+    /// deployment uses a different subnet.
+    pub fn host_ip_from_workspace(&self) -> String {
+        if self.has_private_network() {
+            std::env::var("SANDBOXED_SH_CONTAINER_HOST_IP")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| "10.88.0.1".to_string())
+        } else {
+            "127.0.0.1".to_string()
+        }
+    }
+
     /// Create the default host workspace.
     pub fn default_host(working_dir: PathBuf) -> Self {
         Self {
@@ -3315,11 +3344,13 @@ pub async fn prepare_mission_workspace_with_skills_backend(
             if let McpTransport::Stdio { ref mut env, .. } = cfg.transport {
                 env.entry("MISSION_ID".to_string())
                     .or_insert_with(|| mission_id.to_string());
-                // Use the server's own address so MCPs can reach the API
-                // (including from inside containers where localhost differs).
+                // Use the server's own address so MCPs can reach the API.
+                // Private-network containers (Tailscale veth) cannot reach
+                // the host on 127.0.0.1 — use the veth gateway address there.
                 if let Ok(port) = std::env::var("PORT") {
+                    let host_ip = workspace.host_ip_from_workspace();
                     env.entry("API_URL".to_string())
-                        .or_insert_with(|| format!("http://127.0.0.1:{}", port));
+                        .or_insert_with(|| format!("http://{}:{}", host_ip, port));
                 }
                 // Forward JWT_SECRET to trusted internal MCPs so they can
                 // mint service tokens.  Other MCPs (including third-party ones)

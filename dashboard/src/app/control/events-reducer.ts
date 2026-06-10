@@ -431,6 +431,11 @@ export function eventsToItemsImpl(
             }
           }
         } else {
+          // Legacy finalizers were persisted with empty content; with no
+          // open block they would render as empty thought bubbles. Drop them.
+          if (isDone && content.trim() === "") {
+            break;
+          }
           const newIdx = items.length;
           if (!isGoalDeliverable) {
             items.push({

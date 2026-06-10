@@ -394,6 +394,23 @@ pub(super) fn localhost_api_base_url_from_env() -> Option<String> {
     localhost_api_base_url(std::env::var("PORT").ok().as_deref())
 }
 
+/// API base URL reachable from *inside* the workspace's network namespace.
+/// Identical to [`localhost_api_base_url_from_env`] except for
+/// private-network containers, where the host is only reachable via the
+/// veth gateway address (see `Workspace::host_ip_from_workspace`).
+fn workspace_api_base_url(workspace: &Workspace) -> Option<String> {
+    let port = std::env::var("PORT").ok()?;
+    let port = port.trim();
+    if port.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "http://{}:{}",
+        workspace.host_ip_from_workspace(),
+        port
+    ))
+}
+
 /// Claude Code's built-in `ScheduleWakeup` tool ends the agent's turn with a
 /// promise that "the harness re-invokes you when the wakeup fires" — but in
 /// `--print` mode, open_agent is the harness and would otherwise have no way
@@ -1771,6 +1788,28 @@ fn handle_part_update(
         content,
         mission_id: Some(mission_id),
     })
+}
+
+/// Build the block-final `Thinking` event for a completed thinking block.
+///
+/// All `done: true` thinking emissions must go through this helper: the
+/// finalizer is the only thinking event that gets persisted (incremental
+/// `done: false` deltas are broadcast-only), so it has to carry the full
+/// accumulated block content. An empty finalizer means a runner lost its
+/// buffer — warn so the regression is visible in logs instead of silently
+/// producing empty thought history again.
+fn thinking_final_event(content: String, mission_id: Uuid) -> AgentEvent {
+    if content.trim().is_empty() {
+        tracing::warn!(
+            mission_id = %mission_id,
+            "Finalizing a thinking block with empty content; thought history will miss this block"
+        );
+    }
+    AgentEvent::Thinking {
+        content,
+        done: true,
+        mission_id: Some(mission_id),
+    }
 }
 
 fn parse_opencode_stderr_text_part(line: &str) -> Option<String> {
@@ -4935,9 +4974,11 @@ pub fn run_claudecode_turn<'a>(
                 env.insert("TELEGRAM_ACTION_TOKEN".to_string(), token);
             }
 
-            // Use localhost only — never fall back to a public URL for internal
-            // action endpoints (they use HMAC tokens, not bearer auth).
-            let internal_api_url = localhost_api_base_url_from_env();
+            // Use the internal host address only — never fall back to a public
+            // URL for internal action endpoints (they use HMAC tokens, not
+            // bearer auth). Workspace-aware: private-network containers reach
+            // the host via the veth gateway, not 127.0.0.1.
+            let internal_api_url = workspace_api_base_url(workspace);
             if let Some(api_url) = internal_api_url {
                 env.insert(
                     "TELEGRAM_ACTION_URL".to_string(),
@@ -5172,6 +5213,10 @@ pub fn run_claudecode_turn<'a>(
         // This is needed because Claude sends incremental deltas that need to be accumulated
         let mut block_types: HashMap<u32, String> = HashMap::new();
         let mut thinking_buffer: HashMap<u32, String> = HashMap::new();
+        // Per-turn audit: catches thinking blocks whose deltas we can't
+        // decode (OAuth-encrypted / signature-only) so the turn end can
+        // surface a marker instead of a silently empty thoughts panel.
+        let mut thinking_audit = crate::backend::shared::ThinkingDeltaAudit::default();
         let mut text_buffer: HashMap<u32, String> = HashMap::new();
         let mut active_thinking_index: Option<u32> = None; // Track which thinking block is active
         let mut finalized_thinking_indices: std::collections::HashSet<u32> =
@@ -5503,11 +5548,16 @@ pub fn run_claudecode_turn<'a>(
                                                         // If a new thinking block started, finalize the previous one
                                                         if let Some(prev_idx) = active_thinking_index {
                                                             if prev_idx != index {
-                                                                let _ = events_tx.send(AgentEvent::Thinking {
-                                                                    content: String::new(),
-                                                                    done: true,
-                                                                    mission_id: Some(mission_id),
-                                                                });
+                                                                // The finalizer must carry the full block content:
+                                                                // it is the only thinking event that survives into
+                                                                // persisted history.
+                                                                let _ = events_tx.send(thinking_final_event(
+                                                                    thinking_buffer
+                                                                        .get(&prev_idx)
+                                                                        .cloned()
+                                                                        .unwrap_or_default(),
+                                                                    mission_id,
+                                                                ));
                                                                 finalized_thinking_indices.insert(prev_idx);
                                                             }
                                                         }
@@ -5520,6 +5570,7 @@ pub fn run_claudecode_turn<'a>(
                                                         merge_stream_fragment(buffer, &thinking_content);
 
                                                         // Send this block's accumulated content
+                                                        thinking_audit.note_emitted_thinking();
                                                         let _ = events_tx.send(AgentEvent::Thinking {
                                                             content: buffer.clone(),
                                                             done: false,
@@ -5602,7 +5653,13 @@ pub fn run_claudecode_turn<'a>(
                                                     }
                                                 }
                                             }
-                                            // Ignore other delta types (e.g., input_json_delta for tool use)
+                                            else if delta.delta_type != "input_json_delta" {
+                                                // Unknown delta type (e.g. signature_delta for
+                                                // encrypted thinking) — record it so the turn end
+                                                // can warn and surface a marker.
+                                                thinking_audit
+                                                    .note_undecoded_delta(&delta.delta_type);
+                                            }
                                         }
                                         StreamEvent::ContentBlockStart { index, content_block }
                                             if content_block.block_type == "tool_use" =>
@@ -5619,6 +5676,8 @@ pub fn run_claudecode_turn<'a>(
                                             }
                                         }
                                         StreamEvent::ContentBlockStart { index, content_block } => {
+                                            thinking_audit
+                                                .note_block_start(&content_block.block_type);
                                             block_types.insert(index, content_block.block_type);
                                         }
                                         _ => {}
@@ -5637,6 +5696,7 @@ pub fn run_claudecode_turn<'a>(
                                             usage.cache_read_input_tokens.unwrap_or(0);
                                     }
                                     let mut assistant_thinking_fallback = String::new();
+                                    let mut assistant_emitted_thinking_final = false;
                                     for (content_idx, block) in evt.message.content.into_iter().enumerate() {
                                         let content_idx = content_idx as u32;
                                         match block {
@@ -5818,11 +5878,10 @@ pub fn run_claudecode_turn<'a>(
                                                 // Earlier blocks were already finalized during streaming
                                                 // (via the block-transition mechanism) and re-sending them
                                                 // causes duplicate items in the frontend thinking panel.
-                                                let _ = events_tx.send(AgentEvent::Thinking {
-                                                    content: thinking,
-                                                    done: true,
-                                                    mission_id: Some(mission_id),
-                                                });
+                                                assistant_emitted_thinking_final = true;
+                                                thinking_audit.note_emitted_thinking();
+                                                let _ = events_tx
+                                                    .send(thinking_final_event(thinking, mission_id));
                                             }
                                             _ => {}
                                         }
@@ -5861,6 +5920,34 @@ pub fn run_claudecode_turn<'a>(
                                             "Using assistant thinking-only block as final result ({} chars, no text content in this turn)",
                                             final_result.len()
                                         );
+                                    }
+                                    // The last streaming thinking block has no block-transition
+                                    // finalizer, and OAuth/encrypted turns may carry no
+                                    // ContentBlock::Thinking in the Assistant event. Finalize it
+                                    // here from the streamed buffer so the block-final event
+                                    // (the only persisted one) is never lost.
+                                    if !assistant_emitted_thinking_final {
+                                        if let Some(idx) = active_thinking_index {
+                                            if !finalized_thinking_indices.contains(&idx) {
+                                                if let Some(buffer) = thinking_buffer.get(&idx) {
+                                                    if !buffer.trim().is_empty() {
+                                                        let _ = events_tx.send(thinking_final_event(
+                                                            buffer.clone(),
+                                                            mission_id,
+                                                        ));
+                                                        finalized_thinking_indices.insert(idx);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    // Encrypted/undecoded thinking: if a thinking block was
+                                    // opened but produced no decodable content this turn,
+                                    // surface a marker so the panel isn't silently empty
+                                    // (also warns once about unknown delta types).
+                                    if let Some(marker) = thinking_audit.finish_turn() {
+                                        let _ = events_tx
+                                            .send(thinking_final_event(marker, mission_id));
                                     }
                                     // Reset per-turn accumulation state so the next turn
                                     // starts fresh (block indices restart from 0 each turn)
@@ -7706,6 +7793,11 @@ fn ensure_opencode_provider_for_model(
     opencode_config_dir: &std::path::Path,
     app_working_dir: &std::path::Path,
     model_override: &str,
+    // Host address as seen from the workspace's network namespace.
+    // Private-network containers (Tailscale veth) cannot reach the host
+    // proxy on 127.0.0.1 — pointing builtin/* there made OpenCode exit
+    // banner-only until the 120s inactivity watchdog SIGKILLed it.
+    host_ip: &str,
 ) {
     let model_override = model_override.trim();
     if model_override.is_empty() {
@@ -7796,7 +7888,7 @@ fn ensure_opencode_provider_for_model(
                     model_id: { "name": model_id }
                 },
                 "options": {
-                    "baseURL": format!("http://127.0.0.1:{}/v1", port),
+                    "baseURL": format!("http://{}:{}/v1", host_ip, port),
                     "apiKey": proxy_key
                 }
             }))
@@ -7869,6 +7961,35 @@ fn ensure_opencode_provider_for_model(
             opencode_path.display()
         );
     }
+}
+
+/// Whether an OpenCode session is present in the given XDG data home
+/// (`<data_home>/opencode/storage`). Sessions store an info JSON named
+/// `<session_id>.json` (layout has moved between CLI versions, so search a
+/// few levels deep) and per-message files under `message/<session_id>/`.
+fn opencode_session_exists_in_data_home(data_home: &std::path::Path, session_id: &str) -> bool {
+    let storage = data_home.join("opencode").join("storage");
+    if storage.join("message").join(session_id).is_dir() {
+        return true;
+    }
+    let target = format!("{session_id}.json");
+    fn find_file(dir: &std::path::Path, target: &str, depth: u8) -> bool {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return false;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file() {
+                if path.file_name().and_then(|n| n.to_str()) == Some(target) {
+                    return true;
+                }
+            } else if depth > 0 && path.is_dir() && find_file(&path, target, depth - 1) {
+                return true;
+            }
+        }
+        false
+    }
+    find_file(&storage.join("session"), &target, 3)
 }
 
 fn opencode_storage_roots(workspace: &Workspace) -> Vec<std::path::PathBuf> {
@@ -10744,16 +10865,23 @@ pub async fn run_opencode_turn(
     }
     // Inject provider definitions into opencode.json for models not in
     // OpenCode's built-in snapshot.
+    let workspace_host_ip = workspace.host_ip_from_workspace();
     if let Some(model_override) = resolved_model.as_deref() {
         ensure_opencode_provider_for_model(
             &opencode_config_dir_host,
             app_working_dir,
             model_override,
+            &workspace_host_ip,
         );
     }
     if let Some(ref am) = agent_model {
         if resolved_model.as_deref() != Some(am) {
-            ensure_opencode_provider_for_model(&opencode_config_dir_host, app_working_dir, am);
+            ensure_opencode_provider_for_model(
+                &opencode_config_dir_host,
+                app_working_dir,
+                am,
+                &workspace_host_ip,
+            );
         }
     }
     if needs_google {
@@ -10817,6 +10945,7 @@ pub async fn run_opencode_turn(
             &opencode_config_dir_host,
             app_working_dir,
             opencode_model,
+            &workspace_host_ip,
         );
     }
 
@@ -10844,13 +10973,34 @@ pub async fn run_opencode_turn(
     // id as an OpenCode id when it starts with the "ses_" prefix the CLI
     // uses (`ses_<base62>`); fall back to `--continue` otherwise.
     if is_continuation {
-        let opencode_sid = session_id.filter(|s| is_opencode_session_id(s));
+        // A stored `ses_*` id is only usable if the session actually lives in
+        // the store the CLI will read. Missions created before the per-mission
+        // XDG isolation persisted their sessions in the shared host store —
+        // passing `--session` for those makes the CLI fail with "Session not
+        // found". Fall back to `--continue` (resume last session in this dir)
+        // when the session is not present in the effective store.
+        let shared_xdg = std::env::var("SANDBOXED_SH_OPENCODE_SHARED_XDG")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .is_some();
+        let mission_data_home = work_dir.join(".local").join("share");
+        let opencode_sid = session_id
+            .filter(|s| is_opencode_session_id(s))
+            .filter(|s| shared_xdg || opencode_session_exists_in_data_home(&mission_data_home, s));
         match opencode_sid {
             Some(sid) => {
                 inner_cmd.push_str(" --session ");
                 inner_cmd.push_str(&shell_escape(sid));
             }
             None => {
+                if session_id.is_some() {
+                    tracing::info!(
+                        mission_id = %mission_id,
+                        session_id = ?session_id,
+                        "Stored OpenCode session not found in per-mission storage \
+                         (likely created before XDG isolation); using --continue"
+                    );
+                }
                 inner_cmd.push_str(" --continue");
             }
         }
@@ -10905,7 +11055,7 @@ pub async fn run_opencode_turn(
     env.insert("MISSION_ID".to_string(), mission_id.to_string());
     if let Some(public_url) = public_api_base_url_from_env() {
         env.insert("API_URL".to_string(), public_url);
-    } else if let Some(local_url) = localhost_api_base_url_from_env() {
+    } else if let Some(local_url) = workspace_api_base_url(workspace) {
         env.insert("API_URL".to_string(), local_url);
     }
 
@@ -10983,7 +11133,7 @@ pub async fn run_opencode_turn(
         {
             env.insert("TELEGRAM_ACTION_TOKEN".to_string(), token);
         }
-        let internal_api_url = localhost_api_base_url_from_env();
+        let internal_api_url = workspace_api_base_url(workspace);
         if let Some(api_url) = internal_api_url {
             env.insert(
                 "TELEGRAM_ACTION_URL".to_string(),
@@ -11157,6 +11307,10 @@ pub async fn run_opencode_turn(
     // unlike stderr which truncates long content (fixes #158).
     let sse_text_buffer: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
     let sse_emitted_thinking = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // Latest cumulative thinking content streamed this session. The block-final
+    // Thinking event (the only persisted one) is built from this, including in
+    // the post-loop fallback where the reader task's parser state is gone.
+    let sse_last_thinking: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
     let sse_emitted_text = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let sse_done_sent = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let sse_error_message: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
@@ -11775,6 +11929,10 @@ pub async fn run_opencode_turn(
                                             {
                                                 state.last_emitted_thinking =
                                                     Some(thinking.clone());
+                                                *sse_last_thinking
+                                                    .lock()
+                                                    .unwrap_or_else(|e| e.into_inner()) =
+                                                    thinking.clone();
                                                 sse_emitted_thinking.store(
                                                     true,
                                                     std::sync::atomic::Ordering::SeqCst,
@@ -11955,7 +12113,12 @@ pub async fn run_opencode_turn(
                                             *guard = Some(message.clone());
                                         }
                                     }
-                                    if matches!(event, AgentEvent::Thinking { .. }) {
+                                    if let AgentEvent::Thinking { ref content, .. } = event {
+                                        if !content.trim().is_empty() {
+                                            *sse_last_thinking
+                                                .lock()
+                                                .unwrap_or_else(|e| e.into_inner()) = content.clone();
+                                        }
                                         sse_emitted_thinking.store(true, std::sync::atomic::Ordering::SeqCst);
                                         // New thinking content arrived; reset done flag so this
                                         // turn's thinking block will get its own done event.
@@ -12003,11 +12166,15 @@ pub async fn run_opencode_turn(
                                     if sse_emitted_thinking.load(std::sync::atomic::Ordering::SeqCst)
                                         && !sse_done_sent.load(std::sync::atomic::Ordering::SeqCst)
                                     {
-                                        let _ = events_tx.send(AgentEvent::Thinking {
-                                            content: String::new(),
-                                            done: true,
-                                            mission_id: Some(mission_id),
-                                        });
+                                        // Block-final event: carry the cumulative thinking so
+                                        // persisted history keeps the full block (incremental
+                                        // done:false deltas are not persisted).
+                                        let last_thinking = sse_last_thinking
+                                            .lock()
+                                            .unwrap_or_else(|e| e.into_inner())
+                                            .clone();
+                                        let _ = events_tx
+                                            .send(thinking_final_event(last_thinking, mission_id));
                                         sse_done_sent.store(true, std::sync::atomic::Ordering::SeqCst);
                                     }
                                     // Clear per-turn thinking buffers so each model turn
@@ -12322,10 +12489,11 @@ pub async fn run_opencode_turn(
         if !sse_emitted {
             if let Some(reasoning) = extract_reasoning(&message.parts) {
                 let _ = events_tx.send(AgentEvent::Thinking {
-                    content: reasoning,
+                    content: reasoning.clone(),
                     done: false,
                     mission_id: Some(mission_id),
                 });
+                *sse_last_thinking.lock().unwrap_or_else(|e| e.into_inner()) = reasoning;
                 emitted_thinking = true;
             }
         }
@@ -12333,11 +12501,12 @@ pub async fn run_opencode_turn(
 
     if emitted_thinking || (sse_emitted && !sse_done_sent.load(std::sync::atomic::Ordering::SeqCst))
     {
-        let _ = events_tx.send(AgentEvent::Thinking {
-            content: String::new(),
-            done: true,
-            mission_id: Some(mission_id),
-        });
+        // Block-final event with the full content — the only persisted form.
+        let last_thinking = sse_last_thinking
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let _ = events_tx.send(thinking_final_event(last_thinking, mission_id));
     }
 
     // Check for banner-only output BEFORE emitting TextDelta to avoid
@@ -13338,11 +13507,10 @@ pub async fn run_grok_turn(
                                 // dashboard collapses the reasoning panel
                                 // before streaming text deltas.
                                 if !reasoning_buffer.is_empty() {
-                                    let _ = events_tx.send(AgentEvent::Thinking {
-                                        content: std::mem::take(&mut reasoning_buffer),
-                                        done: true,
-                                        mission_id: Some(mission_id),
-                                    });
+                                    let _ = events_tx.send(thinking_final_event(
+                                        std::mem::take(&mut reasoning_buffer),
+                                        mission_id,
+                                    ));
                                     last_reasoning_len = 0;
                                 }
                                 if value
@@ -13417,11 +13585,10 @@ pub async fn run_grok_turn(
     // Emit done: true so the dashboard finalizes the thinking block in the
     // event store.
     if !reasoning_buffer.is_empty() {
-        let _ = events_tx.send(AgentEvent::Thinking {
-            content: std::mem::take(&mut reasoning_buffer),
-            done: true,
-            mission_id: Some(mission_id),
-        });
+        let _ = events_tx.send(thinking_final_event(
+            std::mem::take(&mut reasoning_buffer),
+            mission_id,
+        ));
     }
     let _ = last_reasoning_len;
 
@@ -14494,11 +14661,10 @@ pub async fn run_codex_turn(
                             _ => false,
                         };
                         if item_changed && !thinking_accumulated.is_empty() {
-                            let _ = events_tx.send(AgentEvent::Thinking {
-                                content: std::mem::take(&mut thinking_accumulated),
-                                done: true,
-                                mission_id: Some(mission_id),
-                            });
+                            let _ = events_tx.send(thinking_final_event(
+                                std::mem::take(&mut thinking_accumulated),
+                                mission_id,
+                            ));
                             thinking_done_emitted = true;
                         }
                         if item_id.is_some() {
@@ -14530,11 +14696,10 @@ pub async fn run_codex_turn(
                         // Flush accumulated thinking as done before tool call,
                         // so the event logger persists the full thought block.
                         if !thinking_accumulated.is_empty() {
-                            let _ = events_tx.send(AgentEvent::Thinking {
-                                content: std::mem::take(&mut thinking_accumulated),
-                                done: true,
-                                mission_id: Some(mission_id),
-                            });
+                            let _ = events_tx.send(thinking_final_event(
+                                std::mem::take(&mut thinking_accumulated),
+                                mission_id,
+                            ));
                             thinking_done_emitted = true;
                         }
                         thinking_item = None;
@@ -14690,11 +14855,7 @@ pub async fn run_codex_turn(
     // Flush any remaining accumulated thinking with full content so
     // the event logger persists it for replay/history.
     if thinking_emitted && !thinking_done_emitted {
-        let _ = events_tx.send(AgentEvent::Thinking {
-            content: thinking_accumulated,
-            done: true,
-            mission_id: Some(mission_id),
-        });
+        let _ = events_tx.send(thinking_final_event(thinking_accumulated, mission_id));
     }
 
     let no_output = assistant_message.trim().is_empty()
@@ -15104,11 +15265,10 @@ pub async fn run_gemini_turn(
                     ExecutionEvent::ToolCall { id, name, args } => {
                         // Flush accumulated thinking before tool call
                         if !thinking_accumulated.is_empty() {
-                            let _ = events_tx.send(AgentEvent::Thinking {
-                                content: std::mem::take(&mut thinking_accumulated),
-                                done: true,
-                                mission_id: Some(mission_id),
-                            });
+                            let _ = events_tx.send(thinking_final_event(
+                                std::mem::take(&mut thinking_accumulated),
+                                mission_id,
+                            ));
                             thinking_done_emitted = true;
                         }
                         pending_tools.insert(id.clone(), name.clone());
@@ -15185,11 +15345,7 @@ pub async fn run_gemini_turn(
 
     // Flush any remaining accumulated thinking with full content
     if thinking_emitted && !thinking_done_emitted {
-        let _ = events_tx.send(AgentEvent::Thinking {
-            content: thinking_accumulated,
-            done: true,
-            mission_id: Some(mission_id),
-        });
+        let _ = events_tx.send(thinking_final_event(thinking_accumulated, mission_id));
     }
 
     let no_output = assistant_message.trim().is_empty() && thinking_for_fallback.is_none();
@@ -15637,9 +15793,10 @@ mod tests {
         is_success_path_auth_error, is_success_path_provider_payload_error,
         is_success_path_rate_limited_error, is_tool_call_only_output,
         opencode_goal_terminal_status, opencode_idle_timeout_result_message,
-        opencode_output_needs_fallback, opencode_session_token_from_line,
-        parse_opencode_goal_objective, parse_opencode_session_token, parse_opencode_sse_event,
-        parse_opencode_stderr_text_part, preferred_model_for_cost, record_codex_error_message,
+        opencode_output_needs_fallback, opencode_session_exists_in_data_home,
+        opencode_session_token_from_line, parse_opencode_goal_objective,
+        parse_opencode_session_token, parse_opencode_sse_event, parse_opencode_stderr_text_part,
+        preferred_model_for_cost, record_codex_error_message,
         replace_filepath_artifact_with_tool_output, resolve_cost_cents_and_source, running_health,
         sanitized_opencode_stdout, set_codex_account_cooldown, stall_severity, strip_ansi_codes,
         strip_opencode_banner_lines, strip_think_tags, summarize_codex_usage_caps,
@@ -16809,7 +16966,12 @@ mod tests {
         )
         .expect("write provider store");
 
-        ensure_opencode_provider_for_model(&config_dir, &app_dir, "spark/qwen3.5-397b");
+        ensure_opencode_provider_for_model(
+            &config_dir,
+            &app_dir,
+            "spark/qwen3.5-397b",
+            "127.0.0.1",
+        );
 
         let opencode_json: serde_json::Value = serde_json::from_str(
             &fs::read_to_string(config_dir.join("opencode.json")).expect("opencode.json"),
@@ -16822,6 +16984,58 @@ mod tests {
         assert_eq!(
             opencode_json["provider"]["spark"]["options"]["baseURL"],
             "https://spark-de79.gazella-vector.ts.net/v1"
+        );
+    }
+
+    #[test]
+    fn opencode_session_exists_checks_per_mission_store() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let data_home = temp.path().join(".local/share");
+
+        // Empty store → session not found (legacy pre-XDG-isolation session).
+        assert!(!opencode_session_exists_in_data_home(
+            &data_home,
+            "ses_abc123"
+        ));
+
+        // Session info file present (nested layout) → found.
+        let info_dir = data_home.join("opencode/storage/session/proj");
+        fs::create_dir_all(&info_dir).unwrap();
+        fs::write(info_dir.join("ses_abc123.json"), "{}").unwrap();
+        assert!(opencode_session_exists_in_data_home(
+            &data_home,
+            "ses_abc123"
+        ));
+
+        // Message dir layout also counts.
+        let temp2 = tempfile::tempdir().expect("temp dir");
+        let data_home2 = temp2.path().join(".local/share");
+        fs::create_dir_all(data_home2.join("opencode/storage/message/ses_xyz")).unwrap();
+        assert!(opencode_session_exists_in_data_home(&data_home2, "ses_xyz"));
+    }
+
+    #[test]
+    fn ensure_opencode_provider_builtin_uses_workspace_host_ip() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let config_dir = temp.path().join("ws");
+        let app_dir = temp.path().join("app");
+        fs::create_dir_all(&config_dir).unwrap();
+        fs::create_dir_all(&app_dir).unwrap();
+
+        // Private-network container case: the proxy must be addressed via
+        // the veth gateway, not the container's own loopback.
+        ensure_opencode_provider_for_model(&config_dir, &app_dir, "builtin/smart", "10.88.0.1");
+
+        let opencode_json: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(config_dir.join("opencode.json")).expect("opencode.json"),
+        )
+        .expect("parse opencode.json");
+        let base_url = opencode_json["provider"]["builtin"]["options"]["baseURL"]
+            .as_str()
+            .expect("baseURL");
+        assert!(
+            base_url.starts_with("http://10.88.0.1:"),
+            "expected veth gateway baseURL, got {base_url}"
         );
     }
 
