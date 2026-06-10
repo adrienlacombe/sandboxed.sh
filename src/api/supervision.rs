@@ -26,7 +26,7 @@ use uuid::Uuid;
 use super::control::MissionStatus;
 #[allow(unused_imports)]
 use super::control::*;
-use super::mission_store::{Mission, MissionStore};
+use super::mission_store::MissionStore;
 
 pub(crate) async fn recover_server_shutdown_missions(
     mission_store: Arc<dyn MissionStore>,
