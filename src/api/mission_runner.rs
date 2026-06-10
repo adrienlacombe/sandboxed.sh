@@ -5095,7 +5095,7 @@ pub fn run_claudecode_turn<'a>(
                 .and_then(|v| v.parse::<usize>().ok())
                 .unwrap_or(4096);
         let mut first_text_delta_at: Option<Instant> = None;
-        let mut degenerate_stream_detected: bool = false;
+        let degenerate_stream_detected: bool = false;
         let mut degenerate_stage_triggered: bool = false;
 
         let mut saw_non_init_event = false;
@@ -5475,11 +5475,6 @@ pub fn run_claudecode_turn<'a>(
                                                                     degenerate_min_repeats,
                                                                 )
                                                             {
-                                                                // Set both flags; `degenerate_stream_detected`
-                                                                // gates this whole `if` so we never fire twice,
-                                                                // and `degenerate_stage_triggered` is what
-                                                                // the post-loop failure path reads.
-                                                                degenerate_stream_detected = true;
                                                                 tracing::warn!(
                                                                     mission_id = %mission_id,
                                                                     streaming_for_secs = streaming_for.as_secs(),

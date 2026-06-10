@@ -6786,7 +6786,7 @@ fn spawn_control_session(
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
-                        lag_total = lag_total.saturating_add(n as u64);
+                        lag_total = lag_total.saturating_add(n);
                         tracing::warn!(
                             dropped = n,
                             lag_total = lag_total,
