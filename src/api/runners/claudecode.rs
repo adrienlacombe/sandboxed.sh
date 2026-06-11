@@ -2161,19 +2161,60 @@ pub fn run_claudecode_turn<'a>(
             mission_id = %mission_id,
             "Event loop completed, waiting for Claude Code process"
         );
-        let exit_status = tokio::task::spawn_blocking(move || {
+        // The final result has already been parsed at this point — the only
+        // thing left is process teardown. The CLI can fail to exit when a
+        // spawned MCP server (or any child) keeps running and holds the PTY
+        // open; an unbounded wait here loses the completed turn and stalls
+        // the mission until the 900s supervision watchdog force-aborts it
+        // (observed on orchestrator missions 832725c5/5daaa900). Bound the
+        // wait and kill the leftover process tree on expiry.
+        const CLI_EXIT_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
+        let child_pid = pty.process_id();
+        let mut wait_handle = tokio::task::spawn_blocking(move || {
             let mut pty = pty;
             pty.wait()
-        })
-        .await;
+        });
+        let exit_status = match tokio::time::timeout(CLI_EXIT_GRACE, &mut wait_handle).await {
+            Ok(joined) => joined,
+            Err(_) => {
+                tracing::warn!(
+                    mission_id = %mission_id,
+                    grace_secs = CLI_EXIT_GRACE.as_secs(),
+                    "Claude CLI did not exit after final result; killing leftover process tree"
+                );
+                #[cfg(unix)]
+                if let Some(pid) = child_pid {
+                    // The CLI is the session leader on its PTY, so its pgid
+                    // matches its pid — killpg takes down lingering MCP
+                    // children too. Plain kill as a fallback.
+                    unsafe {
+                        libc::killpg(pid as i32, libc::SIGKILL);
+                        libc::kill(pid as i32, libc::SIGKILL);
+                    }
+                }
+                wait_handle.await
+            }
+        };
         tracing::debug!(
             mission_id = %mission_id,
             exit_status = ?exit_status,
             "Claude Code process exited"
         );
 
-        // Ensure the PTY reader task stops (it should naturally end after process exit).
-        let _ = reader_handle.await;
+        // Ensure the PTY reader task stops (it should naturally end after
+        // process exit). Bounded: an orphaned child holding the PTY slave
+        // open keeps the blocking read alive indefinitely.
+        let mut reader_handle = reader_handle;
+        if tokio::time::timeout(std::time::Duration::from_secs(10), &mut reader_handle)
+            .await
+            .is_err()
+        {
+            tracing::warn!(
+                mission_id = %mission_id,
+                "PTY reader did not stop after process exit; abandoning it"
+            );
+            reader_handle.abort();
+        }
 
         let usage = crate::cost::TokenUsage {
             input_tokens: total_input_tokens,
