@@ -558,6 +558,47 @@ pub async fn run_grok_turn(
     session_id: Option<&str>,
     is_continuation: bool,
 ) -> AgentResult {
+    if workspace.id == crate::workspace::DEFAULT_WORKSPACE_ID && !work_dir.join(".git").exists() {
+        let file_count = std::fs::read_dir(work_dir)
+            .map(|mut d| {
+                d.by_ref()
+                    .filter(|e| {
+                        e.as_ref()
+                            .map(|e| {
+                                let n = e.file_name();
+                                let n = n.to_string_lossy();
+                                !n.starts_with('.') && n != "output"
+                            })
+                            .unwrap_or(false)
+                    })
+                    .count()
+            })
+            .unwrap_or(0);
+        if file_count == 0 && !is_continuation {
+            let dir_display = work_dir.display();
+            tracing::warn!(
+                mission_id = %mission_id,
+                work_dir = %dir_display,
+                "Grok mission running in empty host workspace with no git repo — goal loop will hallucinate edits"
+            );
+            let msg = format!(
+                "The mission workspace ({dir_display}) is empty and has no git repository. \
+                 Grok cannot edit files or push changes without a project checkout. \
+                 Create this mission on a workspace that contains the target repository, \
+                 or clone the repo into the workspace first.",
+            );
+            // Return a failure result so the control loop emits a single
+            // `AssistantMessage { success: false }` and marks the mission
+            // `Failed` (Bugbot f4a7a2d8). Emitting a manual AssistantMessage
+            // and then returning success:true caused the control loop to
+            // emit a SECOND assistant message with success:true and record
+            // automations as successful, despite the workspace being
+            // unusable. LlmError is the right terminal reason: this is a
+            // "can't run" error, not a clean turn boundary.
+            return AgentResult::failure(msg, 0).with_terminal_reason(TerminalReason::LlmError);
+        }
+    }
+
     if env_var_bool("SANDBOXED_SH_GROK_ACP", true) {
         match run_grok_acp_turn(
             workspace,
@@ -569,6 +610,7 @@ pub async fn run_grok_turn(
             cancel.clone(),
             app_working_dir,
             session_id,
+            is_continuation,
         )
         .await
         {
@@ -619,47 +661,6 @@ async fn run_grok_streaming_json_turn(
     use tokio::io::{AsyncBufReadExt, BufReader};
 
     let workspace_exec = WorkspaceExec::new(workspace.clone());
-
-    if workspace.id == crate::workspace::DEFAULT_WORKSPACE_ID && !work_dir.join(".git").exists() {
-        let file_count = std::fs::read_dir(work_dir)
-            .map(|mut d| {
-                d.by_ref()
-                    .filter(|e| {
-                        e.as_ref()
-                            .map(|e| {
-                                let n = e.file_name();
-                                let n = n.to_string_lossy();
-                                !n.starts_with('.') && n != "output"
-                            })
-                            .unwrap_or(false)
-                    })
-                    .count()
-            })
-            .unwrap_or(0);
-        if file_count == 0 && !is_continuation {
-            let dir_display = work_dir.display();
-            tracing::warn!(
-                mission_id = %mission_id,
-                work_dir = %dir_display,
-                "Grok mission running in empty host workspace with no git repo — goal loop will hallucinate edits"
-            );
-            let msg = format!(
-                "The mission workspace ({dir_display}) is empty and has no git repository. \
-                 Grok cannot edit files or push changes without a project checkout. \
-                 Create this mission on a workspace that contains the target repository, \
-                 or clone the repo into the workspace first.",
-            );
-            // Return a failure result so the control loop emits a single
-            // `AssistantMessage { success: false }` and marks the mission
-            // `Failed` (Bugbot f4a7a2d8). Emitting a manual AssistantMessage
-            // and then returning success:true caused the control loop to
-            // emit a SECOND assistant message with success:true and record
-            // automations as successful, despite the workspace being
-            // unusable. LlmError is the right terminal reason: this is a
-            // "can't run" error, not a clean turn boundary.
-            return AgentResult::failure(msg, 0).with_terminal_reason(TerminalReason::LlmError);
-        }
-    }
 
     let cli_path =
         get_backend_string_setting("grok", "cli_path").unwrap_or_else(|| "grok".to_string());
@@ -1047,8 +1048,9 @@ async fn run_grok_streaming_json_turn(
 
 const GROK_ACP_INIT_ID: u64 = 1;
 const GROK_ACP_SESSION_ID: u64 = 2;
-const GROK_ACP_SET_MODEL_ID: u64 = 3;
-const GROK_ACP_PROMPT_ID: u64 = 4;
+const GROK_ACP_SESSION_NEW_ID: u64 = 3;
+const GROK_ACP_SET_MODEL_ID: u64 = 4;
+const GROK_ACP_PROMPT_ID: u64 = 5;
 
 /// Per-call state for an in-flight grok ACP tool call.
 #[derive(Default, Clone)]
@@ -1081,6 +1083,7 @@ async fn run_grok_acp_turn(
     cancel: CancellationToken,
     app_working_dir: &std::path::Path,
     session_id: Option<&str>,
+    is_continuation: bool,
 ) -> Result<AgentResult, String> {
     use tokio::io::{AsyncBufReadExt, BufReader};
 
@@ -1119,13 +1122,21 @@ async fn run_grok_acp_turn(
         .ok_or_else(|| "failed to capture grok stdout".to_string())?;
     let mut lines = BufReader::new(stdout).lines();
 
-    // Capture stderr for diagnostics (the CLI logs there).
+    // Capture stderr for diagnostics, and watch for the interactive
+    // sign-in prompt: without a usable XAI_API_KEY the CLI prints it to
+    // stderr and blocks on a browser OAuth callback that never arrives in
+    // headless mode. Fail fast instead of waiting out the idle guard.
     let stderr_tail = Arc::new(tokio::sync::Mutex::new(String::new()));
+    let auth_fail = CancellationToken::new();
     if let Some(stderr) = child.stderr.take() {
         let stderr_tail = Arc::clone(&stderr_tail);
+        let auth_fail = auth_fail.clone();
         tokio::spawn(async move {
             let mut lines = BufReader::new(stderr).lines();
             while let Ok(Some(line)) = lines.next_line().await {
+                if grok_line_requests_interactive_login(line.trim()) {
+                    auth_fail.cancel();
+                }
                 let mut tail = stderr_tail.lock().await;
                 tail.push_str(&line);
                 tail.push('\n');
@@ -1182,72 +1193,103 @@ async fn run_grok_acp_turn(
     }
 
     // ── Handshake (failures here fall back to streaming-json) ──────────
-    send(
-        &mut stdin,
-        serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": GROK_ACP_INIT_ID,
-            "method": "initialize",
-            "params": {
-                "protocolVersion": 1,
-                "clientCapabilities": { "fs": { "readTextFile": false, "writeTextFile": false } }
-            }
-        }),
-    )
-    .await?;
-    let _ = await_response(&mut lines, GROK_ACP_INIT_ID, 30).await?;
+    // Wrapped so every early error kills the spawned CLI first — a dropped
+    // tokio Child keeps running (no kill_on_drop), and the fallback path
+    // would spawn a second CLI for the same turn.
+    let handshake: Result<String, String> = async {
+        send(
+            &mut stdin,
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": GROK_ACP_INIT_ID,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": 1,
+                    "clientCapabilities": { "fs": { "readTextFile": false, "writeTextFile": false } }
+                }
+            }),
+        )
+        .await?;
+        let _ = await_response(&mut lines, GROK_ACP_INIT_ID, 30).await?;
 
-    let acp_cwd = workspace_exec.translate_path_for_container(work_dir);
-    let mut acp_session_id: Option<String> = None;
-    if let Some(sid) = session_id.filter(|s| !s.trim().is_empty()) {
-        // Sessions persist server-side; `session/load` resumes prior context.
-        send(
-            &mut stdin,
-            serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": GROK_ACP_SESSION_ID,
-                "method": "session/load",
-                "params": { "sessionId": sid, "cwd": acp_cwd, "mcpServers": [] }
-            }),
-        )
-        .await?;
-        match await_response(&mut lines, GROK_ACP_SESSION_ID, 60).await {
-            Ok(_) => acp_session_id = Some(sid.to_string()),
-            Err(err) => {
-                tracing::info!(
-                    mission_id = %mission_id,
-                    session_id = %sid,
-                    error = %err,
-                    "Grok ACP session/load failed; starting a fresh session"
-                );
+        let acp_cwd = workspace_exec.translate_path_for_container(work_dir);
+        let mut acp_session_id: Option<String> = None;
+        if let Some(sid) = session_id.filter(|s| !s.trim().is_empty()) {
+            // Sessions persist server-side; `session/load` resumes prior context.
+            send(
+                &mut stdin,
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": GROK_ACP_SESSION_ID,
+                    "method": "session/load",
+                    "params": { "sessionId": sid, "cwd": acp_cwd, "mcpServers": [] }
+                }),
+            )
+            .await?;
+            match await_response(&mut lines, GROK_ACP_SESSION_ID, 60).await {
+                Ok(_) => acp_session_id = Some(sid.to_string()),
+                Err(err) if is_continuation => {
+                    // The stored session holds real prior context we cannot
+                    // reach over ACP. The streaming path's `--continue`
+                    // resumes the CLI's last session in this directory —
+                    // defer to it instead of silently dropping context.
+                    return Err(format!(
+                        "stored session {sid} not loadable over ACP on a continuation \
+                         turn ({err}); deferring to --continue"
+                    ));
+                }
+                Err(err) => {
+                    tracing::info!(
+                        mission_id = %mission_id,
+                        session_id = %sid,
+                        error = %err,
+                        "Grok ACP session/load failed; starting a fresh session"
+                    );
+                }
             }
+        } else if is_continuation {
+            // Continuation with no stored session id at all: only the
+            // streaming path's `--continue` can recover the prior session.
+            return Err(
+                "continuation turn without a stored session id; deferring to --continue"
+                    .to_string(),
+            );
         }
+        if acp_session_id.is_none() {
+            send(
+                &mut stdin,
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": GROK_ACP_SESSION_NEW_ID,
+                    "method": "session/new",
+                    "params": { "cwd": acp_cwd, "mcpServers": [] }
+                }),
+            )
+            .await?;
+            let (resp, _) = await_response(&mut lines, GROK_ACP_SESSION_NEW_ID, 60).await?;
+            let sid = resp
+                .get("result")
+                .and_then(|r| r.get("sessionId"))
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| "grok ACP session/new returned no sessionId".to_string())?
+                .to_string();
+            let _ = events_tx.send(AgentEvent::SessionIdUpdate {
+                mission_id,
+                session_id: sid.clone(),
+            });
+            acp_session_id = Some(sid);
+        }
+        Ok(acp_session_id.expect("session id established above"))
     }
-    if acp_session_id.is_none() {
-        send(
-            &mut stdin,
-            serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": GROK_ACP_SESSION_ID,
-                "method": "session/new",
-                "params": { "cwd": acp_cwd, "mcpServers": [] }
-            }),
-        )
-        .await?;
-        let (resp, _) = await_response(&mut lines, GROK_ACP_SESSION_ID, 60).await?;
-        let sid = resp
-            .get("result")
-            .and_then(|r| r.get("sessionId"))
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| "grok ACP session/new returned no sessionId".to_string())?
-            .to_string();
-        let _ = events_tx.send(AgentEvent::SessionIdUpdate {
-            mission_id,
-            session_id: sid.clone(),
-        });
-        acp_session_id = Some(sid);
-    }
-    let acp_session_id = acp_session_id.expect("session id established above");
+    .await;
+    let acp_session_id = match handshake {
+        Ok(sid) => sid,
+        Err(err) => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            return Err(err);
+        }
+    };
 
     // The ACP session default is the non-reasoning chat model
     // (grok-4.20-*-non-reasoning), which emits no thought chunks. The legacy
@@ -1315,6 +1357,16 @@ async fn run_grok_acp_turn(
                 let _ = child.kill().await;
                 return Ok(AgentResult::failure("Mission cancelled".to_string(), 0)
                     .with_terminal_reason(TerminalReason::Cancelled));
+            }
+            _ = auth_fail.cancelled() => {
+                let _ = child.kill().await;
+                return Ok(AgentResult::failure(
+                    "Grok Build requires interactive sign-in (no usable XAI_API_KEY). \
+                     Reconnect the xAI provider or set an API key, then retry."
+                        .to_string(),
+                    0,
+                )
+                .with_terminal_reason(TerminalReason::AuthError));
             }
             line = tokio::time::timeout(idle_limit, lines.next_line()) => match line {
                 Err(_) => {
@@ -1534,7 +1586,17 @@ async fn run_grok_acp_turn(
     let final_text = text_buffer.trim().to_string();
     let (cost_cents, cost_source) =
         resolve_cost_cents_and_source(None, model_used.as_deref().or(Some("grok-build")), &usage);
-    let mut result = if final_text.is_empty() {
+    let mut result = if final_text.is_empty() && stop_reason.is_some() && !tool_calls.is_empty() {
+        // Tool-only turn: the model acted but never emitted a final
+        // message chunk. The work happened — surface it as success with a
+        // synthetic summary instead of a phantom LLM error.
+        let summary = format!(
+            "Completed {} tool action(s) without a final text reply (stopReason: {}).",
+            tool_calls.len(),
+            stop_reason.as_deref().unwrap_or("unknown")
+        );
+        AgentResult::success(summary, cost_cents).with_terminal_reason(TerminalReason::TurnComplete)
+    } else if final_text.is_empty() {
         AgentResult::failure(
             format!(
                 "Grok completed the turn (stopReason: {}) without producing assistant text.",
