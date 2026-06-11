@@ -754,7 +754,7 @@ impl OrchestratorMcp {
             },
             ToolDefinition {
                 name: "wait_for_worker".to_string(),
-                description: "Block until a single worker mission reaches a terminal status. Use wait_for_any_worker to monitor multiple workers simultaneously.".to_string(),
+                description: "Block until a single worker mission reaches a terminal status. Use wait_for_any_worker to monitor multiple workers simultaneously. For waits beyond a few minutes, end your turn and schedule a wakeup instead of polling (each ~90s poll costs a model call).".to_string(),
                 input_schema: json!({
                     "type": "object",
                     "required": ["mission_id"],
@@ -781,7 +781,7 @@ impl OrchestratorMcp {
             },
             ToolDefinition {
                 name: "wait_for_any_worker".to_string(),
-                description: "Block until ANY of the specified worker missions reaches a terminal status. Returns the first worker that finishes. Use this to monitor a pool of workers and react as each completes.".to_string(),
+                description: "Block until ANY of the specified worker missions reaches a terminal status. Returns the first worker that finishes. Use this to monitor a pool of workers and react as each completes. TOKEN ECONOMY: the wait is capped at ~90s per call, so polling a long-running worker burns one of YOUR model calls per 90s. If no worker is likely to finish within a couple of polls, END YOUR TURN and schedule a wakeup (ScheduleWakeup, 10-30 min) instead — check workers once per wakeup.".to_string(),
                 input_schema: json!({
                     "type": "object",
                     "required": ["mission_ids"],
