@@ -9106,12 +9106,22 @@ async fn control_actor_loop(
                         let parallel_running = parallel_runners
                             .get(&id)
                             .is_some_and(|runner| runner.is_running());
+                        // Run-settings (backend/model/agent/profile) are read
+                        // per turn, so changing them on a RUNNING mission is
+                        // safe: the in-flight turn keeps what it loaded and the
+                        // next turn picks up the new row (with the backend
+                        // handoff context below when the backend changed).
+                        // Long-lived missions (orchestrators, /goal loops)
+                        // rarely stop, so the previous hard refusal made them
+                        // effectively unswitchable. The fresh session id this
+                        // writes is also fine mid-run: every backend falls
+                        // back to a fresh/continued session when the stored id
+                        // is not loadable.
                         if main_running || parallel_running {
-                            let _ = respond.send(Err(
-                                "Cannot update mission settings while the mission is running"
-                                    .to_string(),
-                            ));
-                            continue;
+                            tracing::info!(
+                                mission_id = %id,
+                                "Updating run settings while mission is running; they apply from the next turn"
+                            );
                         }
 
                         // Capture the backend before the update so we can detect

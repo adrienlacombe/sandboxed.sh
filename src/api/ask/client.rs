@@ -245,7 +245,12 @@ impl AskClient {
                 }
             }
         }
-        if tool_calls.is_empty() {
+        // Only reinterpret text as tool calls when tools were actually
+        // offered. The forced final-synthesis pass runs with tools disabled;
+        // without this gate a model that writes tool-shaped markup there gets
+        // its entire answer swallowed (content -> None) and the operator sees
+        // "(The assistant reached the tool-call limit without a final answer.)".
+        if tool_calls.is_empty() && !tools.is_empty() {
             if let Some(text) = content.as_deref() {
                 tool_calls = parse_text_tool_calls(text);
             }
@@ -405,7 +410,7 @@ impl AskClient {
                 arguments,
             })
             .collect();
-        if tool_calls.is_empty() {
+        if tool_calls.is_empty() && !tools.is_empty() {
             tool_calls = parse_text_tool_calls(&content);
         }
 
