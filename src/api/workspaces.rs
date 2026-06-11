@@ -793,6 +793,32 @@ async fn delete_workspace(
     // If it's a container workspace, destroy the container first
     if let Some(ws) = state.workspaces.get(id).await {
         if ws.workspace_type == WorkspaceType::Container {
+            // Stop any live mission/exec scopes for this workspace first.
+            // Surviving scope processes (Tailscale daemons, leftover exec
+            // shells) keep the rootfs busy and make removal fail with EBUSY
+            // — this is how `dna` resisted deletion.
+            match list_workspace_scope_units(&ws).await {
+                Ok(units) => {
+                    for unit in units {
+                        let stopped = tokio::process::Command::new("systemctl")
+                            .args(["stop", &unit])
+                            .output()
+                            .await
+                            .map(|out| out.status.success())
+                            .unwrap_or(false);
+                        if !stopped {
+                            tracing::warn!(unit = %unit, "Failed to stop workspace scope before deletion");
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Could not list scopes for workspace {} before deletion: {}",
+                        ws.name,
+                        e
+                    );
+                }
+            }
             if let Err(e) = crate::workspace::destroy_container_workspace(&ws).await {
                 tracing::error!("Failed to destroy container for workspace {}: {}", id, e);
                 return Err((

@@ -901,6 +901,9 @@ pub async fn destroy_container(path: &Path) -> NspawnResult<()> {
             "Container path {} does not exist, nothing to destroy",
             path.display()
         );
+        // Still reap the sibling build log: a partially removed workspace
+        // (rootfs gone, log left) should not orphan it forever.
+        let _ = tokio::fs::remove_file(build_log_path_for(path)).await;
         return Ok(());
     }
 
@@ -910,13 +913,67 @@ pub async fn destroy_container(path: &Path) -> NspawnResult<()> {
     let _ = unmount_if_present(path, "/sys").await;
     let _ = unmount_if_present(path, "/proc").await;
 
+    // Unmount anything else still mounted under the container path (X11
+    // binds, overlay leftovers, runtime mounts not in the legacy list).
+    // A single live mount makes remove_dir_all fail with EBUSY — and worse,
+    // it would recurse *into* a live bind mount.
+    unmount_all_under(path).await;
+
     match tokio::fs::remove_dir_all(path).await {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(NspawnError::DirectoryRemoval(e)),
     }
 
+    // Remove the sibling build log (e.g. containers/<name>.build.log) so a
+    // deleted workspace leaves nothing behind.
+    let _ = tokio::fs::remove_file(build_log_path_for(path)).await;
+
     tracing::info!("Container destroyed successfully");
 
     Ok(())
+}
+
+/// Unmount every mount point under `root` (deepest first), best effort.
+///
+/// Reads `/proc/self/mountinfo` rather than guessing a fixed list; falls back
+/// to a lazy unmount when a regular one fails so a busy mount cannot wedge
+/// container deletion forever.
+async fn unmount_all_under(root: &Path) {
+    let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let root_str = root.to_string_lossy().into_owned();
+    let prefix = format!("{}/", root_str.trim_end_matches('/'));
+
+    let Ok(mountinfo) = tokio::fs::read_to_string("/proc/self/mountinfo").await else {
+        return;
+    };
+    // mountinfo field 5 (index 4) is the mount point, octal-escaped.
+    let mut mounts: Vec<String> = mountinfo
+        .lines()
+        .filter_map(|line| line.split_whitespace().nth(4))
+        .map(|mp| mp.replace("\\040", " ").replace("\\011", "\t"))
+        .filter(|mp| mp == &root_str || mp.starts_with(&prefix))
+        .collect();
+    if mounts.is_empty() {
+        return;
+    }
+    // Deepest first so nested mounts release their parents.
+    mounts.sort_by_key(|mp| std::cmp::Reverse(mp.matches('/').count()));
+    mounts.dedup();
+
+    for mp in mounts {
+        let ok = tokio::process::Command::new("umount")
+            .arg(&mp)
+            .output()
+            .await
+            .map(|out| out.status.success())
+            .unwrap_or(false);
+        if !ok {
+            tracing::warn!(mount = %mp, "umount failed; retrying lazily");
+            let _ = tokio::process::Command::new("umount")
+                .args(["-l", &mp])
+                .output()
+                .await;
+        }
+    }
 }
