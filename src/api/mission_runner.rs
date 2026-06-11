@@ -1398,10 +1398,22 @@ fn extract_part_text<'a>(part: &'a serde_json::Value, part_type: &str) -> Option
     }
 }
 
-/// Strip `<think>...</think>` tags from text output.
-/// Some models (e.g. Minimax, DeepSeek) emit internal reasoning inside inline
-/// `<think>` tags that should not be shown in the text output.
+/// Thinking tag pairs leaked into text output by various models:
+/// `<think>` (DeepSeek, GLM) and `<mm:think>` (MiniMax-M3).
+const THINK_TAG_PAIRS: [(&str, &str); 2] = [("<think>", "</think>"), ("<mm:think>", "</mm:think>")];
+
+/// Strip `<think>...</think>` / `<mm:think>...</mm:think>` tags from text
+/// output. Some models (e.g. Minimax, DeepSeek) emit internal reasoning
+/// inside inline thinking tags that should not be shown in the text output.
 pub(crate) fn strip_think_tags(text: &str) -> String {
+    let mut out = text.to_string();
+    for (open, close) in THINK_TAG_PAIRS {
+        out = strip_think_tags_pair(&out, open, close);
+    }
+    out
+}
+
+fn strip_think_tags_pair(text: &str, open_tag: &str, close_tag: &str) -> String {
     // Case-insensitive search directly on the original text to avoid
     // byte-offset misalignment from to_lowercase() on non-ASCII input.
     fn find_ci(haystack: &str, needle: &str) -> Option<usize> {
@@ -1415,7 +1427,7 @@ pub(crate) fn strip_think_tags(text: &str) -> String {
             .position(|w| w.eq_ignore_ascii_case(needle.as_bytes()))
     }
 
-    if find_ci(text, "<think>").is_none() {
+    if find_ci(text, open_tag).is_none() {
         return text.to_string();
     }
 
@@ -1423,21 +1435,21 @@ pub(crate) fn strip_think_tags(text: &str) -> String {
     let mut pos = 0;
 
     while pos < text.len() {
-        if let Some(rel_start) = find_ci(&text[pos..], "<think>") {
+        if let Some(rel_start) = find_ci(&text[pos..], open_tag) {
             let abs_start = pos + rel_start;
-            // find_ci searches for ASCII "<think>", so abs_start always lands on
+            // find_ci searches for an ASCII tag, so abs_start always lands on
             // a char boundary (the `<` byte). No boundary walk-back needed.
             result.push_str(&text[pos..abs_start]);
 
-            let after_open = abs_start + 7; // "<think>" is 7 ASCII bytes
+            let after_open = abs_start + open_tag.len();
             if after_open <= text.len() {
-                if let Some(rel_close) = find_ci(&text[after_open..], "</think>") {
-                    pos = after_open + rel_close + 8; // "</think>" is 8 ASCII bytes — always safe
+                if let Some(rel_close) = find_ci(&text[after_open..], close_tag) {
+                    pos = after_open + rel_close + close_tag.len();
                 } else {
-                    break; // unclosed tag: drop everything from <think> onwards
+                    break; // unclosed tag: drop everything from the opener onwards
                 }
             } else {
-                break; // unclosed tag: drop everything from <think> onwards
+                break; // unclosed tag: drop everything from the opener onwards
             }
         } else {
             result.push_str(&text[pos..]);
@@ -1448,11 +1460,28 @@ pub(crate) fn strip_think_tags(text: &str) -> String {
     result
 }
 
-/// Extract text inside `<think>...</think>` tags. Handles unclosed tags
-/// (the trailing unclosed opener is included verbatim) and multiple blocks
-/// (concatenated in order, separated by a single newline so callers can
-/// distinguish boundaries; trim will absorb the joiner's whitespace).
+/// Extract text inside `<think>...</think>` / `<mm:think>...</mm:think>`
+/// tags. Handles unclosed tags (the trailing unclosed opener is included
+/// verbatim) and multiple blocks (concatenated in order, separated by a
+/// single newline so callers can distinguish boundaries; trim will absorb
+/// the joiner's whitespace).
 pub(crate) fn extract_think_content(text: &str) -> Option<String> {
+    let mut combined: Option<String> = None;
+    for (open, close) in THINK_TAG_PAIRS {
+        if let Some(part) = extract_think_content_pair(text, open, close) {
+            match combined.as_mut() {
+                Some(acc) => {
+                    acc.push('\n');
+                    acc.push_str(&part);
+                }
+                None => combined = Some(part),
+            }
+        }
+    }
+    combined
+}
+
+fn extract_think_content_pair(text: &str, open_tag: &str, close_tag: &str) -> Option<String> {
     fn find_ci(haystack: &str, needle: &str) -> Option<usize> {
         let needle_len = needle.len();
         if haystack.len() < needle_len {
@@ -1464,32 +1493,29 @@ pub(crate) fn extract_think_content(text: &str) -> Option<String> {
             .position(|w| w.eq_ignore_ascii_case(needle.as_bytes()))
     }
 
-    const OPEN_TAG: &str = "<think>";
-    const CLOSE_TAG: &str = "</think>";
-
     // Walk every `<think>` opener in order. For each one, take everything up
     // to the next `</think>` (or to the end of the string if the close tag
     // is missing — the model streamed the tag header but not the footer yet).
     let mut combined = String::new();
     let mut cursor = 0usize;
     let mut found_any = false;
-    while let Some(open) = find_ci(&text[cursor..], OPEN_TAG) {
+    while let Some(open) = find_ci(&text[cursor..], open_tag) {
         found_any = true;
         let abs_open = cursor + open;
-        let after_open = abs_open + OPEN_TAG.len();
+        let after_open = abs_open + open_tag.len();
         let scan_from = if after_open <= text.len() {
             after_open
         } else {
             text.len()
         };
-        match find_ci(&text[scan_from..], CLOSE_TAG) {
+        match find_ci(&text[scan_from..], close_tag) {
             Some(rel_close) => {
                 let abs_close = scan_from + rel_close;
                 if !combined.is_empty() {
                     combined.push('\n');
                 }
                 combined.push_str(&text[after_open..abs_close]);
-                cursor = abs_close + CLOSE_TAG.len();
+                cursor = abs_close + close_tag.len();
             }
             None => {
                 // Unclosed trailing opener: include the rest of the string
@@ -9467,6 +9493,26 @@ mod tests {
         assert_eq!(result, "beforeafter");
     }
 
+    #[test]
+    fn strip_think_tags_removes_mm_think_blocks() {
+        // MiniMax-M3 leaks `<mm:think>` markup into assistant messages
+        // (seen in prod: assistant bubble starting with raw "<mm:think>").
+        let input = "<mm:think>internal reasoning</mm:think>visible answer";
+        assert_eq!(strip_think_tags(input), "visible answer");
+    }
+
+    #[test]
+    fn strip_think_tags_unclosed_mm_think_drops_rest() {
+        let input = "visible<mm:think>never closed";
+        assert_eq!(strip_think_tags(input), "visible");
+    }
+
+    #[test]
+    fn strip_think_tags_mixed_think_and_mm_think() {
+        let input = "a<think>1</think>b<mm:think>2</mm:think>c";
+        assert_eq!(strip_think_tags(input), "abc");
+    }
+
     // ── extract_think_content tests ───────────────────────────────────
 
     #[test]
@@ -9534,6 +9580,15 @@ mod tests {
         assert_eq!(
             extract_think_content(text).as_deref(),
             Some("mixed case reasoning")
+        );
+    }
+
+    #[test]
+    fn extract_think_content_mm_think_blocks() {
+        let text = "<mm:think>minimax reasoning</mm:think>answer";
+        assert_eq!(
+            extract_think_content(text).as_deref(),
+            Some("minimax reasoning")
         );
     }
 
