@@ -1245,7 +1245,8 @@ async fn run_grok_acp_turn(
     // Wrapped so every early error kills the spawned CLI first — a dropped
     // tokio Child keeps running (no kill_on_drop), and the fallback path
     // would spawn a second CLI for the same turn.
-    let handshake: Result<String, String> = async {
+    let handshake: Result<(String, bool), String> = async {
+        let mut session_load_failed = false;
         send(
             &mut stdin,
             serde_json::json!({
@@ -1288,6 +1289,7 @@ async fn run_grok_acp_turn(
                     ));
                 }
                 Err(err) => {
+                    session_load_failed = true;
                     tracing::info!(
                         mission_id = %mission_id,
                         session_id = %sid,
@@ -1327,11 +1329,14 @@ async fn run_grok_acp_turn(
             });
             acp_session_id = Some(sid);
         }
-        Ok(acp_session_id.expect("session id established above"))
+        Ok((
+            acp_session_id.expect("session id established above"),
+            session_load_failed,
+        ))
     }
     .await;
-    let acp_session_id = match handshake {
-        Ok(sid) => sid,
+    let (acp_session_id, session_load_failed) = match handshake {
+        Ok(pair) => pair,
         Err(err) => {
             let _ = child.kill().await;
             let _ = child.wait().await;
@@ -1389,7 +1394,12 @@ async fn run_grok_acp_turn(
         // turn back to the fallback path (same orphan hazard as handshake).
         let _ = child.kill().await;
         let _ = child.wait().await;
-        return Err(GrokAcpFallback::from(e));
+        // If the stored session already failed to load over ACP, the legacy
+        // path must not upsert an empty session under that id either.
+        return Err(GrokAcpFallback {
+            reason: e,
+            drop_session_id: session_load_failed,
+        });
     }
 
     let mut thinking_buffer = String::new();
