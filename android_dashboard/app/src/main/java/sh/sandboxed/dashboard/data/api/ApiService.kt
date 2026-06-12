@@ -145,9 +145,10 @@ class ApiService(
         obj["deleted_count"]?.jsonPrimitive?.content?.toIntOrNull() ?: 0
     }
 
-    suspend fun missionEvents(id: String, sinceSeq: Long? = null, limit: Int? = null, latest: Boolean? = null, types: String? = null): Pair<List<StoredEvent>, Long?> = withContext(Dispatchers.IO) {
+    suspend fun missionEvents(id: String, sinceSeq: Long? = null, beforeSeq: Long? = null, limit: Int? = null, latest: Boolean? = null, types: String? = null): Pair<List<StoredEvent>, Long?> = withContext(Dispatchers.IO) {
         val q = buildMap<String, String?> {
             if (sinceSeq != null) put("since_seq", sinceSeq.toString())
+            if (beforeSeq != null) put("before_seq", beforeSeq.toString())
             if (limit != null) put("limit", limit.toString())
             if (latest != null) put("latest", latest.toString())
             if (types != null) put("types", types)
@@ -163,7 +164,8 @@ class ApiService(
         }
     }
 
-    suspend fun sendMessage(content: String): ControlMessageResponse = postJson("/api/control/message", ControlMessageRequest(content))
+    suspend fun sendMessage(content: String, missionId: String? = null, clientMessageId: String? = null): ControlMessageResponse =
+        postJson("/api/control/message", ControlMessageRequest(content, missionId, clientMessageId))
     suspend fun cancelControl(): GenericOk = postEmpty("/api/control/cancel")
     suspend fun getQueue(): List<QueuedMessage> = getList("/api/control/queue")
     suspend fun deleteQueueItem(id: String) = withContext(Dispatchers.IO) {

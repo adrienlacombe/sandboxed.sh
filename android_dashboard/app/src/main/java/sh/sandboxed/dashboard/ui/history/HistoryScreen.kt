@@ -142,9 +142,9 @@ private class HistoryViewModel(private val container: AppContainer) : ViewModel(
 
 private fun HistoryFilter.matches(m: Mission): Boolean = when (this) {
     HistoryFilter.ALL -> true
-    HistoryFilter.ACTIVE -> m.status == MissionStatus.ACTIVE || m.status == MissionStatus.PENDING
+    HistoryFilter.ACTIVE -> m.status.isOpen
     HistoryFilter.INTERRUPTED -> m.status == MissionStatus.INTERRUPTED || m.status == MissionStatus.BLOCKED
-    HistoryFilter.COMPLETED -> m.status == MissionStatus.COMPLETED
+    HistoryFilter.COMPLETED -> m.status.isDone
     HistoryFilter.FAILED -> m.status == MissionStatus.FAILED || m.status == MissionStatus.NOT_FEASIBLE
 }
 
@@ -258,7 +258,7 @@ private fun MissionRow(mission: Mission, onOpen: () -> Unit, onResume: () -> Uni
                 if (mission.status.canResume || mission.resumable) {
                     IconButton(onClick = onResume) { Icon(Icons.Filled.PlayArrow, "Resume", tint = Palette.Success) }
                 }
-                if (mission.status == MissionStatus.ACTIVE || mission.status == MissionStatus.PENDING) {
+                if (mission.status.isOpen) {
                     IconButton(onClick = onCancel) { Icon(Icons.Filled.Cancel, "Cancel", tint = Palette.Warning) }
                 }
                 IconButton(onClick = onDelete) { Icon(Icons.Filled.Delete, "Delete", tint = Palette.Error) }

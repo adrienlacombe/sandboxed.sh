@@ -31,6 +31,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.OpenInNew
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.ArrowDownward
 import androidx.compose.material.icons.filled.AttachFile
 import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.CallSplit
@@ -41,6 +42,7 @@ import androidx.compose.material.icons.filled.Computer
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Flag
 import androidx.compose.material.icons.filled.History
+import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Psychology
 import androidx.compose.material.icons.filled.Schedule
@@ -49,6 +51,8 @@ import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.FilterChipDefaults
 import androidx.compose.material3.Icon
@@ -60,11 +64,14 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TextFieldDefaults
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -81,8 +88,14 @@ import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import coil.compose.AsyncImage
 import coil.request.ImageRequest
+import com.mikepenz.markdown.m3.Markdown
+import com.mikepenz.markdown.m3.markdownColor
+import kotlinx.coroutines.launch
 import sh.sandboxed.dashboard.data.AppContainer
 import sh.sandboxed.dashboard.data.Backend
 import sh.sandboxed.dashboard.data.BackendAgent
@@ -94,6 +107,7 @@ import sh.sandboxed.dashboard.data.MissionStatus
 import sh.sandboxed.dashboard.data.Provider
 import sh.sandboxed.dashboard.data.QueuedMessage
 import sh.sandboxed.dashboard.data.RunningMissionInfo
+import sh.sandboxed.dashboard.data.SendState
 import sh.sandboxed.dashboard.data.SharedFile
 import sh.sandboxed.dashboard.data.SlashCommand
 import sh.sandboxed.dashboard.data.Workspace
@@ -142,9 +156,51 @@ fun ControlScreen(
         )
     }
     val slashPanelActive = isSlashPanelActive(state.draft)
+    val scope = rememberCoroutineScope()
 
+    // Pause the event stream and pollers while the app is backgrounded; the
+    // lastSeq replay catches the conversation up on resume.
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            when (event) {
+                Lifecycle.Event.ON_START -> vm.setForeground(true)
+                Lifecycle.Event.ON_STOP -> vm.setForeground(false)
+                else -> {}
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+
+    // Only follow the stream when the user is already at the bottom; otherwise
+    // surface a "new messages" chip instead of yanking them down.
+    val atBottom by remember {
+        derivedStateOf {
+            val info = listState.layoutInfo
+            val lastVisible = info.visibleItemsInfo.lastOrNull()?.index ?: -1
+            info.totalItemsCount == 0 || lastVisible >= info.totalItemsCount - 2
+        }
+    }
+    var newMessagesBelow by remember { mutableStateOf(false) }
+    var lastMessageCount by remember { mutableStateOf(0) }
     LaunchedEffect(state.messages.size) {
-        if (state.messages.isNotEmpty()) listState.animateScrollToItem(state.messages.lastIndex)
+        val count = state.messages.size
+        val wasEmpty = lastMessageCount == 0
+        lastMessageCount = count
+        if (count == 0) return@LaunchedEffect
+        when {
+            // Fresh hydration (mission load/switch): snap straight to the end.
+            wasEmpty -> {
+                listState.scrollToItem(count - 1)
+                newMessagesBelow = false
+            }
+            atBottom -> listState.animateScrollToItem(count - 1)
+            else -> newMessagesBelow = true
+        }
+    }
+    LaunchedEffect(atBottom) {
+        if (atBottom) newMessagesBelow = false
     }
 
     LaunchedEffect(showMissionSwitcher) {
@@ -184,14 +240,36 @@ fun ControlScreen(
             if (state.staleCache) StaleCachePill()
             if (showDiagnostics) DiagnosticsOverlay(state)
             if (state.queue.isNotEmpty()) QueueBar(state.queue, vm::deleteQueueItem, vm::clearQueue)
-            LazyColumn(
-                state = listState,
-                modifier = Modifier.weight(1f).fillMaxWidth(),
-                contentPadding = PaddingValues(16.dp),
-                verticalArrangement = Arrangement.spacedBy(8.dp),
-            ) {
-                items(state.messages, key = { it.id }) { msg ->
-                    MessageRow(msg, resolveUrl, settingsSnapshot.jwtToken, onCopy)
+            Box(Modifier.weight(1f).fillMaxWidth()) {
+                LazyColumn(
+                    state = listState,
+                    modifier = Modifier.fillMaxSize(),
+                    contentPadding = PaddingValues(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    items(state.messages, key = { it.id }) { msg ->
+                        MessageRow(msg, resolveUrl, settingsSnapshot.jwtToken, onCopy, onRetry = { vm.retrySend(it) })
+                    }
+                }
+                if (newMessagesBelow && !atBottom) {
+                    Row(
+                        modifier = Modifier
+                            .align(Alignment.BottomCenter)
+                            .padding(bottom = 12.dp)
+                            .background(Palette.Accent, RoundedCornerShape(999.dp))
+                            .clickable {
+                                scope.launch {
+                                    if (state.messages.isNotEmpty()) listState.animateScrollToItem(state.messages.lastIndex)
+                                }
+                            }
+                            .padding(horizontal = 12.dp, vertical = 6.dp)
+                            .tag(TestTags.CONTROL_NEW_MESSAGES_CHIP),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Icon(Icons.Filled.ArrowDownward, null, tint = Color.White, modifier = Modifier.size(14.dp))
+                        Spacer(Modifier.width(6.dp))
+                        Text("New messages", color = Color.White, style = MaterialTheme.typography.labelMedium)
+                    }
                 }
             }
             if (slashPanelActive && (slashSuggestions.isNotEmpty() || state.slashCommandsLoading)) {
@@ -412,16 +490,6 @@ private fun TopBar(
             }
             if (mission != null) {
                 IconButton(onClick = onAsk, modifier = Modifier.tag(TestTags.CONTROL_TOPBAR_ASK)) { Icon(Icons.Filled.AutoAwesome, "Ask co-pilot", tint = Color(0xFF22D3EE)) }
-                IconButton(onClick = onAutomations, modifier = Modifier.tag(TestTags.CONTROL_TOPBAR_AUTOMATIONS)) { Icon(Icons.Filled.Settings, "Automations", tint = Palette.TextSecondary) }
-            }
-            if (hasThoughts) {
-                IconButton(onClick = onThoughts, modifier = Modifier.tag(TestTags.CONTROL_TOPBAR_THOUGHTS)) { Icon(Icons.Filled.Psychology, "Thoughts", tint = Palette.TextSecondary) }
-            }
-            IconButton(onClick = onDesktop, modifier = Modifier.tag(TestTags.CONTROL_TOPBAR_DESKTOP)) { Icon(Icons.Filled.Computer, "Desktop", tint = Palette.TextSecondary) }
-            if (workerCount > 0) {
-                IconButton(onClick = onWorkers) {
-                    Text("W$workerCount", color = Palette.AccentLight, style = MaterialTheme.typography.labelMedium)
-                }
             }
             IconButton(onClick = onSwitchMissions, modifier = Modifier.tag(TestTags.CONTROL_TOPBAR_MISSIONS)) {
                 Box(contentAlignment = Alignment.Center) {
@@ -432,6 +500,46 @@ private fun TopBar(
                 }
             }
             IconButton(onClick = onNewMission, modifier = Modifier.tag(TestTags.CONTROL_TOPBAR_NEW_MISSION)) { Icon(Icons.Filled.Add, "New mission", tint = Palette.Accent) }
+            // Secondary actions live in an overflow menu so the title and
+            // status line keep usable width on phones.
+            Box {
+                var menuOpen by remember { mutableStateOf(false) }
+                IconButton(onClick = { menuOpen = true }, modifier = Modifier.tag(TestTags.CONTROL_TOPBAR_OVERFLOW)) {
+                    Icon(Icons.Filled.MoreVert, "More actions", tint = Palette.TextSecondary)
+                }
+                DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
+                    if (mission != null) {
+                        DropdownMenuItem(
+                            text = { Text("Automations") },
+                            leadingIcon = { Icon(Icons.Filled.Settings, null) },
+                            onClick = { menuOpen = false; onAutomations() },
+                            modifier = Modifier.tag(TestTags.CONTROL_TOPBAR_AUTOMATIONS),
+                        )
+                    }
+                    DropdownMenuItem(
+                        text = { Text("Desktop") },
+                        leadingIcon = { Icon(Icons.Filled.Computer, null) },
+                        onClick = { menuOpen = false; onDesktop() },
+                        modifier = Modifier.tag(TestTags.CONTROL_TOPBAR_DESKTOP),
+                    )
+                    if (hasThoughts) {
+                        DropdownMenuItem(
+                            text = { Text("Thoughts") },
+                            leadingIcon = { Icon(Icons.Filled.Psychology, null) },
+                            onClick = { menuOpen = false; onThoughts() },
+                            modifier = Modifier.tag(TestTags.CONTROL_TOPBAR_THOUGHTS),
+                        )
+                    }
+                    if (workerCount > 0) {
+                        DropdownMenuItem(
+                            text = { Text("Workers ($workerCount)") },
+                            leadingIcon = { Icon(Icons.Filled.CallSplit, null) },
+                            onClick = { menuOpen = false; onWorkers() },
+                            modifier = Modifier.tag(TestTags.CONTROL_TOPBAR_WORKERS),
+                        )
+                    }
+                }
+            }
         }
         if (mission != null && (mission.metadataModel != null || mission.metadataSource != null || mission.workspaceName != null)) {
             Spacer(Modifier.height(4.dp))
@@ -725,13 +833,13 @@ private fun MissionSwitcherDialog(
                 }
 
                 val nonRunning = visibleRecent.filterNot { it.id in runningIds }
-                if (nonRunning.any { it.status == MissionStatus.ACTIVE || it.status == MissionStatus.PENDING }) {
+                if (nonRunning.any { it.status.isOpen }) {
                     item { DialogSection("Active & pending") }
-                    items(nonRunning.filter { it.status == MissionStatus.ACTIVE || it.status == MissionStatus.PENDING }, key = { it.id }) { m ->
+                    items(nonRunning.filter { it.status.isOpen }, key = { it.id }) { m ->
                         MissionSwitcherMissionRow(m, currentMissionId == m.id, onOpen, onResume, onFollowUp, onCancel, onDelete)
                     }
                 }
-                val completed = nonRunning.filter { it.status == MissionStatus.COMPLETED }
+                val completed = nonRunning.filter { it.status.isDone }
                 if (completed.isNotEmpty()) {
                     item { DialogSection("Completed") }
                     items(completed, key = { it.id }) { m ->
@@ -780,8 +888,8 @@ private fun WorkerDialog(
                 modifier = Modifier.fillMaxWidth().heightIn(max = 460.dp),
                 verticalArrangement = Arrangement.spacedBy(8.dp),
             ) {
-                val active = workers.filter { it.id in runningIds || it.status == MissionStatus.ACTIVE || it.status == MissionStatus.PENDING }
-                val completed = workers.filter { it.status == MissionStatus.COMPLETED }
+                val active = workers.filter { it.id in runningIds || it.status.isOpen }
+                val completed = workers.filter { it.status.isDone }
                 val failed = workers.filter { it.status == MissionStatus.FAILED || it.status == MissionStatus.NOT_FEASIBLE || it.status == MissionStatus.INTERRUPTED }
                 if (active.isNotEmpty()) item { DialogSection("Running") }
                 items(active, key = { it.id }) { worker -> WorkerRow(worker, running.firstOrNull { it.missionId == worker.id }, onOpen) }
@@ -1021,9 +1129,10 @@ private fun MessageRow(
     resolveUrl: (String) -> String,
     authToken: String?,
     onCopy: (String) -> Unit,
+    onRetry: (String) -> Unit,
 ) {
     when (val k = msg.kind) {
-        ChatMessageKind.User -> Bubble(msg.content, mine = true, onCopy = onCopy)
+        ChatMessageKind.User -> Bubble(msg.content, mine = true, onCopy = onCopy, sendState = msg.sendState, onRetry = { onRetry(msg.id) })
         is ChatMessageKind.Assistant -> AssistantBubble(msg.content, k, resolveUrl, authToken, onCopy)
         is ChatMessageKind.Thinking -> ThinkingNote(done = k.done, body = msg.content)
         is ChatMessageKind.Phase -> SystemNote("phase: ${k.phase}${k.detail?.let { " — $it" } ?: ""}")
@@ -1058,18 +1167,53 @@ private fun ThinkingNote(done: Boolean, body: String) {
 
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
-private fun Bubble(text: String, mine: Boolean, onCopy: (String) -> Unit) {
-    val bg = if (mine) Palette.Accent else Palette.Card
+private fun Bubble(
+    text: String,
+    mine: Boolean,
+    onCopy: (String) -> Unit,
+    sendState: SendState = SendState.SENT,
+    onRetry: () -> Unit = {},
+) {
+    val failed = mine && sendState == SendState.FAILED
+    val pending = mine && sendState == SendState.PENDING
+    val bg = if (mine) Palette.Accent.copy(alpha = if (pending) 0.6f else 1f) else Palette.Card
     val fg = if (mine) Color(0xFFFFFFFF) else Palette.TextPrimary
     Row(Modifier.fillMaxWidth(), horizontalArrangement = if (mine) Arrangement.End else Arrangement.Start) {
-        Column(
-            Modifier
-                .widthIn(max = 320.dp)
-                .background(bg, RoundedCornerShape(16.dp))
-                .combinedClickable(onClick = {}, onLongClick = { onCopy(text) })
-                .padding(horizontal = 12.dp, vertical = 10.dp),
-        ) {
-            Text(text, color = fg, style = MaterialTheme.typography.bodyMedium)
+        Column(horizontalAlignment = if (mine) Alignment.End else Alignment.Start) {
+            Column(
+                Modifier
+                    .widthIn(max = 320.dp)
+                    .background(bg, RoundedCornerShape(16.dp))
+                    .then(if (failed) Modifier.border(1.dp, Palette.Error, RoundedCornerShape(16.dp)) else Modifier)
+                    .combinedClickable(onClick = { if (failed) onRetry() }, onLongClick = { onCopy(text) })
+                    .padding(horizontal = 12.dp, vertical = 10.dp),
+            ) {
+                if (mine) {
+                    Text(text, color = fg, style = MaterialTheme.typography.bodyMedium)
+                } else {
+                    // Agent replies are mostly markdown: code blocks, lists, links.
+                    Markdown(
+                        content = text,
+                        colors = markdownColor(
+                            text = fg,
+                            codeText = Palette.TextSecondary,
+                            codeBackground = Palette.BackgroundTertiary,
+                            inlineCodeText = Palette.AccentLight,
+                            inlineCodeBackground = Palette.BackgroundTertiary,
+                            linkText = Palette.AccentLight,
+                            dividerColor = Palette.Border,
+                        ),
+                    )
+                }
+            }
+            if (failed) {
+                Text(
+                    "Failed — tap to retry",
+                    color = Palette.Error,
+                    style = MaterialTheme.typography.labelSmall,
+                    modifier = Modifier.padding(top = 2.dp, end = 4.dp).tag(TestTags.CONTROL_MESSAGE_RETRY),
+                )
+            }
         }
     }
 }

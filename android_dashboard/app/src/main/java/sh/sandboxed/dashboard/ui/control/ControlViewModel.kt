@@ -27,7 +27,9 @@ import sh.sandboxed.dashboard.data.Mission
 import sh.sandboxed.dashboard.data.MissionStatus
 import sh.sandboxed.dashboard.data.QueuedMessage
 import sh.sandboxed.dashboard.data.RunningMissionInfo
+import sh.sandboxed.dashboard.data.SendState
 import sh.sandboxed.dashboard.data.SharedFile
+import sh.sandboxed.dashboard.data.api.HttpException
 import sh.sandboxed.dashboard.data.SlashCommand
 import sh.sandboxed.dashboard.data.SseEvent
 import sh.sandboxed.dashboard.data.ToolUiParser
@@ -98,6 +100,10 @@ class ControlViewModel(private val container: AppContainer) : ViewModel() {
     private var pollJob: Job? = null
     private var slashCommandsJob: Job? = null
     @Volatile private var lastSeq: Long? = null
+    private var foreground = true
+    // Some deployments lack /api/control/parallel/config; remember the 404
+    // instead of re-probing it on every poll tick.
+    private var parallelConfigSupported = true
 
     init {
         viewModelScope.launch {
@@ -108,9 +114,32 @@ class ControlViewModel(private val container: AppContainer) : ViewModel() {
             } catch (_: Throwable) {
                 loadFromCache(container.cached.value.lastMissionId)
             }
+            if (_state.value.mission == null) loadDraftFor(null)
             startStream()
             startRunningPoller()
         }
+    }
+
+    /// Lifecycle hook from the Control screen: tear down the event stream and
+    /// pollers while the app is backgrounded, resume (with delta replay via
+    /// lastSeq) when it comes back.
+    fun setForeground(active: Boolean) {
+        if (active == foreground) return
+        foreground = active
+        if (active) {
+            startStream()
+            startRunningPoller()
+            viewModelScope.launch { runCatching { refreshQueue() } }
+        } else {
+            streamJob?.cancel()
+            pollJob?.cancel()
+            _state.update { it.copy(isConnected = false) }
+        }
+    }
+
+    private fun loadDraftFor(missionId: String?) {
+        val stored = container.cached.value.drafts[missionId.orEmpty()].orEmpty()
+        _state.update { it.copy(draft = stored) }
     }
 
     /// Render the cached copy of a mission when the live fetch failed, flagged
@@ -123,7 +152,7 @@ class ControlViewModel(private val container: AppContainer) : ViewModel() {
 
     fun setDraft(text: String) {
         _state.update { it.copy(draft = text) }
-        viewModelScope.launch { container.settings.setDraft(text) }
+        viewModelScope.launch { container.settings.setDraft(_state.value.mission?.id, text) }
         if (text.trim().startsWith("/")) loadSlashCommandsIfNeeded()
     }
 
@@ -144,29 +173,72 @@ class ControlViewModel(private val container: AppContainer) : ViewModel() {
     fun send() {
         val text = _state.value.draft.trim()
         if (text.isEmpty()) return
+        val missionIdForDraft = _state.value.mission?.id
+        val draftMsg = ChatMessage(kind = ChatMessageKind.User, content = text, sendState = SendState.PENDING)
+        _state.update { it.copy(isSending = true, messages = it.messages + draftMsg, draft = "") }
+        viewModelScope.launch { container.settings.setDraft(missionIdForDraft, "") }
+        viewModelScope.launch { deliver(draftMsg.id, text) }
+    }
+
+    /// Retry a message whose send failed; reuses the original bubble.
+    fun retrySend(messageId: String) {
+        val msg = _state.value.messages.firstOrNull { it.id == messageId } ?: return
+        if (msg.sendState != SendState.FAILED) return
+        markSendState(messageId, SendState.PENDING)
         _state.update { it.copy(isSending = true) }
+        viewModelScope.launch { deliver(messageId, msg.content) }
+    }
 
-        val draftMsg = ChatMessage(kind = ChatMessageKind.User, content = text)
-        _state.update { it.copy(messages = it.messages + draftMsg, draft = "") }
-        viewModelScope.launch { container.settings.setDraft("") }
+    private suspend fun deliver(messageId: String, text: String) {
+        runCatching {
+            var missionId = _state.value.mission?.id
+            if (missionId == null) {
+                val s = container.cached.value
+                val mission = container.api.createMission(CreateMissionRequest(
+                    title = text.take(60),
+                    agent = s.defaultAgent.takeIf { it.isNotBlank() },
+                    backend = s.defaultBackend.takeIf { it.isNotBlank() },
+                    modelOverride = s.defaultModel.takeIf { it.isNotBlank() },
+                ))
+                _state.update { it.copy(mission = mission, childMissions = emptyList(), progress = null) }
+                container.settings.setLastMission(mission.id)
+                missionId = mission.id
+            }
+            // mission_id pins the send to the conversation on screen;
+            // client_message_id lets the server dedupe retries.
+            container.api.sendMessage(text, missionId = missionId, clientMessageId = messageId)
+            refreshQueue()
+        }.onSuccess {
+            markSendState(messageId, SendState.SENT)
+        }.onFailure { e ->
+            markSendState(messageId, SendState.FAILED)
+            _state.update { it.copy(error = e.message) }
+        }
+        _state.update { it.copy(isSending = false) }
+    }
 
-        viewModelScope.launch {
-            runCatching {
-                if (_state.value.mission == null) {
-                    val s = container.cached.value
-                    val mission = container.api.createMission(CreateMissionRequest(
-                        title = text.take(60),
-                        agent = s.defaultAgent.takeIf { it.isNotBlank() },
-                        backend = s.defaultBackend.takeIf { it.isNotBlank() },
-                        modelOverride = s.defaultModel.takeIf { it.isNotBlank() },
-                    ))
-                    _state.update { it.copy(mission = mission, childMissions = emptyList(), progress = null) }
-                    container.settings.setLastMission(mission.id)
-                }
-                container.api.sendMessage(text)
-                refreshQueue()
-            }.onFailure { e -> _state.update { it.copy(error = e.message) } }
-            _state.update { it.copy(isSending = false) }
+    private fun markSendState(id: String, sendState: SendState) {
+        _state.update { st ->
+            st.copy(messages = st.messages.map { if (it.id == id) it.copy(sendState = sendState) else it })
+        }
+    }
+
+    /// Resolve a `user_message` event by id. The optimistic bubble already
+    /// uses `client_message_id` as its id, so a live echo confirms it instead
+    /// of duplicating; a failed bubble whose POST actually reached the server
+    /// is healed to SENT when the echo arrives.
+    private fun confirmUserMessage(id: String, content: String) {
+        _state.update { st ->
+            val idx = st.messages.indexOfFirst { it.id == id }
+            if (idx >= 0) {
+                st.copy(
+                    messages = st.messages.mapIndexed { i, m ->
+                        if (i == idx) m.copy(content = content, sendState = SendState.SENT) else m
+                    },
+                )
+            } else {
+                st.copy(messages = st.messages + ChatMessage(id = id, kind = ChatMessageKind.User, content = content))
+            }
         }
     }
 
@@ -179,7 +251,7 @@ class ControlViewModel(private val container: AppContainer) : ViewModel() {
         if (text.isEmpty()) return
         _state.update { it.copy(draft = "") }
         viewModelScope.launch {
-            container.settings.setDraft("")
+            container.settings.setDraft(mission.id, "")
             val model = container.cached.value.defaultModel.takeIf { it.isNotBlank() }
             runCatching { container.api.parallelSend(mission.id, text, model) }
                 .onSuccess { runCatching { refreshRunning() } }
@@ -234,6 +306,7 @@ class ControlViewModel(private val container: AppContainer) : ViewModel() {
                 lastSeq = null
                 _state.update { it.copy(mission = mission, messages = emptyList(), childMissions = emptyList(), goalStatus = null, progress = null) }
                 container.settings.setLastMission(mission.id)
+                loadDraftFor(mission.id)
                 runCatching { refreshRunning() }
             }.onFailure { e ->
                 _state.update { it.copy(error = e.message) }
@@ -271,7 +344,7 @@ class ControlViewModel(private val container: AppContainer) : ViewModel() {
                     )
                 }
                 container.settings.setLastMission(mission.id)
-                container.settings.setDraft(prompt)
+                container.settings.setDraft(mission.id, prompt)
                 runCatching { refreshRunning() }
             }.onFailure { e ->
                 _state.update { it.copy(error = e.message) }
@@ -290,19 +363,42 @@ class ControlViewModel(private val container: AppContainer) : ViewModel() {
             runCatching {
                 val mission = container.api.loadMission(missionId)
                 container.missionCache.save(mission)
-                _state.update { it.copy(mission = mission, messages = mapHistory(mission), goalStatus = null, progress = null, staleCache = false) }
+                _state.update { it.copy(mission = mission, messages = emptyList(), goalStatus = null, progress = null, staleCache = false) }
                 container.settings.setLastMission(mission.id)
                 lastSeq = null
-                runCatching {
-                    val (_, max) = container.api.missionEvents(mission.id, latest = true, limit = 1)
-                    lastSeq = max
+                if (!hydrateFromEvents(mission.id)) {
+                    _state.update { it.copy(messages = mapHistory(mission)) }
+                    runCatching {
+                        val (_, max) = container.api.missionEvents(mission.id, latest = true, limit = 1)
+                        lastSeq = max
+                    }
                 }
                 refreshChildMissions(mission.id)
+                loadDraftFor(mission.id)
             }.onFailure {
                 loadFromCache(missionId)
             }
         }
     }
+
+    /// Rebuild the conversation from the stored event log instead of
+    /// `mission.history`, which only keeps user/assistant text and drops tool
+    /// calls, thinking, costs, and shared files. Loads the most recent window
+    /// of events in ascending order, then sets the replay cursor.
+    private suspend fun hydrateFromEvents(missionId: String): Boolean = runCatching {
+        val (_, maxSeq) = container.api.missionEvents(missionId, latest = true, limit = 1)
+        val events = if (maxSeq != null && maxSeq > 0) {
+            container.api.missionEvents(missionId, beforeSeq = maxSeq + 1, limit = 300).first
+        } else {
+            emptyList()
+        }
+        if (_state.value.mission?.id != missionId) return@runCatching true
+        _state.update { it.copy(messages = emptyList()) }
+        events.forEach { handle(storedEventToSse(it), live = false) }
+        lastSeq = maxSeq
+        _state.update { it.copy(lastEventSeq = maxSeq) }
+        true
+    }.getOrDefault(false)
 
     fun loadRecentMissions() {
         viewModelScope.launch {
@@ -323,20 +419,24 @@ class ControlViewModel(private val container: AppContainer) : ViewModel() {
     private suspend fun refreshMission() {
         val cur = container.api.currentMission() ?: return
         container.missionCache.save(cur)
-        // Fetch event seq high-water-mark for delta resume on stream reconnect
-        runCatching {
-            val (_, max) = container.api.missionEvents(cur.id, latest = true, limit = 1)
-            lastSeq = max
-        }
         _state.update {
             it.copy(
                 mission = cur,
-                messages = mapHistory(cur),
+                messages = emptyList(),
                 progress = null,
                 staleCache = false,
             )
         }
+        if (!hydrateFromEvents(cur.id)) {
+            _state.update { it.copy(messages = mapHistory(cur)) }
+            // Fetch event seq high-water-mark for delta resume on stream reconnect
+            runCatching {
+                val (_, max) = container.api.missionEvents(cur.id, latest = true, limit = 1)
+                lastSeq = max
+            }
+        }
         refreshChildMissions(cur.id)
+        loadDraftFor(cur.id)
     }
 
     private fun loadSlashCommandsIfNeeded() {
@@ -415,11 +515,19 @@ class ControlViewModel(private val container: AppContainer) : ViewModel() {
 
     private suspend fun refreshRunning() {
         val running = container.api.running()
-        val cfg = runCatching { container.api.parallelConfig() }.getOrNull()
-        _state.update {
-            it.copy(parallel = running, maxParallel = cfg?.maxParallel ?: it.maxParallel)
+        if (parallelConfigSupported) {
+            runCatching { container.api.parallelConfig() }
+                .onSuccess { cfg -> _state.update { it.copy(maxParallel = cfg.maxParallel) } }
+                .onFailure { e -> if ((e as? HttpException)?.status == 404) parallelConfigSupported = false }
         }
-        _state.value.mission?.id?.let { refreshChildMissions(it) }
+        _state.update { it.copy(parallel = running) }
+        // Only refetch the (large) mission list for child workers when the
+        // current mission plausibly has any — mirrors the iOS fix for the
+        // same every-3s no-op fetch.
+        val mid = _state.value.mission?.id ?: return
+        if (_state.value.childMissions.isNotEmpty() || running.any { it.missionId == mid }) {
+            refreshChildMissions(mid)
+        }
     }
 
     private fun handle(evt: SseEvent, live: Boolean) {
@@ -436,17 +544,37 @@ class ControlViewModel(private val container: AppContainer) : ViewModel() {
         if (!isMissionLevelEvent && eventMissionId != null && eventMissionId != currentMissionId) return
 
         when (evt.type) {
-            "user_message" -> appendMessage(ChatMessage(kind = ChatMessageKind.User, content = s("content") ?: return))
+            "user_message" -> {
+                val content = s("content") ?: return
+                val id = s("id")
+                if (id != null) {
+                    confirmUserMessage(id, content)
+                } else {
+                    appendMessage(ChatMessage(kind = ChatMessageKind.User, content = content))
+                }
+            }
             "assistant_message" -> {
                 val content = s("content") ?: return
                 val cost = i("cost_cents") ?: 0
                 val source = s("cost_source") ?: "actual"
                 val model = s("model")
                 val files = parseSharedFiles(obj["shared_files"])
-                appendMessage(ChatMessage(
+                val msg = ChatMessage(
                     kind = ChatMessageKind.Assistant(costCents = cost, costSource = source, model = model, sharedFiles = files),
                     content = content,
-                ))
+                )
+                // The final assistant_message finalizes the bubble that
+                // text_delta has been streaming into (and some flows emit the
+                // same assistant_message twice) — replace instead of stacking
+                // a duplicate.
+                _state.update { st ->
+                    val msgs = st.messages.toMutableList()
+                    val last = msgs.lastOrNull()
+                    val finalizesLast = last?.kind is ChatMessageKind.Assistant &&
+                        (last.content == content || content.startsWith(last.content) || last.content.startsWith(content))
+                    if (finalizesLast) msgs[msgs.lastIndex] = msg else msgs += msg
+                    st.copy(messages = msgs)
+                }
             }
             "text_delta" -> { val content = s("content") ?: return; setStreamingAssistant(content) }
             "thinking" -> {
@@ -636,6 +764,7 @@ class ControlViewModel(private val container: AppContainer) : ViewModel() {
         val data = ev.metadata.toMutableMap()
         data["mission_id"] = JsonPrimitive(ev.missionId)
         if (ev.content.isNotBlank()) data["content"] = JsonPrimitive(ev.content)
+        ev.eventId?.let { data["id"] = JsonPrimitive(it) }
         ev.toolCallId?.let { data["tool_call_id"] = JsonPrimitive(it) }
         ev.toolName?.let { data["name"] = JsonPrimitive(it) }
         when (ev.eventType) {

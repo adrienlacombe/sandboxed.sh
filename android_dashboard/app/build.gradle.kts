@@ -13,8 +13,8 @@ android {
         applicationId = "sh.sandboxed.dashboard"
         minSdk = 33
         targetSdk = 36
-        versionCode = 9
-        versionName = "1.4.0"
+        versionCode = 11
+        versionName = "1.5.1"
         vectorDrawables { useSupportLibrary = true }
     }
 
@@ -96,6 +96,9 @@ dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
 
     implementation("io.coil-kt:coil-compose:2.7.0")
+
+    //noinspection GradleDependency -- newer versions need Kotlin 2.1 metadata; this app builds with Kotlin 2.0.
+    implementation("com.mikepenz:multiplatform-markdown-renderer-m3:0.26.0")
 
     debugImplementation("androidx.compose.ui:ui-tooling")
     debugImplementation("androidx.compose.ui:ui-test-manifest")

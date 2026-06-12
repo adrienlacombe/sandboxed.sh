@@ -62,6 +62,8 @@ import sh.sandboxed.dashboard.data.AppContainer
 import sh.sandboxed.dashboard.data.AskMessage
 import sh.sandboxed.dashboard.data.AskThread
 import sh.sandboxed.dashboard.ui.TestTags
+import com.mikepenz.markdown.m3.Markdown
+import com.mikepenz.markdown.m3.markdownColor
 import sh.sandboxed.dashboard.ui.tag
 import sh.sandboxed.dashboard.ui.theme.Palette
 import sh.sandboxed.dashboard.util.Haptics
@@ -304,7 +306,18 @@ private fun AskBubble(
                         .padding(horizontal = 12.dp, vertical = 8.dp),
                     verticalArrangement = Arrangement.spacedBy(6.dp),
                 ) {
-                    Text(message.content, style = MaterialTheme.typography.bodyMedium, color = Palette.TextPrimary)
+                    Markdown(
+                        content = message.content,
+                        colors = markdownColor(
+                            text = Palette.TextPrimary,
+                            codeText = Palette.TextSecondary,
+                            codeBackground = Palette.BackgroundTertiary,
+                            inlineCodeText = Palette.AccentLight,
+                            inlineCodeBackground = Palette.BackgroundTertiary,
+                            linkText = Palette.AccentLight,
+                            dividerColor = Palette.Border,
+                        ),
+                    )
                     if (message.content.isNotBlank()) {
                         Row(
                             Modifier.tag(TestTags.ASK_SEND_TO_AGENT).clickable { onSendToAgent(message.content) },
