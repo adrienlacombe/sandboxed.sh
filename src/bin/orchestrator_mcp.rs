@@ -903,7 +903,7 @@ impl OrchestratorMcp {
             || params
                 .model_override
                 .as_deref()
-                .map(|m| m.contains("claude"))
+                .map(|m| m.to_ascii_lowercase().contains("claude"))
                 .unwrap_or(false);
         let claude_allowed = std::env::var("SANDBOXED_SH_ALLOW_CLAUDE_WORKERS")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
