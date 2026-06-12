@@ -374,6 +374,9 @@ struct MissionSwitcherSheet: View {
                 }
             }
             .searchable(text: $searchText, prompt: "Search missions...")
+            // Keep the last rows readable above the bottom-pinned search
+            // field (its translucent material let badges bleed through).
+            .contentMargins(.bottom, 72, for: .scrollContent)
             .onChange(of: searchText) { _, newValue in
                 scheduleBackendSearch(for: newValue)
                 recomputeMissionSections()

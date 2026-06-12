@@ -76,7 +76,10 @@ enum Theme {
     static let textPrimary = Color(uiColor: .label)
     static let textSecondary = Color(uiColor: .secondaryLabel)
     static let textTertiary = Color(uiColor: .tertiaryLabel)
-    static let textMuted = Color.white.opacity(0.4)
+    /// Semantic quaternary tone instead of raw white-at-40%: participates in
+    /// vibrancy on materials and tracks Increase Contrast, which a fixed
+    /// opacity never does (HIG: prefer semantic label colors).
+    static let textMuted = Color(uiColor: .quaternaryLabel)
     
     // MARK: - Typography Helpers
     

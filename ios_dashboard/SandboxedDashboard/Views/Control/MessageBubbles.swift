@@ -141,6 +141,7 @@ struct MessageBubble: View {
                     // Timestamp
                     Text(message.timestamp, style: .time)
                         .font(.caption2)
+                        .monospacedDigit()
                         .foregroundStyle(Theme.textMuted)
                 }
             }
@@ -889,6 +890,7 @@ struct ThinkingBubble: View {
                         .font(.caption2)
                     Text(message.timestamp, style: .time)
                         .font(.caption2)
+                        .monospacedDigit()
                         .foregroundStyle(Theme.textMuted)
 
                     Spacer()

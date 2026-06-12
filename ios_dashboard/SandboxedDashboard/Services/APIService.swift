@@ -1233,7 +1233,13 @@ final class APIService {
 
     private func makeURL(_ path: String, queryItems: [URLQueryItem]) -> URL? {
         guard var components = makeURLComponents(path) else { return nil }
-        components.queryItems = queryItems.isEmpty ? nil : queryItems
+        // Only override the query when the caller passes explicit items —
+        // assigning nil here used to wipe query strings already embedded in
+        // `path` (e.g. "/api/fs/list?path=/root"), which the server rejected
+        // with 400 "missing field" errors.
+        if !queryItems.isEmpty {
+            components.queryItems = queryItems
+        }
         return components.url
     }
 

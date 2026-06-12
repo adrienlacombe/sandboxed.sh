@@ -31,6 +31,8 @@ struct WorkerPillView: View {
 
                 Text("\(workers.count)")
                     .font(.caption.weight(.semibold))
+                    .monospacedDigit()
+                    .contentTransition(.numericText())
                     .foregroundStyle(Theme.textPrimary)
 
                 if activeCount > 0 {
@@ -40,6 +42,7 @@ struct WorkerPillView: View {
                             .frame(width: 5, height: 5)
                         Text("\(activeCount)")
                             .font(.system(size: 10, weight: .medium).monospaced())
+                            .contentTransition(.numericText())
                             .foregroundStyle(Theme.accent)
                     }
                 }
@@ -97,5 +100,10 @@ struct WorkerPillView: View {
             .shadow(color: .black.opacity(0.3), radius: 8, y: 4)
         }
         .buttonStyle(.plain)
+        // Roll digits instead of snapping when worker states change.
+        .animation(.snappy, value: workers.count)
+        .animation(.snappy, value: activeCount)
+        .animation(.snappy, value: waitingCount)
+        .animation(.snappy, value: failedCount)
     }
 }

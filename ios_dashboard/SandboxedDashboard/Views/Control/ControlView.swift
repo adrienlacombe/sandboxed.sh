@@ -170,6 +170,10 @@ struct ControlView: View {
     @State private var slashCommandLoading = false
     @State private var copiedMessageId: String?
     @State private var shouldScrollImmediately = false
+    /// Set by revert paths (`applyViewingMission(..., scrollToBottom: false)`
+    /// after a failed mission switch) so the per-mission remount's rescue
+    /// scroll doesn't stomp a deliberately preserved scroll position.
+    @State private var preserveScrollOnNextAppear = false
     @State private var isLoadingHistory = false  // Track when loading historical messages to prevent animated scroll
     @State private var pendingFocusedMessageId: String?
 
@@ -521,6 +525,7 @@ struct ControlView: View {
         )
         .presentationDetents([.medium, .large])
         .presentationDragIndicator(.visible)
+        .presentationCornerRadius(24)
         // Explicit opaque background: the default sheet material composited
         // over the conversation produced a visible vertical seam where the
         // content behind changed brightness.
@@ -580,6 +585,9 @@ struct ControlView: View {
                 if runningMissions.count > 0 {
                     Text("\(runningMissions.count)")
                         .font(.caption2.weight(.medium))
+                        .monospacedDigit()
+                        .contentTransition(.numericText())
+                        .animation(.snappy, value: runningMissions.count)
                 }
             }
             .foregroundStyle(runningMissions.isEmpty ? Theme.textSecondary : Theme.accent)
@@ -1106,6 +1114,11 @@ struct ControlView: View {
                 // Rescue pass for the lazy path: if the initial anchor landed
                 // outside real content (estimated row heights), snap to the
                 // true bottom once layout settles. No-op when already there.
+                // Skipped when a revert path explicitly preserved position.
+                if preserveScrollOnNextAppear {
+                    preserveScrollOnNextAppear = false
+                    return
+                }
                 Task { @MainActor in
                     try? await Task.sleep(for: .milliseconds(80))
                     scrollToBottom(proxy: proxy, immediate: true)
@@ -1542,7 +1555,7 @@ struct ControlView: View {
                         .foregroundStyle(Theme.accent.opacity(0.6))
                     Text(goal.objective)
                         .font(.caption2)
-                        .foregroundStyle(Theme.accent.opacity(0.7))
+                        .foregroundStyle(Theme.accent.opacity(0.85))
                         .lineLimit(1)
                         .truncationMode(.tail)
                 }
@@ -1630,8 +1643,10 @@ struct ControlView: View {
                             .frame(width: 32, height: 32)
                             .background(Theme.error)
                             .clipShape(Circle())
+                            .frame(width: 44, height: 44)
+                            .contentShape(Rectangle())
                     }
-                    .padding(.leading, 8)
+                    .padding(.leading, 2)
                     .transition(.scale.combined(with: .opacity))
                 }
 
@@ -1683,9 +1698,11 @@ struct ControlView: View {
                         Circle()
                             .stroke(!canSend && pendingSendCount == 0 ? Theme.border : Color.clear, lineWidth: 1)
                     )
+                    .frame(width: 44, height: 44)
+                    .contentShape(Rectangle())
                 }
                 .disabled(!canSend)
-                .padding(.trailing, 8)
+                .padding(.trailing, 2)
             }
             .animation(.easeInOut(duration: 0.15), value: runState)
             .animation(.easeInOut(duration: 0.15), value: pendingSendCount > 0)
@@ -2533,6 +2550,7 @@ struct ControlView: View {
 
             // Revert viewing state to avoid filtering out events
             if let fallback = previousViewingMission ?? currentMission {
+                preserveScrollOnNextAppear = true
                 applyViewingMission(fallback, scrollToBottom: false)
             } else {
                 viewingMissionId = previousViewingId
@@ -3733,6 +3751,7 @@ struct ControlView: View {
             queueLength = previousQueueLength
             progress = previousProgress
             if let fallback = previousViewingMission ?? currentMission {
+                preserveScrollOnNextAppear = true
                 applyViewingMission(fallback, scrollToBottom: false)
             } else {
                 viewingMissionId = previousViewingId
