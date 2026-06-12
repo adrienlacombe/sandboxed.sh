@@ -1337,6 +1337,7 @@ pub fn run_claudecode_turn<'a>(
         // decode (OAuth-encrypted / signature-only) so the turn end can
         // surface a marker instead of a silently empty thoughts panel.
         let mut thinking_audit = crate::backend::shared::ThinkingDeltaAudit::default();
+        let mut encrypted_marker_emitted = false;
         let mut text_buffer: HashMap<u32, String> = HashMap::new();
         let mut active_thinking_index: Option<u32> = None; // Track which thinking block is active
         let mut finalized_thinking_indices: std::collections::HashSet<u32> =
@@ -2128,8 +2129,16 @@ pub fn run_claudecode_turn<'a>(
                                     // surface a marker so the panel isn't silently empty
                                     // (also warns once about unknown delta types).
                                     if let Some(marker) = thinking_audit.finish_turn() {
-                                        let _ = events_tx
-                                            .send(thinking_final_event(marker, mission_id));
+                                        // Coalesce: Fable/OAuth missions emit a signature-only
+                                        // thinking block on EVERY assistant round, which used to
+                                        // render dozens of identical "[encrypted thinking]"
+                                        // bubbles per turn (47 in one observed mission). One
+                                        // marker per CLI run says everything the panel needs.
+                                        if !encrypted_marker_emitted {
+                                            encrypted_marker_emitted = true;
+                                            let _ = events_tx
+                                                .send(thinking_final_event(marker, mission_id));
+                                        }
                                     }
                                     // Reset per-turn accumulation state so the next turn
                                     // starts fresh (block indices restart from 0 each turn)
