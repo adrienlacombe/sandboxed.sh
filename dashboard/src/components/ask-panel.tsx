@@ -68,6 +68,8 @@ export function AskPanel({
   }, []);
   const setPanelWidth = useCallback((w: number) => {
     setPanelWidthRaw(w);
+  }, []);
+  const persistPanelWidth = useCallback((w: number) => {
     localStorage.setItem("ask-panel-width", String(Math.round(w)));
   }, []);
   const [loading, setLoading] = useState(false);
@@ -385,7 +387,10 @@ export function AskPanel({
             );
             setPanelWidth(next);
           };
-          const onUp = () => {
+          const onUp = (ev: PointerEvent) => {
+            persistPanelWidth(
+              Math.min(760, Math.max(300, startWidth + (startX - ev.clientX))),
+            );
             window.removeEventListener("pointermove", onMove);
             window.removeEventListener("pointerup", onUp);
             window.removeEventListener("pointercancel", onUp);
