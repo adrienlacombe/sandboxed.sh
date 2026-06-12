@@ -41,7 +41,22 @@ object TestTags {
     const val CONTROL_TOPBAR_MISSIONS = "control.topbar.missions"
     const val CONTROL_TOPBAR_AUTOMATIONS = "control.topbar.automations"
     const val CONTROL_TOPBAR_DESKTOP = "control.topbar.desktop"
+    const val CONTROL_TOPBAR_ASK = "control.topbar.ask"
     const val CONTROL_TOPBAR_RESUME = "control.topbar.resume"
+    const val CONTROL_TOPBAR_THOUGHTS = "control.topbar.thoughts"
+    const val CONTROL_THOUGHTS_CLOSE = "control.thoughts.close"
+    const val CONTROL_COMPOSER_PARALLEL = "control.composer.parallel"
+    const val CONTROL_STALE_PILL = "control.stale_pill"
+    const val CONTROL_DIAGNOSTICS = "control.diagnostics"
+
+    // Control: Ask co-pilot bottom sheet
+    const val ASK_INPUT = "ask.input"
+    const val ASK_SEND = "ask.send"
+    const val ASK_THREADS = "ask.threads"
+    const val ASK_NEW_THREAD = "ask.new_thread"
+    const val ASK_CLEAR = "ask.clear"
+    const val ASK_RETRY = "ask.retry"
+    const val ASK_SEND_TO_AGENT = "ask.send_to_agent"
 
     // Control: New mission dialog
     const val NEW_MISSION_CREATE = "control.new_mission.create"
@@ -108,6 +123,14 @@ object TestTags {
     const val AUTOMATIONS_NEW_INTERVAL_SECS = "automations.new.interval_secs"
     const val AUTOMATIONS_NEW_CREATE = "automations.new.create"
     const val AUTOMATIONS_NEW_CANCEL = "automations.new.cancel"
+    const val AUTOMATIONS_NEW_LIBRARY_NAME = "automations.new.library_name"
+    const val AUTOMATIONS_NEW_FILE_PATH = "automations.new.file_path"
+    const val AUTOMATIONS_NEW_VARIABLES = "automations.new.variables"
+    const val AUTOMATIONS_NEW_STOP_COUNT = "automations.new.stop_count"
+    const val AUTOMATIONS_NEW_STOP_REPO = "automations.new.stop_repo"
+    const val AUTOMATIONS_NEW_RETRIES = "automations.new.retries"
+    const val AUTOMATIONS_NEW_RETRY_DELAY = "automations.new.retry_delay"
+    const val AUTOMATIONS_NEW_BACKOFF = "automations.new.backoff"
 
     // FIDO
     const val FIDO_BIOMETRIC_TOGGLE = "fido.always_biometric"
@@ -137,8 +160,25 @@ object TestTags {
     const val DESKTOP_KEY_ESC = "desktop.key.esc"
     const val DESKTOP_KEY_CTRL_L = "desktop.key.ctrl_l"
     const val DESKTOP_KEY_TAB = "desktop.key.tab"
+    const val DESKTOP_PIP = "desktop.pip"
     // Parameterised helpers
     fun desktopDisplay(display: String) = "desktop.display.${display.removePrefix(":")}"
     fun backendSelect(id: String) = "settings.backend.$id"
     fun agentSelect(id: String) = "settings.agent.$id"
+    const val SETTINGS_MODEL_DEFAULT = "settings.model.default"
+    fun modelSelect(id: String) = "settings.model.${id.replace('/', '_')}"
+
+    // Files: path navigation
+    const val FILES_QUICKNAV = "files.quicknav"
+    const val FILES_PATH_FIELD = "files.path.field"
+    const val FILES_PATH_GO = "files.path.go"
+
+    // Workspaces
+    const val WORKSPACES_DETAIL_CLOSE = "workspaces.detail.close"
+
+    // Mission detail (History)
+    const val MISSION_DETAIL_BACK = "mission_detail.back"
+    const val MISSION_DETAIL_OPEN_CONTROL = "mission_detail.open_control"
+    const val MISSION_DETAIL_SEARCH = "mission_detail.search"
+    const val MISSION_DETAIL_LOAD_MORE = "mission_detail.load_more"
 }

@@ -81,6 +81,13 @@ data class ControlState(
     val desktopDisplay: String = ":101",
     val desktopOpenRequest: Long = 0,
     val loadingRecent: Boolean = false,
+    /// True when the rendered conversation came from the on-disk cache because
+    /// the server could not be reached. Cleared on the next successful fetch.
+    val staleCache: Boolean = false,
+    // Diagnostics (surfaced via the debug overlay on the Control screen).
+    val transport: String = "sse",
+    val eventsReceived: Long = 0,
+    val lastEventSeq: Long? = null,
 )
 
 class ControlViewModel(private val container: AppContainer) : ViewModel() {
@@ -98,10 +105,20 @@ class ControlViewModel(private val container: AppContainer) : ViewModel() {
                 refreshMission()
                 refreshRunning()
                 refreshQueue()
-            } catch (_: Throwable) {}
+            } catch (_: Throwable) {
+                loadFromCache(container.cached.value.lastMissionId)
+            }
             startStream()
             startRunningPoller()
         }
+    }
+
+    /// Render the cached copy of a mission when the live fetch failed, flagged
+    /// stale so the UI can show it isn't current.
+    private suspend fun loadFromCache(missionId: String?) {
+        val cached = missionId?.let { container.missionCache.load(it) } ?: return
+        if (_state.value.messages.isNotEmpty()) return
+        _state.update { it.copy(mission = cached, messages = mapHistory(cached), staleCache = true) }
     }
 
     fun setDraft(text: String) {
@@ -112,6 +129,16 @@ class ControlViewModel(private val container: AppContainer) : ViewModel() {
 
     fun applySlashCommand(command: SlashCommand) {
         setDraft("/${command.name} ")
+    }
+
+    /// Bridge from the Ask co-pilot: drop a co-pilot answer into the real
+    /// composer, appending to any existing draft rather than replacing it.
+    fun appendToComposer(text: String) {
+        val addition = text.trim()
+        if (addition.isEmpty()) return
+        val current = _state.value.draft
+        val next = if (current.isBlank()) addition else current.trimEnd() + "\n" + addition
+        setDraft(next)
     }
 
     fun send() {
@@ -131,6 +158,7 @@ class ControlViewModel(private val container: AppContainer) : ViewModel() {
                         title = text.take(60),
                         agent = s.defaultAgent.takeIf { it.isNotBlank() },
                         backend = s.defaultBackend.takeIf { it.isNotBlank() },
+                        modelOverride = s.defaultModel.takeIf { it.isNotBlank() },
                     ))
                     _state.update { it.copy(mission = mission, childMissions = emptyList(), progress = null) }
                     container.settings.setLastMission(mission.id)
@@ -139,6 +167,23 @@ class ControlViewModel(private val container: AppContainer) : ViewModel() {
                 refreshQueue()
             }.onFailure { e -> _state.update { it.copy(error = e.message) } }
             _state.update { it.copy(isSending = false) }
+        }
+    }
+
+    /// Send the current draft as a parallel (child) mission instead of a turn
+    /// in the current conversation. The backend spawns a worker mission that
+    /// shows up in the running bar and the workers dialog.
+    fun sendParallel() {
+        val text = _state.value.draft.trim()
+        val mission = _state.value.mission ?: return
+        if (text.isEmpty()) return
+        _state.update { it.copy(draft = "") }
+        viewModelScope.launch {
+            container.settings.setDraft("")
+            val model = container.cached.value.defaultModel.takeIf { it.isNotBlank() }
+            runCatching { container.api.parallelSend(mission.id, text, model) }
+                .onSuccess { runCatching { refreshRunning() } }
+                .onFailure { e -> _state.update { it.copy(error = e.message) } }
         }
     }
 
@@ -244,7 +289,8 @@ class ControlViewModel(private val container: AppContainer) : ViewModel() {
         viewModelScope.launch {
             runCatching {
                 val mission = container.api.loadMission(missionId)
-                _state.update { it.copy(mission = mission, messages = mapHistory(mission), goalStatus = null, progress = null) }
+                container.missionCache.save(mission)
+                _state.update { it.copy(mission = mission, messages = mapHistory(mission), goalStatus = null, progress = null, staleCache = false) }
                 container.settings.setLastMission(mission.id)
                 lastSeq = null
                 runCatching {
@@ -252,6 +298,8 @@ class ControlViewModel(private val container: AppContainer) : ViewModel() {
                     lastSeq = max
                 }
                 refreshChildMissions(mission.id)
+            }.onFailure {
+                loadFromCache(missionId)
             }
         }
     }
@@ -274,6 +322,7 @@ class ControlViewModel(private val container: AppContainer) : ViewModel() {
 
     private suspend fun refreshMission() {
         val cur = container.api.currentMission() ?: return
+        container.missionCache.save(cur)
         // Fetch event seq high-water-mark for delta resume on stream reconnect
         runCatching {
             val (_, max) = container.api.missionEvents(cur.id, latest = true, limit = 1)
@@ -284,6 +333,7 @@ class ControlViewModel(private val container: AppContainer) : ViewModel() {
                 mission = cur,
                 messages = mapHistory(cur),
                 progress = null,
+                staleCache = false,
             )
         }
         refreshChildMissions(cur.id)
@@ -307,6 +357,10 @@ class ControlViewModel(private val container: AppContainer) : ViewModel() {
         streamJob?.cancel()
         streamJob = viewModelScope.launch {
             var attempt = 0
+            // SSE is the primary transport; after two consecutive SSE failures
+            // fall back to the WebSocket stream (some proxies buffer or kill
+            // long-lived SSE responses), then keep alternating.
+            var useWs = false
             while (true) {
                 try {
                     // Replay any events we missed since last seq before opening live stream.
@@ -318,21 +372,31 @@ class ControlViewModel(private val container: AppContainer) : ViewModel() {
                             events.forEach { ev ->
                                 handle(storedEventToSse(ev), live = false)
                             }
-                            if (max != null) lastSeq = max
+                            if (max != null) {
+                                lastSeq = max
+                                _state.update { it.copy(lastEventSeq = max) }
+                            }
                         }
                     }
 
-                    container.sse.stream()
+                    _state.update { it.copy(transport = if (useWs) "ws" else "sse") }
+                    val flow = if (useWs) container.controlWs.stream() else container.sse.stream()
+                    flow
                         .catch { e -> _state.update { it.copy(isConnected = false, error = e.message) } }
                         .collect { evt ->
                             attempt = 0
-                            _state.update { it.copy(isConnected = true, error = null) }
+                            // Back online: drop the stale-cache flag and re-sync
+                            // the conversation we were showing from disk.
+                            val wasStale = _state.value.staleCache
+                            _state.update { it.copy(isConnected = true, error = null, eventsReceived = it.eventsReceived + 1, staleCache = false) }
+                            if (wasStale) viewModelScope.launch { runCatching { refreshMission() } }
                             handle(evt, live = true)
                         }
                 } catch (_: Throwable) {
                     _state.update { it.copy(isConnected = false) }
                 }
                 attempt += 1
+                if (attempt >= 2) useWs = !useWs
                 val backoff = (1000L shl minOf(attempt, 5)).coerceAtMost(30_000L)
                 delay(backoff)
             }

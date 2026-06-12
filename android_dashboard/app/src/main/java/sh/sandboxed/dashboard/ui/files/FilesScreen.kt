@@ -16,11 +16,15 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.InsertDriveFile
 import androidx.compose.material.icons.filled.ArrowUpward
+import androidx.compose.material.icons.filled.Bookmark
 import androidx.compose.material.icons.filled.CreateNewFolder
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Download
@@ -31,6 +35,8 @@ import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -87,6 +93,14 @@ private class FilesViewModel(private val container: AppContainer) : ViewModel() 
     fun cd(path: String) {
         _state.update { it.copy(path = path, backStack = it.backStack + it.path) }
         refresh()
+    }
+
+    /// Jump straight to a path (breadcrumb tap, quick-nav shortcut, or the
+    /// editable path field). Pushes the current location so Up still works.
+    fun jumpTo(path: String) {
+        val target = path.trim().ifBlank { "." }
+        if (target == _state.value.path) return
+        cd(target)
     }
 
     fun up() {
@@ -192,6 +206,8 @@ fun FilesScreen(container: AppContainer) {
     val snackbar = remember { SnackbarHostState() }
 
     var showMkdir by remember { mutableStateOf(false) }
+    var showPathEdit by remember { mutableStateOf(false) }
+    var showQuickNav by remember { mutableStateOf(false) }
     var pendingDelete by remember { mutableStateOf<FileEntry?>(null) }
 
     val pickFile = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri: Uri? ->
@@ -222,7 +238,30 @@ fun FilesScreen(container: AppContainer) {
             IconButton(onClick = vm::up, enabled = state.backStack.isNotEmpty(), modifier = Modifier.tag(TestTags.FILES_UP)) {
                 Icon(Icons.Filled.ArrowUpward, "Up", tint = Palette.TextSecondary)
             }
-            Text(if (state.path == ".") "Workspace root" else state.path, color = Palette.TextSecondary, style = MaterialTheme.typography.bodyMedium, modifier = Modifier.tag(TestTags.FILES_PATH))
+            Breadcrumbs(
+                path = state.path,
+                onCrumb = { vm.jumpTo(it) },
+                onEdit = { showPathEdit = true },
+                modifier = Modifier.weight(1f),
+            )
+            Box {
+                IconButton(onClick = { showQuickNav = true }, modifier = Modifier.tag(TestTags.FILES_QUICKNAV)) {
+                    Icon(Icons.Filled.Bookmark, "Quick navigation", tint = Palette.TextSecondary)
+                }
+                DropdownMenu(expanded = showQuickNav, onDismissRequest = { showQuickNav = false }) {
+                    listOf(
+                        "Workspace root" to ".",
+                        "/root/context" to "/root/context",
+                        "/root" to "/root",
+                        "/tmp" to "/tmp",
+                    ).forEach { (label, target) ->
+                        DropdownMenuItem(
+                            text = { Text(label) },
+                            onClick = { showQuickNav = false; vm.jumpTo(target) },
+                        )
+                    }
+                }
+            }
         }
         state.error?.let { Box(Modifier.padding(horizontal = 16.dp, vertical = 8.dp)) { ErrorBanner(it) } }
         if (state.loading && state.entries.isEmpty()) {
@@ -298,6 +337,37 @@ fun FilesScreen(container: AppContainer) {
         )
     }
 
+    if (showPathEdit) {
+        var pathInput by remember(state.path) { mutableStateOf(state.path) }
+        AlertDialog(
+            onDismissRequest = { showPathEdit = false },
+            title = { Text("Go to path") },
+            text = {
+                OutlinedTextField(
+                    value = pathInput, onValueChange = { pathInput = it }, singleLine = true,
+                    label = { Text("Path (\".\" = workspace root)") },
+                    modifier = Modifier.fillMaxWidth().tag(TestTags.FILES_PATH_FIELD),
+                    colors = TextFieldDefaults.colors(
+                        focusedContainerColor = Palette.Card,
+                        unfocusedContainerColor = Palette.Card,
+                        focusedTextColor = Palette.TextPrimary,
+                        unfocusedTextColor = Palette.TextPrimary,
+                        cursorColor = Palette.Accent,
+                    ),
+                )
+            },
+            confirmButton = {
+                Button(
+                    onClick = { vm.jumpTo(pathInput); showPathEdit = false },
+                    colors = ButtonDefaults.buttonColors(containerColor = Palette.Accent),
+                    modifier = Modifier.tag(TestTags.FILES_PATH_GO),
+                ) { Text("Go") }
+            },
+            dismissButton = { TextButton(onClick = { showPathEdit = false }) { Text("Cancel") } },
+            containerColor = Palette.Card,
+        )
+    }
+
     pendingDelete?.let { e ->
         AlertDialog(
             onDismissRequest = { pendingDelete = null },
@@ -312,6 +382,48 @@ fun FilesScreen(container: AppContainer) {
             dismissButton = { TextButton(onClick = { pendingDelete = null }) { Text("Cancel") } },
             containerColor = Palette.Card,
         )
+    }
+}
+
+/// Clickable path segments. Tapping a segment jumps to that ancestor; tapping
+/// the leaf (or the root label) opens the editable path dialog.
+@Composable
+private fun Breadcrumbs(path: String, onCrumb: (String) -> Unit, onEdit: () -> Unit, modifier: Modifier = Modifier) {
+    if (path == "." || path.isBlank()) {
+        Text(
+            "Workspace root",
+            color = Palette.TextSecondary,
+            style = MaterialTheme.typography.bodyMedium,
+            modifier = modifier.clickable(onClick = onEdit).tag(TestTags.FILES_PATH),
+        )
+        return
+    }
+    val absolute = path.startsWith("/")
+    val segments = path.trim('/').split('/').filter { it.isNotBlank() }
+    LazyRow(modifier = modifier.tag(TestTags.FILES_PATH), verticalAlignment = Alignment.CenterVertically) {
+        item {
+            Text(
+                if (absolute) "/" else ".",
+                color = Palette.TextTertiary,
+                style = MaterialTheme.typography.bodyMedium,
+                modifier = Modifier.clickable { onCrumb(if (absolute) "/" else ".") }.padding(vertical = 4.dp),
+            )
+        }
+        itemsIndexed(segments) { i, seg ->
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                if (i > 0 || !absolute) Text("/", color = Palette.TextTertiary, style = MaterialTheme.typography.bodyMedium)
+                val isLeaf = i == segments.lastIndex
+                val target = (if (absolute) "/" else "") + segments.take(i + 1).joinToString("/")
+                Text(
+                    seg,
+                    color = if (isLeaf) Palette.TextPrimary else Palette.TextSecondary,
+                    style = MaterialTheme.typography.bodyMedium,
+                    modifier = Modifier
+                        .clickable { if (isLeaf) onEdit() else onCrumb(target) }
+                        .padding(vertical = 4.dp),
+                )
+            }
+        }
     }
 }
 

@@ -22,6 +22,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material.icons.filled.Pause
+import androidx.compose.material.icons.filled.PictureInPictureAlt
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.TouchApp
@@ -40,6 +41,7 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.TextFieldDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -67,6 +69,7 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import sh.sandboxed.dashboard.data.AppContainer
 import sh.sandboxed.dashboard.data.api.DesktopStreamEvent
+import sh.sandboxed.dashboard.ui.PipHost
 import sh.sandboxed.dashboard.ui.TestTags
 import sh.sandboxed.dashboard.ui.tag
 import sh.sandboxed.dashboard.ui.components.ErrorBanner
@@ -177,18 +180,57 @@ private class DesktopStreamViewModel(
 }
 
 @Composable
-fun DesktopStreamScreen(container: AppContainer, initialDisplay: String) {
+fun DesktopStreamScreen(container: AppContainer, initialDisplay: String, pipHost: PipHost? = null) {
     val vm = remember(initialDisplay) { DesktopStreamViewModel(container, initialDisplay) }
     val state by vm.state.collectAsState()
     var typedText by remember { mutableStateOf("") }
     var frameSize by remember { mutableStateOf(IntSize.Zero) }
+    val inPip by (pipHost?.isInPipMode ?: remember { MutableStateFlow(false) }).collectAsState()
 
     DisposableEffect(vm) {
         onDispose { vm.disconnect() }
     }
 
+    // While a frame is streaming, register its aspect ratio and enable
+    // auto-enter so leaving the app keeps the desktop visible in a PiP window.
+    // Keyed on the frame dimensions (not the Bitmap object) so it doesn't fire
+    // every frame. Cleared on dispose so PiP only auto-enters from this screen.
+    val frameWidth = state.bitmap?.width
+    val frameHeight = state.bitmap?.height
+    LaunchedEffect(frameWidth, frameHeight, state.connected) {
+        if (frameWidth != null && frameHeight != null && state.connected) {
+            pipHost?.setPipActive(true, frameWidth, frameHeight)
+        } else {
+            pipHost?.setPipActive(false, 0, 0)
+        }
+    }
+    DisposableEffect(pipHost) {
+        onDispose { pipHost?.setPipActive(false, 0, 0) }
+    }
+
+    if (inPip) {
+        // PiP window: just the frame, full-bleed, no chrome or input.
+        Box(Modifier.fillMaxSize().background(Color.Black), contentAlignment = Alignment.Center) {
+            state.bitmap?.let {
+                Image(
+                    bitmap = it.asImageBitmap(),
+                    contentDescription = "Desktop frame",
+                    contentScale = ContentScale.Fit,
+                    modifier = Modifier.fillMaxSize(),
+                )
+            }
+        }
+        return
+    }
+
     Column(Modifier.fillMaxSize().background(Palette.BackgroundPrimary)) {
-        DesktopHeader(state = state, onPause = vm::togglePause, onReconnect = { vm.connect() })
+        DesktopHeader(
+            state = state,
+            pipSupported = pipHost?.isPipSupported == true,
+            onPause = vm::togglePause,
+            onReconnect = { vm.connect() },
+            onPip = { pipHost?.enterPip() },
+        )
         DisplayPicker(current = state.display, onSelect = { vm.connect(it) })
         Box(
             modifier = Modifier
@@ -251,8 +293,10 @@ fun DesktopStreamScreen(container: AppContainer, initialDisplay: String) {
 @Composable
 private fun DesktopHeader(
     state: DesktopStreamState,
+    pipSupported: Boolean,
     onPause: () -> Unit,
     onReconnect: () -> Unit,
+    onPip: () -> Unit,
 ) {
     Row(
         Modifier.fillMaxWidth().background(Palette.BackgroundSecondary).padding(horizontal = 16.dp, vertical = 12.dp),
@@ -265,6 +309,11 @@ private fun DesktopHeader(
                 color = if (state.connected) Palette.Success else Palette.Warning,
                 style = MaterialTheme.typography.bodySmall,
             )
+        }
+        if (pipSupported) {
+            IconButton(onClick = onPip, enabled = state.connected && state.bitmap != null, modifier = Modifier.tag(TestTags.DESKTOP_PIP)) {
+                Icon(Icons.Filled.PictureInPictureAlt, "Picture in picture", tint = Palette.Accent)
+            }
         }
         IconButton(onClick = onPause, enabled = state.connected, modifier = Modifier.tag(TestTags.DESKTOP_PAUSE)) {
             Icon(if (state.paused) Icons.Filled.PlayArrow else Icons.Filled.Pause, "Pause stream", tint = Palette.Accent)

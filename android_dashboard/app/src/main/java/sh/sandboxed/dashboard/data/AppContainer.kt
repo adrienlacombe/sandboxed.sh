@@ -10,6 +10,8 @@ import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.stateIn
 import sh.sandboxed.dashboard.data.api.ApiService
+import sh.sandboxed.dashboard.data.api.AskClient
+import sh.sandboxed.dashboard.data.api.ControlWsClient
 import sh.sandboxed.dashboard.data.api.DesktopStreamSocket
 import sh.sandboxed.dashboard.data.api.Net
 import sh.sandboxed.dashboard.data.api.SseClient
@@ -34,6 +36,9 @@ class AppContainer(context: Context) {
 
     val api: ApiService = ApiService(Net.httpClient) { snapshot() }
     val sse: SseClient = SseClient(api, Net.streamingClient)
+    val controlWs: ControlWsClient = ControlWsClient(api, Net.streamingClient)
+    val missionCache: MissionCache = MissionCache(appContext)
+    val ask: AskClient = AskClient(api, Net.streamingClient)
     val terminal: TerminalSocket = TerminalSocket(Net.streamingClient) { snapshot() }
     val desktop: DesktopStreamSocket = DesktopStreamSocket(Net.streamingClient) { snapshot() }
     val fido: FidoChannel = FidoChannel(sse, api, scope, cached).also { it.start() }

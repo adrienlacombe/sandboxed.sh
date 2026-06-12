@@ -13,8 +13,8 @@ android {
         applicationId = "sh.sandboxed.dashboard"
         minSdk = 33
         targetSdk = 36
-        versionCode = 8
-        versionName = "1.3.0"
+        versionCode = 9
+        versionName = "1.4.0"
         vectorDrawables { useSupportLibrary = true }
     }
 

@@ -257,4 +257,17 @@ class ApiService(
         val req = newRequestBuilder(urlOf("/api/control/automations/$id")).delete().build()
         executeText(req)
     }
+
+    // ---- Ask (non-interrupting sidecar co-pilot) ----
+    // Thread list/detail/delete are plain JSON; the streamed turn lives in AskClient.
+    suspend fun listAskThreads(missionId: String): List<sh.sandboxed.dashboard.data.AskThread> =
+        getList("/api/control/missions/$missionId/ask/threads")
+
+    suspend fun getAskThread(missionId: String, threadId: String): sh.sandboxed.dashboard.data.AskThreadDetail =
+        getJson("/api/control/missions/$missionId/ask/threads/$threadId")
+
+    suspend fun deleteAskThread(missionId: String, threadId: String) = withContext(Dispatchers.IO) {
+        val req = newRequestBuilder(urlOf("/api/control/missions/$missionId/ask/threads/$threadId")).delete().build()
+        executeText(req)
+    }
 }

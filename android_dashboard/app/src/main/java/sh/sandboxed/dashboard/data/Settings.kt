@@ -18,6 +18,7 @@ data class AppSettings(
     val lastUsername: String = "",
     val defaultAgent: String = "",
     val defaultBackend: String = "",
+    val defaultModel: String = "",
     val skipAgentSelection: Boolean = false,
     val controlDraftText: String = "",
     val lastMissionId: String? = null,
@@ -34,6 +35,7 @@ class SettingsStore(private val ctx: Context) {
         val LAST_USERNAME = stringPreferencesKey("last_username")
         val DEFAULT_AGENT = stringPreferencesKey("default_agent")
         val DEFAULT_BACKEND = stringPreferencesKey("default_backend")
+        val DEFAULT_MODEL = stringPreferencesKey("default_model")
         val SKIP_AGENT = booleanPreferencesKey("skip_agent_selection")
         val DRAFT = stringPreferencesKey("control_draft_text")
         val LAST_MISSION = stringPreferencesKey("control_last_mission_id")
@@ -51,6 +53,7 @@ class SettingsStore(private val ctx: Context) {
             lastUsername = prefs[Keys.LAST_USERNAME].orEmpty(),
             defaultAgent = prefs[Keys.DEFAULT_AGENT].orEmpty(),
             defaultBackend = prefs[Keys.DEFAULT_BACKEND].orEmpty(),
+            defaultModel = prefs[Keys.DEFAULT_MODEL].orEmpty(),
             skipAgentSelection = prefs[Keys.SKIP_AGENT] ?: false,
             controlDraftText = prefs[Keys.DRAFT].orEmpty(),
             lastMissionId = prefs[Keys.LAST_MISSION],
@@ -68,6 +71,7 @@ class SettingsStore(private val ctx: Context) {
     suspend fun setLastUsername(value: String) = ctx.dataStore.edit { it[Keys.LAST_USERNAME] = value }
     suspend fun setDefaultAgent(value: String) = ctx.dataStore.edit { it[Keys.DEFAULT_AGENT] = value }
     suspend fun setDefaultBackend(value: String) = ctx.dataStore.edit { it[Keys.DEFAULT_BACKEND] = value }
+    suspend fun setDefaultModel(value: String) = ctx.dataStore.edit { it[Keys.DEFAULT_MODEL] = value }
     suspend fun setSkipAgentSelection(value: Boolean) = ctx.dataStore.edit { it[Keys.SKIP_AGENT] = value }
     suspend fun setDraft(value: String) = ctx.dataStore.edit { it[Keys.DRAFT] = value }
     suspend fun setLastMission(value: String?) = ctx.dataStore.edit {

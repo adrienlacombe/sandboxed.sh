@@ -74,6 +74,8 @@ data class Workspace(
     val plugins: List<String> = emptyList(),
     val template: String? = null,
     val distro: String? = null,
+    @SerialName("env_vars") val envVars: Map<String, String> = emptyMap(),
+    val mcps: List<String> = emptyList(),
 ) {
     val isDefault: Boolean get() = id == "00000000-0000-0000-0000-000000000000"
 }

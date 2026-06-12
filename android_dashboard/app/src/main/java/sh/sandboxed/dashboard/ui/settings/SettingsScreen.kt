@@ -58,6 +58,7 @@ fun SettingsScreen(container: AppContainer) {
     var commands by remember { mutableStateOf<BuiltinCommandsResponse?>(null) }
     var selectedBackend by remember(settings.defaultBackend) { mutableStateOf(settings.defaultBackend) }
     var selectedAgent by remember(settings.defaultAgent) { mutableStateOf(settings.defaultAgent) }
+    var selectedModel by remember(settings.defaultModel) { mutableStateOf(settings.defaultModel) }
 
     LaunchedEffect(settings.baseUrl, settings.jwtToken) {
         if (settings.isConfigured && settings.jwtToken != null) {
@@ -152,7 +153,21 @@ fun SettingsScreen(container: AppContainer) {
         if (providers.isNotEmpty()) item {
             GlassCard(modifier = Modifier.fillMaxWidth()) {
                 Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Text("Providers", style = MaterialTheme.typography.titleSmall, color = Palette.TextSecondary)
+                    Text("Model override", style = MaterialTheme.typography.titleSmall, color = Palette.TextSecondary)
+                    Text(
+                        "Used for new missions started from the composer. The new-mission dialog can still pick a different model per mission.",
+                        color = Palette.TextTertiary,
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                    ModelRow(
+                        name = "Default",
+                        detail = "Use the agent or server default",
+                        selected = selectedModel.isBlank(),
+                        tag = TestTags.SETTINGS_MODEL_DEFAULT,
+                    ) {
+                        selectedModel = ""
+                        scope.launch { container.settings.setDefaultModel("") }
+                    }
                     providers.forEach { p ->
                         Column(Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
                             Row {
@@ -160,7 +175,17 @@ fun SettingsScreen(container: AppContainer) {
                                 Text(p.billing, color = Palette.AccentLight, style = MaterialTheme.typography.labelSmall)
                             }
                             if (p.description.isNotBlank()) Text(p.description, color = Palette.TextTertiary, style = MaterialTheme.typography.bodySmall)
-                            if (p.models.isNotEmpty()) Text("${p.models.size} models", color = Palette.TextTertiary, style = MaterialTheme.typography.labelSmall)
+                            p.models.forEach { m ->
+                                ModelRow(
+                                    name = m.name,
+                                    detail = m.id,
+                                    selected = selectedModel == m.id,
+                                    tag = TestTags.modelSelect(m.id),
+                                ) {
+                                    selectedModel = m.id
+                                    scope.launch { container.settings.setDefaultModel(m.id) }
+                                }
+                            }
                         }
                     }
                 }
@@ -193,7 +218,7 @@ fun SettingsScreen(container: AppContainer) {
                     Text("About", style = MaterialTheme.typography.titleSmall, color = Palette.TextSecondary)
                     Spacer(Modifier.height(4.dp))
                     Text("Sandboxed.sh Android Dashboard", color = Palette.TextPrimary)
-                    Text("v0.2.0", color = Palette.TextTertiary, style = MaterialTheme.typography.bodySmall)
+                    Text("v1.4.0", color = Palette.TextTertiary, style = MaterialTheme.typography.bodySmall)
                 }
             }
         }
@@ -208,6 +233,22 @@ private fun SlashCommandRow(sc: SlashCommand) {
             if (sc.params.any { it.required }) Text("required args", color = Palette.Warning, style = MaterialTheme.typography.labelSmall)
         }
         sc.description?.takeIf { it.isNotBlank() }?.let { Text(it, color = Palette.TextTertiary, style = MaterialTheme.typography.bodySmall, maxLines = 2) }
+    }
+}
+
+@Composable
+private fun ModelRow(name: String, detail: String, selected: Boolean, tag: String, onClick: () -> Unit) {
+    Row(
+        modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Column(Modifier.weight(1f)) {
+            Text(name, color = if (selected) Palette.Accent else Palette.TextPrimary, style = MaterialTheme.typography.bodyMedium)
+            Text(detail, color = Palette.TextTertiary, style = MaterialTheme.typography.labelSmall, maxLines = 1)
+        }
+        OutlinedButton(onClick = onClick, modifier = Modifier.testTag(tag)) {
+            Text(if (selected) "Selected" else "Select")
+        }
     }
 }
 
