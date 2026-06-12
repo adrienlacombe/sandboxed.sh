@@ -1193,7 +1193,20 @@ pub fn run_claudecode_turn<'a>(
         if stream_input {
             #[cfg(unix)]
             if let Err(e) = pty.set_raw_input_mode() {
-                tracing::warn!(mission_id = %mission_id, "Failed to set PTY raw input mode: {e}");
+                // Without raw mode, canonical-mode line buffering truncates
+                // stdin writes >4096 bytes and echo reflects injected JSON
+                // back into the parsed stdout stream — stream-input cannot
+                // work. Fail the turn loudly; the operator can unset
+                // SANDBOXED_SH_CLAUDE_STREAM_INPUT to fall back to argv mode.
+                tracing::error!(mission_id = %mission_id, "Failed to set PTY raw input mode: {e}");
+                pty.kill();
+                return AgentResult::failure(
+                    format!(
+                        "Stream-input mode requires PTY raw input mode, which failed: {e}.                          Unset SANDBOXED_SH_CLAUDE_STREAM_INPUT to use argv prompt delivery."
+                    ),
+                    0,
+                )
+                .with_terminal_reason(TerminalReason::LlmError);
             }
             let mut initial_prompt_delivered = false;
             if let Some(w) = stdin_writer.as_mut() {
