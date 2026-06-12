@@ -84,8 +84,11 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.core.net.toUri
 import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.TextLinkStyles
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.Lifecycle
@@ -95,6 +98,7 @@ import coil.compose.AsyncImage
 import coil.request.ImageRequest
 import com.mikepenz.markdown.m3.Markdown
 import com.mikepenz.markdown.m3.markdownColor
+import com.mikepenz.markdown.m3.markdownTypography
 import kotlinx.coroutines.launch
 import sh.sandboxed.dashboard.data.AppContainer
 import sh.sandboxed.dashboard.data.Backend
@@ -1196,12 +1200,15 @@ private fun Bubble(
                         content = text,
                         colors = markdownColor(
                             text = fg,
-                            codeText = Palette.TextSecondary,
                             codeBackground = Palette.BackgroundTertiary,
-                            inlineCodeText = Palette.AccentLight,
                             inlineCodeBackground = Palette.BackgroundTertiary,
-                            linkText = Palette.AccentLight,
                             dividerColor = Palette.Border,
+                        ),
+                        // Since 0.27 code/link text colors live in typography, not markdownColor.
+                        typography = markdownTypography(
+                            code = MaterialTheme.typography.bodyMedium.copy(fontFamily = FontFamily.Monospace, color = Palette.TextSecondary),
+                            inlineCode = MaterialTheme.typography.bodyLarge.copy(fontFamily = FontFamily.Monospace, color = Palette.AccentLight),
+                            textLink = TextLinkStyles(style = SpanStyle(color = Palette.AccentLight, textDecoration = TextDecoration.Underline)),
                         ),
                     )
                 }

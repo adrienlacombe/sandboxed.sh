@@ -54,7 +54,10 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.TextLinkStyles
 import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import org.json.JSONObject
@@ -64,6 +67,7 @@ import sh.sandboxed.dashboard.data.AskThread
 import sh.sandboxed.dashboard.ui.TestTags
 import com.mikepenz.markdown.m3.Markdown
 import com.mikepenz.markdown.m3.markdownColor
+import com.mikepenz.markdown.m3.markdownTypography
 import sh.sandboxed.dashboard.ui.tag
 import sh.sandboxed.dashboard.ui.theme.Palette
 import sh.sandboxed.dashboard.util.Haptics
@@ -310,12 +314,15 @@ private fun AskBubble(
                         content = message.content,
                         colors = markdownColor(
                             text = Palette.TextPrimary,
-                            codeText = Palette.TextSecondary,
                             codeBackground = Palette.BackgroundTertiary,
-                            inlineCodeText = Palette.AccentLight,
                             inlineCodeBackground = Palette.BackgroundTertiary,
-                            linkText = Palette.AccentLight,
                             dividerColor = Palette.Border,
+                        ),
+                        // Since 0.27 code/link text colors live in typography, not markdownColor.
+                        typography = markdownTypography(
+                            code = MaterialTheme.typography.bodyMedium.copy(fontFamily = FontFamily.Monospace, color = Palette.TextSecondary),
+                            inlineCode = MaterialTheme.typography.bodyLarge.copy(fontFamily = FontFamily.Monospace, color = Palette.AccentLight),
+                            textLink = TextLinkStyles(style = SpanStyle(color = Palette.AccentLight, textDecoration = TextDecoration.Underline)),
                         ),
                     )
                     if (message.content.isNotBlank()) {
