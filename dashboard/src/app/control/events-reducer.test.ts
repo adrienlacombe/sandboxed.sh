@@ -98,6 +98,89 @@ describe("eventsToItemsImpl text_delta replay", () => {
 
     expect(items.filter((item) => item.kind === "stream")).toHaveLength(0);
   });
+
+  it("flushes narration emitted between tool calls instead of dropping it", () => {
+    const items = eventsToItemsImpl(
+      [
+        storedEvent(1, "text_delta", "Now regenerating artifacts and running make check."),
+        { ...storedEvent(2, "tool_call", '{"command":"make check"}'), tool_call_id: "t1", tool_name: "Bash" },
+        { ...storedEvent(3, "tool_result", '{"content":"ok"}'), tool_call_id: "t1", tool_name: "Bash" },
+        storedEvent(4, "text_delta", "All checks passed, opening the PR."),
+        storedEvent(5, "assistant_message", "Done: PR opened.", undefined, {
+          success: true,
+        }),
+      ],
+      { status: "awaiting_user" } as Mission,
+    );
+
+    const streams = items.filter((item) => item.kind === "stream");
+    expect(streams).toHaveLength(2);
+    expect(streams[0]).toMatchObject({
+      content: "Now regenerating artifacts and running make check.",
+      done: true,
+    });
+    expect(streams[1]).toMatchObject({
+      content: "All checks passed, opening the PR.",
+      done: true,
+    });
+    // The intermediate narration must render before the tool call.
+    const streamIdx = items.findIndex((item) => item.kind === "stream");
+    const toolIdx = items.findIndex((item) => item.kind === "tool");
+    expect(streamIdx).toBeLessThan(toolIdx);
+  });
+
+  it("removes a flushed narration that duplicates the later assistant reply", () => {
+    const answer =
+      "All checks passed and the branch is pushed; the PR is ready for review now.";
+    const items = eventsToItemsImpl(
+      [
+        storedEvent(1, "text_delta", answer),
+        { ...storedEvent(2, "tool_call", '{"command":"true"}'), tool_call_id: "t1", tool_name: "Bash" },
+        { ...storedEvent(3, "tool_result", '{"content":"ok"}'), tool_call_id: "t1", tool_name: "Bash" },
+        storedEvent(4, "assistant_message", answer, undefined, {
+          success: true,
+        }),
+      ],
+      { status: "awaiting_user" } as Mission,
+    );
+
+    expect(items.filter((item) => item.kind === "stream")).toHaveLength(0);
+    expect(items.filter((item) => item.kind === "assistant")).toHaveLength(1);
+  });
+});
+
+describe("eventsToItemsImpl thinking replay", () => {
+  it("renders one item per block-final thinking event", () => {
+    const items = eventsToItemsImpl(
+      [
+        storedEvent(1, "thinking", "first block", undefined, { done: true }),
+        storedEvent(2, "thinking", "second block", undefined, { done: true }),
+        storedEvent(3, "assistant_message", "done", undefined, {
+          success: true,
+        }),
+      ],
+      { status: "awaiting_user" } as Mission,
+    );
+
+    const thinking = items.filter((item) => item.kind === "thinking");
+    expect(thinking).toHaveLength(2);
+    expect(thinking[0]).toMatchObject({ content: "first block", done: true });
+    expect(thinking[1]).toMatchObject({ content: "second block", done: true });
+  });
+
+  it("ignores legacy empty done finalizers with no open block", () => {
+    const items = eventsToItemsImpl(
+      [
+        storedEvent(1, "thinking", "", undefined, { done: true }),
+        storedEvent(2, "assistant_message", "done", undefined, {
+          success: true,
+        }),
+      ],
+      { status: "awaiting_user" } as Mission,
+    );
+
+    expect(items.filter((item) => item.kind === "thinking")).toHaveLength(0);
+  });
 });
 
 describe("eventsToItemsImpl lazy tool stubs", () => {

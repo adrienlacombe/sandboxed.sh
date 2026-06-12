@@ -47,6 +47,7 @@ struct ChainResponse {
     name: String,
     entries: Vec<ChainEntryResponse>,
     is_default: bool,
+    strip_thinking: bool,
     created_at: chrono::DateTime<chrono::Utc>,
     updated_at: chrono::DateTime<chrono::Utc>,
 }
@@ -71,6 +72,7 @@ impl From<ModelChain> for ChainResponse {
                 })
                 .collect(),
             is_default: chain.is_default,
+            strip_thinking: chain.strip_thinking,
             created_at: chain.created_at,
             updated_at: chain.updated_at,
         }
@@ -105,6 +107,8 @@ struct CreateChainRequest {
     entries: Vec<ChainEntryRequest>,
     #[serde(default)]
     is_default: bool,
+    #[serde(default)]
+    strip_thinking: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -169,6 +173,7 @@ async fn create_chain(
             })
             .collect(),
         is_default: req.is_default,
+        strip_thinking: req.strip_thinking,
         created_at: now,
         updated_at: now,
     };
@@ -182,6 +187,7 @@ struct UpdateChainRequest {
     name: Option<String>,
     entries: Option<Vec<ChainEntryRequest>>,
     is_default: Option<bool>,
+    strip_thinking: Option<bool>,
 }
 
 /// PUT /api/model-routing/chains/:id - Update a chain.
@@ -230,6 +236,10 @@ async fn update_chain(
 
     if let Some(is_default) = req.is_default {
         chain.is_default = is_default;
+    }
+
+    if let Some(strip_thinking) = req.strip_thinking {
+        chain.strip_thinking = strip_thinking;
     }
 
     state.chain_store.upsert(chain.clone()).await;

@@ -212,6 +212,49 @@ export function eventsToItemsImpl(
     }
   };
 
+  // Materialize the pending text-delta run as a finished stream bubble.
+  // Without this, narration the agent emits between tool calls ("Now
+  // regenerating artifacts...") was silently dropped — only the trailing
+  // run after the last tool call ever rendered.
+  // Stream items flushed since the last assistant message. A flushed run can
+  // turn out to duplicate the *next* assistant message of the same turn (the
+  // final text often repeats earlier narration); those are removed
+  // retroactively when that assistant message arrives.
+  let flushedStreamIds: string[] = [];
+
+  const flushTextDelta = (endTime: number) => {
+    if (!lastTextDelta) return;
+    if (!streamDuplicatesAssistant(lastTextDelta.content, lastAssistantContent)) {
+      items.push({
+        kind: "stream",
+        id: lastTextDelta.id,
+        content: lastTextDelta.content,
+        done: true,
+        startTime: lastTextDelta.timestamp,
+        endTime,
+      });
+      flushedStreamIds.push(lastTextDelta.id);
+    }
+    lastTextDelta = null;
+  };
+
+  const dropStreamsDuplicatedBy = (assistantContent: string) => {
+    if (flushedStreamIds.length > 0) {
+      const ids = new Set(flushedStreamIds);
+      for (let i = items.length - 1; i >= 0; i--) {
+        const it = items[i];
+        if (
+          it.kind === "stream" &&
+          ids.has(it.id) &&
+          streamDuplicatesAssistant(it.content, assistantContent)
+        ) {
+          items.splice(i, 1);
+        }
+      }
+    }
+    flushedStreamIds = [];
+  };
+
   const pushGoalDeliverable = (event: StoredEvent, timestamp: number) => {
     const content = event.content.trim();
     if (!content) return;
@@ -257,6 +300,7 @@ export function eventsToItemsImpl(
       case "assistant_message":
       case "assistant_message_canonical": {
         finalizePendingThinking(timestamp);
+        dropStreamsDuplicatedBy(event.content);
         const meta = event.metadata || {};
         const isFailure = meta.success === false;
         const { costCents, costSource } = parseCostMetadata(meta);
@@ -431,6 +475,11 @@ export function eventsToItemsImpl(
             }
           }
         } else {
+          // Legacy finalizers were persisted with empty content; with no
+          // open block they would render as empty thought bubbles. Drop them.
+          if (isDone && content.trim() === "") {
+            break;
+          }
           const newIdx = items.length;
           if (!isGoalDeliverable) {
             items.push({
@@ -453,7 +502,7 @@ export function eventsToItemsImpl(
 
       case "tool_call": {
         finalizePendingThinking(timestamp);
-        lastTextDelta = null;
+        flushTextDelta(timestamp);
         const toolCallId = event.tool_call_id || `unknown-${event.id}`;
         const name = event.tool_name || "unknown";
         const isUiTool =
@@ -484,7 +533,7 @@ export function eventsToItemsImpl(
 
       case "tool_stub": {
         finalizePendingThinking(timestamp);
-        lastTextDelta = null;
+        flushTextDelta(timestamp);
         const toolCallId = event.tool_call_id || `unknown-${event.id}`;
         const name = event.tool_name || "unknown";
         const isUiTool =

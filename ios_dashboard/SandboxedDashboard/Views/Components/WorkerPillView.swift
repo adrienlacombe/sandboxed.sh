@@ -13,20 +13,14 @@ struct WorkerPillView: View {
     let runningWorkers: [RunningMissionInfo]
     let onTap: () -> Void
 
-    private var activeCount: Int {
-        workers.filter { m in
-            m.status == .active || m.status == .pending || m.status == .blocked ||
-            runningWorkers.contains { $0.missionId == m.id }
-        }.count
+    private var buckets: WorkerBuckets {
+        WorkerBuckets(workers: workers, runningWorkers: runningWorkers)
     }
 
-    private var completedCount: Int {
-        workers.filter { $0.status == .completed }.count
-    }
-
-    private var failedCount: Int {
-        workers.filter { $0.status == .failed || $0.status == .notFeasible || $0.status == .interrupted }.count
-    }
+    private var activeCount: Int { buckets.active.count }
+    private var waitingCount: Int { buckets.waiting.count }
+    private var completedCount: Int { buckets.done.count }
+    private var failedCount: Int { buckets.failed.count }
 
     var body: some View {
         Button(action: onTap) {
@@ -37,6 +31,8 @@ struct WorkerPillView: View {
 
                 Text("\(workers.count)")
                     .font(.caption.weight(.semibold))
+                    .monospacedDigit()
+                    .contentTransition(.numericText())
                     .foregroundStyle(Theme.textPrimary)
 
                 if activeCount > 0 {
@@ -46,7 +42,19 @@ struct WorkerPillView: View {
                             .frame(width: 5, height: 5)
                         Text("\(activeCount)")
                             .font(.system(size: 10, weight: .medium).monospaced())
+                            .contentTransition(.numericText())
                             .foregroundStyle(Theme.accent)
+                    }
+                }
+
+                if waitingCount > 0 {
+                    HStack(spacing: 3) {
+                        Circle()
+                            .fill(Theme.info)
+                            .frame(width: 5, height: 5)
+                        Text("\(waitingCount)")
+                            .font(.system(size: 10, weight: .medium).monospaced())
+                            .foregroundStyle(Theme.info)
                     }
                 }
 
@@ -82,10 +90,20 @@ struct WorkerPillView: View {
             .clipShape(Capsule())
             .overlay(
                 Capsule()
-                    .stroke(Theme.border, lineWidth: 1)
+                    .fill(Theme.surfaceSheen)
+                    .allowsHitTesting(false)
+            )
+            .overlay(
+                Capsule()
+                    .strokeBorder(Theme.edgeHighlight, lineWidth: 0.5)
             )
             .shadow(color: .black.opacity(0.3), radius: 8, y: 4)
         }
         .buttonStyle(.plain)
+        // Roll digits instead of snapping when worker states change.
+        .animation(.snappy, value: workers.count)
+        .animation(.snappy, value: activeCount)
+        .animation(.snappy, value: waitingCount)
+        .animation(.snappy, value: failedCount)
     }
 }

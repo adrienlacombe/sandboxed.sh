@@ -64,6 +64,13 @@ pub async fn ask_store(config: &crate::config::Config) -> Result<Arc<AskStore>, 
         .map(Arc::clone)
 }
 
+/// Non-initializing accessor for runners: returns the store only if some Ask
+/// interaction already opened it this process lifetime. Runners use this for
+/// best-effort mid-turn note injection without needing a `Config`.
+pub fn ask_store_if_initialized() -> Option<Arc<AskStore>> {
+    ASK_STORE.get().cloned()
+}
+
 /// Everything the Ask loop needs for one turn.
 pub struct AskTurn {
     pub ask_store: Arc<AskStore>,
@@ -199,6 +206,12 @@ pub async fn run_ask_turn(turn: &AskTurn, user_content: &str) -> Result<String, 
                 "(The assistant reached the tool-call limit without a final answer.)".to_string();
         }
     }
+
+    // Reasoning models (MiniMax, GLM) can leak <think>/<mm:think> blocks into
+    // the visible answer; strip them like the mission path does.
+    final_answer = crate::api::mission_runner::strip_think_tags(&final_answer)
+        .trim()
+        .to_string();
 
     turn.ask_store
         .append_message(
@@ -382,6 +395,12 @@ async fn run_ask_turn_streaming_inner(
         }
     }
 
+    // Reasoning models (MiniMax, GLM) can leak <think>/<mm:think> blocks into
+    // the visible answer; strip them like the mission path does.
+    final_answer = crate::api::mission_runner::strip_think_tags(&final_answer)
+        .trim()
+        .to_string();
+
     turn.ask_store
         .append_message(
             turn.thread_id,
@@ -505,6 +524,11 @@ async fn build_system_prompt(turn: &AskTurn, user_content: &str) -> String {
          operator decide. When you do steer, make the message self-contained and \
          bounded (what to stop, what to do instead, when to stop doing it) — the \
          working agent has no access to this conversation.\n\n\
+         You are strictly reactive: you run only when the operator sends a \
+         message, and you cannot watch, poll, or follow up on your own. Never \
+         promise to \"keep an eye on\" or \"let you know when\" something \
+         happens — instead tell the operator what to ask about next time, or \
+         queue a steering note for the working agent.\n\n\
          Be concise and concrete. Cite event sequence numbers or file paths when \
          relevant. When you identify a blocker the operator could fix through \
          configuration (missing env var, unused key), propose the concrete fix — \

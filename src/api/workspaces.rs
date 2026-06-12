@@ -41,6 +41,10 @@ pub fn routes() -> Router<Arc<super::routes::AppState>> {
         // Memory monitoring
         .route("/:id/memory", get(get_workspace_memory))
         .route("/memory/all", get(get_all_workspaces_memory))
+        // Live + persisted memory caps (per-workspace override of the
+        // MISSION_MEMORY_* defaults; applies to running scopes via
+        // `systemctl set-property --runtime`)
+        .route("/:id/resources", post(update_workspace_resources))
         // Backend preflight checks
         .route(
             "/:id/backends/:backend_id/preflight",
@@ -789,6 +793,32 @@ async fn delete_workspace(
     // If it's a container workspace, destroy the container first
     if let Some(ws) = state.workspaces.get(id).await {
         if ws.workspace_type == WorkspaceType::Container {
+            // Stop any live mission/exec scopes for this workspace first.
+            // Surviving scope processes (Tailscale daemons, leftover exec
+            // shells) keep the rootfs busy and make removal fail with EBUSY
+            // — this is how `dna` resisted deletion.
+            match list_workspace_scope_units(&ws).await {
+                Ok(units) => {
+                    for unit in units {
+                        let stopped = tokio::process::Command::new("systemctl")
+                            .args(["stop", &unit])
+                            .output()
+                            .await
+                            .map(|out| out.status.success())
+                            .unwrap_or(false);
+                        if !stopped {
+                            tracing::warn!(unit = %unit, "Failed to stop workspace scope before deletion");
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Could not list scopes for workspace {} before deletion: {}",
+                        ws.name,
+                        e
+                    );
+                }
+            }
             if let Err(e) = crate::workspace::destroy_container_workspace(&ws).await {
                 tracing::error!("Failed to destroy container for workspace {}: {}", id, e);
                 return Err((
@@ -1630,51 +1660,107 @@ async fn get_container_memory_stats(workspace: &Workspace) -> WorkspaceMemorySta
         };
     }
 
-    // Get container name from workspace ID
-    let container_name = format!(
-        "mission-{}",
-        workspace
-            .id
-            .to_string()
-            .split('-')
-            .next()
-            .unwrap_or("unknown")
-    );
-
-    // Get systemd scope name for the container
-    let scope_name = format!("machine-{}.scope", container_name);
-
-    // Query systemd for memory stats
-    let output = tokio::process::Command::new("systemctl")
-        .args(["show", &scope_name])
-        .output()
-        .await;
-
-    let stats = match output {
-        Ok(output) if output.status.success() => {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            parse_systemd_memory_stats(&stdout)
+    // Aggregate over every transient scope this workspace owns: the boot
+    // scope (`sandboxed-mission-<machine>.scope`) plus per-exec attach
+    // scopes (`sandboxed-exec-<machine>-*.scope`). The previous
+    // `machine-*.scope` lookup never matched: containers boot with
+    // `--register=no`, so machined scopes don't exist.
+    let exec = crate::workspace_exec::WorkspaceExec::new(workspace.clone());
+    let container_name = exec.mission_scope_match_token();
+    let units = match list_workspace_scope_units(workspace).await {
+        Ok(units) => units,
+        Err(e) => {
+            return WorkspaceMemoryStats {
+                workspace_id: workspace.id,
+                workspace_name: workspace.name.clone(),
+                workspace_type: workspace_type_str.to_string(),
+                memory_current_bytes: None,
+                memory_peak_bytes: None,
+                memory_limit_bytes: None,
+                memory_available_bytes: None,
+                memory_current_mb: None,
+                memory_peak_mb: None,
+                memory_limit_mb: None,
+                container_name,
+                error: Some(format!("Could not query mission scopes: {e}")),
+            };
         }
-        Ok(output) => {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            (
-                None,
-                None,
-                None,
-                None,
-                Some(format!("Container not running: {}", stderr.trim())),
-            )
-        }
-        Err(e) => (
-            None,
-            None,
-            None,
-            None,
-            Some(format!("Failed to query systemctl: {}", e)),
-        ),
     };
 
-    let (memory_current, memory_peak, memory_limit, memory_available, error) = stats;
+    if units.is_empty() {
+        return WorkspaceMemoryStats {
+            workspace_id: workspace.id,
+            workspace_name: workspace.name.clone(),
+            workspace_type: workspace_type_str.to_string(),
+            memory_current_bytes: None,
+            memory_peak_bytes: None,
+            memory_limit_bytes: None,
+            memory_available_bytes: None,
+            memory_current_mb: None,
+            memory_peak_mb: None,
+            memory_limit_mb: None,
+            container_name,
+            error: Some(
+                "No active mission scopes (container not running, or memory caps disabled)"
+                    .to_string(),
+            ),
+        };
+    }
+
+    let mut memory_current: Option<u64> = None;
+    let mut memory_peak: Option<u64> = None;
+    let mut memory_limit: Option<u64> = None;
+    let mut memory_available: Option<u64> = None;
+    let mut read_ok = false;
+    let mut last_error: Option<String> = None;
+
+    for unit in &units {
+        let output = tokio::process::Command::new("systemctl")
+            .args([
+                "show",
+                unit,
+                "-p",
+                "MemoryCurrent,MemoryPeak,MemoryMax,MemoryAvailable",
+            ])
+            .output()
+            .await;
+        match &output {
+            Ok(o) if !o.status.success() => {
+                last_error = Some(format!(
+                    "systemctl show {unit} failed: {}",
+                    String::from_utf8_lossy(&o.stderr).trim()
+                ));
+            }
+            Err(e) => {
+                last_error = Some(format!("systemctl show {unit} errored: {e}"));
+            }
+            _ => {}
+        }
+        if let Ok(output) = output {
+            if output.status.success() {
+                read_ok = true;
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let (cur, peak, max, avail, _) = parse_systemd_memory_stats(&stdout);
+                if let Some(c) = cur {
+                    memory_current = Some(memory_current.unwrap_or(0) + c);
+                }
+                if let Some(p) = peak {
+                    memory_peak = Some(memory_peak.unwrap_or(0).max(p));
+                }
+                if let Some(m) = max.filter(|m| *m != u64::MAX) {
+                    // Each scope is independently capped, so the workspace's
+                    // ceiling is the sum across scopes — matching the summed
+                    // `MemoryCurrent` numerator. Taking the min here would let
+                    // summed usage exceed the displayed limit and peg the
+                    // gauge at 100% while still climbing.
+                    memory_limit = Some(memory_limit.unwrap_or(0) + m);
+                }
+                if let Some(a) = avail {
+                    memory_available = Some(memory_available.unwrap_or(0) + a);
+                }
+            }
+        }
+    }
 
     WorkspaceMemoryStats {
         workspace_id: workspace.id,
@@ -1687,17 +1773,239 @@ async fn get_container_memory_stats(workspace: &Workspace) -> WorkspaceMemorySta
         memory_current_mb: memory_current.map(|b| b as f64 / 1024.0 / 1024.0),
         memory_peak_mb: memory_peak.map(|b| b as f64 / 1024.0 / 1024.0),
         memory_limit_mb: memory_limit
-            .map(|b| {
-                if b == u64::MAX {
-                    "unlimited".to_string()
-                } else {
-                    format!("{:.2}", b as f64 / 1024.0 / 1024.0)
-                }
-            })
+            .map(|b| format!("{:.2}", b as f64 / 1024.0 / 1024.0))
             .or(Some("unlimited".to_string())),
-        container_name: Some(container_name),
-        error,
+        container_name,
+        // Scopes exist but not one `systemctl show` succeeded — surface it
+        // instead of returning blank stats with no explanation.
+        error: if read_ok {
+            None
+        } else {
+            Some(last_error.unwrap_or_else(|| {
+                "Found mission scopes but could not read their memory stats".to_string()
+            }))
+        },
     }
+}
+
+/// Every transient scope unit currently alive that belongs to this
+/// workspace's container: the boot scope plus per-exec attach scopes.
+///
+/// `Ok(vec![])` means the query ran and the workspace genuinely has no live
+/// scopes; `Err` means the `systemctl list-units` query itself failed, so
+/// callers must not interpret the result as "no scopes" (the container may
+/// still be running and capped).
+pub(crate) async fn list_workspace_scope_units(
+    workspace: &Workspace,
+) -> Result<Vec<String>, String> {
+    let exec = crate::workspace_exec::WorkspaceExec::new(workspace.clone());
+    let Some(token) = exec.mission_scope_match_token() else {
+        return Ok(Vec::new());
+    };
+    let output = tokio::process::Command::new("systemctl")
+        .args([
+            "list-units",
+            "--plain",
+            "--no-legend",
+            "--all",
+            "sandboxed-mission-*.scope",
+            "sandboxed-exec-*.scope",
+        ])
+        .output()
+        .await
+        .map_err(|e| format!("failed to run systemctl list-units: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "systemctl list-units failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.split_whitespace().next())
+        .filter(|unit| unit.contains(&token))
+        .map(|s| s.to_string())
+        .collect())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Live memory-cap adjustment
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct UpdateWorkspaceResourcesRequest {
+    /// e.g. "24G", "infinity", "50%". `Some("")` clears the workspace
+    /// override (falls back to the global MISSION_MEMORY_MAX default).
+    pub memory_max: Option<String>,
+    pub memory_high: Option<String>,
+    pub memory_swap_max: Option<String>,
+    /// Persist into the workspace env-var overrides (default true). When
+    /// false the change is runtime-only: it survives until the scopes die.
+    #[serde(default = "default_true")]
+    pub persist: bool,
+    /// Apply to currently-running scopes via `systemctl set-property
+    /// --runtime` (default true).
+    #[serde(default = "default_true")]
+    pub apply_live: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Debug, Serialize)]
+pub struct UpdateWorkspaceResourcesResponse {
+    /// Units the new caps were applied to live (empty when none running).
+    pub applied_units: Vec<String>,
+    /// Running scopes whose live retune failed (e.g. `systemctl set-property`
+    /// errored). Non-empty here means scopes exist but caps did not take live.
+    pub failed_units: Vec<String>,
+    pub persisted: bool,
+    /// Effective caps after this call (override merged with global defaults).
+    pub memory_max: Option<String>,
+    pub memory_high: Option<String>,
+    pub memory_swap_max: Option<String>,
+}
+
+/// Validate a systemd memory size: bytes, suffixed (K/M/G/T), percentage,
+/// or "infinity".
+fn valid_memory_size(value: &str) -> bool {
+    let v = value.trim();
+    if v.eq_ignore_ascii_case("infinity") {
+        return true;
+    }
+    let v = v.strip_suffix('%').unwrap_or(v);
+    let v = v
+        .strip_suffix(['K', 'M', 'G', 'T', 'k', 'm', 'g', 't'])
+        .unwrap_or(v);
+    let mut seen_dot = false;
+    let mut seen_digit = false;
+    for c in v.chars() {
+        match c {
+            '0'..='9' => seen_digit = true,
+            '.' if !seen_dot => seen_dot = true,
+            _ => return false,
+        }
+    }
+    seen_digit
+}
+
+/// POST /api/workspaces/:id/resources — adjust a workspace's memory caps.
+///
+/// This is the "boost" path: raise (or clear) one workspace's memory limits
+/// without touching the global env file and without restarting anything.
+/// Running scopes are retuned in place; the persisted override applies to
+/// every scope the workspace boots afterwards.
+async fn update_workspace_resources(
+    AxumPath(id): AxumPath<Uuid>,
+    State(state): State<Arc<super::routes::AppState>>,
+    Json(req): Json<UpdateWorkspaceResourcesRequest>,
+) -> Result<Json<UpdateWorkspaceResourcesResponse>, (StatusCode, String)> {
+    let mut workspace = require_workspace(&state.workspaces, id).await?;
+
+    let updates: [(&str, &Option<String>); 3] = [
+        ("MISSION_MEMORY_MAX", &req.memory_max),
+        ("MISSION_MEMORY_HIGH", &req.memory_high),
+        ("MISSION_MEMORY_SWAP_MAX", &req.memory_swap_max),
+    ];
+
+    for (key, value) in &updates {
+        if let Some(v) = value {
+            if !v.trim().is_empty() && !valid_memory_size(v) {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    format!(
+                        "Invalid {key} value '{v}': expected bytes, K/M/G/T suffix, %, or 'infinity'"
+                    ),
+                ));
+            }
+        }
+    }
+
+    // Merge the requested values into the workspace env overrides (empty
+    // string = clear the override).
+    for (key, value) in &updates {
+        if let Some(v) = value {
+            let v = v.trim();
+            if v.is_empty() {
+                workspace.env_vars.remove(*key);
+            } else {
+                workspace.env_vars.insert(key.to_string(), v.to_string());
+            }
+        }
+    }
+
+    let exec = crate::workspace_exec::WorkspaceExec::new(workspace.clone());
+    let caps = exec.mission_memory_caps();
+
+    let mut applied_units = Vec::new();
+    let mut failed_units = Vec::new();
+    if req.apply_live {
+        let units = match list_workspace_scope_units(&workspace).await {
+            Ok(units) => units,
+            Err(e) => {
+                // Persist still applies (caps take at next boot); record why
+                // the live retune found nothing instead of silently skipping.
+                tracing::warn!(
+                    "apply_live: could not list scopes for {}: {}",
+                    workspace.name,
+                    e
+                );
+                Vec::new()
+            }
+        };
+        for unit in units {
+            let mut cmd = tokio::process::Command::new("systemctl");
+            cmd.args(["set-property", "--runtime", &unit]);
+            cmd.arg(format!(
+                "MemoryMax={}",
+                caps.max.as_deref().unwrap_or("infinity")
+            ));
+            cmd.arg(format!(
+                "MemoryHigh={}",
+                caps.high.as_deref().unwrap_or("infinity")
+            ));
+            cmd.arg(format!(
+                "MemorySwapMax={}",
+                caps.swap_max.as_deref().unwrap_or("infinity")
+            ));
+            match cmd.output().await {
+                Ok(out) if out.status.success() => applied_units.push(unit),
+                Ok(out) => {
+                    let stderr = String::from_utf8_lossy(&out.stderr);
+                    tracing::warn!("set-property failed for {}: {}", unit, stderr.trim());
+                    failed_units.push(unit);
+                }
+                Err(e) => {
+                    tracing::warn!("set-property spawn failed for {}: {}", unit, e);
+                    failed_units.push(unit);
+                }
+            }
+        }
+    }
+
+    if req.persist {
+        state.workspaces.update(workspace.clone()).await;
+    }
+
+    tracing::info!(
+        "Workspace {} memory caps updated: max={:?} high={:?} swap_max={:?} (live: {} unit(s), persisted: {})",
+        workspace.name,
+        caps.max,
+        caps.high,
+        caps.swap_max,
+        applied_units.len(),
+        req.persist
+    );
+
+    Ok(Json(UpdateWorkspaceResourcesResponse {
+        applied_units,
+        failed_units,
+        persisted: req.persist,
+        memory_max: caps.max,
+        memory_high: caps.high,
+        memory_swap_max: caps.swap_max,
+    }))
 }
 
 /// Parse systemd cgroup memory statistics from `systemctl show` output.
@@ -1788,6 +2096,26 @@ mod tests {
     use super::*;
     use std::path::Path;
     use tempfile::TempDir;
+
+    #[test]
+    fn valid_memory_size_accepts_systemd_forms() {
+        for v in [
+            "512", "0", "100M", "1.5G", "2T", "50%", "infinity", "INFINITY",
+        ] {
+            assert!(valid_memory_size(v), "should accept {v}");
+        }
+    }
+
+    #[test]
+    fn valid_memory_size_rejects_f64_quirks_systemd_does_not_accept() {
+        // These all parse as f64 but systemd rejects them; accepting one and
+        // persisting it would break every future container boot.
+        for v in [
+            "1e10", "inf", "nan", "+5", "-5", "1.2.3", "", ".", "0x10", " ",
+        ] {
+            assert!(!valid_memory_size(v), "should reject {v:?}");
+        }
+    }
 
     #[test]
     fn test_path_within_rejects_parent_traversal() {

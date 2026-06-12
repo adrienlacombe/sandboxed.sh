@@ -18,6 +18,12 @@ export interface ModelChain {
   name: string;
   entries: ChainEntry[];
   is_default: boolean;
+  /**
+   * Strip `<think>…</think>` blocks and stray orphan `</think>` tags from
+   * responses routed through this chain. Useful for models (MiniMax, GLM) that
+   * leak reasoning into `content`.
+   */
+  strip_thinking: boolean;
   created_at: string;
   updated_at: string;
 }
@@ -92,6 +98,7 @@ export async function createModelChain(data: {
   name: string;
   entries: ChainEntry[];
   is_default?: boolean;
+  strip_thinking?: boolean;
 }): Promise<ModelChain> {
   return apiPost("/api/model-routing/chains", data, "Failed to create model chain");
 }
@@ -102,6 +109,7 @@ export async function updateModelChain(
     name?: string;
     entries?: ChainEntry[];
     is_default?: boolean;
+    strip_thinking?: boolean;
   }
 ): Promise<ModelChain> {
   return apiPut(

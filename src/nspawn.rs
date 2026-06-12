@@ -540,6 +540,33 @@ async fn unmount_if_present(root: &Path, target: &str) -> NspawnResult<()> {
     Ok(())
 }
 
+/// Build the `systemd-nspawn` command for a one-shot container execution,
+/// wrapped in a capped transient scope under `missions.slice` when
+/// `MISSION_MEMORY_MAX` is configured (config env override → process env).
+///
+/// One-shot executions (workspace init scripts, template builds) can compile
+/// arbitrarily large projects; without this wrapper they run in the API
+/// service's cgroup and can throttle the whole service — same failure mode
+/// as the mission boot/attach paths in `workspace_exec.rs`.
+fn scope_wrapped_nspawn_command(path: &Path, env: &HashMap<String, String>) -> Command {
+    let caps = crate::workspace_exec::mission_memory_caps_from_env(env);
+    // Embed the same machine-name token the mission boot/attach scopes use so
+    // this one-shot scope is discoverable by `list_workspace_scope_units`
+    // (live stats, retune, OOM watchdog). A divergent token would make the
+    // scope get caps yet stay invisible to the workspace memory plumbing.
+    let token =
+        crate::workspace_exec::machine_name_for_path(path).unwrap_or_else(|| "unknown".to_string());
+    let unit = format!("sandboxed-exec-{}-{}", token, uuid::Uuid::new_v4().simple());
+    if let Some(scope_args) = caps.scope_run_args(&unit) {
+        let mut c = Command::new("systemd-run");
+        c.args(&scope_args);
+        c.arg("systemd-nspawn");
+        c
+    } else {
+        Command::new("systemd-nspawn")
+    }
+}
+
 /// Execute a command inside a container using systemd-nspawn.
 pub async fn execute_in_container(
     path: &Path,
@@ -550,7 +577,7 @@ pub async fn execute_in_container(
         return Err(NspawnError::NspawnExecution("Empty command".to_string()));
     }
 
-    let mut cmd = tokio::process::Command::new("systemd-nspawn");
+    let mut cmd = scope_wrapped_nspawn_command(path, &config.env);
     cmd.arg("-D").arg(path);
     cmd.arg("--quiet");
     // Disable timezone bind-mount (minbase containers lack /usr/share/zoneinfo)
@@ -643,7 +670,7 @@ pub async fn execute_in_container_streaming(
         return Err(NspawnError::NspawnExecution("Empty command".to_string()));
     }
 
-    let mut cmd = Command::new("systemd-nspawn");
+    let mut cmd = scope_wrapped_nspawn_command(path, &config.env);
     cmd.arg("-D").arg(path);
     cmd.arg("--quiet");
     cmd.arg("--timezone=off");
@@ -874,6 +901,9 @@ pub async fn destroy_container(path: &Path) -> NspawnResult<()> {
             "Container path {} does not exist, nothing to destroy",
             path.display()
         );
+        // Still reap the sibling build log: a partially removed workspace
+        // (rootfs gone, log left) should not orphan it forever.
+        let _ = tokio::fs::remove_file(build_log_path_for(path)).await;
         return Ok(());
     }
 
@@ -883,13 +913,67 @@ pub async fn destroy_container(path: &Path) -> NspawnResult<()> {
     let _ = unmount_if_present(path, "/sys").await;
     let _ = unmount_if_present(path, "/proc").await;
 
+    // Unmount anything else still mounted under the container path (X11
+    // binds, overlay leftovers, runtime mounts not in the legacy list).
+    // A single live mount makes remove_dir_all fail with EBUSY — and worse,
+    // it would recurse *into* a live bind mount.
+    unmount_all_under(path).await;
+
     match tokio::fs::remove_dir_all(path).await {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(NspawnError::DirectoryRemoval(e)),
     }
 
+    // Remove the sibling build log (e.g. containers/<name>.build.log) so a
+    // deleted workspace leaves nothing behind.
+    let _ = tokio::fs::remove_file(build_log_path_for(path)).await;
+
     tracing::info!("Container destroyed successfully");
 
     Ok(())
+}
+
+/// Unmount every mount point under `root` (deepest first), best effort.
+///
+/// Reads `/proc/self/mountinfo` rather than guessing a fixed list; falls back
+/// to a lazy unmount when a regular one fails so a busy mount cannot wedge
+/// container deletion forever.
+async fn unmount_all_under(root: &Path) {
+    let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let root_str = root.to_string_lossy().into_owned();
+    let prefix = format!("{}/", root_str.trim_end_matches('/'));
+
+    let Ok(mountinfo) = tokio::fs::read_to_string("/proc/self/mountinfo").await else {
+        return;
+    };
+    // mountinfo field 5 (index 4) is the mount point, octal-escaped.
+    let mut mounts: Vec<String> = mountinfo
+        .lines()
+        .filter_map(|line| line.split_whitespace().nth(4))
+        .map(|mp| mp.replace("\\040", " ").replace("\\011", "\t"))
+        .filter(|mp| mp == &root_str || mp.starts_with(&prefix))
+        .collect();
+    if mounts.is_empty() {
+        return;
+    }
+    // Deepest first so nested mounts release their parents.
+    mounts.sort_by_key(|mp| std::cmp::Reverse(mp.matches('/').count()));
+    mounts.dedup();
+
+    for mp in mounts {
+        let ok = tokio::process::Command::new("umount")
+            .arg(&mp)
+            .output()
+            .await
+            .map(|out| out.status.success())
+            .unwrap_or(false);
+        if !ok {
+            tracing::warn!(mount = %mp, "umount failed; retrying lazily");
+            let _ = tokio::process::Command::new("umount")
+                .args(["-l", &mp])
+                .output()
+                .await;
+        }
+    }
 }
