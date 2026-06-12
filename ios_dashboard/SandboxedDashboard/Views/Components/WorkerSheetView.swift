@@ -13,23 +13,14 @@ struct WorkerSheetView: View {
     let runningWorkers: [RunningMissionInfo]
     @State private var peekingWorker: Mission?
 
-    private var activeWorkers: [Mission] {
-        workers.filter { m in
-            m.status == .active || m.status == .pending || m.status == .awaitingUser ||
-            runningWorkers.contains { $0.missionId == m.id }
-        }
+    private var buckets: WorkerBuckets {
+        WorkerBuckets(workers: workers, runningWorkers: runningWorkers)
     }
 
-    private var completedWorkers: [Mission] {
-        workers.filter { $0.status == .completed || $0.status == .acknowledged }
-    }
-
-    private var failedWorkers: [Mission] {
-        workers.filter { m in
-            m.status == .failed || m.status == .notFeasible ||
-            m.status == .interrupted || m.status == .blocked
-        }
-    }
+    private var activeWorkers: [Mission] { buckets.active }
+    private var waitingWorkers: [Mission] { buckets.waiting }
+    private var completedWorkers: [Mission] { buckets.done }
+    private var failedWorkers: [Mission] { buckets.failed }
 
     var body: some View {
         NavigationStack {
@@ -41,6 +32,11 @@ struct WorkerSheetView: View {
                     // Active workers
                     if !activeWorkers.isEmpty {
                         workerSection("Running", icon: "bolt.fill", tint: Theme.accent, missions: activeWorkers)
+                    }
+
+                    // Waiting on user input
+                    if !waitingWorkers.isEmpty {
+                        workerSection("Waiting", icon: "hourglass", tint: Theme.info, missions: waitingWorkers)
                     }
 
                     // Completed workers
@@ -81,6 +77,11 @@ struct WorkerSheetView: View {
                 tint: Theme.accent
             )
             summaryCard(
+                count: waitingWorkers.count,
+                label: "Waiting",
+                tint: Theme.info
+            )
+            summaryCard(
                 count: completedWorkers.count,
                 label: "Done",
                 tint: Theme.success
@@ -108,7 +109,12 @@ struct WorkerSheetView: View {
         .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
         .overlay(
             RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .stroke(count > 0 ? tint.opacity(0.15) : Theme.borderSubtle, lineWidth: 1)
+                .fill(Theme.surfaceSheen)
+                .allowsHitTesting(false)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .strokeBorder(count > 0 ? tint.opacity(0.18) : Theme.borderSubtle, lineWidth: 0.5)
         )
     }
 
