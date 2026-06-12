@@ -96,6 +96,24 @@ pub fn classify_outcome(
     if failed {
         return BoardTaskOutcome::Failed;
     }
+    // Harness-level failures can surface as a "successful" turn whose entire
+    // output is an error banner (e.g. opencode session errors arrive via
+    // stderr text, not terminal_reason — observed in the dev smoke test).
+    // Only match banners at the very start so a legit summary that merely
+    // mentions errors isn't misclassified.
+    let trimmed = output.trim();
+    if trimmed.is_empty() {
+        return BoardTaskOutcome::Failed;
+    }
+    const ERROR_BANNERS: [&str; 4] = [
+        "Error:",
+        "[session.error]",
+        "[MAIN] SESSION.ERROR",
+        "Session ended with error",
+    ];
+    if ERROR_BANNERS.iter().any(|b| trimmed.starts_with(b)) {
+        return BoardTaskOutcome::Failed;
+    }
     // Worker contract: a stuck worker ends its turn with a line starting
     // "BLOCKED". Look near the start of the final message.
     let head: String = output.trim_start().chars().take(600).collect();
@@ -617,6 +635,28 @@ mod tests {
         assert_eq!(
             classify_outcome(Some(TerminalReason::Stalled), false, "whatever"),
             BoardTaskOutcome::Failed
+        );
+        // Harness error banners masquerading as a successful turn.
+        assert_eq!(
+            classify_outcome(
+                Some(TerminalReason::TurnComplete),
+                true,
+                "Error: Unexpected error, check log file at /root/.local/share/opencode/log"
+            ),
+            BoardTaskOutcome::Failed
+        );
+        assert_eq!(
+            classify_outcome(Some(TerminalReason::TurnComplete), true, "   "),
+            BoardTaskOutcome::Failed
+        );
+        // A summary that merely mentions an error is still a success.
+        assert_eq!(
+            classify_outcome(
+                Some(TerminalReason::TurnComplete),
+                true,
+                "Done. Fixed the Error: handling path and verified with cargo test."
+            ),
+            BoardTaskOutcome::Success
         );
         assert_eq!(classify_outcome(None, false, "x"), BoardTaskOutcome::Failed);
         assert_eq!(
