@@ -1235,6 +1235,20 @@ impl ModelChainStore {
                 if !account.has_credentials() {
                     continue;
                 }
+                // Custom providers are a shared type: an entry like
+                // "custom/claude-fable-5" must only resolve to the custom
+                // account(s) that actually declare that model, not every
+                // custom endpoint in the store.
+                if matches!(provider_type, crate::ai_providers::ProviderType::Custom) {
+                    let model_known = account
+                        .custom_models
+                        .as_ref()
+                        .map(|ms| ms.iter().any(|m| m.id == entry.model_id))
+                        .unwrap_or(false);
+                    if !model_known {
+                        continue;
+                    }
+                }
                 let oauth_is_fresh = account
                     .oauth
                     .as_ref()
