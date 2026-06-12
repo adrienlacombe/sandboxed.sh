@@ -48,12 +48,14 @@ describe("prepareVisibleAutomations", () => {
     overrides: Partial<{
       active: boolean;
       created_at: string;
+      last_triggered_at: string | null;
       command_source: { type: string };
     }> = {},
   ) => ({
     id,
     active: overrides.active ?? true,
     created_at: overrides.created_at ?? "2026-05-21T00:00:00Z",
+    last_triggered_at: overrides.last_triggered_at ?? null,
     command_source: overrides.command_source ?? { type: "inline" },
   });
 
@@ -63,7 +65,7 @@ describe("prepareVisibleAutomations", () => {
       make("running", { active: true, command_source: { type: "native_loop" } }),
     ]);
 
-    expect(result.map((a) => a.id)).toEqual(["running"]);
+    expect(result.live.map((a) => a.id)).toEqual(["running"]);
   });
 
   it("preserves inactive non-native_loop rows (user-paused automations stay visible)", () => {
@@ -72,7 +74,7 @@ describe("prepareVisibleAutomations", () => {
       make("paused-library", { active: false, command_source: { type: "library" } }),
     ]);
 
-    expect(result.map((a) => a.id).sort()).toEqual(
+    expect(result.live.map((a) => a.id).sort()).toEqual(
       ["paused-by-user", "paused-library"].sort(),
     );
   });
@@ -83,7 +85,7 @@ describe("prepareVisibleAutomations", () => {
       make("active-old", { active: true, created_at: "2026-05-20T00:00:00Z" }),
     ]);
 
-    expect(result.map((a) => a.id)).toEqual(["active-old", "paused"]);
+    expect(result.live.map((a) => a.id)).toEqual(["active-old", "paused"]);
   });
 
   it("within the same active state, sorts newest first", () => {
@@ -93,7 +95,7 @@ describe("prepareVisibleAutomations", () => {
       make("middle", { active: true, created_at: "2026-05-21T00:00:00Z" }),
     ]);
 
-    expect(result.map((a) => a.id)).toEqual(["newest", "middle", "oldest"]);
+    expect(result.live.map((a) => a.id)).toEqual(["newest", "middle", "oldest"]);
   });
 
   it("does not mutate the input array (sort + filter return a fresh list)", () => {
@@ -129,6 +131,21 @@ describe("prepareVisibleAutomations", () => {
       intervalDriver,
     ]);
 
-    expect(result.map((a) => a.id)).toEqual(["interval-driver"]);
+    expect(result.live.map((a) => a.id)).toEqual(["interval-driver"]);
+  });
+
+  it("routes fired one-shot wakeups (inactive + last_triggered_at) to spent", () => {
+    const result = prepareVisibleAutomations([
+      make("live-driver", { active: true }),
+      make("paused-never-fired", { active: false, last_triggered_at: null }),
+      make("spent-wakeup", {
+        active: false,
+        last_triggered_at: "2026-05-22T10:00:00Z",
+      }),
+    ]);
+    expect(result.live.map((a) => a.id).sort()).toEqual(
+      ["live-driver", "paused-never-fired"].sort(),
+    );
+    expect(result.spent.map((a) => a.id)).toEqual(["spent-wakeup"]);
   });
 });
