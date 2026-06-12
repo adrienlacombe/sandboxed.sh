@@ -49,6 +49,7 @@ describe("prepareVisibleAutomations", () => {
       active: boolean;
       created_at: string;
       last_triggered_at: string | null;
+      stop_policy: { type: string };
       command_source: { type: string };
     }> = {},
   ) => ({
@@ -56,6 +57,7 @@ describe("prepareVisibleAutomations", () => {
     active: overrides.active ?? true,
     created_at: overrides.created_at ?? "2026-05-21T00:00:00Z",
     last_triggered_at: overrides.last_triggered_at ?? null,
+    stop_policy: overrides.stop_policy ?? { type: "never" },
     command_source: overrides.command_source ?? { type: "inline" },
   });
 
@@ -141,10 +143,16 @@ describe("prepareVisibleAutomations", () => {
       make("spent-wakeup", {
         active: false,
         last_triggered_at: "2026-05-22T10:00:00Z",
+        stop_policy: { type: "after_first_fire" },
+      }),
+      make("paused-recurring", {
+        active: false,
+        last_triggered_at: "2026-05-22T10:00:00Z",
+        stop_policy: { type: "never" },
       }),
     ]);
     expect(result.live.map((a) => a.id).sort()).toEqual(
-      ["live-driver", "paused-never-fired"].sort(),
+      ["live-driver", "paused-never-fired", "paused-recurring"].sort(),
     );
     expect(result.spent.map((a) => a.id)).toEqual(["spent-wakeup"]);
   });

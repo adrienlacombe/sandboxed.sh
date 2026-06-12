@@ -216,6 +216,7 @@ export function prepareVisibleAutomations<
     active: boolean;
     created_at?: string;
     last_triggered_at?: string | null;
+    stop_policy?: { type: string } | null;
     command_source?: { type: string } | null;
   }
 >(automations: A[]): { live: A[]; spent: A[] } {
@@ -236,7 +237,15 @@ export function prepareVisibleAutomations<
   const live: A[] = [];
   const spent: A[] = [];
   for (const a of kept) {
-    if (!a.active && a.last_triggered_at) spent.push(a);
+    // Spent = a fired ONE-SHOT (stop_policy after_first_fire) that is now
+    // inactive — i.e. a completed ScheduleWakeup. A user-paused recurring
+    // automation (interval/webhook, different stop policy) is NOT spent even
+    // though it has fired before; it stays in `live` so it remains editable.
+    const isFiredOneShot =
+      !a.active &&
+      !!a.last_triggered_at &&
+      a.stop_policy?.type === "after_first_fire";
+    if (isFiredOneShot) spent.push(a);
     else live.push(a);
   }
   live.sort(sortByCreated);
