@@ -657,9 +657,22 @@ function normalizePlanStatus(raw: unknown): PlanItem["status"] {
 export function extractMissionState(items: ChatItem[]): MissionStateSummary {
   let plan: MissionStateSummary["plan"] = null;
   let upNext: MissionStateSummary["upNext"] = null;
+  // Lazily-loaded history stubs carry no args; if a stub for one of these
+  // tools is NEWER than the last parsed snapshot, the parsed one is stale —
+  // drop it rather than present outdated state as current.
+  let stalePlanAfter = 0;
+  let staleUpNextAfter = 0;
   for (const item of items) {
-    if (item.kind !== "tool" || !isRecord(item.args)) continue;
+    if (item.kind !== "tool") continue;
     const name = item.name;
+    if (!isRecord(item.args)) {
+      if (name === "TodoWrite" || name === "todowrite" || name === "update_plan") {
+        stalePlanAfter = Math.max(stalePlanAfter, item.startTime);
+      } else if (name === "ScheduleWakeup") {
+        staleUpNextAfter = Math.max(staleUpNextAfter, item.startTime);
+      }
+      continue;
+    }
     if (name === "TodoWrite" || name === "todowrite" || name === "update_plan") {
       const raw = (item.args as Record<string, unknown>)["todos"] ??
         (item.args as Record<string, unknown>)["plan"];
@@ -692,11 +705,17 @@ export function extractMissionState(items: ChatItem[]): MissionStateSummary {
         upNext = {
           reason,
           delaySeconds:
-            typeof args["delaySeconds"] === "number" ? args["delaySeconds"] : null,
+            typeof args["delaySeconds"] === "number"
+              ? args["delaySeconds"]
+              : typeof args["delay_seconds"] === "number"
+                ? args["delay_seconds"]
+                : null,
           timestamp: item.startTime,
         };
       }
     }
   }
+  if (plan && stalePlanAfter > plan.timestamp) plan = null;
+  if (upNext && staleUpNextAfter > upNext.timestamp) upNext = null;
   return { plan, upNext };
 }
