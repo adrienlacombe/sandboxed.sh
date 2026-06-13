@@ -854,7 +854,7 @@ impl ModelChainStore {
                     },
                     ChainEntry {
                         provider_id: "zai".to_string(),
-                        model_id: "glm-5.1".to_string(),
+                        model_id: "glm-5.2".to_string(),
                     },
                 ],
                 is_default: true,
@@ -869,8 +869,10 @@ impl ModelChainStore {
             if let Some(chain) = chains.iter_mut().find(|c| c.id == "builtin/smart") {
                 let mut migrated = false;
                 for entry in &mut chain.entries {
-                    if entry.provider_id == "zai" && entry.model_id == "glm-5" {
-                        entry.model_id = "glm-5.1".to_string();
+                    if entry.provider_id == "zai"
+                        && matches!(entry.model_id.as_str(), "glm-5" | "glm-5.1")
+                    {
+                        entry.model_id = "glm-5.2".to_string();
                         migrated = true;
                     }
                     if entry.provider_id == "minimax"
