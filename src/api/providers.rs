@@ -1403,7 +1403,15 @@ fn get_configured_provider_ids(working_dir: &std::path::Path) -> HashSet<String>
         {
             for provider in providers {
                 if provider.enabled && provider.has_credentials() {
-                    configured.insert(provider.provider_type.id().to_string());
+                    // Use the same id the provider listing exposes: custom
+                    // providers are keyed by their sanitized name (e.g.
+                    // "spark"), not the generic "custom" type id, so the
+                    // dashboard's connected-marker lookup matches.
+                    if provider.provider_type == ProviderType::Custom {
+                        configured.insert(sanitize_custom_provider_id(&provider.name));
+                    } else {
+                        configured.insert(provider.provider_type.id().to_string());
+                    }
                 }
             }
         }
