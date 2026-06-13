@@ -729,8 +729,13 @@ exec "$SCRIPT_DIR/.sandboxed-sh-telegram-action.py" "$@"
     }
 }
 
-const CODEX_ACCOUNT_CONCURRENCY_LIMIT: usize = 5;
-const CODEX_OAUTH_ACCOUNT_CONCURRENCY_LIMIT: usize = 5;
+// Max concurrent Codex turns per account, enforced by a per-account semaphore.
+// Raised 5 -> 10 (operator decision) to widen the effective Codex ceiling
+// (accounts x limit) and reduce "all accounts at capacity" when many board
+// workers want Codex at once. Higher values risk upstream rate-limiting per
+// ChatGPT/OpenAI account.
+const CODEX_ACCOUNT_CONCURRENCY_LIMIT: usize = 10;
+const CODEX_OAUTH_ACCOUNT_CONCURRENCY_LIMIT: usize = 10;
 const CODEX_ACCOUNT_LEASE_WAIT_TIMEOUT: Duration = Duration::from_secs(15);
 
 static CODEX_ACCOUNT_POOL: LazyLock<StdMutex<HashMap<String, Arc<Semaphore>>>> =
