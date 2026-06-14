@@ -119,6 +119,28 @@ fn header_truthy(headers: &HeaderMap, key: &str) -> bool {
 // Provider Base URLs
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Client-side concurrency gate for Kimi.
+///
+/// Kimi Code subscriptions enforce a 5-hour rolling call/token budget (separate
+/// from the monthly quota), so a burst of parallel requests — e.g. a benchmark
+/// fanning out many tasks — trips upstream 429s and the account gets cooled
+/// down. Cap how many Kimi requests we have in flight so we pace into the
+/// budget instead of bursting. Excess requests wait for a slot (backpressure)
+/// rather than failing. Tunable via `KIMI_MAX_CONCURRENCY` (default 6).
+static KIMI_CONCURRENCY: std::sync::LazyLock<tokio::sync::Semaphore> =
+    std::sync::LazyLock::new(|| {
+        let n = std::env::var("KIMI_MAX_CONCURRENCY")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(6);
+        tracing::info!(
+            max_concurrency = n,
+            "Kimi proxy concurrency gate initialized"
+        );
+        tokio::sync::Semaphore::new(n)
+    });
+
 /// Default base URL for OpenAI-compatible providers.
 ///
 /// Returns `None` for providers that don't have an OpenAI-compatible API
@@ -659,6 +681,17 @@ pub(crate) async fn chat_completions_inner(
         {
             continue;
         }
+
+        // Pace Kimi: hold a concurrency slot for the duration of this attempt so
+        // parallel callers (e.g. a benchmark) don't burst past Kimi's rolling
+        // rate limit. Excess requests wait here instead of bursting into 429s.
+        // The guard is dropped at the end of the iteration (on `continue` or
+        // when the response is returned). `None` for every other provider.
+        let _kimi_permit = if provider_type == ProviderType::Kimi {
+            KIMI_CONCURRENCY.acquire().await.ok()
+        } else {
+            None
+        };
 
         // The synthetic "anthropic-cli-proxy" account is the only Anthropic
         // entry without an api_key — `read_standard_accounts` hoists the
@@ -1482,7 +1515,19 @@ pub(crate) async fn chat_completions_inner(
         // Pre-stream error handling: 429, 529, 5xx → cooldown + try next
         if status == StatusCode::TOO_MANY_REQUESTS || status.as_u16() == 529 {
             let elapsed_ms = request_start.elapsed().as_millis() as u64;
-            let retry_after = parse_rate_limit_headers(upstream_resp.headers(), provider_type);
+            let mut retry_after = parse_rate_limit_headers(upstream_resp.headers(), provider_type);
+            // Kimi: keep the rate-limit cooldown short instead of letting it grow
+            // exponentially (5s→300s). Its rolling-window quota frees up
+            // continuously and we already throttle via `KIMI_CONCURRENCY`, so a
+            // brief account-wide pause is enough; a multi-minute cooldown would
+            // outlast a caller's retry budget and make the whole run give up.
+            // Honor a real upstream `retry-after` when present (and shorter).
+            if provider_type == ProviderType::Kimi && status == StatusCode::TOO_MANY_REQUESTS {
+                let capped = retry_after
+                    .unwrap_or(std::time::Duration::from_secs(5))
+                    .min(std::time::Duration::from_secs(15));
+                retry_after = Some(capped);
+            }
             // Passive Codex usage capture (B): a 429 from the local CLIProxyAPI
             // on the Codex path carries a `model_cooldown` body with the weekly
             // (secondary) window reset. The cli-proxy strips the rich x-codex-*
