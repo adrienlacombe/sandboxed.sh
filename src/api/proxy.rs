@@ -265,7 +265,7 @@ struct ModelObject {
 ///
 /// Accepts either the internal `SANDBOXED_PROXY_SECRET` or any user-generated
 /// proxy API key from the `ProxyApiKeyStore`.
-async fn verify_proxy_auth(
+pub(crate) async fn verify_proxy_auth(
     headers: &HeaderMap,
     state: &super::routes::AppState,
 ) -> Result<(), Response> {

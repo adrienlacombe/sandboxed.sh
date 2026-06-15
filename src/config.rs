@@ -236,6 +236,16 @@ pub struct Config {
 
     /// Whether mission automations are enabled
     pub automations_enabled: bool,
+
+    /// DGX Spark build-offload config (all optional; offload is disabled unless
+    /// all three are set). The host holds these credentials so workspaces never
+    /// need Spark access. See `src/api/spark.rs`.
+    /// Arbiter base URL, e.g. `http://100.77.4.93:8088`.
+    pub spark_arbiter_url: Option<String>,
+    /// Arbiter bearer token (matches `/etc/spark-arbiter.env` on the Spark).
+    pub spark_arbiter_token: Option<String>,
+    /// SSH target for rsync of the workspace, e.g. `th0rgal@100.77.4.93`.
+    pub spark_ssh_target: Option<String>,
 }
 
 /// API auth configuration.
@@ -605,6 +615,16 @@ impl Config {
             .transpose()?
             .unwrap_or(true);
 
+        let env_opt = |k: &str| {
+            std::env::var(k)
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        };
+        let spark_arbiter_url = env_opt("SPARK_ARBITER_URL");
+        let spark_arbiter_token = env_opt("SPARK_ARBITER_TOKEN");
+        let spark_ssh_target = env_opt("SPARK_SSH_TARGET");
+
         Ok(Self {
             default_model,
             working_dir,
@@ -623,6 +643,9 @@ impl Config {
             library_path,
             default_backend,
             automations_enabled,
+            spark_arbiter_url,
+            spark_arbiter_token,
+            spark_ssh_target,
         })
     }
 
@@ -647,6 +670,9 @@ impl Config {
             library_path,
             default_backend: None,
             automations_enabled: true,
+            spark_arbiter_url: None,
+            spark_arbiter_token: None,
+            spark_ssh_target: None,
         }
     }
 }

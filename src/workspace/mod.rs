@@ -265,6 +265,56 @@ impl Workspace {
         }
     }
 
+    /// Whether this workspace opted into offloading Lean builds to the DGX
+    /// Spark (`config.spark_offload.enabled == true`).
+    pub fn spark_offload_enabled(&self) -> bool {
+        self.config
+            .get("spark_offload")
+            .and_then(|v| v.get("enabled"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+    }
+
+    /// Env vars that let the in-workspace `spark-build` wrapper offload a build
+    /// for `mission_id` to the Spark via the host endpoint — or `None` when the
+    /// workspace hasn't opted in or the proxy secret isn't available. Only the
+    /// local endpoint URL + the proxy secret it already trusts are exposed;
+    /// Spark credentials stay on the host (see `src/api/spark.rs`).
+    pub fn spark_offload_env(&self, mission_id: Uuid) -> Option<HashMap<String, String>> {
+        if !self.spark_offload_enabled() {
+            return None;
+        }
+        let secret = std::env::var("SANDBOXED_PROXY_SECRET")
+            .ok()
+            .filter(|s| !s.trim().is_empty())?;
+        let port = std::env::var("PORT")
+            .ok()
+            .filter(|s| !s.trim().is_empty())?;
+        let host_dir = mission_workspace_dir_for_root(&self.path, mission_id);
+        let short = &mission_id.to_string()[..8];
+        let guest_dir = if self.workspace_type == WorkspaceType::Container {
+            format!("/workspaces/mission-{}", short)
+        } else {
+            host_dir.to_string_lossy().to_string()
+        };
+        let mut m = HashMap::new();
+        m.insert(
+            "SPARK_OFFLOAD_URL".to_string(),
+            format!(
+                "http://{}:{}/api/spark/offload",
+                self.host_ip_from_workspace(),
+                port
+            ),
+        );
+        m.insert("SPARK_OFFLOAD_TOKEN".to_string(), secret);
+        m.insert(
+            "SPARK_WORKSPACE_HOST_DIR".to_string(),
+            host_dir.to_string_lossy().to_string(),
+        );
+        m.insert("SPARK_WORKSPACE_GUEST_DIR".to_string(), guest_dir);
+        Some(m)
+    }
+
     /// Create the default host workspace.
     pub fn default_host(working_dir: PathBuf) -> Self {
         Self {

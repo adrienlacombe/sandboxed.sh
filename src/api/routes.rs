@@ -1113,6 +1113,7 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         .nest("/api/durable-jobs", durable_jobs::routes())
         // System component management endpoints
         .nest("/api/system", system_api::routes())
+        .nest("/api/spark", super::spark::routes())
         // Auth management endpoints
         .route("/api/auth/status", get(auth::auth_status))
         .route("/api/auth/change-password", post(auth::change_password))
