@@ -375,15 +375,21 @@ function removeOutboxEntry(missionId: string, id: string): void {
   writeOutbox(map);
 }
 
-function formatMissionDocumentTitle(mission: Mission | null | undefined) {
-  if (!mission) return DEFAULT_DOCUMENT_TITLE;
+function formatMissionDocumentTitle(
+  mission: Mission | null | undefined,
+  awaitingUser = false,
+) {
+  // Prefix mirrors the favicon's "needs answer" badge so a backgrounded tab
+  // reads as needing input from the tab list alone.
+  const prefix = awaitingUser ? "● " : "";
+  if (!mission) return `${prefix}${DEFAULT_DOCUMENT_TITLE}`;
   const title = getMissionTitle(mission, {
     maxLength: MAX_DOCUMENT_MISSION_TITLE_LENGTH,
     fallback: getMissionShortName(mission.id),
   }).trim();
   return title
-    ? `${title} | ${DEFAULT_DOCUMENT_TITLE}`
-    : DEFAULT_DOCUMENT_TITLE;
+    ? `${prefix}${title} | ${DEFAULT_DOCUMENT_TITLE}`
+    : `${prefix}${DEFAULT_DOCUMENT_TITLE}`;
 }
 
 function readLegacyControlDraft(): string {
@@ -8998,15 +9004,15 @@ export default function ControlClient() {
     };
   }, [showMissionMenu]);
 
-  // Update favicon with mission status dot
-  useFaviconStatus(faviconStatus, viewingMissionIsRunning);
+  // Update favicon with mission status dot + a "needs answer" attention badge.
+  useFaviconStatus(faviconStatus, viewingMissionIsRunning, hasPendingUserInput);
 
   useEffect(() => {
-    document.title = formatMissionDocumentTitle(activeMission);
+    document.title = formatMissionDocumentTitle(activeMission, hasPendingUserInput);
     return () => {
       document.title = DEFAULT_DOCUMENT_TITLE;
     };
-  }, [activeMission]);
+  }, [activeMission, hasPendingUserInput]);
 
   // Derive the last resolved model from assistant messages (for the debug dropdown)
   const lastResolvedModel = useMemo(() => {
