@@ -139,29 +139,50 @@ fn missions_slice() -> Option<String> {
     }
 }
 
-/// Memory caps applied to a mission's transient scopes.
+/// Resource caps applied to a mission's transient scopes (memory + CPU).
 ///
 /// Resolution order (per key): workspace `env_vars` override → API process
 /// env. The workspace override is what makes "boost this one workspace"
 /// possible without touching the global env file or restarting anything.
+///
+/// The CPU caps are what keep one mission's runaway build (e.g. a Lean/proof
+/// fan-out spawning dozens of parallel jobs) from saturating every core and
+/// starving the harness's own response streaming. `missions.slice` carries the
+/// *aggregate* CPU guard (a slice-level `CPUWeight`/`CPUQuota` drop-in, lower
+/// than `system.slice` where the API service lives, so missions yield to the
+/// API tier under contention); these per-scope caps are the *per-mission*
+/// guard inside that envelope. Emitting any CPU property also makes systemd
+/// delegate the `cpu` controller into `missions.slice`, without which a
+/// per-scope `CPUQuota` would silently not be enforced.
 #[derive(Debug, Clone, Default)]
-pub struct MissionMemoryCaps {
+pub struct MissionResourceCaps {
     pub max: Option<String>,
     pub high: Option<String>,
     pub swap_max: Option<String>,
+    /// `CPUWeight` (1..=10000, or "idle"). Relative share under contention.
+    pub cpu_weight: Option<String>,
+    /// `CPUQuota` (e.g. "400%" = 4 cores, or "infinity"). Hard per-mission
+    /// ceiling so a single mission can never take the whole host.
+    pub cpu_quota: Option<String>,
 }
 
-impl MissionMemoryCaps {
-    /// `true` when no MemoryMax is configured — scope wrapping is skipped
-    /// entirely (Docker installs without systemd PID 1, dev hosts, …).
+impl MissionResourceCaps {
+    /// `true` when no cap of any kind is configured — scope wrapping is
+    /// skipped entirely (Docker installs without systemd PID 1, dev hosts, …).
     pub fn is_disabled(&self) -> bool {
         self.max.is_none()
+            && self.high.is_none()
+            && self.swap_max.is_none()
+            && self.cpu_weight.is_none()
+            && self.cpu_quota.is_none()
     }
 
     /// `systemd-run` arguments for a transient scope carrying these caps.
-    /// Returns `None` when caps are disabled.
+    /// Returns `None` when no cap is configured.
     pub(crate) fn scope_run_args(&self, unit: &str) -> Option<Vec<String>> {
-        let max = self.max.as_ref()?;
+        if self.is_disabled() {
+            return None;
+        }
         let mut args = vec![
             "--scope".to_string(),
             "--quiet".to_string(),
@@ -171,35 +192,46 @@ impl MissionMemoryCaps {
         if let Some(slice) = missions_slice() {
             args.push(format!("--slice={slice}"));
         }
-        args.push(format!("--property=MemoryMax={max}"));
+        if let Some(max) = &self.max {
+            args.push(format!("--property=MemoryMax={max}"));
+        }
         if let Some(high) = &self.high {
             args.push(format!("--property=MemoryHigh={high}"));
         }
         if let Some(swap) = &self.swap_max {
             args.push(format!("--property=MemorySwapMax={swap}"));
         }
+        if let Some(weight) = &self.cpu_weight {
+            args.push(format!("--property=CPUWeight={weight}"));
+        }
+        if let Some(quota) = &self.cpu_quota {
+            args.push(format!("--property=CPUQuota={quota}"));
+        }
         Some(args)
     }
 }
 
-/// Build [`MissionMemoryCaps`] from an arbitrary env map (workspace env vars,
+/// Build [`MissionResourceCaps`] from an arbitrary env map (workspace env vars,
 /// `NspawnConfig::env`, …) with process-env fallback.
-pub(crate) fn mission_memory_caps_from_env(env: &HashMap<String, String>) -> MissionMemoryCaps {
-    MissionMemoryCaps {
-        max: resolve_memory_var(env, "MISSION_MEMORY_MAX"),
-        high: resolve_memory_var(env, "MISSION_MEMORY_HIGH"),
-        swap_max: resolve_memory_var(env, "MISSION_MEMORY_SWAP_MAX"),
+pub(crate) fn mission_resource_caps_from_env(env: &HashMap<String, String>) -> MissionResourceCaps {
+    MissionResourceCaps {
+        max: resolve_resource_var(env, "MISSION_MEMORY_MAX"),
+        high: resolve_resource_var(env, "MISSION_MEMORY_HIGH"),
+        swap_max: resolve_resource_var(env, "MISSION_MEMORY_SWAP_MAX"),
+        cpu_weight: resolve_resource_var(env, "MISSION_CPU_WEIGHT"),
+        cpu_quota: resolve_resource_var(env, "MISSION_CPU_QUOTA"),
     }
 }
 
-/// Resolve one memory-cap key: workspace env override first, then process env.
-/// An empty workspace value is treated as "no override" and falls back to the
-/// process default — same as removing the key — so clearing a cap via the raw
-/// env editor and via the Resources "Reset to defaults" button behave
+/// Resolve one resource-cap key: workspace env override first, then process
+/// env. An empty workspace value is treated as "no override" and falls back to
+/// the process default — same as removing the key — so clearing a cap via the
+/// raw env editor and via the Resources "Reset to defaults" button behave
 /// identically, and neither silently drops the mission out of its cgroup scope.
 /// To run a single workspace genuinely uncapped, set the value to `"infinity"`
-/// (which still wraps the mission in a discoverable scope).
-fn resolve_memory_var(workspace_env: &HashMap<String, String>, key: &str) -> Option<String> {
+/// (memory) or `"infinity"`/`10000` (CPU), which still wraps the mission in a
+/// discoverable scope.
+fn resolve_resource_var(workspace_env: &HashMap<String, String>, key: &str) -> Option<String> {
     if let Some(v) = workspace_env.get(key) {
         let v = v.trim();
         if !v.is_empty() {
@@ -703,10 +735,10 @@ impl WorkspaceExec {
         machine_name_for_path(&self.workspace.path)
     }
 
-    /// Memory caps for this workspace's mission scopes (workspace env
-    /// override → process env; see [`resolve_memory_var`]).
-    pub fn mission_memory_caps(&self) -> MissionMemoryCaps {
-        mission_memory_caps_from_env(&self.workspace.env_vars)
+    /// Resource caps (memory + CPU) for this workspace's mission scopes
+    /// (workspace env override → process env; see [`resolve_resource_var`]).
+    pub fn mission_resource_caps(&self) -> MissionResourceCaps {
+        mission_resource_caps_from_env(&self.workspace.env_vars)
     }
 
     /// The boot scope unit name for this workspace's container, when one can
@@ -803,7 +835,7 @@ impl WorkspaceExec {
         // nspawn boot, so shipping this binary is a no-op until the env is
         // enabled (Docker installs without systemd PID 1 stay on the direct
         // path).
-        let caps = self.mission_memory_caps();
+        let caps = self.mission_resource_caps();
         let scope_args = caps.scope_run_args(&mission_scope_unit(&name));
         let mut cmd = if let Some(scope_args) = scope_args {
             let mut c = Command::new("systemd-run");
@@ -978,7 +1010,7 @@ impl WorkspaceExec {
         // own capped transient scope when `MISSION_MEMORY_MAX` is set.
         // The unit embeds the machine name so the API layer can find and
         // retune every scope belonging to one workspace at runtime.
-        let caps = self.mission_memory_caps();
+        let caps = self.mission_resource_caps();
         let exec_unit = format!(
             "sandboxed-exec-{}-{}",
             self.machine_name().unwrap_or_else(|| "unknown".to_string()),
@@ -1456,7 +1488,7 @@ impl WorkspaceExec {
         // on 2026-06-07 despite boot-path caps being deployed. systemd-run
         // --scope keeps the payload as its own foreground child, so PTY
         // semantics and group-kill teardown are preserved.
-        let caps = self.mission_memory_caps();
+        let caps = self.mission_resource_caps();
         let exec_unit = format!(
             "sandboxed-exec-{}-{}",
             self.machine_name().unwrap_or_else(|| "unknown".to_string()),
