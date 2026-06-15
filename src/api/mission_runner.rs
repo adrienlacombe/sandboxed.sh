@@ -5901,6 +5901,21 @@ fn format_exit_status(status: &std::process::ExitStatus) -> String {
     "code <unknown>".to_string()
 }
 
+fn curl_dependency_error(output: &str) -> Option<&'static str> {
+    let lower = output.to_lowercase();
+    if lower.contains("curl: not found")
+        || lower.contains("curl: command not found")
+        || lower.contains("curl: error while loading shared libraries")
+        || lower.contains("error while loading shared libraries: libcurl")
+    {
+        return Some(
+            "curl is missing or not executable in the workspace. \
+             Rebuild the workspace or install curl and ca-certificates in the workspace template.",
+        );
+    }
+    None
+}
+
 /// Check basic internet connectivity using a reliable public endpoint.
 /// This verifies the workspace has any network access at all.
 async fn check_basic_internet_connectivity(
@@ -5950,7 +5965,9 @@ async fn check_basic_internet_connectivity(
         let stderr = String::from_utf8_lossy(&output.stderr);
         let combined = format!("{}{}", stdout, stderr);
 
-        let err = if combined.contains("Network is unreachable") {
+        let err = if let Some(message) = curl_dependency_error(&combined) {
+            format!("Workspace dependency check failed: {}", message)
+        } else if combined.contains("Network is unreachable") {
             "No internet connectivity: Network is unreachable. \
              The workspace has no network access."
                 .to_string()
@@ -6106,6 +6123,13 @@ async fn check_api_reachability(
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     let combined = format!("{}{}", stdout, stderr);
+
+    if let Some(message) = curl_dependency_error(&combined) {
+        return Err(format!(
+            "Cannot connect to {} API: Workspace dependency check failed: {}",
+            api_name, message
+        ));
+    }
 
     // Check for common error patterns
     if combined.contains("Could not resolve host") {
@@ -8031,18 +8055,18 @@ mod tests {
         codex_final_message_looks_like_progress_update, codex_is_goal_request,
         codex_key_fingerprint, codex_missing_goal_final_response_message,
         codex_tool_stall_should_retry_with_default_model, codex_turn_requires_tool_activity,
-        custom_opencode_provider_definition, ensure_opencode_provider_for_model,
-        extract_codex_reset_window, extract_model_from_message, extract_opencode_session_id,
-        extract_part_text, extract_str, extract_think_content, is_capacity_limited_error,
-        is_codex_chatgpt_account_model_blocked, is_codex_node_wrapper, is_opencode_session_id,
-        is_provider_payload_error, is_rate_limited_error, is_session_corruption_error,
-        is_success_path_auth_error, is_success_path_provider_payload_error,
-        is_success_path_rate_limited_error, is_tool_call_only_output,
-        opencode_goal_terminal_status, opencode_idle_timeout_result_message,
-        opencode_output_needs_fallback, opencode_session_exists_in_data_home,
-        opencode_session_token_from_line, parse_opencode_goal_objective,
-        parse_opencode_session_token, parse_opencode_sse_event, parse_opencode_stderr_text_part,
-        preferred_model_for_cost, record_codex_error_message,
+        curl_dependency_error, custom_opencode_provider_definition,
+        ensure_opencode_provider_for_model, extract_codex_reset_window, extract_model_from_message,
+        extract_opencode_session_id, extract_part_text, extract_str, extract_think_content,
+        is_capacity_limited_error, is_codex_chatgpt_account_model_blocked, is_codex_node_wrapper,
+        is_opencode_session_id, is_provider_payload_error, is_rate_limited_error,
+        is_session_corruption_error, is_success_path_auth_error,
+        is_success_path_provider_payload_error, is_success_path_rate_limited_error,
+        is_tool_call_only_output, opencode_goal_terminal_status,
+        opencode_idle_timeout_result_message, opencode_output_needs_fallback,
+        opencode_session_exists_in_data_home, opencode_session_token_from_line,
+        parse_opencode_goal_objective, parse_opencode_session_token, parse_opencode_sse_event,
+        parse_opencode_stderr_text_part, preferred_model_for_cost, record_codex_error_message,
         replace_filepath_artifact_with_tool_output, running_health, sanitized_opencode_stdout,
         set_codex_account_cooldown, stall_severity, strip_ansi_codes, strip_opencode_banner_lines,
         strip_think_tags, summarize_codex_usage_caps, summarize_recent_opencode_stderr,
@@ -8066,6 +8090,28 @@ mod tests {
     use std::fs;
     use std::time::Duration;
     use uuid::Uuid;
+
+    #[test]
+    fn curl_dependency_error_detects_missing_curl() {
+        assert!(curl_dependency_error("/bin/sh: 1: curl: not found").is_some());
+        assert!(curl_dependency_error("curl: command not found").is_some());
+    }
+
+    #[test]
+    fn curl_dependency_error_detects_broken_shared_library() {
+        assert!(
+            curl_dependency_error(
+                "curl: error while loading shared libraries: libcurl.so.4: cannot open shared object file"
+            )
+            .is_some()
+        );
+    }
+
+    #[test]
+    fn curl_dependency_error_ignores_network_failures() {
+        assert!(curl_dependency_error("curl: (7) Failed to connect to 1.1.1.1").is_none());
+        assert!(curl_dependency_error("Network is unreachable").is_none());
+    }
 
     #[test]
     fn extract_codex_reset_window_pulls_the_reset_time() {

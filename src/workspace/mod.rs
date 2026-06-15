@@ -2549,14 +2549,14 @@ async fn sync_workspace_mcp_binaries(
     working_dir: &Path,
     container_root: &Path,
 ) -> anyhow::Result<()> {
-    // Copy runtime binaries into the container so per-workspace harnesses can
-    // start even when the image lacks the host's developer tooling.
+    // Copy project/runtime binaries into the container so per-workspace
+    // harnesses can start even when the image lacks the host's developer
+    // tooling. Do not copy distro-managed tools such as curl/wget/npm wrappers
+    // from the host: they are often dynamically linked against libraries that
+    // do not exist inside a debootstrap minbase rootfs. The harness bootstrap
+    // installs those from the container distro instead.
     for binary in [
         "opencode",
-        "curl",
-        "wget",
-        "bunx",
-        "npx",
         "workspace-mcp",
         "desktop-mcp",
         "orchestrator-mcp",
@@ -2854,7 +2854,18 @@ export PATH="/root/.bun/bin:/root/.cache/.bun/bin:$PATH"
 #     Without these the rest of this script no-ops (no bun, no npm, no curl)
 #     and the workspace ends up unusable for missions.
 export DEBIAN_FRONTEND=noninteractive
-if ! command -v curl >/dev/null 2>&1; then
+for tool in curl wget; do
+  if command -v "$tool" >/dev/null 2>&1 && ! "$tool" --version >/dev/null 2>&1; then
+    tool_path="$(command -v "$tool" || true)"
+    case "$tool_path" in
+      /usr/local/bin/*)
+        echo "[sandboxed] removing non-functional copied $tool at $tool_path"
+        rm -f "$tool_path" || true
+        ;;
+    esac
+  fi
+done
+if ! command -v curl >/dev/null 2>&1 || ! curl --version >/dev/null 2>&1; then
   echo "[sandboxed] baseline rootfs prereqs: installing curl/ca-certs/gnupg/git/jq/python3/build-essential"
   apt-get update -qq || true
   apt-get install -y -qq --no-install-recommends curl ca-certificates gnupg git jq python3 wget build-essential || true
