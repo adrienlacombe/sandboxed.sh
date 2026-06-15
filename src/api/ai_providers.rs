@@ -6446,31 +6446,29 @@ async fn get_provider_usage(
                 // months-stale access_token and surface as HTTP 401.
                 if oauth_token_expired(o.expires_at) {
                     let (token, refresh_err) = if let Some(uuid) = provider_uuid {
-                        match exchange_anthropic_refresh_token(&o.refresh_token).await {
-                            Ok(fresh) => {
-                                let access = fresh.access_token.clone();
-                                if state
-                                    .ai_providers
-                                    .set_oauth_credentials(uuid, fresh)
-                                    .await
-                                    .is_none()
-                                {
-                                    tracing::warn!(
-                                        provider_id = %uuid,
-                                        "Provider disappeared while persisting refreshed OAuth credentials"
-                                    );
-                                }
-                                (access, None)
-                            }
+                        // Route through the single locked, all-tiers refresh path so
+                        // this on-demand probe can't rotate the (rotating) Anthropic
+                        // refresh token out from under the proactive refresher or the
+                        // shared credential tiers and leave them with invalid_grant.
+                        match refresh_store_account_oauth_locked(
+                            &state.ai_providers,
+                            uuid,
+                            ProviderType::Anthropic,
+                            &o.refresh_token,
+                        )
+                        .await
+                        {
+                            Ok((access, _refresh, _expires_at)) => (access, None),
                             Err(e) => {
-                                let lower = e.to_lowercase();
+                                let msg = e.to_string();
+                                let lower = msg.to_lowercase();
                                 let is_permanent = lower.contains("invalid_grant")
                                     || lower.contains("refresh token not found");
                                 if is_permanent {
                                     tracing::debug!(
                                         provider_id = %uuid,
                                         "Per-provider Anthropic OAuth refresh failed (permanent, re-auth needed): {}",
-                                        e
+                                        msg
                                     );
                                 } else if should_warn_oauth(&format!(
                                     "anthropic-oauth-refresh:{}",
@@ -6479,16 +6477,16 @@ async fn get_provider_usage(
                                     tracing::warn!(
                                         provider_id = %uuid,
                                         "Per-provider Anthropic OAuth refresh failed: {}",
-                                        e
+                                        msg
                                     );
                                 } else {
                                     tracing::debug!(
                                         provider_id = %uuid,
                                         "Per-provider Anthropic OAuth refresh failed (suppressed): {}",
-                                        e
+                                        msg
                                     );
                                 }
-                                (o.access_token.clone(), Some(e))
+                                (o.access_token.clone(), Some(msg))
                             }
                         }
                     } else {
@@ -9776,20 +9774,15 @@ pub async fn refresh_due_store_oauth(
         if oauth.expires_at - now_ms > refresh_threshold_ms {
             continue;
         }
-        // Serialize with the file-based refresher to avoid racing a rotating
-        // refresh token (best-effort — proceed unlocked if contended).
-        let _lock = acquire_oauth_refresh_lock(provider_type).ok();
-        match refresh_oauth_token_internal(&provider_type, &oauth.refresh_token).await {
-            Ok((access, refresh, expires_at)) => {
-                let mut updated = account.clone();
-                updated.oauth = Some(crate::ai_providers::OAuthCredentials {
-                    access_token: access.clone(),
-                    refresh_token: refresh.clone(),
-                    expires_at,
-                });
-                ai_providers.update(account.id, updated).await;
-                // Keep the credential tiers consistent too (best-effort).
-                let _ = sync_oauth_to_all_tiers(provider_type, &refresh, &access, expires_at);
+        match refresh_store_account_oauth_locked(
+            ai_providers,
+            account.id,
+            provider_type,
+            &oauth.refresh_token,
+        )
+        .await
+        {
+            Ok((_access, _refresh, expires_at)) => {
                 refreshed += 1;
                 tracing::info!(
                     provider = ?provider_type,
@@ -9802,11 +9795,88 @@ pub async fn refresh_due_store_oauth(
                 tracing::warn!(
                     provider = ?provider_type,
                     account_id = %account.id,
-                    error = ?e,
+                    error = %e,
                     "Failed to refresh store-backed OAuth token (account may need reconnect)"
                 );
             }
         }
     }
     (found, refreshed)
+}
+
+/// Refresh a single **store-backed** OAuth account under the global per-type
+/// refresh lock, writing the rotated token back to the AIProviderStore record
+/// and — only when this account currently owns the shared credential tiers —
+/// to the credential tiers (`credentials.json` / OpenCode `auth.json` / Claude
+/// CLI creds).
+///
+/// This is the single writer for store-account OAuth rotation. Providers like
+/// Anthropic rotate **and revoke** the refresh token on every refresh, so every
+/// stored copy of the token must move together. Ad-hoc callers (e.g. the usage
+/// probe) MUST go through here rather than rotating the token in isolation —
+/// otherwise the other stores hit `invalid_grant` on their next refresh.
+///
+/// The credential tiers are a singleton per provider type, but the store can
+/// hold several accounts of the same type (e.g. multiple Anthropic logins). We
+/// therefore mirror to the tiers only when the account's current refresh token
+/// matches the tier token — i.e. this account is the one the harnesses/tiers
+/// are actually using — so refreshing a secondary account never clobbers the
+/// primary account's tier credentials.
+pub async fn refresh_store_account_oauth_locked(
+    ai_providers: &crate::ai_providers::AIProviderStore,
+    account_id: uuid::Uuid,
+    provider_type: ProviderType,
+    fallback_refresh_token: &str,
+) -> Result<(String, String, i64), OAuthRefreshError> {
+    // Serialize with every other refresh path for this provider type so a
+    // rotating refresh token is only ever consumed once.
+    let _lock = acquire_oauth_refresh_lock(provider_type).ok();
+
+    // Re-read the freshest refresh token now that we hold the lock — another
+    // path may have rotated it while we were waiting.
+    let refresh_token = ai_providers
+        .get(account_id)
+        .await
+        .and_then(|p| p.oauth)
+        .map(|o| o.refresh_token)
+        .filter(|t| !t.trim().is_empty())
+        .unwrap_or_else(|| fallback_refresh_token.to_string());
+
+    // Does this account currently back the shared credential tiers? If there is
+    // no tier entry yet (e.g. a freshly connected single account), treat it as
+    // the owner so the tiers get populated.
+    let owns_tiers = read_oauth_token_entry(provider_type)
+        .map(|e| e.refresh_token)
+        .map_or(true, |tier_token| tier_token == refresh_token);
+
+    let (access, refresh, expires_at) =
+        refresh_oauth_token_internal(&provider_type, &refresh_token).await?;
+
+    // Always update this account's own store record.
+    if ai_providers
+        .set_oauth_credentials(
+            account_id,
+            crate::ai_providers::OAuthCredentials {
+                access_token: access.clone(),
+                refresh_token: refresh.clone(),
+                expires_at,
+            },
+        )
+        .await
+        .is_none()
+    {
+        tracing::warn!(
+            provider = ?provider_type,
+            account_id = %account_id,
+            "Provider disappeared while persisting refreshed OAuth credentials"
+        );
+    }
+
+    // Only mirror to the shared tiers when this account owns them, so a
+    // secondary login never overwrites the primary's tier credentials.
+    if owns_tiers {
+        let _ = sync_oauth_to_all_tiers(provider_type, &refresh, &access, expires_at);
+    }
+
+    Ok((access, refresh, expires_at))
 }

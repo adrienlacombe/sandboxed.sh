@@ -2742,7 +2742,30 @@ async fn oauth_token_refresher_loop(
         }
     }
 
+    // Store-backed account types refreshed proactively (their tokens live in
+    // the AIProviderStore, possibly with several accounts per type).
+    let store_oauth_types = [ProviderType::Anthropic, ProviderType::Xai];
+
     loop {
+        // Refresh store-backed OAuth accounts FIRST. For any account that also
+        // owns the shared credential tiers, this rotates the token AND writes it
+        // to the tiers before the file-tier pass runs below — otherwise that
+        // pass would refresh the tier copy independently and revoke the store
+        // record's refresh token (the Anthropic split-brain that produced
+        // recurring invalid_grant). xAI lives only in the store.
+        let mut store_found = 0u32;
+        let mut store_refreshed = 0u32;
+        for &store_type in &store_oauth_types {
+            let (f, r) = ai_providers_api::refresh_due_store_oauth(
+                &ai_providers,
+                store_type,
+                refresh_threshold_ms,
+            )
+            .await;
+            store_found += f;
+            store_refreshed += r;
+        }
+
         // Check credential files directly for each OAuth-capable provider type.
         // This ensures we find tokens even if they aren't in the AIProviderStore.
         let mut found_count = 0u32;
@@ -2822,17 +2845,6 @@ async fn oauth_token_refresher_loop(
                 },
             }
         }
-
-        // Also refresh store-backed OAuth accounts whose tokens live only in
-        // the AIProviderStore (not auth.json/credentials.json) — notably
-        // xAI/Grok connected via the dashboard. Without this their short-lived
-        // access token expires and model-routing silently drops the provider.
-        let (store_found, store_refreshed) = ai_providers_api::refresh_due_store_oauth(
-            &ai_providers,
-            ProviderType::Xai,
-            refresh_threshold_ms,
-        )
-        .await;
 
         tracing::debug!(
             oauth_tokens_found = found_count,
