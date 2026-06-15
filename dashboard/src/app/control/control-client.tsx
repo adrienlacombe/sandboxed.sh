@@ -71,6 +71,7 @@ import { getRuntimeApiBase } from "@/lib/settings";
 import { authHeader } from "@/lib/auth";
 import { stripRichFileTagsByName } from "@/lib/rich-tags";
 import { readCachedEvents, writeCachedEvents } from "@/lib/event-cache";
+import { createClientMessageId } from "@/lib/client-message-id";
 import {
   cancelControl,
   postControlMessage,
@@ -8023,7 +8024,7 @@ export default function ControlClient() {
       submittingRef.current = true;
 
       const targetMissionId = viewingMissionIdRef.current;
-      const tempId = crypto.randomUUID();
+      const tempId = createClientMessageId();
       const timestamp = Date.now();
       const hasExistingUserMessages = items.some(
         (item) => item.kind === "user",
