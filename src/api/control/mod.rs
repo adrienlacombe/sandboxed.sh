@@ -2453,13 +2453,30 @@ pub struct ControlMessageResponse {
 }
 
 /// A message waiting in the queue
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueuedMessage {
     pub id: Uuid,
     pub content: String,
     pub agent: Option<String>,
     /// Which mission this queued message belongs to
     pub mission_id: Option<Uuid>,
+}
+
+/// Serialize the control session queue to a stable JSON snapshot for
+/// persistence across restarts (see `MissionStore::save_control_queue`).
+fn serialize_queue_snapshot(
+    queue: &VecDeque<(Uuid, String, Option<String>, Option<Uuid>)>,
+) -> String {
+    let items: Vec<QueuedMessage> = queue
+        .iter()
+        .map(|(id, content, agent, target_mid)| QueuedMessage {
+            id: *id,
+            content: content.clone(),
+            agent: agent.clone(),
+            mission_id: *target_mid,
+        })
+        .collect();
+    serde_json::to_string(&items).unwrap_or_else(|_| "[]".to_string())
 }
 
 /// Tool result posted by the frontend for an interactive tool call.
@@ -8452,6 +8469,30 @@ async fn control_actor_loop(
     // Queue stores (id, content, agent, target_mission_id) for the current/primary mission
     // The target_mission_id tracks which mission each queued message is intended for
     let mut queue: VecDeque<(Uuid, String, Option<String>, Option<Uuid>)> = VecDeque::new();
+    // Restore any messages that were queued before the last restart. The queue
+    // is persisted as a JSON snapshot (see `persist_queue` at the loop top) so
+    // pending messages aren't lost when sandboxed.sh restarts.
+    if let Ok(payload) = mission_store.load_control_queue(&session_user_id).await {
+        if !payload.trim().is_empty() {
+            match serde_json::from_str::<Vec<QueuedMessage>>(&payload) {
+                Ok(items) => {
+                    for it in items {
+                        queue.push_back((it.id, it.content, it.agent, it.mission_id));
+                    }
+                    if !queue.is_empty() {
+                        tracing::info!(
+                            "Restored {} queued message(s) from the previous session",
+                            queue.len()
+                        );
+                    }
+                }
+                Err(e) => tracing::warn!("Failed to parse persisted control queue: {e}"),
+            }
+        }
+    }
+    // Snapshot of the queue as last written to the store; used to debounce
+    // persistence so we only write to the DB when the queue actually changes.
+    let mut last_persisted_queue: String = serialize_queue_snapshot(&queue);
     let mut history: Vec<(String, String)> = Vec::new(); // (role, content) pairs (user/assistant)
     let mut running: Option<tokio::task::JoinHandle<(Uuid, String, crate::agents::AgentResult)>> =
         None;
@@ -8672,6 +8713,23 @@ async fn control_actor_loop(
     }
 
     loop {
+        // Persist the pending queue whenever it changes so a restart doesn't
+        // lose queued messages. Debounced by snapshot comparison — the DB is
+        // written only when the queue actually changed (no per-iteration churn
+        // during streaming, where the queue is usually unchanged).
+        {
+            let snapshot = serialize_queue_snapshot(&queue);
+            if snapshot != last_persisted_queue {
+                if let Err(e) = mission_store
+                    .save_control_queue(&session_user_id, &snapshot)
+                    .await
+                {
+                    tracing::warn!("Failed to persist control queue: {e}");
+                } else {
+                    last_persisted_queue = snapshot;
+                }
+            }
+        }
         tokio::select! {
             cmd = cmd_rx.recv() => {
                 let Some(cmd) = cmd else { break };
