@@ -520,6 +520,28 @@ impl WorkspaceExec {
                 .entry("SANDBOXED_SH_CONTAINER_FALLBACK".to_string())
                 .or_insert_with(|| "1".to_string());
         }
+
+        // Make GitHub auth survive per-mission HOME divergence. The credential
+        // injection writes ~/.git-credentials, ~/.gitconfig, and
+        // ~/.config/gh/hosts.yml to the workspace home — but some backends
+        // (claudecode) launch the agent with HOME/XDG_CONFIG_HOME pointed at a
+        // per-mission dir. Export non-secret pointers to those files so both
+        // `gh` and `git` can still find them.
+        let git_creds = self.workspace.resolved_git_credentials.clone().or_else(|| {
+            crate::workspace::git_credentials::GitCredentialConfig::resolve(
+                &self.workspace.path,
+                None,
+            )
+        });
+        if let Some(creds) = git_creds {
+            creds.apply_to_env(
+                &mut merged,
+                &self.workspace.path,
+                self.workspace.workspace_type,
+                &self.workspace.env_vars,
+            );
+        }
+
         merged
     }
 

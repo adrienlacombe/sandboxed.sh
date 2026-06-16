@@ -3300,7 +3300,7 @@ async fn run_mission_turn(
     convo.push('\n');
 
     // Ensure mission workspace exists and is configured for OpenCode.
-    let workspace = workspace::resolve_workspace(&workspaces, &config, workspace_id).await;
+    let mut workspace = workspace::resolve_workspace(&workspaces, &config, workspace_id).await;
     if let Err(e) =
         workspace::sync_workspace_mcp_binaries_for_workspace(&config.working_dir, &workspace).await
     {
@@ -3315,7 +3315,7 @@ async fn run_mission_turn(
         let lib_guard = library.read().await;
         let lib_ref = lib_guard.as_ref().map(|l| l.as_ref());
         workspace::prepare_mission_workspace_with_skills_backend(
-            &workspace,
+            &mut workspace,
             &mcp,
             lib_ref,
             mission_id,
@@ -3323,6 +3323,7 @@ async fn run_mission_turn(
             None, // custom_providers: TODO integrate with provider store
             effective_config_profile.as_deref(),
             boss_user_id.as_deref(),
+            Some(&config.working_dir),
         )
         .await
     };

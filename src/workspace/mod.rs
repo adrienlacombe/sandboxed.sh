@@ -15,6 +15,8 @@ use std::sync::Arc;
 
 // Per-backend config generation (Phase 4 of the decomposition).
 pub mod config;
+// GitHub git-credential injection so workspace agents can commit/push.
+pub mod git_credentials;
 pub(crate) use config::write_opencode_config;
 pub use config::*;
 #[allow(unused_imports)]
@@ -82,6 +84,35 @@ pub fn use_nspawn_for_workspace(workspace: &Workspace) -> bool {
         return false;
     }
     nspawn::nspawn_available()
+}
+
+/// True when `workspace_env` marks container fallback (Docker/macOS without nspawn).
+pub fn container_fallback_from_env(workspace_env: &HashMap<String, String>) -> bool {
+    workspace_env
+        .get("SANDBOXED_SH_CONTAINER_FALLBACK")
+        .map(|v| {
+            matches!(
+                v.trim().to_lowercase().as_str(),
+                "1" | "true" | "yes" | "y" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+/// Home directory root for credential/config writes inside a workspace.
+///
+/// Container under nspawn → `<workspace_root>/root`; otherwise host `$HOME`.
+/// Subpaths (`.claude`, `.codex`, etc.) are appended by callers.
+pub fn resolve_workspace_home_root(
+    workspace_root: &Path,
+    workspace_type: WorkspaceType,
+    workspace_env: &HashMap<String, String>,
+) -> PathBuf {
+    if workspace_type == WorkspaceType::Container && !container_fallback_from_env(workspace_env) {
+        workspace_root.join("root")
+    } else {
+        PathBuf::from(home_dir())
+    }
 }
 
 /// Status of a workspace.
@@ -198,6 +229,10 @@ pub struct Workspace {
     /// Defaults to "default" if not specified.
     #[serde(default)]
     pub config_profile: Option<String>,
+    /// GitHub credentials resolved at mission prep; reused by [`WorkspaceExec`]
+    /// so env injection does not re-read the connection file.
+    #[serde(skip, default)]
+    pub resolved_git_credentials: Option<git_credentials::GitCredentialConfig>,
 }
 
 impl Workspace {
@@ -253,6 +288,7 @@ impl Workspace {
             mcps: Vec::new(),
             mcps_replace_defaults: true,
             config_profile: None,
+            resolved_git_credentials: None,
         }
     }
 
@@ -279,6 +315,7 @@ impl Workspace {
             tailscale_mode: None,
             mcps: Vec::new(),
             mcps_replace_defaults: true,
+            resolved_git_credentials: None,
         }
     }
 }
@@ -471,6 +508,7 @@ impl WorkspaceStore {
                     mcps: Vec::new(),
                     mcps_replace_defaults: true,
                     config_profile: None,
+                    resolved_git_credentials: None,
                 };
 
                 orphaned.push(workspace);
@@ -770,15 +808,7 @@ fn opencode_entry_from_mcp(
                 }
             }
 
-            let container_fallback = workspace_env
-                .get("SANDBOXED_SH_CONTAINER_FALLBACK")
-                .map(|v| {
-                    matches!(
-                        v.trim().to_lowercase().as_str(),
-                        "1" | "true" | "yes" | "y" | "on"
-                    )
-                })
-                .unwrap_or(false)
+            let container_fallback = container_fallback_from_env(workspace_env)
                 || (workspace_type == WorkspaceType::Container && !nspawn::nspawn_available());
             let per_workspace_runner = env_var_bool("SANDBOXED_SH_PER_WORKSPACE_RUNNER", true);
             if container_fallback {
@@ -1824,13 +1854,13 @@ pub async fn prepare_mission_workspace_in(
 /// Prepare a workspace directory for a mission with skill and tool syncing.
 /// This version syncs skills and tools from the workspace to the mission directory.
 pub async fn prepare_mission_workspace_with_skills(
-    workspace: &Workspace,
+    workspace: &mut Workspace,
     mcp: &McpRegistry,
     library: Option<&LibraryStore>,
     mission_id: Uuid,
 ) -> anyhow::Result<PathBuf> {
     prepare_mission_workspace_with_skills_backend(
-        workspace, mcp, library, mission_id, "opencode", None, None, None,
+        workspace, mcp, library, mission_id, "opencode", None, None, None, None,
     )
     .await
 }
@@ -1883,7 +1913,7 @@ fn read_custom_providers_from_file(workspace_root: &Path) -> Vec<AIProvider> {
 /// MCP's own implicit `orchestrator-mcp` store.
 #[allow(clippy::too_many_arguments)]
 pub async fn prepare_mission_workspace_with_skills_backend(
-    workspace: &Workspace,
+    workspace: &mut Workspace,
     mcp: &McpRegistry,
     library: Option<&LibraryStore>,
     mission_id: Uuid,
@@ -1891,6 +1921,7 @@ pub async fn prepare_mission_workspace_with_skills_backend(
     custom_providers: Option<&[AIProvider]>,
     config_profile: Option<&str>,
     boss_user_id: Option<&str>,
+    app_working_dir: Option<&Path>,
 ) -> anyhow::Result<PathBuf> {
     // Mission workspace directory lives under the selected workspace root.
     // This keeps filesystem and config effects scoped to the mission.
@@ -2107,6 +2138,16 @@ pub async fn prepare_mission_workspace_with_skills_backend(
         codex_profile_base.as_deref(),
     )
     .await?;
+
+    // Inject GitHub git credentials so agents can commit/push without any
+    // per-mission setup. Opt-in: only runs when a GitHub account is connected
+    // via the dashboard, or a token is set in the backend env. Non-fatal — a
+    // credential write must never break the mission.
+    git_credentials::GitCredentialConfig::inject_for_mission(
+        workspace,
+        mission_id,
+        app_working_dir,
+    );
 
     // Sync native opencode agents from profile into the workspace path read by
     // vanilla `opencode`.
@@ -2874,6 +2915,21 @@ if ! command -v node >/dev/null 2>&1 && ! command -v bun >/dev/null 2>&1; then
   echo "[sandboxed] baseline rootfs prereqs: installing Node.js 22 (NodeSource)"
   curl -fsSL https://deb.nodesource.com/setup_22.x | bash - >/dev/null 2>&1 || true
   apt-get install -y -qq --no-install-recommends nodejs || true
+fi
+
+# GitHub CLI (`gh`) — not in the base Ubuntu repos, so add GitHub's apt repo.
+# Needed so agents can use `gh` (PRs/issues/releases); it picks up the injected
+# credentials from ~/.config/gh/hosts.yml (see workspace::git_credentials).
+if ! command -v gh >/dev/null 2>&1; then
+  echo "[sandboxed] installing GitHub CLI (gh)"
+  install -d -m 0755 /etc/apt/keyrings || true
+  curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+    -o /etc/apt/keyrings/githubcli-archive-keyring.gpg 2>/dev/null || true
+  chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg 2>/dev/null || true
+  echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+    > /etc/apt/sources.list.d/github-cli.list || true
+  apt-get update -qq || true
+  apt-get install -y -qq --no-install-recommends gh || true
 fi
 
 # Ensure bun is in PATH first (it's our preferred package manager)

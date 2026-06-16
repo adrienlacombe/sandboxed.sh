@@ -15,6 +15,7 @@ export * from "./api/core";
 export * from "./api/missions";
 export * from "./api/workspaces";
 export * from "./api/providers";
+export * from "./api/github";
 export * from "./api/automations";
 export * from "./api/telegram";
 export * from "./api/assistant";

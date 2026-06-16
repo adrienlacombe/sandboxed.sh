@@ -534,7 +534,7 @@ impl AssistantMcp {
             },
             ToolDefinition {
                 name: "workspace_bash".to_string(),
-                description: "Run a bash command inside a sandboxed.sh workspace with the workspace's configured environment variables (GH_TOKEN, SSH keys, ...) — the same context missions run in. Prefer this over local bash for git/gh operations and anything needing workspace secrets.".to_string(),
+                description: "Run a bash command inside a sandboxed.sh workspace — the same context missions run in, with the workspace's configured environment variables and (when a GitHub account is connected in the dashboard) GitHub git credentials wired in for `git push`. Prefer this over local bash for git operations and anything needing workspace secrets.".to_string(),
                 input_schema: json!({
                     "type": "object",
                     "required": ["command"],
