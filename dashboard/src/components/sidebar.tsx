@@ -18,6 +18,7 @@ import {
   Cpu,
   GearSix,
   GitBranch,
+  GithubLogo,
   Key,
   Layout,
   Lightning,
@@ -77,6 +78,7 @@ const navigation: NavItem[] = [
     children: [
       { name: 'Backends', href: '/settings/backends', icon: Cpu },
       { name: 'Providers', href: '/settings/providers', icon: Key },
+      { name: 'GitHub', href: '/settings/github', icon: GithubLogo },
       { name: 'LLM', href: '/settings/llm', icon: Sparkle },
       { name: 'Security', href: '/settings/secrets', icon: Lock },
       { name: 'Data', href: '/settings/data', icon: Archive },

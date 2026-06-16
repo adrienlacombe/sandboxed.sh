@@ -11732,7 +11732,7 @@ async fn run_single_control_turn(
     }
     // Ensure a workspace directory for this mission (if applicable).
     let (working_dir_path, runtime_workspace) = if let Some(mid) = mission_id {
-        let ws = workspace::resolve_workspace(&workspaces, &config, workspace_id).await;
+        let mut ws = workspace::resolve_workspace(&workspaces, &config, workspace_id).await;
         if let Err(e) =
             workspace::sync_workspace_mcp_binaries_for_workspace(&config.working_dir, &ws).await
         {
@@ -11746,7 +11746,7 @@ async fn run_single_control_turn(
         let lib_guard = library.read().await;
         let lib_ref = lib_guard.as_ref().map(|l| l.as_ref());
         let dir = match Box::pin(workspace::prepare_mission_workspace_with_skills_backend(
-            &ws,
+            &mut ws,
             &mcp,
             lib_ref,
             mid,
@@ -11754,6 +11754,7 @@ async fn run_single_control_turn(
             None, // custom_providers: TODO integrate with provider store
             effective_config_profile.as_deref(),
             boss_user_id.as_deref(),
+            Some(&config.working_dir),
         ))
         .await
         {

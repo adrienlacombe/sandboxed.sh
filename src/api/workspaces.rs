@@ -510,6 +510,7 @@ async fn create_workspace(
             mcps: mcps.clone(),
             mcps_replace_defaults,
             config_profile: config_profile.clone(),
+            resolved_git_credentials: None,
         },
         WorkspaceType::Container => {
             let mut ws = Workspace::new_container(req.name, path);

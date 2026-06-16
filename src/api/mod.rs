@@ -32,6 +32,7 @@ pub mod durable_jobs;
 pub mod fido;
 mod fs;
 mod github_auth;
+pub mod github_integration;
 pub(crate) mod grok_goal;
 pub mod library;
 pub mod mcp;

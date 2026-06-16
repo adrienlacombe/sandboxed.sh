@@ -41,7 +41,7 @@ use crate::backend::registry::BackendRegistry;
 use crate::backend_config::BackendConfigEntry;
 use crate::config::{AuthMode, Config};
 use crate::mcp::McpRegistry;
-use crate::util::AI_PROVIDERS_PATH;
+use crate::util::{AI_PROVIDERS_PATH, GITHUB_CONNECTION_PATH};
 use crate::workspace;
 
 /// Check whether a CLI binary is available on `$PATH`.
@@ -107,6 +107,13 @@ pub struct AppState {
         Arc<RwLock<HashMap<crate::ai_providers::ProviderType, crate::ai_providers::PendingOAuth>>>,
     /// Pending GitHub OAuth login state, keyed by random nonce.
     pub pending_github_oauth: Arc<RwLock<HashMap<String, super::github_auth::PendingGithubOAuth>>>,
+    /// Connected GitHub account (for git push), set via the dashboard
+    /// "Connect GitHub" flow and injected into mission workspaces.
+    pub github_connection: Arc<crate::github_connection::GithubConnectionStore>,
+    /// Pending "Connect GitHub" integration authorizations, keyed by random
+    /// nonce. Distinct from `pending_github_oauth` (dashboard login).
+    pub pending_github_integration:
+        Arc<RwLock<HashMap<String, super::github_integration::PendingGithubIntegration>>>,
     /// Secrets store for encrypted credentials
     pub secrets: Option<Arc<crate::secrets::SecretsStore>>,
     /// Console session pool for WebSocket reconnection
@@ -190,6 +197,13 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
     );
     let pending_oauth = Arc::new(RwLock::new(HashMap::new()));
     let pending_github_oauth = Arc::new(RwLock::new(HashMap::new()));
+    let github_connection = Arc::new(
+        crate::github_connection::GithubConnectionStore::new(
+            config.working_dir.join(GITHUB_CONNECTION_PATH),
+        )
+        .await,
+    );
+    let pending_github_integration = Arc::new(RwLock::new(HashMap::new()));
 
     // Initialize provider health tracker and model chain store
     let health_tracker = Arc::new(crate::provider_health::ProviderHealthTracker::new());
@@ -475,6 +489,8 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         ai_providers,
         pending_oauth,
         pending_github_oauth,
+        github_connection,
+        pending_github_integration,
         secrets,
         console_pool,
         settings,
@@ -1065,6 +1081,21 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         )
         // AI Provider endpoints
         .nest("/api/ai/providers", ai_providers_api::routes())
+        // "Connect GitHub" integration (the GitHub callback above is public;
+        // these require auth). Registered explicitly rather than nested to keep
+        // the base-path DELETE unambiguous (no trailing-slash gotcha).
+        .route(
+            "/api/integrations/github/authorize",
+            post(super::github_integration::authorize),
+        )
+        .route(
+            "/api/integrations/github/status",
+            get(super::github_integration::status),
+        )
+        .route(
+            "/api/integrations/github",
+            axum::routing::delete(super::github_integration::disconnect),
+        )
         // Model routing (chains + health)
         .nest("/api/model-routing", model_routing_api::routes())
         // Proxy API key management

@@ -345,6 +345,21 @@ impl AuthConfig {
             && self.jwt_secret.as_deref().is_some_and(|s| !s.is_empty())
     }
 
+    /// Whether the GitHub OAuth *App* credentials are present. Unlike
+    /// [`Self::github_enabled`] this does not require the login allowlist or a
+    /// JWT secret — it gates the "Connect GitHub" integration flow, which only
+    /// needs the OAuth App to mint a git-push token. Reuses the same
+    /// `GITHUB_OAUTH_CLIENT_ID` / `GITHUB_OAUTH_CLIENT_SECRET`.
+    pub fn github_oauth_app_configured(&self) -> bool {
+        self.github_oauth_client_id
+            .as_deref()
+            .is_some_and(|s| !s.is_empty())
+            && self
+                .github_oauth_client_secret
+                .as_deref()
+                .is_some_and(|s| !s.is_empty())
+    }
+
     /// True iff `gh_login` is permitted to sign in via GitHub OAuth.
     pub fn github_user_allowed(&self, gh_login: &str) -> bool {
         let login = gh_login.trim().to_lowercase();

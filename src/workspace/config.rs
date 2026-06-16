@@ -191,15 +191,7 @@ pub(crate) async fn write_opencode_config(
         || workspace_desktop_flag
         || workspace_has_display
         || has_desktop_mcp;
-    let container_fallback = workspace_env
-        .get("SANDBOXED_SH_CONTAINER_FALLBACK")
-        .map(|v| {
-            matches!(
-                v.trim().to_lowercase().as_str(),
-                "1" | "true" | "yes" | "y" | "on"
-            )
-        })
-        .unwrap_or(false);
+    let container_fallback = super::container_fallback_from_env(workspace_env);
     let per_workspace_runner = env_var_bool("SANDBOXED_SH_PER_WORKSPACE_RUNNER", true);
     let mut tools = serde_json::Map::new();
     match workspace_type {
@@ -948,21 +940,7 @@ fn resolve_codex_dir(
     workspace_type: WorkspaceType,
     workspace_env: &HashMap<String, String>,
 ) -> PathBuf {
-    let container_fallback = workspace_env
-        .get("SANDBOXED_SH_CONTAINER_FALLBACK")
-        .map(|v| {
-            matches!(
-                v.trim().to_lowercase().as_str(),
-                "1" | "true" | "yes" | "y" | "on"
-            )
-        })
-        .unwrap_or(false);
-
-    if workspace_type == WorkspaceType::Container && !container_fallback {
-        return workspace_root.join("root").join(".codex");
-    }
-
-    PathBuf::from(home_dir()).join(".codex")
+    super::resolve_workspace_home_root(workspace_root, workspace_type, workspace_env).join(".codex")
 }
 
 fn resolve_claudecode_dir(
@@ -970,21 +948,8 @@ fn resolve_claudecode_dir(
     workspace_type: WorkspaceType,
     workspace_env: &HashMap<String, String>,
 ) -> PathBuf {
-    let container_fallback = workspace_env
-        .get("SANDBOXED_SH_CONTAINER_FALLBACK")
-        .map(|v| {
-            matches!(
-                v.trim().to_lowercase().as_str(),
-                "1" | "true" | "yes" | "y" | "on"
-            )
-        })
-        .unwrap_or(false);
-
-    if workspace_type == WorkspaceType::Container && !container_fallback {
-        return workspace_root.join("root").join(".claude");
-    }
-
-    PathBuf::from(home_dir()).join(".claude")
+    super::resolve_workspace_home_root(workspace_root, workspace_type, workspace_env)
+        .join(".claude")
 }
 
 fn codex_entry_from_mcp(
