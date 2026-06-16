@@ -1322,6 +1322,41 @@ impl WorkspaceExec {
         })
     }
 
+    /// Build the `(program, args)` for an *interactive* shell that joins this
+    /// workspace's shared persistent container leader via `nsenter` — the same
+    /// mechanism mission harnesses use (see [`Self::spawn_streaming_pty`]).
+    ///
+    /// The dashboard workspace shell uses this so it no longer boots a second
+    /// `systemd-nspawn -D <dir>` on a directory a running mission already holds,
+    /// which nspawn rejects with "Directory tree … is currently busy".
+    /// Joining the existing leader via `nsenter` is concurrent-safe.
+    ///
+    /// Returns `Ok(None)` for workspaces that don't go through nspawn (host, or
+    /// the non-nspawn container fallback); the caller should spawn the shell
+    /// directly in that case.
+    pub async fn build_interactive_shell_invocation(
+        &self,
+        cwd: &Path,
+        program: &str,
+        args: &[String],
+        extra_env: HashMap<String, String>,
+    ) -> anyhow::Result<Option<(String, Vec<String>)>> {
+        if !(self.workspace.workspace_type == WorkspaceType::Container
+            && use_nspawn_for_workspace(&self.workspace))
+        {
+            return Ok(None);
+        }
+        let mut env = self.build_env(extra_env);
+        // Mirror spawn_streaming_pty: interactive shells (and some CLIs) behave
+        // oddly without TERM, and nsenter does not propagate the caller's env.
+        env.entry("TERM".to_string())
+            .or_insert_with(|| "xterm-256color".to_string());
+        let invocation = self
+            .build_container_nsenter_invocation(cwd, program, args, &mut env)
+            .await?;
+        Ok(Some(invocation))
+    }
+
     /// Build the (program, args) tuple for spawning a command inside an
     /// nspawn container via nsenter. Also mutates `env` to add container
     /// defaults (HOME, SSH_AUTH_SOCK). The returned args end with
