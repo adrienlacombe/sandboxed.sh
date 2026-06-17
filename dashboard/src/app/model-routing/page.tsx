@@ -1028,7 +1028,7 @@ export default function ModelRoutingPage() {
           {/* Create form */}
           {showCreate && (
             <div className="mb-4 rounded-lg border border-indigo-500/20 bg-indigo-500/[0.03] p-4 space-y-3">
-              <div className="grid grid-cols-2 gap-3">
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                 <div>
                   <label className="text-xs text-white/40 mb-1 block">Chain ID</label>
                   <input
