@@ -204,12 +204,15 @@ export const Sidebar = memo(function Sidebar({
       : currentMission?.status === 'failed' 
         ? 'text-red-400' 
         : 'text-white/40';
+  const hideClosedMobileNav = !open && !isDesktop;
 
   return (
     <aside
       ref={asideRef}
       id={id}
       aria-label="Main navigation"
+      aria-hidden={hideClosedMobileNav ? true : undefined}
+      inert={hideClosedMobileNav ? true : undefined}
       className={cn(
         'fixed left-0 top-0 z-40 flex h-screen w-56 flex-col glass-panel border-r border-white/[0.06]',
         // Off-canvas drawer below lg; always docked at lg+ so desktop is
