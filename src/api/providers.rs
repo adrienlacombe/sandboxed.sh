@@ -48,12 +48,24 @@ pub const DEFAULT_CATALOG_PROVIDER_IDS: &[&str] = &[
     "minimax",
 ];
 
-/// Upper bound on the number of live models merged from a single
-/// OpenAI-compatible `/v1/models` response. OpenRouter has no usable prefix
-/// filter and exposes a large, fast-growing catalog; without a bound it can
-/// flood the routing picker (and the cached catalog). Prefix-filtered
-/// providers stay well under this and are left uncapped.
+/// Upper bound on models merged for a single provider from live `/v1/models`
+/// and from models.dev. OpenRouter has no usable prefix filter and exposes a
+/// large, fast-growing catalog; without a bound it can flood the routing
+/// picker (and the cached catalog). Prefix-filtered providers stay well under
+/// this and are left uncapped.
 const MAX_CATALOG_MODELS_PER_PROVIDER: usize = 100;
+
+const OPENROUTER_PROVIDER_ID: &str = "open-router";
+
+/// Best-effort seed slugs kept in the default config; prioritized when capping
+/// the models.dev OpenRouter catalog (which has no popularity sort).
+const OPENROUTER_SEED_MODEL_IDS: &[&str] = &[
+    "anthropic/claude-opus-4.8",
+    "anthropic/claude-sonnet-4.6",
+    "google/gemini-3.1-pro-preview",
+    "openai/gpt-5.5",
+    "meta-llama/llama-3.3-70b-instruct:free",
+];
 
 /// Maximum length (in `char`s) of a model description surfaced from a
 /// `/v1/models` entry. OpenRouter descriptions can run several paragraphs; the
@@ -305,6 +317,49 @@ fn models_dev_provider_key(provider_id: &str) -> &str {
         "open-router" => "openrouter",
         _ => provider_id,
     }
+}
+
+/// Cap a catalog slice, keeping `priority_ids` first (in that order) then filling
+/// from the remainder in stable id order until `limit`.
+fn cap_catalog_entries(
+    mut entries: Vec<CatalogEntry>,
+    limit: usize,
+    priority_ids: &[&str],
+) -> Vec<CatalogEntry> {
+    if entries.len() <= limit {
+        return entries;
+    }
+
+    let priority_normalized: HashSet<String> = priority_ids
+        .iter()
+        .map(|id| normalize_model_id(id))
+        .collect();
+    let mut priority_entries = Vec::new();
+    let mut rest = Vec::new();
+    for entry in entries.drain(..) {
+        if priority_normalized.contains(&normalize_model_id(&entry.id)) {
+            priority_entries.push(entry);
+        } else {
+            rest.push(entry);
+        }
+    }
+    priority_entries.sort_by_key(|entry| {
+        priority_ids
+            .iter()
+            .position(|id| normalize_model_id(id) == normalize_model_id(&entry.id))
+            .unwrap_or(usize::MAX)
+    });
+    rest.sort_by(|a, b| a.id.cmp(&b.id));
+
+    let mut capped = priority_entries;
+    for entry in rest {
+        if capped.len() >= limit {
+            break;
+        }
+        capped.push(entry);
+    }
+    capped.truncate(limit);
+    capped
 }
 
 fn merge_catalog_entries(
@@ -944,13 +999,23 @@ fn truncate_description(description: &str) -> String {
 /// Fetch models from an OpenAI-compatible /v1/models endpoint.
 /// Filters results by the given prefix (e.g. "grok-", "glm-").
 /// Returns model IDs and generated display names.
+///
+/// `models_query` is appended after `/models` (e.g. `?sort=most-popular` for
+/// OpenRouter). When `sort_results_by_id` is false the API response order is
+/// preserved (used for server-side popularity sorts).
 pub async fn fetch_openai_compatible_models(
     base_url: &str,
     api_key: &str,
     prefix_filters: &[&str],
+    models_query: Option<&str>,
+    sort_results_by_id: bool,
 ) -> Result<Vec<ProviderModel>, String> {
     let client = reqwest::Client::new();
-    let url = format!("{}/models", base_url.trim_end_matches('/'));
+    let base = base_url.trim_end_matches('/');
+    let url = match models_query.filter(|query| !query.is_empty()) {
+        Some(query) => format!("{base}/models{query}"),
+        None => format!("{base}/models"),
+    };
 
     let resp = client
         .get(&url)
@@ -1003,7 +1068,9 @@ pub async fn fetch_openai_compatible_models(
         })
         .collect();
 
-    models.sort_by(|a, b| a.id.cmp(&b.id));
+    if sort_results_by_id {
+        models.sort_by(|a, b| a.id.cmp(&b.id));
+    }
     Ok(models)
 }
 
@@ -1091,22 +1158,41 @@ pub async fn fetch_models_dev_catalog() -> Result<HashMap<String, Vec<CatalogEnt
             continue;
         };
 
-        let entries = models.iter().map(|(model_id, value)| {
-            let name = value
-                .get("name")
-                .and_then(|n| n.as_str())
-                .unwrap_or(model_id)
-                .to_string();
-            CatalogEntry {
-                id: model_id.clone(),
-                name,
-                provider_id: (*provider_id).to_string(),
-                sources: vec![CatalogSource::ModelsDev],
-                availability: CatalogAvailability::Known,
-                last_checked_at: now,
-                description: None,
-            }
-        });
+        let mut entries: Vec<CatalogEntry> = models
+            .iter()
+            .map(|(model_id, value)| {
+                let name = value
+                    .get("name")
+                    .and_then(|n| n.as_str())
+                    .unwrap_or(model_id)
+                    .to_string();
+                CatalogEntry {
+                    id: model_id.clone(),
+                    name,
+                    provider_id: (*provider_id).to_string(),
+                    sources: vec![CatalogSource::ModelsDev],
+                    availability: CatalogAvailability::Known,
+                    last_checked_at: now,
+                    description: None,
+                }
+            })
+            .collect();
+
+        if *provider_id == OPENROUTER_PROVIDER_ID && entries.len() > MAX_CATALOG_MODELS_PER_PROVIDER
+        {
+            let before = entries.len();
+            entries = cap_catalog_entries(
+                entries,
+                MAX_CATALOG_MODELS_PER_PROVIDER,
+                OPENROUTER_SEED_MODEL_IDS,
+            );
+            tracing::info!(
+                "Capping open-router models.dev catalog from {} to {} models",
+                before,
+                entries.len()
+            );
+        }
+
         merge_catalog_entries(&mut catalog, provider_id, entries);
     }
 
@@ -1304,6 +1390,12 @@ pub async fn fetch_model_catalog(
         provider_id: &'static str,
         base_url: &'static str,
         prefix_filters: Vec<&'static str>,
+        /// Extra query on `/models` (e.g. OpenRouter `?sort=most-popular`).
+        models_query: Option<&'static str>,
+        /// When false, keep the API response order (popularity sorts).
+        sort_results_by_id: bool,
+        /// Fetch even when no API key is configured (public catalog endpoints).
+        allow_unauthenticated: bool,
         /// Upper bound on models merged from this provider's `/v1/models`.
         /// Set for prefix-less, large catalogs (OpenRouter) to keep the
         /// routing picker bounded; `None` means no cap.
@@ -1316,14 +1408,20 @@ pub async fn fetch_model_catalog(
             provider_id: "openai",
             base_url: "https://api.openai.com/v1",
             prefix_filters: vec!["gpt-", "o1-", "o3-", "o4-", "chatgpt-"],
+            models_query: None,
+            sort_results_by_id: true,
+            allow_unauthenticated: false,
             max_models: None,
         },
         FetchTarget {
             provider_type: ProviderType::OpenRouter,
             provider_id: "open-router",
             base_url: "https://openrouter.ai/api/v1",
-            // No usable prefix and a large, fast-growing catalog, so cap it.
+            // No usable prefix; ask OpenRouter for weekly token volume order.
             prefix_filters: vec![],
+            models_query: Some("?sort=most-popular"),
+            sort_results_by_id: false,
+            allow_unauthenticated: true,
             max_models: Some(MAX_CATALOG_MODELS_PER_PROVIDER),
         },
         FetchTarget {
@@ -1331,6 +1429,9 @@ pub async fn fetch_model_catalog(
             provider_id: "xai",
             base_url: "https://api.x.ai/v1",
             prefix_filters: vec!["grok-"],
+            models_query: None,
+            sort_results_by_id: true,
+            allow_unauthenticated: false,
             max_models: None,
         },
         FetchTarget {
@@ -1338,6 +1439,9 @@ pub async fn fetch_model_catalog(
             provider_id: "cerebras",
             base_url: "https://api.cerebras.ai/v1",
             prefix_filters: vec![],
+            models_query: None,
+            sort_results_by_id: true,
+            allow_unauthenticated: false,
             max_models: None,
         },
         FetchTarget {
@@ -1345,6 +1449,9 @@ pub async fn fetch_model_catalog(
             provider_id: "zai",
             base_url: "https://open.bigmodel.cn/api/paas/v4",
             prefix_filters: vec!["glm-"],
+            models_query: None,
+            sort_results_by_id: true,
+            allow_unauthenticated: false,
             max_models: None,
         },
         FetchTarget {
@@ -1352,6 +1459,9 @@ pub async fn fetch_model_catalog(
             provider_id: "minimax",
             base_url: "https://api.minimax.io/v1",
             prefix_filters: vec!["MiniMax-"],
+            models_query: None,
+            sort_results_by_id: true,
+            allow_unauthenticated: false,
             max_models: None,
         },
     ];
@@ -1412,6 +1522,9 @@ pub async fn fetch_model_catalog(
         let provider_id = target.provider_id.to_string();
         let base_url = target.base_url.to_string();
         let max_models = target.max_models;
+        let models_query = target.models_query.map(str::to_string);
+        let sort_results_by_id = target.sort_results_by_id;
+        let allow_unauthenticated = target.allow_unauthenticated;
         let prefix_filters: Vec<String> = target
             .prefix_filters
             .iter()
@@ -1419,13 +1532,27 @@ pub async fn fetch_model_catalog(
             .collect();
 
         handles.push(tokio::spawn(async move {
-            match key {
+            let api_key = match key {
+                Some(k) if !k.is_empty() => Some(k),
+                _ if allow_unauthenticated => Some(String::new()),
+                _ => None,
+            };
+            match api_key {
                 Some(api_key) => {
                     let filters: Vec<&str> = prefix_filters.iter().map(|s| s.as_str()).collect();
-                    match fetch_openai_compatible_models(&base_url, &api_key, &filters).await {
+                    match fetch_openai_compatible_models(
+                        &base_url,
+                        &api_key,
+                        &filters,
+                        models_query.as_deref(),
+                        sort_results_by_id,
+                    )
+                    .await
+                    {
                         Ok(mut models) => {
-                            // Bound large catalogs (OpenRouter). Models are
-                            // sorted by id, so truncation is deterministic.
+                            // Bound large catalogs (OpenRouter). OpenRouter
+                            // keeps the API's most-popular order; others are
+                            // sorted by id before truncation.
                             if let Some(limit) = max_models {
                                 if models.len() > limit {
                                     tracing::info!(
@@ -1474,7 +1601,7 @@ pub async fn fetch_model_catalog(
         // when present, empty otherwise.
         let api_key = provider.api_key.clone().unwrap_or_default();
         handles.push(tokio::spawn(async move {
-            match fetch_openai_compatible_models(&base_url, &api_key, &[]).await {
+            match fetch_openai_compatible_models(&base_url, &api_key, &[], None, true).await {
                 Ok(models) if !models.is_empty() => {
                     tracing::info!(
                         "Fetched {} models from custom provider {} ({})",
@@ -2161,6 +2288,34 @@ mod tests {
     }
 
     #[test]
+    fn cap_catalog_entries_prioritizes_seeds_then_truncates() {
+        let now = chrono::Utc::now();
+        let make = |id: &str| CatalogEntry {
+            id: id.to_string(),
+            name: id.to_string(),
+            provider_id: OPENROUTER_PROVIDER_ID.to_string(),
+            sources: vec![CatalogSource::ModelsDev],
+            availability: CatalogAvailability::Known,
+            last_checked_at: now,
+            description: None,
+        };
+        let mut entries: Vec<CatalogEntry> = (0..150)
+            .map(|i| make(&format!("vendor/model-{i:03}")))
+            .collect();
+        entries.push(make("anthropic/claude-opus-4.8"));
+        entries.push(make("openai/gpt-5.5"));
+
+        let capped = cap_catalog_entries(
+            entries,
+            MAX_CATALOG_MODELS_PER_PROVIDER,
+            OPENROUTER_SEED_MODEL_IDS,
+        );
+        assert_eq!(capped.len(), MAX_CATALOG_MODELS_PER_PROVIDER);
+        assert_eq!(capped[0].id, "anthropic/claude-opus-4.8");
+        assert!(capped.iter().any(|entry| entry.id == "openai/gpt-5.5"));
+    }
+
+    #[test]
     fn truncate_description_bounds_long_text() {
         // Short descriptions pass through unchanged (after trimming).
         assert_eq!(truncate_description("  Short blurb  "), "Short blurb");
@@ -2411,9 +2566,9 @@ mod tests {
         let mut any_stale = false;
 
         for target in &targets {
-            let api_key = get_api_key_for_provider(target.provider_type, &[]);
-            let api_key = match api_key {
+            let api_key = match get_api_key_for_provider(target.provider_type, &[]) {
                 Some(k) => k,
+                None if target.provider_id == OPENROUTER_PROVIDER_ID => String::new(),
                 None => {
                     eprintln!(
                         "[SKIP] {}: no API key found (set {} or configure in OpenCode auth)",
@@ -2426,11 +2581,24 @@ mod tests {
 
             any_checked = true;
 
+            let (models_query, sort_results_by_id) = if target.provider_id == OPENROUTER_PROVIDER_ID
+            {
+                (Some("?sort=most-popular"), false)
+            } else {
+                (None, true)
+            };
+
             let fetched = if target.is_anthropic {
                 fetch_anthropic_models(&api_key).await
             } else {
-                fetch_openai_compatible_models(target.base_url, &api_key, &target.prefix_filters)
-                    .await
+                fetch_openai_compatible_models(
+                    target.base_url,
+                    &api_key,
+                    &target.prefix_filters,
+                    models_query,
+                    sort_results_by_id,
+                )
+                .await
             };
 
             match fetched {
