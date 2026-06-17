@@ -759,7 +759,7 @@ export default function SettingsPage() {
 
   if (loading && !fileContent) {
     return (
-      <div className="h-screen flex flex-col p-6 gap-4 overflow-hidden">
+      <div className="h-[calc(100vh-3rem)] lg:h-screen flex flex-col p-6 gap-4 overflow-hidden">
         <div className="h-16 rounded-xl bg-white/[0.02] border border-white/[0.06]" />
         <div className="flex items-center justify-between mb-2">
           <div className="flex items-center gap-2">
@@ -786,7 +786,7 @@ export default function SettingsPage() {
   }
 
   return (
-    <div className="h-screen flex flex-col p-6 gap-4 overflow-hidden">
+    <div className="h-[calc(100vh-3rem)] lg:h-screen flex flex-col p-6 gap-4 overflow-hidden">
       {/* Git Status Bar */}
       {status && (
         <div className="p-4 rounded-xl bg-white/[0.02] border border-white/[0.06]">

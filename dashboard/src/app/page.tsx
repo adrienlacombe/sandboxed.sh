@@ -538,7 +538,7 @@ function OverviewPageContent() {
   );
 
   return (
-    <div className="flex h-screen overflow-hidden">
+    <div className="flex flex-col lg:flex-row lg:h-screen lg:overflow-hidden">
       {/* Main content */}
       <div className="flex-1 flex flex-col p-6 min-h-0">
         {/* Header */}
@@ -571,8 +571,8 @@ function OverviewPageContent() {
           />
         </div>
 
-        {/* Compact Kanban Board - 3 columns, fills available space */}
-        <div className="flex-1 min-h-0 grid grid-cols-3 gap-4 mb-4">
+        {/* Compact Kanban Board - 3 columns on desktop; stacks on mobile. */}
+        <div className="grid grid-cols-1 gap-4 mb-4 lg:flex-1 lg:min-h-0 lg:grid-cols-3">
           {columnData.map((col) => {
             const ColIcon = col.icon;
             return (
@@ -674,7 +674,7 @@ function OverviewPageContent() {
 
       {/* Right sidebar - no glass panel wrapper, just border. Flex column so
           the automations panel stretches into the remaining vertical space. */}
-      <div className="flex h-screen w-72 flex-col gap-4 overflow-y-auto border-l border-white/[0.06] p-4">
+      <div className="flex w-full flex-col gap-4 overflow-y-auto border-t border-white/[0.06] p-4 lg:h-screen lg:w-72 lg:border-t-0 lg:border-l">
         <div className="flex-shrink-0">
           <LastDaySummary
             missions={missions}

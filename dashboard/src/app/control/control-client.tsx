@@ -9080,7 +9080,7 @@ export default function ControlClient() {
 
   return (
     <NowTickProvider>
-      <div className="flex h-screen flex-col p-6">
+      <div className="flex h-[calc(100vh-3rem)] flex-col p-6 lg:h-screen">
         {/* Always-on debug overlay so any OOM-style crash leaves a trail
           we can reconstruct from sessionStorage after reload. Cheap:
           a polling tick every 2s that reads performance.memory and
@@ -9716,7 +9716,7 @@ export default function ControlClient() {
         </div>
 
         {/* Main content area - Chat and Desktop stream side by side */}
-        <div className="flex-1 min-h-0 flex gap-4">
+        <div className="flex-1 min-h-0 flex flex-col gap-4 lg:flex-row max-lg:overflow-y-auto">
           {/* Chat container. We intentionally do NOT animate flex-grow when
           side panels (Workers / Workbench / Thinking) open: animating layout
           properties like `flex-grow` re-flows the entire (potentially huge)
@@ -9726,7 +9726,7 @@ export default function ControlClient() {
           snap to its new width in a single layout pass. */}
           <div
             className={cn(
-              "flex-1 min-h-0 flex flex-col rounded-2xl glass-panel border border-white/[0.06] overflow-hidden relative",
+              "flex-1 min-h-0 flex flex-col rounded-2xl glass-panel border border-white/[0.06] overflow-hidden relative max-lg:min-h-[60vh]",
               showDesktopStream && "flex-[2]",
             )}
           >
@@ -10265,7 +10265,9 @@ export default function ControlClient() {
                 // `transition-all duration-300` that was animating width on
                 // mount (the width change is what caused the chat-side reflow
                 // freeze when toggling the Workers panel).
-                "min-h-0 flex flex-col gap-4 animate-fade-in shrink-0",
+                // Below lg the side panel stacks under the chat at full width
+                // with a capped height instead of competing for horizontal room.
+                "min-h-0 flex flex-col gap-4 animate-fade-in shrink-0 max-lg:w-full max-lg:min-w-0 max-lg:max-w-none max-lg:max-h-none max-lg:h-[60vh] max-lg:resize-none",
                 showDesktopStream
                   ? "basis-auto w-[clamp(400px,44vw,820px)] h-[min(720px,calc(100vh-7rem))] min-h-[420px] min-w-[360px] max-h-[calc(100vh-7rem)] max-w-[820px] resize overflow-hidden"
                   : "w-80",

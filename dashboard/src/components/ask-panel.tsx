@@ -368,7 +368,7 @@ export function AskPanel({
 
   return (
     <div
-      className="@container relative flex h-full shrink-0 flex-col rounded-2xl border border-[rgb(var(--copilot)/0.25)] bg-[rgb(var(--background-elevated)/0.72)] backdrop-blur-xl"
+      className="@container relative flex h-full shrink-0 flex-col rounded-2xl border border-[rgb(var(--copilot)/0.25)] bg-[rgb(var(--background-elevated)/0.72)] backdrop-blur-xl max-lg:max-w-full max-lg:h-[60vh]"
       style={{ width: panelWidth }}
     >
       {/* Drag the left edge to trade width between the chat and the co-pilot. */}

@@ -86,7 +86,13 @@ const navigation: NavItem[] = [
   },
 ];
 
-export const Sidebar = memo(function Sidebar() {
+export const Sidebar = memo(function Sidebar({
+  open = false,
+  onClose,
+}: {
+  open?: boolean;
+  onClose?: () => void;
+}) {
   const pathname = usePathname();
   const [currentMission, setCurrentMission] = useState<Mission | null>(null);
   const [expandedItems, setExpandedItems] = useState<Set<string>>(new Set());
@@ -160,7 +166,15 @@ export const Sidebar = memo(function Sidebar() {
         : 'text-white/40';
 
   return (
-    <aside className="fixed left-0 top-0 z-40 flex h-screen w-56 flex-col glass-panel border-r border-white/[0.06]">
+    <aside
+      className={cn(
+        'fixed left-0 top-0 z-40 flex h-screen w-56 flex-col glass-panel border-r border-white/[0.06]',
+        // Off-canvas drawer below lg; always docked at lg+ so desktop is
+        // unchanged (lg:translate-x-0 wins regardless of `open`).
+        'transition-transform duration-200 lg:translate-x-0',
+        open ? 'translate-x-0' : '-translate-x-full',
+      )}
+    >
       {/* Header */}
       <div className="flex h-16 items-center gap-2 border-b border-white/[0.06] px-4">
         <BrainLogo size={32} />
@@ -220,6 +234,7 @@ export const Sidebar = memo(function Sidebar() {
                         <Link
                           key={child.name}
                           href={child.href}
+                          onClick={onClose}
                           className={cn(
                             'flex items-center gap-3 rounded-lg px-3 py-2 text-sm transition-all',
                             isChildCurrent
@@ -243,6 +258,7 @@ export const Sidebar = memo(function Sidebar() {
             <Link
               key={item.name}
               href={item.href}
+              onClick={onClose}
               className={cn(
                 'flex items-center gap-3 rounded-lg px-3 py-2.5 text-sm font-medium transition-all relative',
                 isCurrentPath
@@ -264,8 +280,9 @@ export const Sidebar = memo(function Sidebar() {
 
       {/* Current Mission Status */}
       {currentMission && (
-        <Link 
+        <Link
           href={`/control?mission=${currentMission.id}`}
+          onClick={onClose}
           className="mx-3 mb-3 p-3 rounded-xl bg-white/[0.02] border border-white/[0.04] hover:bg-white/[0.04] transition-colors"
         >
           <div className="flex items-center gap-2 mb-1.5">
