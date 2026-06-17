@@ -37,12 +37,8 @@ pub(crate) fn find_ascii_case_insensitive(haystack: &[u8], needle: &[u8]) -> Opt
         return None;
     }
 
-    for idx in 0..=haystack.len() - needle.len() {
-        if starts_with_ascii_case_insensitive(&haystack[idx..], needle) {
-            return Some(idx);
-        }
-    }
-    None
+    (0..=haystack.len() - needle.len())
+        .find(|&idx| starts_with_ascii_case_insensitive(&haystack[idx..], needle))
 }
 
 #[inline]
