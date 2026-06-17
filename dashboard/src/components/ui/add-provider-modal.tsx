@@ -19,6 +19,7 @@ import {
 const providerIcons: Record<string, string> = {
   anthropic: '🧠',
   openai: '🤖',
+  'open-router': '🔀',
   google: '🔮',
   'deep-infra': '🚀',
   cerebras: '🧬',

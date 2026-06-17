@@ -727,7 +727,7 @@ export default function ModelRoutingPage() {
 
   const { data: providersData } = useSWR(
     'routing-providers',
-    () => listProviders({ includeAll: true }),
+    () => listProviders({ includeAll: true, includeUnverified: true }),
     { revalidateOnFocus: false }
   );
   const providers = useMemo(

@@ -40,6 +40,7 @@ const CODEX_MODEL_PROBE_TTL: Duration = Duration::from_secs(10 * 60);
 pub const DEFAULT_CATALOG_PROVIDER_IDS: &[&str] = &[
     "anthropic",
     "openai",
+    "open-router",
     "google",
     "xai",
     "cerebras",
@@ -284,6 +285,14 @@ fn merge_provider_models(
 
 fn normalize_model_id(id: &str) -> String {
     id.trim().to_ascii_lowercase()
+}
+
+fn models_dev_provider_key(provider_id: &str) -> &str {
+    match provider_id {
+        // Sandboxed/OpenCode use `open-router`; models.dev uses `openrouter`.
+        "open-router" => "openrouter",
+        _ => provider_id,
+    }
 }
 
 fn merge_catalog_entries(
@@ -662,6 +671,43 @@ fn default_providers_config() -> ProvidersConfig {
                 ],
             },
             Provider {
+                id: "open-router".to_string(),
+                name: "OpenRouter (API Key)".to_string(),
+                billing: "pay-per-token".to_string(),
+                description: "Aggregator routing through OpenRouter".to_string(),
+                models: vec![
+                    // OpenRouter model IDs are vendor-prefixed (provider/model).
+                    // The live catalog is merged from models.dev and /v1/models
+                    // when available; these keep the picker useful before the
+                    // background catalog finishes.
+                    ProviderModel {
+                        id: "anthropic/claude-opus-4.8".to_string(),
+                        name: "Claude Opus 4.8".to_string(),
+                        description: Some("Anthropic Claude via OpenRouter".to_string()),
+                    },
+                    ProviderModel {
+                        id: "anthropic/claude-sonnet-4.6".to_string(),
+                        name: "Claude Sonnet 4.6".to_string(),
+                        description: Some("Anthropic Claude via OpenRouter".to_string()),
+                    },
+                    ProviderModel {
+                        id: "google/gemini-3.1-pro-preview".to_string(),
+                        name: "Gemini 3.1 Pro Preview".to_string(),
+                        description: Some("Google Gemini via OpenRouter".to_string()),
+                    },
+                    ProviderModel {
+                        id: "openai/gpt-5.5".to_string(),
+                        name: "GPT-5.5".to_string(),
+                        description: Some("OpenAI GPT via OpenRouter".to_string()),
+                    },
+                    ProviderModel {
+                        id: "meta-llama/llama-3.3-70b-instruct:free".to_string(),
+                        name: "Llama 3.3 70B Instruct (free)".to_string(),
+                        description: Some("Meta Llama via OpenRouter".to_string()),
+                    },
+                ],
+            },
+            Provider {
                 id: "google".to_string(),
                 name: "Google AI (OAuth)".to_string(),
                 billing: "subscription".to_string(),
@@ -910,10 +956,20 @@ pub async fn fetch_openai_compatible_models(
             {
                 return None;
             }
+            let name = entry
+                .get("display_name")
+                .or_else(|| entry.get("name"))
+                .and_then(|n| n.as_str())
+                .map(str::to_string)
+                .unwrap_or_else(|| model_id_to_display_name(id));
+            let description = entry
+                .get("description")
+                .and_then(|d| d.as_str())
+                .map(str::to_string);
             Some(ProviderModel {
                 id: id.to_string(),
-                name: model_id_to_display_name(id),
-                description: None,
+                name,
+                description,
             })
         })
         .collect();
@@ -999,7 +1055,7 @@ pub async fn fetch_models_dev_catalog() -> Result<HashMap<String, Vec<CatalogEnt
     let mut catalog: HashMap<String, Vec<CatalogEntry>> = HashMap::new();
 
     for provider_id in DEFAULT_CATALOG_PROVIDER_IDS {
-        let Some(provider) = providers.get(*provider_id) else {
+        let Some(provider) = providers.get(models_dev_provider_key(provider_id)) else {
             continue;
         };
         let Some(models) = provider.get("models").and_then(|m| m.as_object()) else {
@@ -1227,6 +1283,12 @@ pub async fn fetch_model_catalog(
             provider_id: "openai",
             base_url: "https://api.openai.com/v1",
             prefix_filters: vec!["gpt-", "o1-", "o3-", "o4-", "chatgpt-"],
+        },
+        FetchTarget {
+            provider_type: ProviderType::OpenRouter,
+            provider_id: "open-router",
+            base_url: "https://openrouter.ai/api/v1",
+            prefix_filters: vec![],
         },
         FetchTarget {
             provider_type: ProviderType::Xai,
@@ -2023,6 +2085,28 @@ mod tests {
     }
 
     #[test]
+    fn default_openrouter_catalog_uses_vendor_prefixed_model_ids() {
+        let defaults = default_providers_config();
+        let openrouter = defaults
+            .providers
+            .iter()
+            .find(|provider| provider.id == "open-router")
+            .expect("openrouter provider");
+
+        assert!(openrouter
+            .models
+            .iter()
+            .any(|model| model.id == "anthropic/claude-opus-4.8"));
+        assert!(openrouter.models.iter().all(|model| model.id.contains('/')));
+    }
+
+    #[test]
+    fn models_dev_provider_key_maps_openrouter() {
+        assert_eq!(models_dev_provider_key("open-router"), "openrouter");
+        assert_eq!(models_dev_provider_key("anthropic"), "anthropic");
+    }
+
+    #[test]
     fn default_xai_catalog_includes_grok_build_for_model_routing() {
         let defaults = default_providers_config();
         let xai = defaults
@@ -2215,6 +2299,13 @@ mod tests {
                 is_anthropic: false,
             },
             TestTarget {
+                provider_id: "open-router",
+                provider_type: ProviderType::OpenRouter,
+                base_url: "https://openrouter.ai/api/v1",
+                prefix_filters: vec![],
+                is_anthropic: false,
+            },
+            TestTarget {
                 provider_id: "xai",
                 provider_type: ProviderType::Xai,
                 base_url: "https://api.x.ai/v1",
@@ -2349,7 +2440,7 @@ mod tests {
         if !any_checked {
             eprintln!("\n[INFO] No API keys were available. Set environment variables to check staleness:");
             eprintln!(
-                "  ANTHROPIC_API_KEY, OPENAI_API_KEY, XAI_API_KEY, CEREBRAS_API_KEY, ZHIPU_API_KEY"
+                "  ANTHROPIC_API_KEY, OPENAI_API_KEY, OPENROUTER_API_KEY, XAI_API_KEY, CEREBRAS_API_KEY, ZHIPU_API_KEY"
             );
         }
 
