@@ -10269,8 +10269,8 @@ export default function ControlClient() {
                 // with a capped height instead of competing for horizontal room.
                 "min-h-0 flex flex-col gap-4 animate-fade-in shrink-0 max-lg:w-full max-lg:min-w-0 max-lg:max-w-none max-lg:max-h-none max-lg:h-[60vh] max-lg:resize-none",
                 showDesktopStream
-                  ? "basis-auto w-[clamp(400px,44vw,820px)] h-[min(720px,calc(100vh-7rem))] min-h-[420px] min-w-[360px] max-h-[calc(100vh-7rem)] max-w-[820px] resize overflow-hidden"
-                  : "w-80",
+                  ? "lg:basis-auto lg:w-[clamp(400px,44vw,820px)] lg:h-[min(720px,calc(100vh-7rem))] lg:min-h-[420px] lg:min-w-[360px] lg:max-h-[calc(100vh-7rem)] lg:max-w-[820px] lg:resize overflow-hidden"
+                  : "lg:w-80",
               )}
             >
               {showWorkbenchPanel && (
