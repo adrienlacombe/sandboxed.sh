@@ -1098,6 +1098,13 @@ pub fn run_claudecode_turn<'a>(
             tracing::warn!("No authentication available for Claude Code!");
         }
 
+        // DGX Spark build offload (opt-in per workspace): expose the local host
+        // endpoint + token + workspace paths so the in-workspace `spark-build`
+        // wrapper can ship Lean builds to the Spark. Credentials stay on the host.
+        if let Some(spark_vars) = workspace.spark_offload_env(mission_id) {
+            env.extend(spark_vars);
+        }
+
         // Inject Telegram action environment variables when processing a Telegram message.
         // These are needed by the telegram-action CLI helper inside the container to schedule
         // reminders, send replies, etc.

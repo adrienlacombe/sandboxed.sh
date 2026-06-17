@@ -2453,13 +2453,58 @@ pub struct ControlMessageResponse {
 }
 
 /// A message waiting in the queue
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueuedMessage {
     pub id: Uuid,
     pub content: String,
     pub agent: Option<String>,
     /// Which mission this queued message belongs to
     pub mission_id: Option<Uuid>,
+}
+
+/// Serialize the control session queue to a stable JSON snapshot for
+/// persistence across restarts (see `MissionStore::save_control_queue`).
+fn serialize_queue_snapshot(
+    queue: &VecDeque<(Uuid, String, Option<String>, Option<Uuid>)>,
+) -> String {
+    let items: Vec<QueuedMessage> = queue
+        .iter()
+        .map(|(id, content, agent, target_mid)| QueuedMessage {
+            id: *id,
+            content: content.clone(),
+            agent: agent.clone(),
+            mission_id: *target_mid,
+        })
+        .collect();
+    serde_json::to_string(&items).unwrap_or_else(|_| "[]".to_string())
+}
+
+/// Persist the control queue snapshot iff it changed since `last_persisted`
+/// (debounced so unchanged iterations don't churn the DB).
+///
+/// Called both at the actor-loop top and immediately after every dequeue. The
+/// post-dequeue call is what prevents stale double-execution: without it, a
+/// popped message lingers in the persisted snapshot until the next loop pass, so
+/// a crash after the pop (during the potentially-awaiting work that starts the
+/// run) would restore and re-run a message that already started — bypassing the
+/// in-memory idempotency guard.
+async fn persist_control_queue_if_changed(
+    mission_store: &Arc<dyn MissionStore>,
+    session_user_id: &str,
+    queue: &VecDeque<(Uuid, String, Option<String>, Option<Uuid>)>,
+    last_persisted: &mut String,
+) {
+    let snapshot = serialize_queue_snapshot(queue);
+    if snapshot != *last_persisted {
+        if let Err(e) = mission_store
+            .save_control_queue(session_user_id, &snapshot)
+            .await
+        {
+            tracing::warn!("Failed to persist control queue: {e}");
+        } else {
+            *last_persisted = snapshot;
+        }
+    }
 }
 
 /// Tool result posted by the frontend for an interactive tool call.
@@ -8482,6 +8527,54 @@ async fn control_actor_loop(
     // Queue stores (id, content, agent, target_mission_id) for the current/primary mission
     // The target_mission_id tracks which mission each queued message is intended for
     let mut queue: VecDeque<(Uuid, String, Option<String>, Option<Uuid>)> = VecDeque::new();
+    // Re-drive any messages that were queued before the last restart. They are
+    // persisted as a JSON snapshot (see `persist_control_queue_if_changed`) so a
+    // restart doesn't lose pending work. We re-inject them through the normal
+    // command channel rather than pushing straight onto `queue`: an idle actor
+    // never dequeues a pre-filled `queue` on its own, so the work would
+    // otherwise sit forever. Routing them as commands also de-duplicates against
+    // a client retry of the same id via `accept_user_message_id` (whichever
+    // arrives first runs; the other is dropped), so nothing executes twice.
+    let mut restored_db_snapshot = String::new();
+    if let Ok(payload) = mission_store.load_control_queue(&session_user_id).await {
+        if !payload.trim().is_empty() {
+            match serde_json::from_str::<Vec<QueuedMessage>>(&payload) {
+                Ok(items) => {
+                    let count = items.len();
+                    for it in items {
+                        let (ack_tx, _ack_rx) = tokio::sync::oneshot::channel();
+                        if let Err(e) = self_cmd_tx.try_send(ControlCommand::UserMessage {
+                            id: it.id,
+                            content: it.content,
+                            agent: it.agent,
+                            target_mission_id: it.mission_id,
+                            strict: false,
+                            respond: ack_tx,
+                        }) {
+                            tracing::warn!("Failed to re-queue restored control message: {e}");
+                        }
+                    }
+                    if count > 0 {
+                        // Remember the stale on-disk snapshot so the first
+                        // loop-top persist below rewrites the DB to the real
+                        // (re-injected) state instead of leaving it stale.
+                        restored_db_snapshot = payload;
+                        tracing::info!("Re-queued {count} message(s) from the previous session");
+                    }
+                }
+                Err(e) => tracing::warn!("Failed to parse persisted control queue: {e}"),
+            }
+        }
+    }
+    // Snapshot of the queue as last written to the store; used to debounce
+    // persistence so we only write to the DB when the queue actually changes.
+    // When messages were restored, seed it with the stale on-disk snapshot so
+    // the first loop-top persist overwrites it with the live queue.
+    let mut last_persisted_queue: String = if restored_db_snapshot.is_empty() {
+        serialize_queue_snapshot(&queue)
+    } else {
+        restored_db_snapshot
+    };
     let mut history: Vec<(String, String)> = Vec::new(); // (role, content) pairs (user/assistant)
     let mut running: Option<tokio::task::JoinHandle<(Uuid, String, crate::agents::AgentResult)>> =
         None;
@@ -8494,10 +8587,11 @@ async fn control_actor_loop(
     // Track current activity label for the main runner
     let mut main_runner_activity: Option<String> = None;
     // Idempotency guard for user sends. The dashboard may retry a POST if a
-    // weak connection drops after the command reached this actor but before
-    // the HTTP response got back. Since the client can now provide the UUID,
-    // ignore repeated commands with the same id instead of queueing/running
-    // the same user message twice.
+    // weak connection drops after the command reached this actor but before the
+    // HTTP response got back; since the client provides the UUID, repeated
+    // commands with the same id are ignored instead of running twice. Restored
+    // messages (re-injected as commands above) rely on this same guard: the
+    // first occurrence runs, any later duplicate is dropped.
     let mut accepted_user_message_ids: HashSet<Uuid> = HashSet::new();
     // Track subtasks for the main runner
     let mut main_runner_subtasks: Vec<super::mission_runner::SubtaskInfo> = Vec::new();
@@ -8734,6 +8828,19 @@ async fn control_actor_loop(
     }
 
     loop {
+        // Persist the pending queue whenever it changes so a restart doesn't
+        // lose queued messages. Debounced by snapshot comparison — the DB is
+        // written only when the queue actually changed (no per-iteration churn
+        // during streaming, where the queue is usually unchanged). Each dequeue
+        // site below also persists immediately so a popped message can't be
+        // re-run after a crash (see `persist_control_queue_if_changed`).
+        persist_control_queue_if_changed(
+            &mission_store,
+            &session_user_id,
+            &queue,
+            &mut last_persisted_queue,
+        )
+        .await;
         tokio::select! {
             cmd = cmd_rx.recv() => {
                 let Some(cmd) = cmd else { break };
@@ -9201,6 +9308,15 @@ async fn control_actor_loop(
                         }
                         if running.is_none() {
                             if let Some((mid, msg, per_msg_agent, msg_target_mid)) = queue.pop_front() {
+                                // Persist the dequeue before the awaits that start
+                                // the run, so a crash here can't restore + re-run it.
+                                persist_control_queue_if_changed(
+                                    &mission_store,
+                                    &session_user_id,
+                                    &queue,
+                                    &mut last_persisted_queue,
+                                )
+                                .await;
                                 set_and_emit_status(
                                     &status,
                                     &events_tx,
@@ -10097,6 +10213,16 @@ async fn control_actor_loop(
                                 // Start execution if not already running
                                 if running.is_none() {
                                     if let Some((mid, msg, _per_msg_agent, msg_target_mid)) = queue.pop_front() {
+                                        // Persist the dequeue before the awaits that
+                                        // start the run, so a crash here can't
+                                        // restore + re-run it.
+                                        persist_control_queue_if_changed(
+                                            &mission_store,
+                                            &session_user_id,
+                                            &queue,
+                                            &mut last_persisted_queue,
+                                        )
+                                        .await;
                                         let target_mid = msg_target_mid.unwrap_or(mission_id);
                                         set_and_emit_status(
                                             &status,
@@ -10850,6 +10976,15 @@ async fn control_actor_loop(
 
                 // Start next queued message, if any.
                 if let Some((mid, msg, per_msg_agent, msg_target_mid)) = queue.pop_front() {
+                    // Persist the dequeue before the awaits that start the run, so
+                    // a crash here can't restore + re-run it.
+                    persist_control_queue_if_changed(
+                        &mission_store,
+                        &session_user_id,
+                        &queue,
+                        &mut last_persisted_queue,
+                    )
+                    .await;
                     set_and_emit_status(
                         &status,
                         &events_tx,

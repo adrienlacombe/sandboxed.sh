@@ -44,15 +44,44 @@ use uuid::Uuid;
 
 use crate::github_connection::{GithubConnection, GithubConnectionStore};
 use crate::util::{env_var_nonempty, home_dir, write_file_0600, GITHUB_CONNECTION_PATH};
-use crate::workspace::{
-    container_fallback_from_env, resolve_workspace_home_root, Workspace, WorkspaceType,
-};
+use crate::workspace::{container_fallback_from_env, Workspace, WorkspaceType};
 
 const MANAGED_BEGIN: &str = "# >>> sandboxed.sh git credentials >>>";
 const MANAGED_END: &str = "# <<< sandboxed.sh git credentials <<<";
 /// Host the `store` credential helper is scoped to, so we never hijack auth
 /// for other git hosts the workspace may talk to.
 const GITHUB_CREDENTIAL_HOST: &str = "https://github.com";
+
+/// Subdirectory under a **host** workspace's root used as the git/gh credential
+/// home. Containers already get an isolated home (`<root>/root`), but host
+/// workspaces previously shared the operator's real `$HOME` — so a connected
+/// account's `~/.gitconfig` / `~/.git-credentials` / `~/.config/gh/hosts.yml`
+/// would land on (and overwrite) the operator's own files. Writing them under
+/// this sandboxed subdir keeps the operator's dotfiles untouched; git/gh still
+/// find the creds because [`GitCredentialConfig::apply_to_env`] points them here
+/// explicitly (`GIT_CONFIG_*`, `GH_CONFIG_DIR`, `SANDBOXED_SH_GIT_CREDENTIALS_FILE`).
+const HOST_GIT_HOME_SUBDIR: &str = ".sandboxed-sh/git-home";
+
+/// Git/gh credential home for a workspace. Mirrors the harness's `$HOME` for
+/// containers (so creds are visible to the agent), but isolates **host**
+/// workspaces into [`HOST_GIT_HOME_SUBDIR`] instead of the operator's real
+/// `$HOME`. Container fallback (Docker/macOS) keeps using the host `$HOME`,
+/// matching where that harness actually runs.
+fn resolve_git_home_root(
+    workspace_root: &Path,
+    workspace_type: WorkspaceType,
+    workspace_env: &HashMap<String, String>,
+) -> PathBuf {
+    if workspace_type == WorkspaceType::Host {
+        workspace_root.join(HOST_GIT_HOME_SUBDIR)
+    } else if workspace_type == WorkspaceType::Container
+        && !container_fallback_from_env(workspace_env)
+    {
+        workspace_root.join("root")
+    } else {
+        PathBuf::from(home_dir())
+    }
+}
 
 /// Resolved git credential configuration sourced from the backend environment.
 #[derive(Debug, Clone)]
@@ -234,18 +263,17 @@ impl GitCredentialConfig {
         );
     }
 
-    /// Materialize git credential files into the workspace home.
-    ///
-    /// Resolves the home the same way Codex/Claude credentials are placed
-    /// ([`resolve_workspace_home_root`]) so git creds always land in the
-    /// `$HOME` the harness actually runs with:
+    /// Materialize git credential files into the workspace's git-credential home
+    /// ([`resolve_git_home_root`]):
     ///
     /// - Container under systemd-nspawn → `<workspace_root>/root` (the
     ///   container's `/root`).
     /// - Container in fallback mode (no nspawn, e.g. Docker/macOS — flagged via
     ///   `SANDBOXED_SH_CONTAINER_FALLBACK` in the workspace env) → the host
     ///   `$HOME`, because the harness then runs directly on the host.
-    /// - Host → the host `$HOME`.
+    /// - Host → a sandboxed subdir ([`HOST_GIT_HOME_SUBDIR`]), NOT the
+    ///   operator's real `$HOME`, so we never clobber their dotfiles. git/gh are
+    ///   pointed here via env in [`Self::apply_to_env`].
     ///
     /// Returns the home directory written into (for logging).
     pub fn write_for_workspace(
@@ -254,7 +282,7 @@ impl GitCredentialConfig {
         workspace_type: WorkspaceType,
         workspace_env: &HashMap<String, String>,
     ) -> std::io::Result<PathBuf> {
-        let home = resolve_workspace_home_root(workspace_root, workspace_type, workspace_env);
+        let home = resolve_git_home_root(workspace_root, workspace_type, workspace_env);
         std::fs::create_dir_all(&home)?;
 
         self.write_git_credentials(&home)?;
@@ -272,7 +300,7 @@ impl GitCredentialConfig {
         workspace_type: WorkspaceType,
         workspace_env: &HashMap<String, String>,
     ) -> std::io::Result<PathBuf> {
-        let home = resolve_workspace_home_root(workspace_root, workspace_type, workspace_env);
+        let home = resolve_git_home_root(workspace_root, workspace_type, workspace_env);
         scrub_home(&home, &self.token)?;
         Ok(home)
     }
@@ -302,6 +330,11 @@ impl GitCredentialConfig {
     /// Requires the account login, so it only runs on the dashboard-connected
     /// path. On the env-var fallback the login is unknown, so `gh` is left
     /// untouched (git still works via `.git-credentials`).
+    ///
+    /// Merges the `github.com` entry into any existing `hosts.yml` rather than
+    /// overwriting the file, so a pre-existing entry for another host (e.g. a
+    /// GitHub Enterprise instance, or — on a host workspace — the operator's own
+    /// `gh auth`) is preserved.
     fn write_gh_hosts(&self, home: &Path) -> std::io::Result<()> {
         let Some(login) = self
             .login
@@ -313,14 +346,10 @@ impl GitCredentialConfig {
         };
         let gh_dir = home.join(".config").join("gh");
         std::fs::create_dir_all(&gh_dir)?;
-        // Both the host-level `oauth_token`/`user` (older gh) and the `users`
-        // map (newer gh) are written so `gh auth status` works across versions.
-        let hosts = format!(
-            "github.com:\n    git_protocol: https\n    user: {login}\n    oauth_token: {token}\n    users:\n        {login}:\n            oauth_token: {token}\n",
-            login = login,
-            token = self.token,
-        );
-        write_file_0600(&gh_dir.join("hosts.yml"), hosts.as_bytes())
+        let path = gh_dir.join("hosts.yml");
+        let existing = std::fs::read_to_string(&path).unwrap_or_default();
+        let merged = merge_gh_hosts(&existing, login, &self.token);
+        write_file_0600(&path, merged.as_bytes())
     }
 
     /// The managed `.gitconfig` block (between the sentinel markers).
@@ -338,6 +367,52 @@ impl GitCredentialConfig {
         s.push_str(MANAGED_END);
         s
     }
+}
+
+/// Merge the `github.com` entry into existing `gh` `hosts.yml` content, dropping
+/// any prior `github.com` entry and preserving every other host. Both the
+/// host-level `oauth_token`/`user` (older gh) and the `users` map (newer gh) are
+/// written so `gh auth status` works across versions. Falls back to a
+/// github.com-only document if the existing file can't be parsed as a mapping.
+fn merge_gh_hosts(existing: &str, login: &str, token: &str) -> String {
+    use serde_yaml::{Mapping, Value};
+
+    let github_entry = {
+        let mut entry = Mapping::new();
+        entry.insert(
+            Value::String("git_protocol".into()),
+            Value::String("https".into()),
+        );
+        entry.insert(Value::String("user".into()), Value::String(login.into()));
+        entry.insert(
+            Value::String("oauth_token".into()),
+            Value::String(token.into()),
+        );
+        let mut user_entry = Mapping::new();
+        user_entry.insert(
+            Value::String("oauth_token".into()),
+            Value::String(token.into()),
+        );
+        let mut users = Mapping::new();
+        users.insert(Value::String(login.into()), Value::Mapping(user_entry));
+        entry.insert(Value::String("users".into()), Value::Mapping(users));
+        Value::Mapping(entry)
+    };
+
+    let mut doc: Mapping = serde_yaml::from_str::<Value>(existing)
+        .ok()
+        .and_then(|v| match v {
+            Value::Mapping(m) => Some(m),
+            _ => None,
+        })
+        .unwrap_or_default();
+    doc.insert(Value::String("github.com".into()), github_entry);
+
+    serde_yaml::to_string(&Value::Mapping(doc)).unwrap_or_else(|_| {
+        format!(
+            "github.com:\n    git_protocol: https\n    user: {login}\n    oauth_token: {token}\n    users:\n        {login}:\n            oauth_token: {token}\n"
+        )
+    })
 }
 
 /// Merge a github.com token line into existing `.git-credentials` content,
@@ -430,12 +505,19 @@ fn push_unique_candidate(candidates: &mut Vec<PathBuf>, path: PathBuf) {
     }
 }
 
+/// The git-credential home as the *agent process* sees it. Matches
+/// [`resolve_git_home_root`] except for nspawn containers, where the host path
+/// `<workspace_root>/root` is the container-internal `/root`.
 fn resolve_workspace_home_for_process(
-    _workspace_root: &Path,
+    workspace_root: &Path,
     workspace_type: WorkspaceType,
     workspace_env: &HashMap<String, String>,
 ) -> PathBuf {
-    if workspace_type == WorkspaceType::Container && !container_fallback_from_env(workspace_env) {
+    if workspace_type == WorkspaceType::Host {
+        workspace_root.join(HOST_GIT_HOME_SUBDIR)
+    } else if workspace_type == WorkspaceType::Container
+        && !container_fallback_from_env(workspace_env)
+    {
         PathBuf::from("/root")
     } else {
         PathBuf::from(home_dir())
@@ -573,6 +655,7 @@ fn remove_file_if_exists(path: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::workspace::resolve_workspace_home_root;
 
     #[test]
     fn merge_credentials_into_empty() {
@@ -677,6 +760,60 @@ mod tests {
         let env = HashMap::new();
         let home = resolve_workspace_home_root(root, WorkspaceType::Host, &env);
         assert_eq!(home, PathBuf::from(crate::util::home_dir()));
+    }
+
+    #[test]
+    fn git_home_isolates_host_workspace_from_operator_home() {
+        // Host workspace: git creds go to a sandboxed subdir, NOT the operator's
+        // real $HOME, so we never clobber their ~/.gitconfig / ~/.config/gh.
+        let root = Path::new("/srv/ws/mission-1");
+        let env = HashMap::new();
+        let write = resolve_git_home_root(root, WorkspaceType::Host, &env);
+        let process = resolve_workspace_home_for_process(root, WorkspaceType::Host, &env);
+        assert_eq!(write, root.join(HOST_GIT_HOME_SUBDIR));
+        // Write and process homes must agree for a host workspace (no namespace).
+        assert_eq!(write, process);
+        assert_ne!(write, PathBuf::from(crate::util::home_dir()));
+        // Containers are unchanged (already isolated at <root>/root).
+        assert_eq!(
+            resolve_git_home_root(root, WorkspaceType::Container, &env),
+            root.join("root")
+        );
+    }
+
+    #[test]
+    fn gh_hosts_merge_preserves_other_hosts_and_replaces_github() {
+        let existing = "\
+git.example.com:
+    git_protocol: ssh
+    user: someone
+    oauth_token: keep-me
+github.com:
+    git_protocol: https
+    user: old-user
+    oauth_token: stale-token
+";
+        let merged = merge_gh_hosts(existing, "new-user", "fresh-token");
+        let parsed: serde_yaml::Value = serde_yaml::from_str(&merged).unwrap();
+        let map = parsed.as_mapping().unwrap();
+        // Other host untouched.
+        let other = map.get("git.example.com").unwrap();
+        assert_eq!(other.get("oauth_token").unwrap().as_str(), Some("keep-me"));
+        // github.com replaced with the new identity/token; no stale data left.
+        let gh = map.get("github.com").unwrap();
+        assert_eq!(gh.get("user").unwrap().as_str(), Some("new-user"));
+        assert_eq!(gh.get("oauth_token").unwrap().as_str(), Some("fresh-token"));
+        assert!(!merged.contains("stale-token"));
+        assert!(!merged.contains("old-user"));
+    }
+
+    #[test]
+    fn gh_hosts_merge_writes_github_into_empty_file() {
+        let merged = merge_gh_hosts("", "ada", "tok");
+        let parsed: serde_yaml::Value = serde_yaml::from_str(&merged).unwrap();
+        let gh = parsed.as_mapping().unwrap().get("github.com").unwrap();
+        assert_eq!(gh.get("user").unwrap().as_str(), Some("ada"));
+        assert_eq!(gh.get("oauth_token").unwrap().as_str(), Some("tok"));
     }
 
     #[test]

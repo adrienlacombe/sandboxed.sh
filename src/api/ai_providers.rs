@@ -5887,6 +5887,12 @@ async fn list_provider_types() -> Json<Vec<ProviderTypeInfo>> {
             uses_oauth: true,
             env_var: None,
         },
+        ProviderTypeInfo {
+            id: "kimi".to_string(),
+            name: "Kimi".to_string(),
+            uses_oauth: true,
+            env_var: None,
+        },
     ];
     Json(types)
 }
@@ -6440,31 +6446,29 @@ async fn get_provider_usage(
                 // months-stale access_token and surface as HTTP 401.
                 if oauth_token_expired(o.expires_at) {
                     let (token, refresh_err) = if let Some(uuid) = provider_uuid {
-                        match exchange_anthropic_refresh_token(&o.refresh_token).await {
-                            Ok(fresh) => {
-                                let access = fresh.access_token.clone();
-                                if state
-                                    .ai_providers
-                                    .set_oauth_credentials(uuid, fresh)
-                                    .await
-                                    .is_none()
-                                {
-                                    tracing::warn!(
-                                        provider_id = %uuid,
-                                        "Provider disappeared while persisting refreshed OAuth credentials"
-                                    );
-                                }
-                                (access, None)
-                            }
+                        // Route through the single locked, all-tiers refresh path so
+                        // this on-demand probe can't rotate the (rotating) Anthropic
+                        // refresh token out from under the proactive refresher or the
+                        // shared credential tiers and leave them with invalid_grant.
+                        match refresh_store_account_oauth_locked(
+                            &state.ai_providers,
+                            uuid,
+                            ProviderType::Anthropic,
+                            &o.refresh_token,
+                        )
+                        .await
+                        {
+                            Ok((access, _refresh, _expires_at)) => (access, None),
                             Err(e) => {
-                                let lower = e.to_lowercase();
+                                let msg = e.to_string();
+                                let lower = msg.to_lowercase();
                                 let is_permanent = lower.contains("invalid_grant")
                                     || lower.contains("refresh token not found");
                                 if is_permanent {
                                     tracing::debug!(
                                         provider_id = %uuid,
                                         "Per-provider Anthropic OAuth refresh failed (permanent, re-auth needed): {}",
-                                        e
+                                        msg
                                     );
                                 } else if should_warn_oauth(&format!(
                                     "anthropic-oauth-refresh:{}",
@@ -6473,16 +6477,16 @@ async fn get_provider_usage(
                                     tracing::warn!(
                                         provider_id = %uuid,
                                         "Per-provider Anthropic OAuth refresh failed: {}",
-                                        e
+                                        msg
                                     );
                                 } else {
                                     tracing::debug!(
                                         provider_id = %uuid,
                                         "Per-provider Anthropic OAuth refresh failed (suppressed): {}",
-                                        e
+                                        msg
                                     );
                                 }
-                                (o.access_token.clone(), Some(e))
+                                (o.access_token.clone(), Some(msg))
                             }
                         }
                     } else {
@@ -7823,6 +7827,431 @@ fn parse_openai_authorization_input(input: &str) -> (Option<String>, Option<Stri
 }
 
 /// POST /api/ai/providers/:id/oauth/authorize - Initiate OAuth authorization.
+// ─────────────────────────────────────────────────────────────────────────────
+// Kimi (Moonshot) Code subscription — OAuth 2.0 Device Authorization Grant
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Kimi Code OAuth client id (hardcoded, shared with kimi-cli; no registration).
+const KIMI_CLIENT_ID: &str = "17e5f671-d194-4dfb-9706-5516cb48c098";
+const KIMI_DEVICE_AUTH_URL: &str = "https://auth.kimi.com/api/oauth/device_authorization";
+const KIMI_TOKEN_URL: &str = "https://auth.kimi.com/api/oauth/token";
+/// Kimi Code coding endpoint (OpenAI Chat Completions compatible).
+pub(crate) const KIMI_API_BASE_URL: &str = "https://api.kimi.com/coding/v1";
+/// The coding endpoint returns 403 unless the User-Agent matches a known
+/// coding-agent pattern, so pin it to the Kimi CLI's UA.
+const KIMI_USER_AGENT: &str = "KimiCLI/1.5";
+const KIMI_DEVICE_GRANT: &str = "urn:ietf:params:oauth:grant-type:device_code";
+
+#[derive(Clone)]
+enum KimiDeviceStatus {
+    Pending,
+    Authorized {
+        refresh_token: String,
+        access_token: String,
+        expires_at: i64,
+    },
+    Expired,
+    Error(String),
+}
+
+struct KimiDeviceFlow {
+    status: KimiDeviceStatus,
+    #[allow(dead_code)]
+    created_at: Instant,
+}
+
+/// In-flight Kimi device-authorization flows, keyed by the route path id
+/// ("kimi" for first-time add, or a provider-row UUID for reconnect).
+static KIMI_DEVICE_FLOWS: LazyLock<StdMutex<HashMap<String, KimiDeviceFlow>>> =
+    LazyLock::new(|| StdMutex::new(HashMap::new()));
+
+fn set_kimi_device_status(key: &str, status: KimiDeviceStatus) {
+    let mut flows = KIMI_DEVICE_FLOWS.lock().unwrap();
+    if let Some(flow) = flows.get_mut(key) {
+        flow.status = status;
+    }
+}
+
+/// Stable device id for the Kimi `X-Msh-Device-Id` header, persisted under
+/// `~/.sandboxed-sh/kimi_device_id` so it survives restarts.
+fn kimi_device_id() -> String {
+    let path = PathBuf::from(home_dir())
+        .join(".sandboxed-sh")
+        .join("kimi_device_id");
+    if let Ok(existing) = std::fs::read_to_string(&path) {
+        let trimmed = existing.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    let id = uuid::Uuid::new_v4().to_string();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(&path, &id);
+    id
+}
+
+/// Apply the headers Kimi's auth/token endpoints expect (UA + device metadata).
+fn kimi_device_headers(builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    builder
+        .header("User-Agent", KIMI_USER_AGENT)
+        .header("X-Msh-Platform", "sandboxed-sh")
+        .header("X-Msh-Version", "1.5.0")
+        .header("X-Msh-Device-Name", "sandboxed-sh")
+        .header("X-Msh-Device-Model", "server")
+        .header("X-Msh-Os-Version", std::env::consts::OS)
+        .header("X-Msh-Device-Id", kimi_device_id())
+}
+
+#[derive(Debug, Deserialize)]
+struct KimiDeviceAuthResponse {
+    device_code: String,
+    user_code: String,
+    verification_uri: String,
+    #[serde(default)]
+    verification_uri_complete: Option<String>,
+    #[serde(default = "kimi_default_interval")]
+    interval: u64,
+    #[serde(default)]
+    expires_in: u64,
+}
+
+fn kimi_default_interval() -> u64 {
+    5
+}
+
+enum KimiPollOutcome {
+    Pending,
+    SlowDown,
+    Authorized {
+        refresh_token: String,
+        access_token: String,
+        expires_at: i64,
+    },
+    Denied(String),
+}
+
+async fn kimi_start_device_authorization(
+    client: &reqwest::Client,
+) -> Result<KimiDeviceAuthResponse, String> {
+    let resp = kimi_device_headers(
+        client
+            .post(KIMI_DEVICE_AUTH_URL)
+            .form(&[("client_id", KIMI_CLIENT_ID)]),
+    )
+    .send()
+    .await
+    .map_err(|e| format!("Failed to start Kimi device authorization: {e}"))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        return Err(format!(
+            "Kimi device authorization failed ({status}): {text}"
+        ));
+    }
+
+    resp.json::<KimiDeviceAuthResponse>()
+        .await
+        .map_err(|e| format!("Failed to parse Kimi device authorization response: {e}"))
+}
+
+async fn kimi_poll_token_once(
+    client: &reqwest::Client,
+    device_code: &str,
+) -> Result<KimiPollOutcome, String> {
+    let resp = kimi_device_headers(client.post(KIMI_TOKEN_URL).form(&[
+        ("grant_type", KIMI_DEVICE_GRANT),
+        ("client_id", KIMI_CLIENT_ID),
+        ("device_code", device_code),
+    ]))
+    .send()
+    .await
+    .map_err(|e| format!("Failed to poll Kimi token endpoint: {e}"))?;
+
+    let status = resp.status();
+    let data: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("Failed to parse Kimi token response: {e}"))?;
+
+    if status.is_success() {
+        let access_token = data
+            .get("access_token")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "Kimi token response missing access_token".to_string())?
+            .to_string();
+        let refresh_token = data
+            .get("refresh_token")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let expires_in = data
+            .get("expires_in")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(3600);
+        let expires_at = chrono::Utc::now().timestamp_millis() + expires_in * 1000;
+        return Ok(KimiPollOutcome::Authorized {
+            refresh_token,
+            access_token,
+            expires_at,
+        });
+    }
+
+    let error = data
+        .get("error")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown_error");
+    match error {
+        "authorization_pending" => Ok(KimiPollOutcome::Pending),
+        "slow_down" => Ok(KimiPollOutcome::SlowDown),
+        other => Ok(KimiPollOutcome::Denied(other.to_string())),
+    }
+}
+
+/// Background task: poll the Kimi token endpoint until the user authorizes the
+/// device, then persist the OAuth credentials (auth.json + sandboxed store).
+fn spawn_kimi_device_poll(key: String, dev: KimiDeviceAuthResponse) {
+    tokio::spawn(async move {
+        let client = reqwest::Client::new();
+        let mut interval = dev.interval.max(1);
+        let expires_in = if dev.expires_in > 0 {
+            dev.expires_in
+        } else {
+            600
+        };
+        let deadline = Instant::now() + Duration::from_secs(expires_in);
+        // Last transient poll error, surfaced only if we never get a definitive
+        // answer before the device code expires (see the `Err` arm below).
+        let mut last_transient_error: Option<String> = None;
+
+        loop {
+            if Instant::now() >= deadline {
+                let status = match last_transient_error.take() {
+                    Some(e) => KimiDeviceStatus::Error(format!(
+                        "Kimi device login timed out after repeated polling errors: {e}"
+                    )),
+                    None => KimiDeviceStatus::Expired,
+                };
+                set_kimi_device_status(&key, status);
+                return;
+            }
+            tokio::time::sleep(Duration::from_secs(interval)).await;
+            match kimi_poll_token_once(&client, &dev.device_code).await {
+                Ok(KimiPollOutcome::Pending) => continue,
+                Ok(KimiPollOutcome::SlowDown) => {
+                    interval += 5;
+                    continue;
+                }
+                Ok(KimiPollOutcome::Authorized {
+                    refresh_token,
+                    access_token,
+                    expires_at,
+                }) => {
+                    if let Err(e) = sync_to_opencode_auth(
+                        ProviderType::Kimi,
+                        &refresh_token,
+                        &access_token,
+                        expires_at,
+                    ) {
+                        set_kimi_device_status(&key, KimiDeviceStatus::Error(e));
+                    } else {
+                        set_kimi_device_status(
+                            &key,
+                            KimiDeviceStatus::Authorized {
+                                refresh_token,
+                                access_token,
+                                expires_at,
+                            },
+                        );
+                    }
+                    return;
+                }
+                Ok(KimiPollOutcome::Denied(msg)) => {
+                    set_kimi_device_status(&key, KimiDeviceStatus::Error(msg));
+                    return;
+                }
+                Err(e) => {
+                    // Transient transport/parse failure — a single network blip
+                    // must not permanently fail the flow. Keep polling until the
+                    // device code expires; the error is only surfaced at the
+                    // deadline if no definitive outcome ever arrives.
+                    tracing::warn!("Kimi device-token poll error (will retry until expiry): {e}");
+                    last_transient_error = Some(e);
+                    continue;
+                }
+            }
+        }
+    });
+}
+
+async fn refresh_kimi_oauth_tokens(
+    client: &reqwest::Client,
+    refresh_token: &str,
+) -> Result<(String, String, i64), OAuthRefreshError> {
+    let resp = kimi_device_headers(client.post(KIMI_TOKEN_URL).form(&[
+        ("grant_type", "refresh_token"),
+        ("client_id", KIMI_CLIENT_ID),
+        ("refresh_token", refresh_token),
+    ]))
+    .send()
+    .await
+    .map_err(|e| OAuthRefreshError::Other(format!("Failed to refresh Kimi token: {e}")))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        if text.contains("invalid_grant") {
+            return Err(OAuthRefreshError::InvalidGrant(format!(
+                "Kimi refresh token expired or revoked ({status}): {text}"
+            )));
+        }
+        return Err(OAuthRefreshError::Other(format!(
+            "Kimi OAuth refresh failed ({status}): {text}"
+        )));
+    }
+
+    let data: serde_json::Value = resp.json().await.map_err(|e| {
+        OAuthRefreshError::Other(format!("Failed to parse Kimi refresh response: {e}"))
+    })?;
+    let access_token = data
+        .get("access_token")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            OAuthRefreshError::Other("No access_token in Kimi refresh response".to_string())
+        })?;
+    let new_refresh = data
+        .get("refresh_token")
+        .and_then(|v| v.as_str())
+        .unwrap_or(refresh_token);
+    let expires_in = data
+        .get("expires_in")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(3600);
+    let expires_at = chrono::Utc::now().timestamp_millis() + expires_in * 1000;
+    Ok((
+        access_token.to_string(),
+        new_refresh.to_string(),
+        expires_at,
+    ))
+}
+
+/// Create or update the stored Kimi provider row from fresh OAuth credentials.
+/// Modeled on [`upsert_grok_oauth_provider`], but Kimi mirrors creds into the
+/// store (so the chain resolver/multi-account UI see them) and pins `base_url`.
+async fn upsert_kimi_oauth_provider(
+    state: &super::routes::AppState,
+    refresh_token: &str,
+    access_token: &str,
+    expires_at: i64,
+    use_for_backends: Option<Vec<String>>,
+    target_id: Option<uuid::Uuid>,
+) -> Result<ProviderResponse, (StatusCode, String)> {
+    let backends =
+        use_for_backends.unwrap_or_else(|| default_backends_for_provider(ProviderType::Kimi));
+    let existing = state.ai_providers.get_all_by_type(ProviderType::Kimi).await;
+    let mut provider = target_id
+        .and_then(|tid| existing.iter().find(|p| p.id == tid).cloned())
+        .or_else(|| existing.iter().find(|p| p.has_oauth()).cloned())
+        .unwrap_or_else(|| {
+            crate::ai_providers::AIProvider::new(
+                ProviderType::Kimi,
+                "Kimi (Subscription)".to_string(),
+            )
+        });
+
+    provider.api_key = None;
+    provider.oauth = Some(crate::ai_providers::OAuthCredentials {
+        refresh_token: refresh_token.to_string(),
+        access_token: access_token.to_string(),
+        expires_at,
+    });
+    provider.base_url = Some(KIMI_API_BASE_URL.to_string());
+    provider.use_for_backends = Some(backends.clone());
+    provider.enabled = true;
+
+    let stored = if state.ai_providers.get(provider.id).await.is_some() {
+        state.ai_providers.update(provider.id, provider).await
+    } else {
+        let id = state.ai_providers.add(provider).await;
+        state.ai_providers.get(id).await
+    }
+    .ok_or_else(|| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to save Kimi OAuth provider".to_string(),
+        )
+    })?;
+
+    if let Err(e) =
+        update_provider_backends(&state.config.working_dir, ProviderType::Kimi.id(), backends)
+    {
+        tracing::error!("Failed to save Kimi provider backends: {}", e);
+    }
+
+    Ok(build_response_from_store(&stored))
+}
+
+/// Background loop: keep the Kimi OAuth access token fresh. The chain resolver
+/// forwards the access token as a Bearer but does NOT refresh it, so without
+/// this a short-lived Kimi token would be dropped mid-mission.
+pub fn spawn_kimi_oauth_refresh_loop(state: Arc<super::routes::AppState>) {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(300)).await;
+
+            // Only do work if a Kimi provider exists.
+            if state
+                .ai_providers
+                .get_all_by_type(ProviderType::Kimi)
+                .await
+                .is_empty()
+            {
+                continue;
+            }
+            let Some(entry) = read_oauth_token_entry(ProviderType::Kimi) else {
+                continue;
+            };
+            // Refresh only when within 10 minutes of expiry.
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            if entry.expires_at > now_ms + 600_000 || entry.refresh_token.trim().is_empty() {
+                continue;
+            }
+
+            let client = reqwest::Client::new();
+            match refresh_kimi_oauth_tokens(&client, &entry.refresh_token).await {
+                Ok((access, refresh, expires_at)) => {
+                    if let Err(e) =
+                        sync_to_opencode_auth(ProviderType::Kimi, &refresh, &access, expires_at)
+                    {
+                        tracing::warn!("Failed to persist refreshed Kimi token: {e}");
+                    }
+                    // Update store rows so the chain resolver sees the fresh token.
+                    for mut acct in state.ai_providers.get_all_by_type(ProviderType::Kimi).await {
+                        if acct.oauth.is_some() {
+                            acct.oauth = Some(crate::ai_providers::OAuthCredentials {
+                                refresh_token: refresh.clone(),
+                                access_token: access.clone(),
+                                expires_at,
+                            });
+                            let id = acct.id;
+                            state.ai_providers.update(id, acct).await;
+                        }
+                    }
+                    tracing::info!("Refreshed Kimi OAuth token (expires_at={expires_at})");
+                }
+                Err(OAuthRefreshError::InvalidGrant(msg)) => {
+                    tracing::warn!("Kimi refresh token invalid; user must re-authenticate: {msg}");
+                }
+                Err(e) => {
+                    tracing::debug!("Kimi token refresh failed: {e}");
+                }
+            }
+        }
+    });
+}
+
 async fn oauth_authorize(
     State(state): State<Arc<super::routes::AppState>>,
     AxumPath(id): AxumPath<String>,
@@ -7986,6 +8415,39 @@ async fn oauth_authorize(
                 method: "auto".to_string(),
             }))
         }
+        ProviderType::Kimi => {
+            let client = reqwest::Client::new();
+            let dev = kimi_start_device_authorization(&client)
+                .await
+                .map_err(internal_error)?;
+            let verify_url = dev
+                .verification_uri_complete
+                .clone()
+                .unwrap_or_else(|| dev.verification_uri.clone());
+            let user_code = dev.user_code.clone();
+
+            // Track the in-flight flow keyed by the path id, then poll in the
+            // background until the user approves in the browser.
+            {
+                let mut flows = KIMI_DEVICE_FLOWS.lock().unwrap();
+                flows.insert(
+                    id.clone(),
+                    KimiDeviceFlow {
+                        status: KimiDeviceStatus::Pending,
+                        created_at: std::time::Instant::now(),
+                    },
+                );
+            }
+            spawn_kimi_device_poll(id.clone(), dev);
+
+            Ok(Json(OAuthAuthorizeResponse {
+                url: verify_url,
+                instructions: format!(
+                    "1. Open the Kimi authorization page.\n2. Confirm code: {user_code}\n3. After approving in the browser, return here and click Connect."
+                ),
+                method: "auto".to_string(),
+            }))
+        }
         _ => Err((
             StatusCode::BAD_REQUEST,
             "OAuth not supported for this provider".to_string(),
@@ -8021,8 +8483,12 @@ async fn oauth_callback(
                 },
             };
 
-            if resolved_type_and_uuid.map(|(pt, _)| pt) == Some(ProviderType::Xai) {
-                // xAI tracks creds in auth.json only; don't mirror to the store.
+            if matches!(
+                resolved_type_and_uuid.map(|(pt, _)| pt),
+                Some(ProviderType::Xai) | Some(ProviderType::Kimi)
+            ) {
+                // xAI/Kimi already upserted the store row inside
+                // oauth_callback_inner; don't double-mirror here.
                 return json.into_response();
             }
 
@@ -8185,6 +8651,56 @@ async fn oauth_callback_inner(
             upsert_grok_oauth_provider(&state, &entry, req.use_for_backends.clone(), target_id)
                 .await?;
         return Ok(Json(response));
+    }
+
+    if provider_type == ProviderType::Kimi {
+        // The background poll task (spawned in oauth_authorize) drives the
+        // device flow; here we just gate on its current status.
+        let status = {
+            let flows = KIMI_DEVICE_FLOWS.lock().unwrap();
+            flows.get(&id).map(|f| f.status.clone())
+        };
+        match status {
+            Some(KimiDeviceStatus::Authorized {
+                refresh_token,
+                access_token,
+                expires_at,
+            }) => {
+                KIMI_DEVICE_FLOWS.lock().unwrap().remove(&id);
+                let target_id = uuid::Uuid::parse_str(&id).ok();
+                let response = upsert_kimi_oauth_provider(
+                    &state,
+                    &refresh_token,
+                    &access_token,
+                    expires_at,
+                    req.use_for_backends.clone(),
+                    target_id,
+                )
+                .await?;
+                return Ok(Json(response));
+            }
+            Some(KimiDeviceStatus::Expired) => {
+                KIMI_DEVICE_FLOWS.lock().unwrap().remove(&id);
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "Kimi device authorization expired. Please start again.".to_string(),
+                ));
+            }
+            Some(KimiDeviceStatus::Error(msg)) => {
+                KIMI_DEVICE_FLOWS.lock().unwrap().remove(&id);
+                return Err((
+                    StatusCode::BAD_GATEWAY,
+                    format!("Kimi authorization failed: {msg}"),
+                ));
+            }
+            Some(KimiDeviceStatus::Pending) | None => {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "Kimi is not connected yet. Finish the browser authorization, then click Connect."
+                        .to_string(),
+                ));
+            }
+        }
     }
 
     // Get pending OAuth state
@@ -9272,20 +9788,15 @@ pub async fn refresh_due_store_oauth(
         if oauth.expires_at - now_ms > refresh_threshold_ms {
             continue;
         }
-        // Serialize with the file-based refresher to avoid racing a rotating
-        // refresh token (best-effort — proceed unlocked if contended).
-        let _lock = acquire_oauth_refresh_lock(provider_type).ok();
-        match refresh_oauth_token_internal(&provider_type, &oauth.refresh_token).await {
-            Ok((access, refresh, expires_at)) => {
-                let mut updated = account.clone();
-                updated.oauth = Some(crate::ai_providers::OAuthCredentials {
-                    access_token: access.clone(),
-                    refresh_token: refresh.clone(),
-                    expires_at,
-                });
-                ai_providers.update(account.id, updated).await;
-                // Keep the credential tiers consistent too (best-effort).
-                let _ = sync_oauth_to_all_tiers(provider_type, &refresh, &access, expires_at);
+        match refresh_store_account_oauth_locked(
+            ai_providers,
+            account.id,
+            provider_type,
+            &oauth.refresh_token,
+        )
+        .await
+        {
+            Ok((_access, _refresh, expires_at)) => {
                 refreshed += 1;
                 tracing::info!(
                     provider = ?provider_type,
@@ -9298,11 +9809,88 @@ pub async fn refresh_due_store_oauth(
                 tracing::warn!(
                     provider = ?provider_type,
                     account_id = %account.id,
-                    error = ?e,
+                    error = %e,
                     "Failed to refresh store-backed OAuth token (account may need reconnect)"
                 );
             }
         }
     }
     (found, refreshed)
+}
+
+/// Refresh a single **store-backed** OAuth account under the global per-type
+/// refresh lock, writing the rotated token back to the AIProviderStore record
+/// and — only when this account currently owns the shared credential tiers —
+/// to the credential tiers (`credentials.json` / OpenCode `auth.json` / Claude
+/// CLI creds).
+///
+/// This is the single writer for store-account OAuth rotation. Providers like
+/// Anthropic rotate **and revoke** the refresh token on every refresh, so every
+/// stored copy of the token must move together. Ad-hoc callers (e.g. the usage
+/// probe) MUST go through here rather than rotating the token in isolation —
+/// otherwise the other stores hit `invalid_grant` on their next refresh.
+///
+/// The credential tiers are a singleton per provider type, but the store can
+/// hold several accounts of the same type (e.g. multiple Anthropic logins). We
+/// therefore mirror to the tiers only when the account's current refresh token
+/// matches the tier token — i.e. this account is the one the harnesses/tiers
+/// are actually using — so refreshing a secondary account never clobbers the
+/// primary account's tier credentials.
+pub async fn refresh_store_account_oauth_locked(
+    ai_providers: &crate::ai_providers::AIProviderStore,
+    account_id: uuid::Uuid,
+    provider_type: ProviderType,
+    fallback_refresh_token: &str,
+) -> Result<(String, String, i64), OAuthRefreshError> {
+    // Serialize with every other refresh path for this provider type so a
+    // rotating refresh token is only ever consumed once.
+    let _lock = acquire_oauth_refresh_lock(provider_type).ok();
+
+    // Re-read the freshest refresh token now that we hold the lock — another
+    // path may have rotated it while we were waiting.
+    let refresh_token = ai_providers
+        .get(account_id)
+        .await
+        .and_then(|p| p.oauth)
+        .map(|o| o.refresh_token)
+        .filter(|t| !t.trim().is_empty())
+        .unwrap_or_else(|| fallback_refresh_token.to_string());
+
+    // Does this account currently back the shared credential tiers? If there is
+    // no tier entry yet (e.g. a freshly connected single account), treat it as
+    // the owner so the tiers get populated.
+    let owns_tiers = read_oauth_token_entry(provider_type)
+        .map(|e| e.refresh_token)
+        .map_or(true, |tier_token| tier_token == refresh_token);
+
+    let (access, refresh, expires_at) =
+        refresh_oauth_token_internal(&provider_type, &refresh_token).await?;
+
+    // Always update this account's own store record.
+    if ai_providers
+        .set_oauth_credentials(
+            account_id,
+            crate::ai_providers::OAuthCredentials {
+                access_token: access.clone(),
+                refresh_token: refresh.clone(),
+                expires_at,
+            },
+        )
+        .await
+        .is_none()
+    {
+        tracing::warn!(
+            provider = ?provider_type,
+            account_id = %account_id,
+            "Provider disappeared while persisting refreshed OAuth credentials"
+        );
+    }
+
+    // Only mirror to the shared tiers when this account owns them, so a
+    // secondary login never overwrites the primary's tier credentials.
+    if owns_tiers {
+        let _ = sync_oauth_to_all_tiers(provider_type, &refresh, &access, expires_at);
+    }
+
+    Ok((access, refresh, expires_at))
 }

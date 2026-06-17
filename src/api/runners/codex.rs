@@ -841,10 +841,16 @@ pub async fn run_codex_turn(
         "Starting Codex execution via WorkspaceExec"
     );
 
+    // DGX Spark build offload (opt-in per workspace) — see
+    // Workspace::spark_offload_env. Exported to the codex app-server process so
+    // the in-workspace `spark-build` wrapper can reach the host offload endpoint.
+    let extra_env = workspace.spark_offload_env(mission_id).unwrap_or_default();
+
     let codex_config = crate::backend::codex::client::CodexConfig {
         cli_path,
         model_effort: model_effort.map(|s| s.to_string()),
         cancel_token: Some(cancel.clone()),
+        extra_env,
         external_chatgpt_auth: prepared_oauth_account.as_ref().map(|account| {
             crate::backend::codex::client::CodexExternalChatgptAuth {
                 access_token: account.access_token.clone(),

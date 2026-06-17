@@ -658,6 +658,14 @@ CREATE TABLE IF NOT EXISTS board_tasks (
 CREATE INDEX IF NOT EXISTS idx_board_tasks_boss ON board_tasks(boss_mission_id);
 CREATE INDEX IF NOT EXISTS idx_board_tasks_worker ON board_tasks(worker_mission_id);
 CREATE INDEX IF NOT EXISTS idx_board_tasks_status ON board_tasks(status);
+
+-- Persisted control-session message queue (JSON snapshot) so pending queued
+-- messages survive a restart. Single row (the DB is already per-user).
+CREATE TABLE IF NOT EXISTS control_queue (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    payload TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
 "#;
 
 /// Content size threshold for inline storage (64KB).
@@ -2919,6 +2927,42 @@ impl MissionStore for SqliteMissionStore {
             )
             .map_err(|e| e.to_string())?;
             Ok(())
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
+    async fn save_control_queue(&self, _user_id: &str, payload: &str) -> Result<(), String> {
+        let conn = self.conn.clone();
+        let payload = payload.to_string();
+        let now = now_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "INSERT INTO control_queue (id, payload, updated_at) VALUES (1, ?1, ?2)
+                 ON CONFLICT(id) DO UPDATE SET payload = ?1, updated_at = ?2",
+                params![payload, now],
+            )
+            .map_err(|e| e.to_string())?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
+    async fn load_control_queue(&self, _user_id: &str) -> Result<String, String> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let payload: Option<String> = conn
+                .query_row(
+                    "SELECT payload FROM control_queue WHERE id = 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|e| e.to_string())?;
+            Ok(payload.unwrap_or_default())
         })
         .await
         .map_err(|e| e.to_string())?

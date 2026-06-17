@@ -47,6 +47,34 @@ const SEED_EVENT_COUNT: usize = 40;
 /// fetch serves both this scan and the [`SEED_EVENT_COUNT`] seed.
 const GOAL_SCAN_EVENT_COUNT: usize = 200;
 
+/// Nudge appended before the forced, tools-disabled synthesis pass. MiniMax-M3
+/// tends to free-style another tool call here (emitting raw `<invoke>`/`<tool_call>`
+/// markup wrapped in its interleave sentinels); this pushes it to answer in prose
+/// instead. `finalize_answer` strips any markup that leaks through regardless.
+const FINAL_SYNTHESIS_NUDGE: &str = "You have no tools available for this reply. Do NOT emit any tool call, function call, or XML markup such as <invoke> or <tool_call>. Answer the operator directly in prose, using only what you already gathered from the tool results above.";
+
+/// Shown when the turn produced no usable prose (tool-call limit hit, or the
+/// model emitted only tool-call markup that was stripped away).
+const TOOL_LIMIT_FALLBACK: &str =
+    "(The assistant reached the tool-call limit without a final answer.)";
+
+/// Clean a final answer before it is shown/persisted: strip reasoning blocks
+/// (`<think>`/`<mm:think>`) like the mission path does, then strip any tool-call
+/// markup the model leaked into prose. The text tool-call parser only runs when
+/// tools are offered, so the tools-disabled synthesis pass can otherwise leak
+/// raw `]<]minimax[>[<invoke …>` markup verbatim into the chat (observed in prod
+/// on mission cd6cfe3f). Falls back to a canned notice when nothing but markup
+/// remains.
+fn finalize_answer(raw: &str) -> String {
+    let stripped = crate::api::mission_runner::strip_think_tags(raw);
+    let cleaned = client::strip_leaked_tool_markup(&stripped);
+    if cleaned.is_empty() {
+        TOOL_LIMIT_FALLBACK.to_string()
+    } else {
+        cleaned
+    }
+}
+
 static ASK_STORE: OnceCell<Arc<AskStore>> = OnceCell::const_new();
 
 /// Get (lazily initializing) the global Ask store, placed next to the mission
@@ -194,6 +222,7 @@ pub async fn run_ask_turn(turn: &AskTurn, user_content: &str) -> Result<String, 
         // final answer. Give it one more pass with tools disabled so it must
         // synthesize from the results it already gathered, rather than bailing
         // with a canned "tool-call limit" message.
+        messages.push(json!({ "role": "user", "content": FINAL_SYNTHESIS_NUDGE }));
         match turn.llm.complete(&messages, &[]).await {
             Ok(c) => {
                 total_tokens += c.total_tokens.unwrap_or(0);
@@ -201,17 +230,9 @@ pub async fn run_ask_turn(turn: &AskTurn, user_content: &str) -> Result<String, 
             }
             Err(e) => tracing::warn!("[Ask] forced final-answer pass failed: {e}"),
         }
-        if final_answer.is_empty() {
-            final_answer =
-                "(The assistant reached the tool-call limit without a final answer.)".to_string();
-        }
     }
 
-    // Reasoning models (MiniMax, GLM) can leak <think>/<mm:think> blocks into
-    // the visible answer; strip them like the mission path does.
-    final_answer = crate::api::mission_runner::strip_think_tags(&final_answer)
-        .trim()
-        .to_string();
+    final_answer = finalize_answer(&final_answer);
 
     turn.ask_store
         .append_message(
@@ -370,36 +391,33 @@ async fn run_ask_turn_streaming_inner(
         }
     }
 
+    let mut synthesized = false;
     if final_answer.is_empty() {
         // Same forced synthesis as the non-streaming path: one more pass with
-        // tools disabled, streamed so the operator sees the answer arrive.
-        let txc = tx.clone();
-        match turn
-            .llm
-            .complete_stream(&messages, &[], |frag| {
-                let _ = txc.send(AskStreamEvent::Delta {
-                    content: frag.to_string(),
-                });
-            })
-            .await
-        {
+        // tools disabled. Unlike the in-loop turns, this pass is NOT streamed
+        // live — a tools-disabled MiniMax pass may free-style raw tool-call
+        // markup, which would flash into the UI before the post-stream
+        // reconcile. We collect it, clean it, and emit the result as one delta.
+        messages.push(json!({ "role": "user", "content": FINAL_SYNTHESIS_NUDGE }));
+        synthesized = true;
+        match turn.llm.complete_stream(&messages, &[], |_| {}).await {
             Ok(c) => {
                 total_tokens += c.total_tokens.unwrap_or(0);
                 final_answer = c.content.unwrap_or_default();
             }
             Err(e) => tracing::warn!("[Ask] forced final-answer pass (stream) failed: {e}"),
         }
-        if final_answer.is_empty() {
-            final_answer =
-                "(The assistant reached the tool-call limit without a final answer.)".to_string();
-        }
     }
 
-    // Reasoning models (MiniMax, GLM) can leak <think>/<mm:think> blocks into
-    // the visible answer; strip them like the mission path does.
-    final_answer = crate::api::mission_runner::strip_think_tags(&final_answer)
-        .trim()
-        .to_string();
+    final_answer = finalize_answer(&final_answer);
+
+    // The synthesis pass was suppressed above; surface its cleaned text so the
+    // operator sees an answer before `onDone` reconciles against the store.
+    if synthesized {
+        let _ = tx.send(AskStreamEvent::Delta {
+            content: final_answer.clone(),
+        });
+    }
 
     turn.ask_store
         .append_message(

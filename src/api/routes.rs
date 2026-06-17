@@ -529,6 +529,9 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
     // dashboard always reads a fresh-enough cache.
     super::ai_providers::spawn_usage_refresh_loop(Arc::clone(&state));
 
+    // Keep short-lived Kimi OAuth access tokens fresh for the chain resolver.
+    super::ai_providers::spawn_kimi_oauth_refresh_loop(Arc::clone(&state));
+
     // Initialize the metadata LLM client for AI-powered mission titles/descriptions
     {
         super::metadata_llm::init_metadata_llm(state.http_client.clone());
@@ -647,7 +650,13 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         .nest(
             "/v1",
             proxy_api::routes().layer(DefaultBodyLimit::max(50 * 1024 * 1024)),
-        );
+        )
+        // Spark build-offload endpoint authenticates with a per-mission scoped
+        // HMAC capability token verified inside the handler
+        // (verify_spark_offload_token), NOT the dashboard JWT — so it must
+        // bypass require_auth like the /v1 proxy, otherwise the in-workspace
+        // spark-build wrapper's token is rejected at the auth layer.
+        .nest("/api/spark", super::spark::routes());
 
     // File upload routes with increased body limit (10GB)
     let upload_route = Router::new()
@@ -2739,7 +2748,30 @@ async fn oauth_token_refresher_loop(
         }
     }
 
+    // Store-backed account types refreshed proactively (their tokens live in
+    // the AIProviderStore, possibly with several accounts per type).
+    let store_oauth_types = [ProviderType::Anthropic, ProviderType::Xai];
+
     loop {
+        // Refresh store-backed OAuth accounts FIRST. For any account that also
+        // owns the shared credential tiers, this rotates the token AND writes it
+        // to the tiers before the file-tier pass runs below — otherwise that
+        // pass would refresh the tier copy independently and revoke the store
+        // record's refresh token (the Anthropic split-brain that produced
+        // recurring invalid_grant). xAI lives only in the store.
+        let mut store_found = 0u32;
+        let mut store_refreshed = 0u32;
+        for &store_type in &store_oauth_types {
+            let (f, r) = ai_providers_api::refresh_due_store_oauth(
+                &ai_providers,
+                store_type,
+                refresh_threshold_ms,
+            )
+            .await;
+            store_found += f;
+            store_refreshed += r;
+        }
+
         // Check credential files directly for each OAuth-capable provider type.
         // This ensures we find tokens even if they aren't in the AIProviderStore.
         let mut found_count = 0u32;
@@ -2819,17 +2851,6 @@ async fn oauth_token_refresher_loop(
                 },
             }
         }
-
-        // Also refresh store-backed OAuth accounts whose tokens live only in
-        // the AIProviderStore (not auth.json/credentials.json) — notably
-        // xAI/Grok connected via the dashboard. Without this their short-lived
-        // access token expires and model-routing silently drops the provider.
-        let (store_found, store_refreshed) = ai_providers_api::refresh_due_store_oauth(
-            &ai_providers,
-            ProviderType::Xai,
-            refresh_threshold_ms,
-        )
-        .await;
 
         tracing::debug!(
             oauth_tokens_found = found_count,

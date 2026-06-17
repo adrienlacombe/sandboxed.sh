@@ -338,7 +338,7 @@ fn merge_cached_provider_models(
     }
 }
 
-fn sanitize_custom_provider_id(name: &str) -> String {
+pub(crate) fn sanitize_custom_provider_id(name: &str) -> String {
     name.chars()
         .filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-')
         .collect::<String>()
@@ -833,6 +833,33 @@ fn default_providers_config() -> ProvidersConfig {
                         id: "MiniMax-M2".to_string(),
                         name: "MiniMax M2".to_string(),
                         description: Some("Fast and economical".to_string()),
+                    },
+                ],
+            },
+            Provider {
+                id: "kimi".to_string(),
+                name: "Kimi (Subscription)".to_string(),
+                billing: "subscription".to_string(),
+                description: "Kimi Code via Moonshot OAuth (device login)".to_string(),
+                models: vec![
+                    ProviderModel {
+                        id: "kimi-for-coding".to_string(),
+                        name: "Kimi for Coding".to_string(),
+                        description: Some(
+                            "Stable coding alias that tracks the latest Kimi coding model \
+                             (recommended)"
+                                .to_string(),
+                        ),
+                    },
+                    ProviderModel {
+                        id: "kimi-k2.6".to_string(),
+                        name: "Kimi K2.6".to_string(),
+                        description: Some("Latest Kimi K2 model".to_string()),
+                    },
+                    ProviderModel {
+                        id: "kimi-k2-thinking".to_string(),
+                        name: "Kimi K2 Thinking".to_string(),
+                        description: Some("Extended-reasoning Kimi K2 variant".to_string()),
                     },
                 ],
             },

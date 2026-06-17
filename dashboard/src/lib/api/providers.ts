@@ -26,6 +26,7 @@ export type AIProviderType =
   | "zai"
   | "minimax"
   | "github-copilot"
+  | "kimi"
   | "custom";
 
 export interface AIProviderTypeInfo {

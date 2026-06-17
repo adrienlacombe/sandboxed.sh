@@ -265,6 +265,60 @@ impl Workspace {
         }
     }
 
+    /// Whether this workspace opted into offloading Lean builds to the DGX
+    /// Spark (`config.spark_offload.enabled == true`).
+    pub fn spark_offload_enabled(&self) -> bool {
+        self.config
+            .get("spark_offload")
+            .and_then(|v| v.get("enabled"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+    }
+
+    /// Env vars that let the in-workspace `spark-build` wrapper offload a build
+    /// for `mission_id` to the Spark via the host endpoint — or `None` when the
+    /// workspace hasn't opted in or no signing secret is available. The token
+    /// exposed is a per-mission, scope-bound capability token (NOT the master
+    /// proxy secret): a leak only authorizes spark builds for this one mission,
+    /// never the LLM proxy or another mission. Spark credentials stay on the
+    /// host (see `src/api/spark.rs`).
+    pub fn spark_offload_env(&self, mission_id: Uuid) -> Option<HashMap<String, String>> {
+        if !self.spark_offload_enabled() {
+            return None;
+        }
+        let token = crate::api::spark::build_spark_offload_token(mission_id)?;
+        let port = std::env::var("PORT")
+            .ok()
+            .filter(|s| !s.trim().is_empty())?;
+        let host_dir = mission_workspace_dir_for_root(&self.path, mission_id);
+        let short = &mission_id.to_string()[..8];
+        let guest_dir = if self.workspace_type == WorkspaceType::Container {
+            format!("/workspaces/mission-{}", short)
+        } else {
+            host_dir.to_string_lossy().to_string()
+        };
+        let mut m = HashMap::new();
+        m.insert(
+            "SPARK_OFFLOAD_URL".to_string(),
+            format!(
+                "http://{}:{}/api/spark/offload",
+                self.host_ip_from_workspace(),
+                port
+            ),
+        );
+        m.insert("SPARK_OFFLOAD_TOKEN".to_string(), token);
+        m.insert(
+            "SPARK_OFFLOAD_MISSION_ID".to_string(),
+            mission_id.to_string(),
+        );
+        m.insert(
+            "SPARK_WORKSPACE_HOST_DIR".to_string(),
+            host_dir.to_string_lossy().to_string(),
+        );
+        m.insert("SPARK_WORKSPACE_GUEST_DIR".to_string(), guest_dir);
+        Some(m)
+    }
+
     /// Create the default host workspace.
     pub fn default_host(working_dir: PathBuf) -> Self {
         Self {
@@ -1877,15 +1931,20 @@ fn read_custom_providers_from_file(workspace_root: &Path) -> Vec<AIProvider> {
         if let Ok(contents) = std::fs::read_to_string(path) {
             match serde_json::from_str::<Vec<AIProvider>>(&contents) {
                 Ok(providers) => {
+                    // Include Custom providers and Kimi (which, like Custom, needs
+                    // an explicit OpenCode provider block — it is not a built-in).
                     let custom: Vec<AIProvider> = providers
                         .into_iter()
-                        .filter(|p| p.provider_type == ProviderType::Custom && p.enabled)
+                        .filter(|p| {
+                            matches!(p.provider_type, ProviderType::Custom | ProviderType::Kimi)
+                                && p.enabled
+                        })
                         .collect();
                     if !custom.is_empty() {
                         tracing::debug!(
                             path = %path.display(),
                             count = custom.len(),
-                            "Loaded custom providers from file"
+                            "Loaded custom/Kimi providers from file"
                         );
                         return custom;
                     }

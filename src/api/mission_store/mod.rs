@@ -2691,6 +2691,20 @@ pub trait MissionStore: Send + Sync {
         let _ = task;
         Err("Task board not supported by this mission store".to_string())
     }
+
+    /// Persist the control session's pending message queue as a JSON snapshot
+    /// so queued messages survive a server restart. Default no-op for
+    /// non-durable stores (memory/file); SQLite overrides this.
+    async fn save_control_queue(&self, user_id: &str, payload: &str) -> Result<(), String> {
+        let _ = (user_id, payload);
+        Ok(())
+    }
+
+    /// Load the persisted control-queue snapshot (empty string if none).
+    async fn load_control_queue(&self, user_id: &str) -> Result<String, String> {
+        let _ = user_id;
+        Ok(String::new())
+    }
 }
 
 /// Mission store type selection.

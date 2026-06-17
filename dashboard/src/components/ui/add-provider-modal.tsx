@@ -28,6 +28,7 @@ const providerIcons: Record<string, string> = {
   zai: '⚡',
   xai: '𝕏',
   minimax: 'M',
+  kimi: '🌙',
   custom: '🔧',
 };
 
@@ -75,6 +76,15 @@ const getProviderAuthMethods = (providerType: AIProviderType): AIProviderAuthMet
         description: 'Use your grok.com account through Grok Build',
       },
       { label: 'Enter API Key', type: 'api', description: 'Use an existing xAI API key' },
+    ];
+  }
+  if (providerType === 'kimi') {
+    return [
+      {
+        label: 'Kimi Code (Device OAuth)',
+        type: 'oauth',
+        description: 'Authorize your Kimi Code subscription via device-code login',
+      },
     ];
   }
   return [];
@@ -144,6 +154,33 @@ export function AddProviderModal({ open, onClose, onSuccess, providerTypes }: Ad
     document.addEventListener('keydown', handleKeyDown);
     return () => document.removeEventListener('keydown', handleKeyDown);
   }, [handleClose, open, loading]);
+
+  // Auto-poll the Kimi device-code flow so the user doesn't have to keep
+  // clicking Connect: the backend returns "not connected yet" until the
+  // browser authorization completes, at which point this resolves.
+  useEffect(() => {
+    if (step !== 'oauth-callback') return;
+    if (oauthResponse?.method !== 'auto') return;
+    if (selectedProvider !== 'kimi' || selectedMethodIndex === null) return;
+    let cancelled = false;
+    const interval = setInterval(async () => {
+      if (cancelled || loading) return;
+      try {
+        await oauthCallback(selectedProvider, selectedMethodIndex, '');
+        if (cancelled) return;
+        clearInterval(interval);
+        toast.success('Provider connected');
+        onSuccess();
+        onClose();
+      } catch {
+        // Still pending — keep polling until the user finishes in the browser.
+      }
+    }, 3000);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
+  }, [step, oauthResponse, selectedProvider, selectedMethodIndex, loading, onSuccess, onClose]);
 
   // Handle click outside
   useEffect(() => {
@@ -753,6 +790,12 @@ export function AddProviderModal({ open, onClose, onSuccess, providerTypes }: Ad
                   {loading ? <Loader className="h-4 w-4 animate-spin mx-auto" /> : 'Connect'}
                 </button>
               </div>
+              {oauthResponse.method === 'auto' && selectedProvider === 'kimi' && (
+                <div className="flex items-center gap-2 text-xs text-white/40">
+                  <Loader className="h-3 w-3 animate-spin" />
+                  Waiting for authorization in your browser…
+                </div>
+              )}
             </div>
           )}
 

@@ -212,7 +212,7 @@ async fn send_message_streaming_app_server(
         enabled_features: vec!["goals".to_string()],
         default_model: cfg.default_model.clone(),
         model_effort: cfg.model_effort.clone(),
-        env: std::collections::HashMap::new(),
+        env: cfg.extra_env.clone(),
     };
     // Keep an owned clone of the spawn config so the driver task can
     // re-spawn the codex process via `thread/resume` if the stdio

@@ -211,6 +211,72 @@ fn self_send_message(
     }
 }
 
+/// Fire-and-forget cancel of a specific (worker) mission's runner. Mirrors
+/// [`self_send_message`]: try_send only, receiver dropped — the scheduler runs
+/// on the task that consumes this channel and must never await it.
+fn self_cancel_mission(cmd_tx: &mpsc::Sender<ControlCommand>, mission_id: Uuid) -> bool {
+    let (respond, _rx) = oneshot::channel();
+    match cmd_tx.try_send(ControlCommand::CancelMission {
+        mission_id,
+        min_idle: None,
+        respond,
+    }) {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::warn!(target = %mission_id, "board: cancel-worker send failed: {}", e);
+            false
+        }
+    }
+}
+
+/// Boss-mission statuses that mean the board can no longer be driven: the boss
+/// will never run another turn to deliver verdicts or read a wake, so its board
+/// must stop scheduling. `Active`/`Pending` are live; `AwaitingUser` and
+/// `Acknowledged` are the NORMAL idle states a boss parks in between board
+/// wakes, so they are deliberately NOT terminal here.
+fn boss_status_is_terminal(status: MissionStatus) -> bool {
+    matches!(
+        status,
+        MissionStatus::Completed
+            | MissionStatus::Failed
+            | MissionStatus::Interrupted
+            | MissionStatus::Blocked
+            | MissionStatus::NotFeasible
+    )
+}
+
+/// Tear down the board of a boss mission that has terminated: cancel every
+/// non-terminal task (and stop any live worker) so the scheduler stops reviving
+/// work the boss can never judge. Once all tasks are terminal the boss drops out
+/// of `list_active_board_missions` on the next pass.
+async fn cancel_dead_boss_board(
+    mission_store: &Arc<dyn MissionStore>,
+    cmd_tx: &mpsc::Sender<ControlCommand>,
+    boss_id: Uuid,
+    tasks: &[BoardTask],
+) {
+    let mut cancelled = 0u32;
+    for task in tasks.iter().filter(|t| !t.status.is_terminal()) {
+        if let Some(worker_id) = task.worker_mission_id {
+            self_cancel_mission(cmd_tx, worker_id);
+        }
+        let mut t = task.clone();
+        t.status = BoardTaskStatus::Cancelled;
+        t.notes = append_note(&t.notes, "cancelled: boss mission terminated");
+        match mission_store.save_board_task(&t).await {
+            Ok(()) => cancelled += 1,
+            Err(e) => tracing::warn!(
+                boss = %boss_id, task = %t.task_key,
+                "board: failed to cancel orphaned task: {}", e
+            ),
+        }
+    }
+    if cancelled > 0 {
+        tracing::info!(boss = %boss_id, cancelled,
+            "board: boss mission terminated — cancelled orphaned board tasks");
+    }
+}
+
 fn seconds_since(rfc3339: &str) -> i64 {
     chrono::DateTime::parse_from_rfc3339(rfc3339)
         .map(|t| (chrono::Utc::now() - t.with_timezone(&chrono::Utc)).num_seconds())
@@ -251,6 +317,20 @@ pub async fn scheduler_pass(
                 continue;
             }
         };
+
+        // --- Dead-boss teardown: `list_active_board_missions` keys only on task
+        // status, so a boss whose own mission has terminated (failed, completed,
+        // interrupted, …) with tasks still in flight would otherwise keep
+        // getting workers re-spawned and wake banners it can never act on.
+        // Cancel its non-terminal tasks (+ live workers) and skip; next pass the
+        // boss drops out entirely.
+        if let Ok(Some(boss)) = mission_store.get_mission(boss_id).await {
+            if boss_status_is_terminal(boss.status) {
+                cancel_dead_boss_board(mission_store, cmd_tx, boss_id, &tasks).await;
+                wake_state.remove(&boss_id);
+                continue;
+            }
+        }
 
         // --- Zombie sweep: running tasks whose worker is not actually running.
         for task in tasks
@@ -755,5 +835,137 @@ mod tests {
             store.list_active_board_missions().await.expect("active"),
             vec![boss]
         );
+    }
+
+    #[test]
+    fn boss_terminal_status_classification() {
+        for s in [
+            MissionStatus::Completed,
+            MissionStatus::Failed,
+            MissionStatus::Interrupted,
+            MissionStatus::Blocked,
+            MissionStatus::NotFeasible,
+        ] {
+            assert!(boss_status_is_terminal(s), "{s} should be terminal");
+        }
+        // Live + the two idle states a boss legitimately parks in between wakes.
+        for s in [
+            MissionStatus::Pending,
+            MissionStatus::Active,
+            MissionStatus::AwaitingUser,
+            MissionStatus::Acknowledged,
+        ] {
+            assert!(!boss_status_is_terminal(s), "{s} should NOT be terminal");
+        }
+    }
+
+    #[tokio::test]
+    async fn dead_boss_board_is_cancelled_and_drops_out() {
+        use crate::api::mission_store::InMemoryMissionStore;
+
+        let store: Arc<dyn MissionStore> = Arc::new(InMemoryMissionStore::new());
+        let boss = store
+            .create_mission_with_parent(
+                Some("benchmark"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("create boss");
+        let boss_id = boss.id;
+        store
+            .upsert_board_tasks(
+                boss_id,
+                vec![
+                    NewBoardTask {
+                        task_key: "running".into(),
+                        title: "in flight".into(),
+                        prompt: "p".into(),
+                        backend: "codex".into(),
+                        model_override: None,
+                        model_effort: None,
+                        working_directory: None,
+                        depends_on: vec![],
+                    },
+                    NewBoardTask {
+                        task_key: "pending".into(),
+                        title: "queued".into(),
+                        prompt: "p".into(),
+                        backend: "codex".into(),
+                        model_override: None,
+                        model_effort: None,
+                        working_directory: None,
+                        depends_on: vec![],
+                    },
+                ],
+            )
+            .await
+            .expect("upsert");
+
+        // Mark one task running with a worker, then kill the boss.
+        let listed = store.list_board_tasks(boss_id).await.expect("list");
+        let mut running = listed
+            .iter()
+            .find(|t| t.task_key == "running")
+            .unwrap()
+            .clone();
+        running.status = BoardTaskStatus::Running;
+        running.worker_mission_id = Some(Uuid::new_v4());
+        store.save_board_task(&running).await.expect("save");
+        store
+            .update_mission_status(boss_id, MissionStatus::Failed)
+            .await
+            .expect("kill boss");
+
+        // Before the pass the dead boss is still listed (task-status keyed).
+        assert_eq!(
+            store.list_active_board_missions().await.expect("active"),
+            vec![boss_id]
+        );
+
+        let (cmd_tx, mut cmd_rx) = mpsc::channel::<ControlCommand>(16);
+        let snapshot = RunnerSnapshot {
+            present: HashSet::new(),
+            running_ids: HashSet::new(),
+            running_count: 0,
+            main_running: false,
+        };
+        let mut wake_state = HashMap::new();
+        wake_state.insert(boss_id, true);
+
+        scheduler_pass(&store, &cmd_tx, &snapshot, 4, &mut wake_state).await;
+
+        // All tasks cancelled, boss no longer scheduled, wake state cleared.
+        let after = store.list_board_tasks(boss_id).await.expect("list");
+        assert!(
+            after.iter().all(|t| t.status == BoardTaskStatus::Cancelled),
+            "every task should be cancelled, got {:?}",
+            after.iter().map(|t| t.status).collect::<Vec<_>>()
+        );
+        assert!(store
+            .list_active_board_missions()
+            .await
+            .expect("active")
+            .is_empty());
+        assert!(!wake_state.contains_key(&boss_id));
+
+        // The live worker got a cancel; no wake banner was sent to the dead boss.
+        let mut saw_cancel = false;
+        let mut saw_wake = false;
+        while let Ok(cmd) = cmd_rx.try_recv() {
+            match cmd {
+                ControlCommand::CancelMission { .. } => saw_cancel = true,
+                ControlCommand::UserMessage { .. } => saw_wake = true,
+                _ => {}
+            }
+        }
+        assert!(saw_cancel, "live worker should have been cancelled");
+        assert!(!saw_wake, "dead boss must not receive a board wake");
     }
 }
