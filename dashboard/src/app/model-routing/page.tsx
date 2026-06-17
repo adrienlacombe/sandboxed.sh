@@ -727,6 +727,12 @@ export default function ModelRoutingPage() {
 
   const { data: providersData } = useSWR(
     'routing-providers',
+    // The routing page is a configuration surface: you choose which models to
+    // route to, which can include providers you haven't account-verified yet
+    // (e.g. OpenRouter before a key is set). `includeUnverified` deliberately
+    // surfaces the public catalog for every provider here. Volume stays
+    // bounded: per-provider catalogs are prefix-filtered and OpenRouter is
+    // capped server-side (see MAX_CATALOG_MODELS_PER_PROVIDER).
     () => listProviders({ includeAll: true, includeUnverified: true }),
     { revalidateOnFocus: false }
   );

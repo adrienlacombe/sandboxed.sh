@@ -48,6 +48,18 @@ pub const DEFAULT_CATALOG_PROVIDER_IDS: &[&str] = &[
     "minimax",
 ];
 
+/// Upper bound on the number of live models merged from a single
+/// OpenAI-compatible `/v1/models` response. OpenRouter has no usable prefix
+/// filter and exposes a large, fast-growing catalog; without a bound it can
+/// flood the routing picker (and the cached catalog). Prefix-filtered
+/// providers stay well under this and are left uncapped.
+const MAX_CATALOG_MODELS_PER_PROVIDER: usize = 100;
+
+/// Maximum length (in `char`s) of a model description surfaced from a
+/// `/v1/models` entry. OpenRouter descriptions can run several paragraphs; the
+/// picker only needs a short blurb.
+const MAX_MODEL_DESCRIPTION_CHARS: usize = 200;
+
 /// Where a catalog entry came from.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -679,7 +691,10 @@ fn default_providers_config() -> ProvidersConfig {
                     // OpenRouter model IDs are vendor-prefixed (provider/model).
                     // The live catalog is merged from models.dev and /v1/models
                     // when available; these keep the picker useful before the
-                    // background catalog finishes.
+                    // background catalog finishes. IDs verified against
+                    // OpenRouter's public catalog on 2026-06-17 — treat as
+                    // best-effort seeds that the live catalog supersedes (slugs
+                    // can drift as models are retired).
                     ProviderModel {
                         id: "anthropic/claude-opus-4.8".to_string(),
                         name: "Claude Opus 4.8".to_string(),
@@ -913,6 +928,19 @@ fn model_id_to_display_name(id: &str) -> String {
         .join(" ")
 }
 
+/// Trim a model description to a sane length for the routing picker.
+/// OpenRouter (and some other catalogs) return multi-paragraph descriptions;
+/// keep a short blurb and append an ellipsis when truncated. Operates on
+/// `char` boundaries so multibyte text isn't split mid-codepoint.
+fn truncate_description(description: &str) -> String {
+    let trimmed = description.trim();
+    if trimmed.chars().count() <= MAX_MODEL_DESCRIPTION_CHARS {
+        return trimmed.to_string();
+    }
+    let truncated: String = trimmed.chars().take(MAX_MODEL_DESCRIPTION_CHARS).collect();
+    format!("{}…", truncated.trim_end())
+}
+
 /// Fetch models from an OpenAI-compatible /v1/models endpoint.
 /// Filters results by the given prefix (e.g. "grok-", "glm-").
 /// Returns model IDs and generated display names.
@@ -965,7 +993,8 @@ pub async fn fetch_openai_compatible_models(
             let description = entry
                 .get("description")
                 .and_then(|d| d.as_str())
-                .map(str::to_string);
+                .map(truncate_description)
+                .filter(|d| !d.is_empty());
             Some(ProviderModel {
                 id: id.to_string(),
                 name,
@@ -1275,6 +1304,10 @@ pub async fn fetch_model_catalog(
         provider_id: &'static str,
         base_url: &'static str,
         prefix_filters: Vec<&'static str>,
+        /// Upper bound on models merged from this provider's `/v1/models`.
+        /// Set for prefix-less, large catalogs (OpenRouter) to keep the
+        /// routing picker bounded; `None` means no cap.
+        max_models: Option<usize>,
     }
 
     let targets = vec![
@@ -1283,36 +1316,43 @@ pub async fn fetch_model_catalog(
             provider_id: "openai",
             base_url: "https://api.openai.com/v1",
             prefix_filters: vec!["gpt-", "o1-", "o3-", "o4-", "chatgpt-"],
+            max_models: None,
         },
         FetchTarget {
             provider_type: ProviderType::OpenRouter,
             provider_id: "open-router",
             base_url: "https://openrouter.ai/api/v1",
+            // No usable prefix and a large, fast-growing catalog, so cap it.
             prefix_filters: vec![],
+            max_models: Some(MAX_CATALOG_MODELS_PER_PROVIDER),
         },
         FetchTarget {
             provider_type: ProviderType::Xai,
             provider_id: "xai",
             base_url: "https://api.x.ai/v1",
             prefix_filters: vec!["grok-"],
+            max_models: None,
         },
         FetchTarget {
             provider_type: ProviderType::Cerebras,
             provider_id: "cerebras",
             base_url: "https://api.cerebras.ai/v1",
             prefix_filters: vec![],
+            max_models: None,
         },
         FetchTarget {
             provider_type: ProviderType::Zai,
             provider_id: "zai",
             base_url: "https://open.bigmodel.cn/api/paas/v4",
             prefix_filters: vec!["glm-"],
+            max_models: None,
         },
         FetchTarget {
             provider_type: ProviderType::Minimax,
             provider_id: "minimax",
             base_url: "https://api.minimax.io/v1",
             prefix_filters: vec!["MiniMax-"],
+            max_models: None,
         },
     ];
 
@@ -1371,6 +1411,7 @@ pub async fn fetch_model_catalog(
     for (target, key) in target_keys {
         let provider_id = target.provider_id.to_string();
         let base_url = target.base_url.to_string();
+        let max_models = target.max_models;
         let prefix_filters: Vec<String> = target
             .prefix_filters
             .iter()
@@ -1382,7 +1423,20 @@ pub async fn fetch_model_catalog(
                 Some(api_key) => {
                     let filters: Vec<&str> = prefix_filters.iter().map(|s| s.as_str()).collect();
                     match fetch_openai_compatible_models(&base_url, &api_key, &filters).await {
-                        Ok(models) => {
+                        Ok(mut models) => {
+                            // Bound large catalogs (OpenRouter). Models are
+                            // sorted by id, so truncation is deterministic.
+                            if let Some(limit) = max_models {
+                                if models.len() > limit {
+                                    tracing::info!(
+                                        "Capping {} catalog from {} to {} models",
+                                        provider_id,
+                                        models.len(),
+                                        limit
+                                    );
+                                    models.truncate(limit);
+                                }
+                            }
                             tracing::info!(
                                 "Fetched {} models from {} API",
                                 models.len(),
@@ -2104,6 +2158,24 @@ mod tests {
     fn models_dev_provider_key_maps_openrouter() {
         assert_eq!(models_dev_provider_key("open-router"), "openrouter");
         assert_eq!(models_dev_provider_key("anthropic"), "anthropic");
+    }
+
+    #[test]
+    fn truncate_description_bounds_long_text() {
+        // Short descriptions pass through unchanged (after trimming).
+        assert_eq!(truncate_description("  Short blurb  "), "Short blurb");
+
+        // Long descriptions are capped and get an ellipsis.
+        let long = "x".repeat(MAX_MODEL_DESCRIPTION_CHARS + 50);
+        let out = truncate_description(&long);
+        assert!(out.ends_with('…'));
+        assert_eq!(out.chars().count(), MAX_MODEL_DESCRIPTION_CHARS + 1);
+
+        // Multibyte text isn't split mid-codepoint.
+        let emoji = "🚀".repeat(MAX_MODEL_DESCRIPTION_CHARS + 10);
+        let out = truncate_description(&emoji);
+        assert!(out.ends_with('…'));
+        assert_eq!(out.chars().count(), MAX_MODEL_DESCRIPTION_CHARS + 1);
     }
 
     #[test]
