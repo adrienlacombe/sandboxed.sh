@@ -830,18 +830,26 @@ struct ControlView: View {
 
     @ViewBuilder
     private var workerPillOrNil: some View {
-        if !childMissions.isEmpty {
-            WorkerPillView(
-                workers: childMissions,
-                runningWorkers: runningMissions,
-                onTap: {
-                    HapticService.lightTap()
-                    showWorkerSheet = true
-                }
-            )
-            .padding(.bottom, 12)
-            .transition(.move(edge: .bottom).combined(with: .opacity))
-            .animation(.spring(response: 0.3), value: childMissions.count)
+        HStack(spacing: 8) {
+            // Board belongs to the mission being VIEWED (viewingMissionId),
+            // which can differ from the session's current mission.
+            if let missionId = viewingMissionId ?? currentMission?.id {
+                TaskBoardPillLoader(missionId: missionId)
+                    .padding(.bottom, 12)
+            }
+            if !childMissions.isEmpty {
+                WorkerPillView(
+                    workers: childMissions,
+                    runningWorkers: runningMissions,
+                    onTap: {
+                        HapticService.lightTap()
+                        showWorkerSheet = true
+                    }
+                )
+                .padding(.bottom, 12)
+                .transition(.move(edge: .bottom).combined(with: .opacity))
+                .animation(.spring(response: 0.3), value: childMissions.count)
+            }
         }
     }
 

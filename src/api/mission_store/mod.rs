@@ -1008,6 +1008,156 @@ pub fn now_string() -> String {
     Utc::now().to_rfc3339()
 }
 
+// ---------------------------------------------------------------------------
+// Task board: server-scheduled worker tasks owned by a boss mission.
+//
+// The board replaces LLM-driven scheduling: the boss agent registers a task
+// DAG once, and the control loop spawns worker missions for ready tasks up to
+// capacity, settles them when their turn ends, and notifies the boss with a
+// digest. See `api::control::board` for the scheduler.
+// ---------------------------------------------------------------------------
+
+/// Lifecycle of a board task.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BoardTaskStatus {
+    /// Registered; waiting on dependencies and/or capacity.
+    Pending,
+    /// A worker mission is executing this task.
+    Running,
+    /// The worker's turn ended; awaiting a boss verdict.
+    Settled,
+    /// Boss accepted the result (terminal).
+    Accepted,
+    /// Worker failed after retry (terminal unless re-planned).
+    Failed,
+    /// Cancelled by the boss or the user (terminal).
+    Cancelled,
+}
+
+impl std::fmt::Display for BoardTaskStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            Self::Pending => "pending",
+            Self::Running => "running",
+            Self::Settled => "settled",
+            Self::Accepted => "accepted",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+        };
+        write!(f, "{}", s)
+    }
+}
+
+impl BoardTaskStatus {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "pending" => Some(Self::Pending),
+            "running" => Some(Self::Running),
+            "settled" => Some(Self::Settled),
+            "accepted" => Some(Self::Accepted),
+            "failed" => Some(Self::Failed),
+            "cancelled" => Some(Self::Cancelled),
+            _ => None,
+        }
+    }
+
+    /// Terminal states never transition again (except via explicit re-plan).
+    pub fn is_terminal(&self) -> bool {
+        matches!(self, Self::Accepted | Self::Failed | Self::Cancelled)
+    }
+}
+
+/// How a settled task's worker turn ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BoardTaskOutcome {
+    /// Worker reported completion.
+    Success,
+    /// Worker stopped with a BLOCKED question for the boss.
+    Blocked,
+    /// Worker turn failed (llm error, stall, interruption).
+    Failed,
+}
+
+impl std::fmt::Display for BoardTaskOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            Self::Success => "success",
+            Self::Blocked => "blocked",
+            Self::Failed => "failed",
+        };
+        write!(f, "{}", s)
+    }
+}
+
+impl BoardTaskOutcome {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "success" => Some(Self::Success),
+            "blocked" => Some(Self::Blocked),
+            "failed" => Some(Self::Failed),
+            _ => None,
+        }
+    }
+}
+
+/// A task on a boss mission's board.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BoardTask {
+    pub id: Uuid,
+    pub boss_mission_id: Uuid,
+    /// Stable, boss-chosen key (unique per board) used for `depends_on`
+    /// references and digests.
+    pub task_key: String,
+    pub title: String,
+    pub prompt: String,
+    /// Worker backend (e.g. "codex", "opencode", "grok"). Never claudecode.
+    pub backend: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_override: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_effort: Option<String>,
+    /// Working directory for the worker (usually an isolated git worktree).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub working_directory: Option<String>,
+    /// Task keys (same board) that must settle successfully or be accepted
+    /// before this task may start.
+    pub depends_on: Vec<String>,
+    pub status: BoardTaskStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<BoardTaskOutcome>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worker_mission_id: Option<Uuid>,
+    /// Number of worker spawns so far (1 = first attempt).
+    pub attempts: u32,
+    /// Truncated tail of the worker's final message, set on settle.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result_digest: Option<String>,
+    /// Free-form audit trail: rejections with feedback, retries, cancellations.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub notes: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// Payload for registering/updating tasks on a board.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NewBoardTask {
+    pub task_key: String,
+    pub title: String,
+    pub prompt: String,
+    pub backend: String,
+    #[serde(default)]
+    pub model_override: Option<String>,
+    #[serde(default)]
+    pub model_effort: Option<String>,
+    #[serde(default)]
+    pub working_directory: Option<String>,
+    #[serde(default)]
+    pub depends_on: Vec<String>,
+}
+
 /// Sanitize a string for use as a filename.
 pub fn sanitize_filename(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
@@ -2492,6 +2642,68 @@ pub trait MissionStore: Send + Sync {
     ) -> Result<Vec<TelegramWorkflowEvent>, String> {
         let _ = (workflow_id, limit);
         Ok(vec![])
+    }
+
+    // ---- Task board ------------------------------------------------------
+
+    /// Register or update tasks on a boss mission's board. Tasks are keyed by
+    /// `(boss_mission_id, task_key)`: a new key inserts, an existing key in
+    /// `pending` status is updated in place, and any other status is left
+    /// untouched (the current row is returned so the caller sees the real
+    /// state). Returns the post-upsert rows in input order.
+    async fn upsert_board_tasks(
+        &self,
+        boss_mission_id: Uuid,
+        tasks: Vec<NewBoardTask>,
+    ) -> Result<Vec<BoardTask>, String> {
+        let _ = (boss_mission_id, tasks);
+        Err("Task board not supported by this mission store".to_string())
+    }
+
+    /// All tasks on a boss mission's board, oldest first.
+    async fn list_board_tasks(&self, boss_mission_id: Uuid) -> Result<Vec<BoardTask>, String> {
+        let _ = boss_mission_id;
+        Ok(vec![])
+    }
+
+    /// Boss mission ids that have at least one non-terminal task. Drives the
+    /// scheduler's per-tick scan.
+    async fn list_active_board_missions(&self) -> Result<Vec<Uuid>, String> {
+        Ok(vec![])
+    }
+
+    async fn get_board_task(&self, task_id: Uuid) -> Result<Option<BoardTask>, String> {
+        let _ = task_id;
+        Ok(None)
+    }
+
+    /// Look up the task currently bound to a worker mission, if any.
+    async fn get_board_task_by_worker(
+        &self,
+        worker_mission_id: Uuid,
+    ) -> Result<Option<BoardTask>, String> {
+        let _ = worker_mission_id;
+        Ok(None)
+    }
+
+    /// Persist the full state of a task (matched by `task.id`).
+    async fn save_board_task(&self, task: &BoardTask) -> Result<(), String> {
+        let _ = task;
+        Err("Task board not supported by this mission store".to_string())
+    }
+
+    /// Persist the control session's pending message queue as a JSON snapshot
+    /// so queued messages survive a server restart. Default no-op for
+    /// non-durable stores (memory/file); SQLite overrides this.
+    async fn save_control_queue(&self, user_id: &str, payload: &str) -> Result<(), String> {
+        let _ = (user_id, payload);
+        Ok(())
+    }
+
+    /// Load the persisted control-queue snapshot (empty string if none).
+    async fn load_control_queue(&self, user_id: &str) -> Result<String, String> {
+        let _ = user_id;
+        Ok(String::new())
     }
 }
 

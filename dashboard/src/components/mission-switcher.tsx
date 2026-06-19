@@ -1257,6 +1257,8 @@ export function MissionSwitcher({
                   return (
                     <div
                       key={row.id}
+                      data-index={virtualRow.index}
+                      ref={rowVirtualizer.measureElement}
                       className="absolute left-0 top-0 w-full px-3 pt-3 pb-2 border-t border-white/[0.06] bg-[#1a1a1a]"
                       style={{ transform: `translateY(${virtualRow.start}px)` }}
                     >
@@ -1302,6 +1304,8 @@ export function MissionSwitcher({
                 return (
                   <div
                     key={item.id}
+                    data-index={virtualRow.index}
+                    ref={rowVirtualizer.measureElement}
                     className="absolute left-0 top-0 w-full"
                     style={{ transform: `translateY(${virtualRow.start}px)` }}
                   >

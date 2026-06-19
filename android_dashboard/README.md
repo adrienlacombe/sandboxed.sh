@@ -8,7 +8,7 @@ The Android app is published on Zapstore:
 
 https://zapstore.dev/apps/sh.sandboxed.dashboard
 
-## What's in v0.2.0
+## What's in the app
 
 ### Bottom-tab screens
 
@@ -43,7 +43,7 @@ https://zapstore.dev/apps/sh.sandboxed.dashboard
 | --- | --- |
 | Language | Kotlin 2.0.21 |
 | Build | AGP 8.9.1, Gradle 8.11.1 |
-| SDK | `compileSdk` 36, `targetSdk` 36, `minSdk` 26 (Android 8.0) |
+| SDK | `compileSdk` 36, `targetSdk` 36, `minSdk` 33 (Android 13) |
 | UI | Jetpack Compose (BOM 2024.12.01), Material 3 with `material-icons-extended` |
 | Navigation | `androidx.navigation:navigation-compose` 2.9.8 |
 | State | ViewModel + StateFlow, Compose `collectAsState` |

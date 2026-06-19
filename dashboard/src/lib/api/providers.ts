@@ -26,6 +26,7 @@ export type AIProviderType =
   | "zai"
   | "minimax"
   | "github-copilot"
+  | "kimi"
   | "custom";
 
 export interface AIProviderTypeInfo {
@@ -136,6 +137,28 @@ export interface Provider {
 
 export interface ProvidersResponse {
   providers: Provider[];
+  /** Provider ids with working credentials. When `includeAll` is set, the
+   * `providers` list also includes unconfigured catalog providers; use this to
+   * tell which are actually connected. */
+  configured_ids?: string[];
+}
+
+/** A model in the full supported-models catalog (`/api/providers/catalog`). */
+export interface CatalogModel {
+  provider_id: string;
+  provider_name: string;
+  id: string;
+  /** The `provider/model` id to pass to the router (e.g. "zai/glm-5.2"). */
+  value: string;
+  name: string;
+  description?: string;
+  /** True when a credential for this provider is configured. */
+  configured: boolean;
+}
+
+export interface ModelCatalogResponse {
+  count: number;
+  models: CatalogModel[];
 }
 
 export interface BackendModelOption {
@@ -430,6 +453,13 @@ export async function listProviders(options?: {
   const query = params.toString();
   const res = await apiFetch(`/api/providers${query ? `?${query}` : ""}`);
   if (!res.ok) throw new Error("Failed to fetch providers");
+  return res.json();
+}
+
+/** The full catalog of supported `provider/model` ids the router accepts. */
+export async function getModelCatalog(): Promise<ModelCatalogResponse> {
+  const res = await apiFetch("/api/providers/catalog");
+  if (!res.ok) throw new Error("Failed to fetch model catalog");
   return res.json();
 }
 

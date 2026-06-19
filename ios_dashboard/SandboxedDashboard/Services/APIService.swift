@@ -230,6 +230,40 @@ final class APIService {
     func getMission(id: String) async throws -> Mission {
         try await get("/api/control/missions/\(id)")
     }
+
+    // MARK: - Mission task board
+
+    /// Server-owned task board for a boss mission. Returns an empty board
+    /// (not an error) for missions that never registered tasks.
+    func getMissionBoard(missionId: String) async throws -> MissionBoard {
+        try await get("/api/control/missions/\(missionId)/board")
+    }
+
+    struct BoardVerdictBody: Encodable {
+        let action: String
+        let feedback: String?
+    }
+
+    @discardableResult
+    func boardTaskVerdict(
+        taskId: String,
+        action: String,
+        feedback: String? = nil
+    ) async throws -> BoardTask {
+        try await post(
+            "/api/control/board/tasks/\(taskId)/verdict",
+            body: BoardVerdictBody(action: action, feedback: feedback)
+        )
+    }
+
+    @discardableResult
+    func cancelBoardTask(taskId: String) async throws -> BoardTask {
+        struct Empty: Encodable {}
+        return try await post(
+            "/api/control/board/tasks/\(taskId)/cancel",
+            body: Empty()
+        )
+    }
     
     func getCurrentMission() async throws -> Mission? {
         try await get("/api/control/missions/current")

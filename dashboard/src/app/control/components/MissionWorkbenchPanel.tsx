@@ -26,6 +26,7 @@ import type { inferMissionRole } from "@/lib/mission-role";
 import type { Mission, MissionStatus } from "@/lib/api";
 import type { MissionStateSummary } from "../events-reducer";
 import { missionStatusDotClass, missionStatusLabel } from "./common";
+import { MissionTaskBoard } from "./MissionTaskBoard";
 
 export function MissionWorkbenchPanel({
   mission,
@@ -397,6 +398,13 @@ export function MissionWorkbenchPanel({
                   ))}
                 </ul>
               </div>
+            )}
+
+            {mission && (
+              <MissionTaskBoard
+                missionId={mission.id}
+                onViewMission={onViewMission}
+              />
             )}
 
             {childMissions.length > 0 && (

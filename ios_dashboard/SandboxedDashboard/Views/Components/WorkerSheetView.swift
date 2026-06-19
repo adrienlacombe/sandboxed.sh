@@ -12,6 +12,9 @@ struct WorkerSheetView: View {
     let workers: [Mission]
     let runningWorkers: [RunningMissionInfo]
     @State private var peekingWorker: Mission?
+    // Completed workers are terminal and never reused, so they start collapsed
+    // to keep the focus on what's still in flight.
+    @State private var showCompleted = false
 
     private var buckets: WorkerBuckets {
         WorkerBuckets(workers: workers, runningWorkers: runningWorkers)
@@ -29,6 +32,13 @@ struct WorkerSheetView: View {
                     // Summary cards
                     summaryRow
 
+                    if !workers.isEmpty {
+                        Text("\(workers.count) sub-mission\(workers.count == 1 ? "" : "s") spawned in total. Completed ones have finished and are not reused.")
+                            .font(.caption2)
+                            .foregroundStyle(Theme.textMuted)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+
                     // Active workers
                     if !activeWorkers.isEmpty {
                         workerSection("Running", icon: "bolt.fill", tint: Theme.accent, missions: activeWorkers)
@@ -39,14 +49,14 @@ struct WorkerSheetView: View {
                         workerSection("Waiting", icon: "hourglass", tint: Theme.info, missions: waitingWorkers)
                     }
 
-                    // Completed workers
-                    if !completedWorkers.isEmpty {
-                        workerSection("Completed", icon: "checkmark.circle.fill", tint: Theme.success, missions: completedWorkers)
-                    }
-
-                    // Failed workers
+                    // Failed workers (actionable — surfaced before completed)
                     if !failedWorkers.isEmpty {
                         workerSection("Failed", icon: "xmark.circle.fill", tint: Theme.error, missions: failedWorkers)
+                    }
+
+                    // Completed workers — collapsed by default (terminal noise).
+                    if !completedWorkers.isEmpty {
+                        collapsibleCompletedSection
                     }
 
                     if workers.isEmpty {
@@ -82,14 +92,14 @@ struct WorkerSheetView: View {
                 tint: Theme.info
             )
             summaryCard(
-                count: completedWorkers.count,
-                label: "Done",
-                tint: Theme.success
-            )
-            summaryCard(
                 count: failedWorkers.count,
                 label: "Failed",
                 tint: Theme.error
+            )
+            summaryCard(
+                count: completedWorkers.count,
+                label: "Done",
+                tint: Theme.success
             )
         }
     }
@@ -119,6 +129,38 @@ struct WorkerSheetView: View {
     }
 
     // MARK: - Sections
+
+    private var collapsibleCompletedSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Button {
+                HapticService.lightTap()
+                withAnimation(.snappy) { showCompleted.toggle() }
+            } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: "checkmark.circle.fill")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(Theme.success)
+                    Text("Completed")
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(Theme.textSecondary)
+                    Text("(\(completedWorkers.count))")
+                        .font(.caption)
+                        .foregroundStyle(Theme.textMuted)
+                    Spacer()
+                    Image(systemName: showCompleted ? "chevron.up" : "chevron.down")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(Theme.textMuted)
+                }
+            }
+            .buttonStyle(.plain)
+
+            if showCompleted {
+                ForEach(completedWorkers) { mission in
+                    workerRow(mission)
+                }
+            }
+        }
+    }
 
     private func workerSection(_ title: String, icon: String, tint: Color, missions: [Mission]) -> some View {
         VStack(alignment: .leading, spacing: 8) {

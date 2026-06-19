@@ -1,7 +1,8 @@
 //! In-memory mission store (non-persistent).
 
 use super::{
-    now_string, Mission, MissionHistoryEntry, MissionStatus, MissionStatusCounts, MissionStore,
+    now_string, BoardTask, BoardTaskStatus, Mission, MissionHistoryEntry, MissionStatus,
+    MissionStatusCounts, MissionStore, NewBoardTask,
 };
 use crate::api::control::{AgentTreeNode, DesktopSessionInfo};
 use async_trait::async_trait;
@@ -17,6 +18,7 @@ const METADATA_SOURCE_USER: &str = "user";
 pub struct InMemoryMissionStore {
     missions: Arc<RwLock<HashMap<Uuid, Mission>>>,
     trees: Arc<RwLock<HashMap<Uuid, AgentTreeNode>>>,
+    board_tasks: Arc<RwLock<HashMap<Uuid, BoardTask>>>,
 }
 
 impl InMemoryMissionStore {
@@ -24,6 +26,7 @@ impl InMemoryMissionStore {
         Self {
             missions: Arc::new(RwLock::new(HashMap::new())),
             trees: Arc::new(RwLock::new(HashMap::new())),
+            board_tasks: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 }
@@ -461,6 +464,119 @@ impl MissionStore for InMemoryMissionStore {
         _key_files: &[String],
         _success: bool,
     ) -> Result<(), String> {
+        Ok(())
+    }
+
+    // ---- Task board ------------------------------------------------------
+
+    async fn upsert_board_tasks(
+        &self,
+        boss_mission_id: Uuid,
+        tasks: Vec<NewBoardTask>,
+    ) -> Result<Vec<BoardTask>, String> {
+        let mut map = self.board_tasks.write().await;
+        let now = now_string();
+        let mut out = Vec::with_capacity(tasks.len());
+        for t in tasks {
+            let existing_id = map
+                .values()
+                .find(|bt| bt.boss_mission_id == boss_mission_id && bt.task_key == t.task_key)
+                .map(|bt| bt.id);
+            match existing_id {
+                Some(id) => {
+                    let bt = map.get_mut(&id).expect("just found");
+                    if bt.status == BoardTaskStatus::Pending {
+                        bt.title = t.title;
+                        bt.prompt = t.prompt;
+                        bt.backend = t.backend;
+                        bt.model_override = t.model_override;
+                        bt.model_effort = t.model_effort;
+                        bt.working_directory = t.working_directory;
+                        bt.depends_on = t.depends_on;
+                        bt.updated_at = now.clone();
+                    }
+                    out.push(bt.clone());
+                }
+                None => {
+                    let bt = BoardTask {
+                        id: Uuid::new_v4(),
+                        boss_mission_id,
+                        task_key: t.task_key,
+                        title: t.title,
+                        prompt: t.prompt,
+                        backend: t.backend,
+                        model_override: t.model_override,
+                        model_effort: t.model_effort,
+                        working_directory: t.working_directory,
+                        depends_on: t.depends_on,
+                        status: BoardTaskStatus::Pending,
+                        outcome: None,
+                        worker_mission_id: None,
+                        attempts: 0,
+                        result_digest: None,
+                        notes: None,
+                        created_at: now.clone(),
+                        updated_at: now.clone(),
+                    };
+                    map.insert(bt.id, bt.clone());
+                    out.push(bt);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    async fn list_board_tasks(&self, boss_mission_id: Uuid) -> Result<Vec<BoardTask>, String> {
+        let map = self.board_tasks.read().await;
+        let mut tasks: Vec<BoardTask> = map
+            .values()
+            .filter(|bt| bt.boss_mission_id == boss_mission_id)
+            .cloned()
+            .collect();
+        tasks.sort_by(|a, b| {
+            a.created_at
+                .cmp(&b.created_at)
+                .then_with(|| a.task_key.cmp(&b.task_key))
+        });
+        Ok(tasks)
+    }
+
+    async fn list_active_board_missions(&self) -> Result<Vec<Uuid>, String> {
+        let map = self.board_tasks.read().await;
+        let mut ids: Vec<Uuid> = map
+            .values()
+            .filter(|bt| !bt.status.is_terminal())
+            .map(|bt| bt.boss_mission_id)
+            .collect();
+        ids.sort();
+        ids.dedup();
+        Ok(ids)
+    }
+
+    async fn get_board_task(&self, task_id: Uuid) -> Result<Option<BoardTask>, String> {
+        Ok(self.board_tasks.read().await.get(&task_id).cloned())
+    }
+
+    async fn get_board_task_by_worker(
+        &self,
+        worker_mission_id: Uuid,
+    ) -> Result<Option<BoardTask>, String> {
+        let map = self.board_tasks.read().await;
+        Ok(map
+            .values()
+            .filter(|bt| bt.worker_mission_id == Some(worker_mission_id))
+            .max_by(|a, b| a.updated_at.cmp(&b.updated_at))
+            .cloned())
+    }
+
+    async fn save_board_task(&self, task: &BoardTask) -> Result<(), String> {
+        let mut map = self.board_tasks.write().await;
+        if !map.contains_key(&task.id) {
+            return Err(format!("Board task {} not found", task.id));
+        }
+        let mut saved = task.clone();
+        saved.updated_at = now_string();
+        map.insert(task.id, saved);
         Ok(())
     }
 }

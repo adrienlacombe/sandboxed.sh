@@ -41,7 +41,7 @@ use crate::backend::registry::BackendRegistry;
 use crate::backend_config::BackendConfigEntry;
 use crate::config::{AuthMode, Config};
 use crate::mcp::McpRegistry;
-use crate::util::AI_PROVIDERS_PATH;
+use crate::util::{AI_PROVIDERS_PATH, GITHUB_CONNECTION_PATH};
 use crate::workspace;
 
 /// Check whether a CLI binary is available on `$PATH`.
@@ -107,6 +107,13 @@ pub struct AppState {
         Arc<RwLock<HashMap<crate::ai_providers::ProviderType, crate::ai_providers::PendingOAuth>>>,
     /// Pending GitHub OAuth login state, keyed by random nonce.
     pub pending_github_oauth: Arc<RwLock<HashMap<String, super::github_auth::PendingGithubOAuth>>>,
+    /// Connected GitHub account (for git push), set via the dashboard
+    /// "Connect GitHub" flow and injected into mission workspaces.
+    pub github_connection: Arc<crate::github_connection::GithubConnectionStore>,
+    /// Pending "Connect GitHub" integration authorizations, keyed by random
+    /// nonce. Distinct from `pending_github_oauth` (dashboard login).
+    pub pending_github_integration:
+        Arc<RwLock<HashMap<String, super::github_integration::PendingGithubIntegration>>>,
     /// Secrets store for encrypted credentials
     pub secrets: Option<Arc<crate::secrets::SecretsStore>>,
     /// Console session pool for WebSocket reconnection
@@ -190,6 +197,13 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
     );
     let pending_oauth = Arc::new(RwLock::new(HashMap::new()));
     let pending_github_oauth = Arc::new(RwLock::new(HashMap::new()));
+    let github_connection = Arc::new(
+        crate::github_connection::GithubConnectionStore::new(
+            config.working_dir.join(GITHUB_CONNECTION_PATH),
+        )
+        .await,
+    );
+    let pending_github_integration = Arc::new(RwLock::new(HashMap::new()));
 
     // Initialize provider health tracker and model chain store
     let health_tracker = Arc::new(crate::provider_health::ProviderHealthTracker::new());
@@ -475,6 +489,8 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         ai_providers,
         pending_oauth,
         pending_github_oauth,
+        github_connection,
+        pending_github_integration,
         secrets,
         console_pool,
         settings,
@@ -512,6 +528,9 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
     // Start background refresh of provider rate-limit / usage info so the
     // dashboard always reads a fresh-enough cache.
     super::ai_providers::spawn_usage_refresh_loop(Arc::clone(&state));
+
+    // Keep short-lived Kimi OAuth access tokens fresh for the chain resolver.
+    super::ai_providers::spawn_kimi_oauth_refresh_loop(Arc::clone(&state));
 
     // Initialize the metadata LLM client for AI-powered mission titles/descriptions
     {
@@ -572,23 +591,13 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         });
     }
 
-    // Fetch model catalog from provider APIs in background
-    {
-        let catalog = Arc::clone(&state.model_catalog);
-        let ai_providers = Arc::clone(&state.ai_providers);
-        let working_dir = config.working_dir.clone();
-        tokio::spawn(async move {
-            let fetched = super::providers::fetch_model_catalog(&ai_providers, &working_dir).await;
-            let provider_count = fetched.len();
-            let model_count: usize = fetched.values().map(|v| v.len()).sum();
-            *catalog.write().await = fetched;
-            tracing::info!(
-                "Model catalog populated: {} models from {} providers",
-                model_count,
-                provider_count
-            );
-        });
-    }
+    // Keep the model catalog populated: initial fetch + periodic refresh so
+    // newly-added provider models appear without a backend restart.
+    super::providers::spawn_model_catalog_refresh(
+        Arc::clone(&state.model_catalog),
+        Arc::clone(&state.ai_providers),
+        config.working_dir.clone(),
+    );
 
     let public_routes = Router::new()
         .route("/api/health", get(health))
@@ -641,7 +650,13 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         .nest(
             "/v1",
             proxy_api::routes().layer(DefaultBodyLimit::max(50 * 1024 * 1024)),
-        );
+        )
+        // Spark build-offload endpoint authenticates with a per-mission scoped
+        // HMAC capability token verified inside the handler
+        // (verify_spark_offload_token), NOT the dashboard JWT — so it must
+        // bypass require_auth like the /v1 proxy, otherwise the in-workspace
+        // spark-build wrapper's token is rejected at the auth layer.
+        .nest("/api/spark", super::spark::routes());
 
     // File upload routes with increased body limit (10GB)
     let upload_route = Router::new()
@@ -694,6 +709,22 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
             get(control::get_current_mission),
         )
         .route("/api/control/missions/:id", get(control::get_mission))
+        .route(
+            "/api/control/missions/:id/board",
+            get(control::get_mission_board),
+        )
+        .route(
+            "/api/control/missions/:id/board/tasks",
+            post(control::upsert_mission_board_tasks),
+        )
+        .route(
+            "/api/control/board/tasks/:task_id/verdict",
+            post(control::board_task_verdict),
+        )
+        .route(
+            "/api/control/board/tasks/:task_id/cancel",
+            post(control::cancel_board_task),
+        )
         .route(
             "/api/control/missions/:id/tree",
             get(control::get_mission_tree),
@@ -1023,6 +1054,10 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
             get(super::providers::list_full_model_catalog),
         )
         .route(
+            "/api/providers/catalog/refresh",
+            post(super::providers::refresh_model_catalog),
+        )
+        .route(
             "/api/monitoring/memory-health",
             get(super::monitoring::memory_health_handler),
         )
@@ -1055,6 +1090,21 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         )
         // AI Provider endpoints
         .nest("/api/ai/providers", ai_providers_api::routes())
+        // "Connect GitHub" integration (the GitHub callback above is public;
+        // these require auth). Registered explicitly rather than nested to keep
+        // the base-path DELETE unambiguous (no trailing-slash gotcha).
+        .route(
+            "/api/integrations/github/authorize",
+            post(super::github_integration::authorize),
+        )
+        .route(
+            "/api/integrations/github/status",
+            get(super::github_integration::status),
+        )
+        .route(
+            "/api/integrations/github",
+            axum::routing::delete(super::github_integration::disconnect),
+        )
         // Model routing (chains + health)
         .nest("/api/model-routing", model_routing_api::routes())
         // Proxy API key management
@@ -2698,7 +2748,30 @@ async fn oauth_token_refresher_loop(
         }
     }
 
+    // Store-backed account types refreshed proactively (their tokens live in
+    // the AIProviderStore, possibly with several accounts per type).
+    let store_oauth_types = [ProviderType::Anthropic, ProviderType::Xai];
+
     loop {
+        // Refresh store-backed OAuth accounts FIRST. For any account that also
+        // owns the shared credential tiers, this rotates the token AND writes it
+        // to the tiers before the file-tier pass runs below — otherwise that
+        // pass would refresh the tier copy independently and revoke the store
+        // record's refresh token (the Anthropic split-brain that produced
+        // recurring invalid_grant). xAI lives only in the store.
+        let mut store_found = 0u32;
+        let mut store_refreshed = 0u32;
+        for &store_type in &store_oauth_types {
+            let (f, r) = ai_providers_api::refresh_due_store_oauth(
+                &ai_providers,
+                store_type,
+                refresh_threshold_ms,
+            )
+            .await;
+            store_found += f;
+            store_refreshed += r;
+        }
+
         // Check credential files directly for each OAuth-capable provider type.
         // This ensures we find tokens even if they aren't in the AIProviderStore.
         let mut found_count = 0u32;
@@ -2778,17 +2851,6 @@ async fn oauth_token_refresher_loop(
                 },
             }
         }
-
-        // Also refresh store-backed OAuth accounts whose tokens live only in
-        // the AIProviderStore (not auth.json/credentials.json) — notably
-        // xAI/Grok connected via the dashboard. Without this their short-lived
-        // access token expires and model-routing silently drops the provider.
-        let (store_found, store_refreshed) = ai_providers_api::refresh_due_store_oauth(
-            &ai_providers,
-            ProviderType::Xai,
-            refresh_threshold_ms,
-        )
-        .await;
 
         tracing::debug!(
             oauth_tokens_found = found_count,

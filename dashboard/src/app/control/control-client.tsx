@@ -71,6 +71,7 @@ import { getRuntimeApiBase } from "@/lib/settings";
 import { authHeader } from "@/lib/auth";
 import { stripRichFileTagsByName } from "@/lib/rich-tags";
 import { readCachedEvents, writeCachedEvents } from "@/lib/event-cache";
+import { createClientMessageId } from "@/lib/client-message-id";
 import {
   cancelControl,
   postControlMessage,
@@ -374,15 +375,21 @@ function removeOutboxEntry(missionId: string, id: string): void {
   writeOutbox(map);
 }
 
-function formatMissionDocumentTitle(mission: Mission | null | undefined) {
-  if (!mission) return DEFAULT_DOCUMENT_TITLE;
+function formatMissionDocumentTitle(
+  mission: Mission | null | undefined,
+  awaitingUser = false,
+) {
+  // Prefix mirrors the favicon's "needs answer" badge so a backgrounded tab
+  // reads as needing input from the tab list alone.
+  const prefix = awaitingUser ? "● " : "";
+  if (!mission) return `${prefix}${DEFAULT_DOCUMENT_TITLE}`;
   const title = getMissionTitle(mission, {
     maxLength: MAX_DOCUMENT_MISSION_TITLE_LENGTH,
     fallback: getMissionShortName(mission.id),
   }).trim();
   return title
-    ? `${title} | ${DEFAULT_DOCUMENT_TITLE}`
-    : DEFAULT_DOCUMENT_TITLE;
+    ? `${prefix}${title} | ${DEFAULT_DOCUMENT_TITLE}`
+    : `${prefix}${DEFAULT_DOCUMENT_TITLE}`;
 }
 
 function readLegacyControlDraft(): string {
@@ -1174,6 +1181,48 @@ function QuestionToolItem({
       setSubmitting(false);
     }
   };
+
+  // An already-answered question that came back as a lazy history stub carries
+  // no args (the question text wasn't loaded), so `parseQuestionArgs` is empty.
+  // Without this guard it would render the misleading "reply below to continue"
+  // input for a question the user already answered. Show a compact answered
+  // state instead — the live, unanswered empty-args case still falls through to
+  // the input fallback below.
+  const answeredStub = isFallback && (hasResult || item.hasResult === true);
+  if (answeredStub) {
+    const answerText = (() => {
+      const r = item.result;
+      if (isRecord(r) && Array.isArray(r["answers"])) {
+        const flat = (r["answers"] as unknown[])
+          .flat()
+          .filter((a): a is string => typeof a === "string");
+        if (flat.length > 0) return flat.join(", ");
+      }
+      return null;
+    })();
+    return (
+      <div
+        id={`chat-item-${item.id}`}
+        data-chat-item-id={item.id}
+        className="flex justify-start gap-3"
+      >
+        <div className="@max-[30rem]:hidden flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-indigo-500/20">
+          <Bot className="h-4 w-4 text-indigo-400" />
+        </div>
+        <div className="max-w-[90%] rounded-2xl rounded-tl-md bg-white/[0.03] border border-white/[0.06] px-4 py-3">
+          <div className="text-xs text-white/40">
+            Tool: <span className="font-mono text-indigo-400">question</span>
+            <span className="ml-2 text-emerald-400/80">answered</span>
+          </div>
+          {answerText && (
+            <div className="mt-1 text-sm text-white/70">
+              Your answer: <span className="text-white/90">{answerText}</span>
+            </div>
+          )}
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div
@@ -2081,14 +2130,19 @@ const ToolCallItem = memo(function ToolCallItem({
   workspaceId,
   missionId,
   onLoadDetails,
+  defaultExpanded = false,
 }: {
   item: Extract<ChatItem, { kind: "tool" }>;
   highlighted?: boolean;
   workspaceId?: string;
   missionId?: string;
   onLoadDetails?: (toolCallId: string) => Promise<void>;
+  /** Last transcript row opens by default; collapses again once superseded. */
+  defaultExpanded?: boolean;
 }) {
-  const [expanded, setExpanded] = useState(false);
+  // `null` follows `defaultExpanded`; a click pins the user's explicit choice.
+  const [manualExpanded, setManualExpanded] = useState<boolean | null>(null);
+  const expanded = manualExpanded ?? defaultExpanded;
   const isLazy = item.lazy === true;
   const isDone = !isLazy && item.result !== undefined;
 
@@ -2114,7 +2168,7 @@ const ToolCallItem = memo(function ToolCallItem({
   const [resultExpanded, setResultExpanded] = useState(false);
   const handleToggleExpanded = useCallback(() => {
     const nextExpanded = !expanded;
-    setExpanded(nextExpanded);
+    setManualExpanded(nextExpanded);
     if (nextExpanded && isLazy && !item.loading) {
       void onLoadDetails?.(item.toolCallId);
     }
@@ -2391,6 +2445,7 @@ function CollapsedToolGroup({
   workspaceId,
   missionId,
   onLoadToolDetails,
+  isLast = false,
 }: {
   tools: Extract<ChatItem, { kind: "tool" }>[];
   isExpanded: boolean;
@@ -2402,6 +2457,10 @@ function CollapsedToolGroup({
   workspaceId?: string;
   missionId?: string;
   onLoadToolDetails?: (toolCallId: string) => Promise<void>;
+  /** True when this group is the last transcript row: its newest (always
+      shown) tool then opens by default. The hidden "previous" tools stay
+      collapsed regardless. */
+  isLast?: boolean;
 }) {
   const hiddenCount = tools.length - 1;
   const lastTool = tools[tools.length - 1];
@@ -2446,8 +2505,12 @@ function CollapsedToolGroup({
     return () => cancelAnimationFrame(raf);
   }, [isExpanded, measureRow]);
 
-  // Helper to render appropriate tool component
-  const renderTool = (tool: Extract<ChatItem, { kind: "tool" }>) => {
+  // Helper to render appropriate tool component. `isLastTool` only applies to
+  // the newest tool of the group when the group itself is the transcript tail.
+  const renderTool = (
+    tool: Extract<ChatItem, { kind: "tool" }>,
+    isLastTool = false,
+  ) => {
     if (isSubagentTool(tool.name)) {
       return <SubagentToolItem key={tool.id} item={tool} />;
     }
@@ -2458,6 +2521,7 @@ function CollapsedToolGroup({
         workspaceId={workspaceId}
         missionId={missionId}
         onLoadDetails={onLoadToolDetails}
+        defaultExpanded={isLastTool}
       />
     );
   };
@@ -2487,7 +2551,7 @@ function CollapsedToolGroup({
             Hide {hiddenCount} previous tool{hiddenCount > 1 ? "s" : ""}
           </span>
         </button>
-        {renderTool(lastTool)}
+        {renderTool(lastTool, isLast)}
       </div>
     );
   }
@@ -2510,7 +2574,7 @@ function CollapsedToolGroup({
           Show {hiddenCount} previous tool{hiddenCount > 1 ? "s" : ""}
         </span>
       </button>
-      {renderTool(lastTool)}
+      {renderTool(lastTool, isLast)}
     </div>
   );
 }
@@ -2521,6 +2585,8 @@ type ChatItemRowProps = {
   workspaceId: string | undefined;
   missionId: string | undefined;
   basePath: string | undefined;
+  /** This row is the transcript tail: its collapsible content opens by default. */
+  isLast: boolean;
   isToolGroupExpanded: boolean;
   onToggleToolGroup: (groupId: string) => void;
   measureRow?: (el: HTMLElement) => void;
@@ -2552,6 +2618,7 @@ const ChatItemRow = memo(function ChatItemRow({
   workspaceId,
   missionId,
   basePath,
+  isLast,
   isToolGroupExpanded,
   onToggleToolGroup,
   measureRow,
@@ -2589,6 +2656,7 @@ const ChatItemRow = memo(function ChatItemRow({
           workspaceId={workspaceId}
           missionId={missionId}
           onLoadToolDetails={onLoadToolDetails}
+          isLast={isLast}
         />
       </div>
     );
@@ -2795,6 +2863,7 @@ const ChatItemRow = memo(function ChatItemRow({
         basePath={basePath}
         workspaceId={workspaceId}
         missionId={missionId}
+        defaultExpanded={isLast}
       />
     );
   }
@@ -2806,6 +2875,7 @@ const ChatItemRow = memo(function ChatItemRow({
         basePath={basePath}
         workspaceId={workspaceId}
         missionId={missionId}
+        defaultExpanded={isLast}
       />
     );
   }
@@ -2932,6 +3002,7 @@ const ChatItemRow = memo(function ChatItemRow({
           workspaceId={workspaceId}
           missionId={missionId}
           onLoadDetails={onLoadToolDetails}
+          defaultExpanded={isLast}
         />
       );
     }
@@ -2947,6 +3018,7 @@ const ChatItemRow = memo(function ChatItemRow({
         workspaceId={workspaceId}
         missionId={missionId}
         onLoadDetails={onLoadToolDetails}
+        defaultExpanded={isLast}
       />
     );
   }
@@ -3840,7 +3912,11 @@ export default function ControlClient() {
         .join("|"),
     [groupedItems],
   );
-  const { isAtBottom, scrollToBottom } = useVirtualTimelineAnchor({
+  const {
+    isAtBottom,
+    scrollToBottom,
+    registerContent: registerChatContent,
+  } = useVirtualTimelineAnchor({
     scrollElementRef: containerRef,
     virtualizer: chatVirtualizer,
     itemCount: groupedItems.length,
@@ -7981,7 +8057,7 @@ export default function ControlClient() {
       submittingRef.current = true;
 
       const targetMissionId = viewingMissionIdRef.current;
-      const tempId = crypto.randomUUID();
+      const tempId = createClientMessageId();
       const timestamp = Date.now();
       const hasExistingUserMessages = items.some(
         (item) => item.kind === "user",
@@ -8929,15 +9005,15 @@ export default function ControlClient() {
     };
   }, [showMissionMenu]);
 
-  // Update favicon with mission status dot
-  useFaviconStatus(faviconStatus, viewingMissionIsRunning);
+  // Update favicon with mission status dot + a "needs answer" attention badge.
+  useFaviconStatus(faviconStatus, viewingMissionIsRunning, hasPendingUserInput);
 
   useEffect(() => {
-    document.title = formatMissionDocumentTitle(activeMission);
+    document.title = formatMissionDocumentTitle(activeMission, hasPendingUserInput);
     return () => {
       document.title = DEFAULT_DOCUMENT_TITLE;
     };
-  }, [activeMission]);
+  }, [activeMission, hasPendingUserInput]);
 
   // Derive the last resolved model from assistant messages (for the debug dropdown)
   const lastResolvedModel = useMemo(() => {
@@ -9037,7 +9113,7 @@ export default function ControlClient() {
 
   return (
     <NowTickProvider>
-      <div className="flex h-screen flex-col p-6">
+      <div className="flex h-[calc(100vh-3rem)] flex-col p-6 lg:h-screen">
         {/* Always-on debug overlay so any OOM-style crash leaves a trail
           we can reconstruct from sessionStorage after reload. Cheap:
           a polling tick every 2s that reads performance.memory and
@@ -9673,7 +9749,7 @@ export default function ControlClient() {
         </div>
 
         {/* Main content area - Chat and Desktop stream side by side */}
-        <div className="flex-1 min-h-0 flex gap-4">
+        <div className="flex-1 min-h-0 flex flex-col gap-4 lg:flex-row max-lg:overflow-y-auto">
           {/* Chat container. We intentionally do NOT animate flex-grow when
           side panels (Workers / Workbench / Thinking) open: animating layout
           properties like `flex-grow` re-flows the entire (potentially huge)
@@ -9683,7 +9759,7 @@ export default function ControlClient() {
           snap to its new width in a single layout pass. */}
           <div
             className={cn(
-              "flex-1 min-h-0 flex flex-col rounded-2xl glass-panel border border-white/[0.06] overflow-hidden relative",
+              "flex-1 min-h-0 flex flex-col rounded-2xl glass-panel border border-white/[0.06] overflow-hidden relative max-lg:min-h-[60vh]",
               showDesktopStream && "flex-[2]",
             )}
           >
@@ -9843,6 +9919,7 @@ export default function ControlClient() {
               ) : (
                 <div className="@container mx-auto max-w-3xl space-y-6">
                   <div
+                    ref={registerChatContent}
                     className="relative w-full"
                     style={{ height: `${chatVirtualizer.getTotalSize()}px` }}
                   >
@@ -9850,6 +9927,8 @@ export default function ControlClient() {
                       const item = groupedItems[virtualRow.index];
                       if (!item) return null;
                       const key = getGroupedItemKey(item);
+                      const isLast =
+                        virtualRow.index === groupedItems.length - 1;
                       const isToolGroupExpanded =
                         item.kind === "tool_group"
                           ? expandedToolGroups.has(item.groupId)
@@ -9870,6 +9949,7 @@ export default function ControlClient() {
                             workspaceId={missionForDownloads?.workspace_id}
                             missionId={missionForDownloads?.id}
                             basePath={missionWorkingDirectory}
+                            isLast={isLast}
                             isToolGroupExpanded={isToolGroupExpanded}
                             onToggleToolGroup={handleToggleToolGroup}
                             measureRow={measureRowSync}
@@ -10222,10 +10302,12 @@ export default function ControlClient() {
                 // `transition-all duration-300` that was animating width on
                 // mount (the width change is what caused the chat-side reflow
                 // freeze when toggling the Workers panel).
-                "min-h-0 flex flex-col gap-4 animate-fade-in shrink-0",
+                // Below lg the side panel stacks under the chat at full width
+                // with a capped height instead of competing for horizontal room.
+                "min-h-0 flex flex-col gap-4 animate-fade-in shrink-0 max-lg:w-full max-lg:min-w-0 max-lg:max-w-none max-lg:max-h-none max-lg:h-[60vh] max-lg:resize-none",
                 showDesktopStream
-                  ? "basis-auto w-[clamp(400px,44vw,820px)] h-[min(720px,calc(100vh-7rem))] min-h-[420px] min-w-[360px] max-h-[calc(100vh-7rem)] max-w-[820px] resize overflow-hidden"
-                  : "w-80",
+                  ? "lg:basis-auto lg:w-[clamp(400px,44vw,820px)] lg:h-[min(720px,calc(100vh-7rem))] lg:min-h-[420px] lg:min-w-[360px] lg:max-h-[calc(100vh-7rem)] lg:max-w-[820px] lg:resize overflow-hidden"
+                  : "lg:w-80",
               )}
             >
               {showWorkbenchPanel && (

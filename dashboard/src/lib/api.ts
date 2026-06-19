@@ -15,6 +15,7 @@ export * from "./api/core";
 export * from "./api/missions";
 export * from "./api/workspaces";
 export * from "./api/providers";
+export * from "./api/github";
 export * from "./api/automations";
 export * from "./api/telegram";
 export * from "./api/assistant";
@@ -442,6 +443,85 @@ export async function postControlMessage(
     body: JSON.stringify(body),
   });
   if (!res.ok) throw new Error("Failed to post control message");
+  return res.json();
+}
+
+// ---- Mission task board ----------------------------------------------------
+
+export type BoardTaskStatus =
+  | "pending"
+  | "running"
+  | "settled"
+  | "accepted"
+  | "failed"
+  | "cancelled";
+
+export type BoardTaskOutcome = "success" | "blocked" | "failed";
+
+export interface BoardTask {
+  id: string;
+  boss_mission_id: string;
+  task_key: string;
+  title: string;
+  prompt: string;
+  backend: string;
+  model_override?: string;
+  model_effort?: string;
+  working_directory?: string;
+  depends_on: string[];
+  status: BoardTaskStatus;
+  outcome?: BoardTaskOutcome;
+  worker_mission_id?: string;
+  attempts: number;
+  result_digest?: string;
+  notes?: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface BoardUtilization {
+  pending: number;
+  running: number;
+  settled: number;
+  accepted: number;
+  failed: number;
+  cancelled: number;
+  total: number;
+  max_parallel: number;
+}
+
+export interface MissionBoard {
+  tasks: BoardTask[];
+  utilization: BoardUtilization;
+}
+
+export async function getMissionBoard(
+  missionId: string,
+): Promise<MissionBoard> {
+  const res = await apiFetch(`/api/control/missions/${missionId}/board`);
+  if (!res.ok) throw new Error("Failed to fetch mission board");
+  return res.json();
+}
+
+export async function postBoardTaskVerdict(
+  taskId: string,
+  action: "accept" | "reject",
+  feedback?: string,
+): Promise<BoardTask> {
+  const res = await apiFetch(`/api/control/board/tasks/${taskId}/verdict`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ action, feedback }),
+  });
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+export async function cancelBoardTask(taskId: string): Promise<BoardTask> {
+  const res = await apiFetch(`/api/control/board/tasks/${taskId}/cancel`, {
+    method: "POST",
+  });
+  if (!res.ok) throw new Error(await res.text());
   return res.json();
 }
 

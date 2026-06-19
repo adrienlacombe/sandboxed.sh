@@ -729,8 +729,13 @@ exec "$SCRIPT_DIR/.sandboxed-sh-telegram-action.py" "$@"
     }
 }
 
-const CODEX_ACCOUNT_CONCURRENCY_LIMIT: usize = 5;
-const CODEX_OAUTH_ACCOUNT_CONCURRENCY_LIMIT: usize = 5;
+// Max concurrent Codex turns per account, enforced by a per-account semaphore.
+// Raised 5 -> 10 (operator decision) to widen the effective Codex ceiling
+// (accounts x limit) and reduce "all accounts at capacity" when many board
+// workers want Codex at once. Higher values risk upstream rate-limiting per
+// ChatGPT/OpenAI account.
+const CODEX_ACCOUNT_CONCURRENCY_LIMIT: usize = 10;
+const CODEX_OAUTH_ACCOUNT_CONCURRENCY_LIMIT: usize = 10;
 const CODEX_ACCOUNT_LEASE_WAIT_TIMEOUT: Duration = Duration::from_secs(15);
 
 static CODEX_ACCOUNT_POOL: LazyLock<StdMutex<HashMap<String, Arc<Semaphore>>>> =
@@ -2464,6 +2469,49 @@ pub struct QueuedMessage {
     pub agent: Option<String>,
 }
 
+/// Environment flag gating the background-task auto-resume feature.
+///
+/// Default enabled; set `BACKGROUND_TASK_AUTORESUME=0` (or `false`/`no`/`off`)
+/// to disable. When disabled, capture and the watcher both no-op.
+pub const BACKGROUND_TASK_AUTORESUME_ENV: &str = "BACKGROUND_TASK_AUTORESUME";
+
+/// Whether the background-task auto-resume feature is enabled.
+pub fn background_task_autoresume_enabled() -> bool {
+    crate::util::env_var_bool(BACKGROUND_TASK_AUTORESUME_ENV, true)
+}
+
+/// An in-flight Claude Code background shell task (`Bash` tool with
+/// `run_in_background: true`).
+///
+/// Recorded when the CLI emits the background-start marker (see
+/// `crate::api::runners::claudecode::parse_background_task_start`) and consumed
+/// by the auto-resume watcher (`crate::api::supervision::bg_autoresume`), which
+/// which polls for completion and wakes the agent with the output once the job
+/// finishes.
+#[derive(Debug, Clone)]
+pub struct BackgroundTask {
+    /// CLI-assigned background id (e.g. `bash_1`).
+    pub id: String,
+    /// Path the CLI writes the job's combined output to (inside the workspace).
+    pub output_path: String,
+    /// The shell command that was launched, for the resume message. Best-effort
+    /// (empty if the matching tool_call wasn't observed).
+    pub command: String,
+    /// When we first observed the task start. Used for the overall timeout.
+    pub started_at: Instant,
+}
+
+/// Shared, cross-task registry of in-flight background tasks per mission.
+///
+/// The control actor (writer) records tasks here from the `ToolResult` event
+/// arm, and the supervision watcher (reader) polls and resumes from it. A
+/// shared registry is required because a mission's [`MissionRunner`] is torn
+/// down once its turn ends and the mission parks in `AwaitingUser` — exactly
+/// when the watcher needs to act — so per-runner state alone would not survive.
+///
+/// Keyed by mission id, then by background-task id.
+pub type BackgroundTaskRegistry = Arc<RwLock<HashMap<Uuid, HashMap<String, BackgroundTask>>>>;
+
 /// Isolated runner for a single mission.
 /// Info about a tracked subtask (from delegate_task/Task tool calls).
 #[derive(Debug, Clone)]
@@ -2548,6 +2596,15 @@ pub struct MissionRunner {
     /// Shared with the turn loops via Arc so they can increment/decrement
     /// without holding the runner's outer lock.
     pub active_tool_calls: Arc<std::sync::atomic::AtomicUsize>,
+
+    /// In-flight background shell tasks started this mission (`Bash` with
+    /// `run_in_background: true`), keyed by background-task id.
+    ///
+    /// This mirrors the shared [`BackgroundTaskRegistry`], which is the source
+    /// of truth used by the auto-resume watcher (the runner is torn down when
+    /// the mission parks in `AwaitingUser`, so this field is informational and
+    /// for in-process inspection only).
+    pub background_tasks: HashMap<String, BackgroundTask>,
 }
 
 impl MissionRunner {
@@ -2587,6 +2644,7 @@ impl MissionRunner {
             working_directory: None,
             user_id: None,
             active_tool_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            background_tasks: HashMap::new(),
         }
     }
 
@@ -3295,7 +3353,7 @@ async fn run_mission_turn(
     convo.push('\n');
 
     // Ensure mission workspace exists and is configured for OpenCode.
-    let workspace = workspace::resolve_workspace(&workspaces, &config, workspace_id).await;
+    let mut workspace = workspace::resolve_workspace(&workspaces, &config, workspace_id).await;
     if let Err(e) =
         workspace::sync_workspace_mcp_binaries_for_workspace(&config.working_dir, &workspace).await
     {
@@ -3310,7 +3368,7 @@ async fn run_mission_turn(
         let lib_guard = library.read().await;
         let lib_ref = lib_guard.as_ref().map(|l| l.as_ref());
         workspace::prepare_mission_workspace_with_skills_backend(
-            &workspace,
+            &mut workspace,
             &mcp,
             lib_ref,
             mission_id,
@@ -3318,6 +3376,7 @@ async fn run_mission_turn(
             None, // custom_providers: TODO integrate with provider store
             effective_config_profile.as_deref(),
             boss_user_id.as_deref(),
+            Some(&config.working_dir),
         )
         .await
     };
@@ -5896,6 +5955,21 @@ fn format_exit_status(status: &std::process::ExitStatus) -> String {
     "code <unknown>".to_string()
 }
 
+fn curl_dependency_error(output: &str) -> Option<&'static str> {
+    let lower = output.to_lowercase();
+    if lower.contains("curl: not found")
+        || lower.contains("curl: command not found")
+        || lower.contains("curl: error while loading shared libraries")
+        || lower.contains("error while loading shared libraries: libcurl")
+    {
+        return Some(
+            "curl is missing or not executable in the workspace. \
+             Rebuild the workspace or install curl and ca-certificates in the workspace template.",
+        );
+    }
+    None
+}
+
 /// Check basic internet connectivity using a reliable public endpoint.
 /// This verifies the workspace has any network access at all.
 async fn check_basic_internet_connectivity(
@@ -5945,7 +6019,9 @@ async fn check_basic_internet_connectivity(
         let stderr = String::from_utf8_lossy(&output.stderr);
         let combined = format!("{}{}", stdout, stderr);
 
-        let err = if combined.contains("Network is unreachable") {
+        let err = if let Some(message) = curl_dependency_error(&combined) {
+            format!("Workspace dependency check failed: {}", message)
+        } else if combined.contains("Network is unreachable") {
             "No internet connectivity: Network is unreachable. \
              The workspace has no network access."
                 .to_string()
@@ -6101,6 +6177,13 @@ async fn check_api_reachability(
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     let combined = format!("{}{}", stdout, stderr);
+
+    if let Some(message) = curl_dependency_error(&combined) {
+        return Err(format!(
+            "Cannot connect to {} API: Workspace dependency check failed: {}",
+            api_name, message
+        ));
+    }
 
     // Check for common error patterns
     if combined.contains("Could not resolve host") {
@@ -8026,18 +8109,18 @@ mod tests {
         codex_final_message_looks_like_progress_update, codex_is_goal_request,
         codex_key_fingerprint, codex_missing_goal_final_response_message,
         codex_tool_stall_should_retry_with_default_model, codex_turn_requires_tool_activity,
-        custom_opencode_provider_definition, ensure_opencode_provider_for_model,
-        extract_codex_reset_window, extract_model_from_message, extract_opencode_session_id,
-        extract_part_text, extract_str, extract_think_content, is_capacity_limited_error,
-        is_codex_chatgpt_account_model_blocked, is_codex_node_wrapper, is_opencode_session_id,
-        is_provider_payload_error, is_rate_limited_error, is_session_corruption_error,
-        is_success_path_auth_error, is_success_path_provider_payload_error,
-        is_success_path_rate_limited_error, is_tool_call_only_output,
-        opencode_goal_terminal_status, opencode_idle_timeout_result_message,
-        opencode_output_needs_fallback, opencode_session_exists_in_data_home,
-        opencode_session_token_from_line, parse_opencode_goal_objective,
-        parse_opencode_session_token, parse_opencode_sse_event, parse_opencode_stderr_text_part,
-        preferred_model_for_cost, record_codex_error_message,
+        curl_dependency_error, custom_opencode_provider_definition,
+        ensure_opencode_provider_for_model, extract_codex_reset_window, extract_model_from_message,
+        extract_opencode_session_id, extract_part_text, extract_str, extract_think_content,
+        is_capacity_limited_error, is_codex_chatgpt_account_model_blocked, is_codex_node_wrapper,
+        is_opencode_session_id, is_provider_payload_error, is_rate_limited_error,
+        is_session_corruption_error, is_success_path_auth_error,
+        is_success_path_provider_payload_error, is_success_path_rate_limited_error,
+        is_tool_call_only_output, opencode_goal_terminal_status,
+        opencode_idle_timeout_result_message, opencode_output_needs_fallback,
+        opencode_session_exists_in_data_home, opencode_session_token_from_line,
+        parse_opencode_goal_objective, parse_opencode_session_token, parse_opencode_sse_event,
+        parse_opencode_stderr_text_part, preferred_model_for_cost, record_codex_error_message,
         replace_filepath_artifact_with_tool_output, running_health, sanitized_opencode_stdout,
         set_codex_account_cooldown, stall_severity, strip_ansi_codes, strip_opencode_banner_lines,
         strip_think_tags, summarize_codex_usage_caps, summarize_recent_opencode_stderr,
@@ -8061,6 +8144,28 @@ mod tests {
     use std::fs;
     use std::time::Duration;
     use uuid::Uuid;
+
+    #[test]
+    fn curl_dependency_error_detects_missing_curl() {
+        assert!(curl_dependency_error("/bin/sh: 1: curl: not found").is_some());
+        assert!(curl_dependency_error("curl: command not found").is_some());
+    }
+
+    #[test]
+    fn curl_dependency_error_detects_broken_shared_library() {
+        assert!(
+            curl_dependency_error(
+                "curl: error while loading shared libraries: libcurl.so.4: cannot open shared object file"
+            )
+            .is_some()
+        );
+    }
+
+    #[test]
+    fn curl_dependency_error_ignores_network_failures() {
+        assert!(curl_dependency_error("curl: (7) Failed to connect to 1.1.1.1").is_none());
+        assert!(curl_dependency_error("Network is unreachable").is_none());
+    }
 
     #[test]
     fn extract_codex_reset_window_pulls_the_reset_time() {

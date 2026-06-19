@@ -570,6 +570,9 @@ mod tests {
             default_backend: None,
             automations_enabled: true,
             max_concurrent_tasks: 5,
+            spark_arbiter_url: None,
+            spark_arbiter_token: None,
+            spark_ssh_target: None,
         }
     }
 

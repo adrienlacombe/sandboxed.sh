@@ -273,9 +273,11 @@ export const WorkersStrip = memo(function WorkersStrip({
             style={{ width: `${pct}%` }}
           />
         )}
-        <span className="relative z-10 flex items-center gap-1.5">
+        <span className="relative z-10 flex min-w-0 items-center gap-1.5">
           {status.indicator}
-          <span className="truncate font-medium text-foreground/85">{title}</span>
+          <span className="min-w-0 truncate font-medium text-foreground/85">
+            {title}
+          </span>
           {status.activity && status.isActive && (
             <span className="hidden truncate text-white/40 lg:inline max-w-[120px]">
               {status.activity}
@@ -336,7 +338,7 @@ export const WorkersStrip = memo(function WorkersStrip({
           >
             <ArrowLeft className="h-3 w-3 shrink-0" />
             <Crown className="h-3 w-3 shrink-0" />
-            <span className="truncate">{parentTitle}</span>
+            <span className="min-w-0 truncate">{parentTitle}</span>
           </button>
           {total > 0 && (
             <span aria-hidden className="shrink-0 h-3.5 w-px bg-white/10" />

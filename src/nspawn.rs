@@ -549,7 +549,7 @@ async fn unmount_if_present(root: &Path, target: &str) -> NspawnResult<()> {
 /// service's cgroup and can throttle the whole service — same failure mode
 /// as the mission boot/attach paths in `workspace_exec.rs`.
 fn scope_wrapped_nspawn_command(path: &Path, env: &HashMap<String, String>) -> Command {
-    let caps = crate::workspace_exec::mission_memory_caps_from_env(env);
+    let caps = crate::workspace_exec::mission_resource_caps_from_env(env);
     // Embed the same machine-name token the mission boot/attach scopes use so
     // this one-shot scope is discoverable by `list_workspace_scope_units`
     // (live stats, retune, OOM watchdog). A divergent token would make the

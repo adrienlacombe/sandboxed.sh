@@ -29,23 +29,18 @@ struct WorkerPillView: View {
                     .font(.system(size: 11, weight: .medium))
                     .foregroundStyle(Theme.accent)
 
-                Text("\(workers.count)")
+                // Headline = workers running right now, NOT the cumulative
+                // total. The total counts every sub-mission that ever ran,
+                // most of which have finished and are never reused, so leading
+                // with it implied a far larger live fleet than exists.
+                Text("\(activeCount)")
                     .font(.caption.weight(.semibold))
                     .monospacedDigit()
                     .contentTransition(.numericText())
-                    .foregroundStyle(Theme.textPrimary)
-
-                if activeCount > 0 {
-                    HStack(spacing: 3) {
-                        Circle()
-                            .fill(Theme.accent)
-                            .frame(width: 5, height: 5)
-                        Text("\(activeCount)")
-                            .font(.system(size: 10, weight: .medium).monospaced())
-                            .contentTransition(.numericText())
-                            .foregroundStyle(Theme.accent)
-                    }
-                }
+                    .foregroundStyle(activeCount > 0 ? Theme.textPrimary : Theme.textMuted)
+                Text("active")
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(Theme.textTertiary)
 
                 if waitingCount > 0 {
                     HStack(spacing: 3) {
@@ -55,17 +50,6 @@ struct WorkerPillView: View {
                         Text("\(waitingCount)")
                             .font(.system(size: 10, weight: .medium).monospaced())
                             .foregroundStyle(Theme.info)
-                    }
-                }
-
-                if completedCount > 0 {
-                    HStack(spacing: 3) {
-                        Circle()
-                            .fill(Theme.success)
-                            .frame(width: 5, height: 5)
-                        Text("\(completedCount)")
-                            .font(.system(size: 10, weight: .medium).monospaced())
-                            .foregroundStyle(Theme.success)
                     }
                 }
 
@@ -79,6 +63,14 @@ struct WorkerPillView: View {
                             .foregroundStyle(Theme.error)
                     }
                 }
+
+                // Cumulative count of every sub-mission ever spawned — kept
+                // for reference but visually muted so it doesn't read as a
+                // live fleet size.
+                Text("· \(workers.count) total")
+                    .font(.system(size: 10))
+                    .monospacedDigit()
+                    .foregroundStyle(Theme.textMuted)
 
                 Image(systemName: "chevron.up")
                     .font(.system(size: 9, weight: .bold))

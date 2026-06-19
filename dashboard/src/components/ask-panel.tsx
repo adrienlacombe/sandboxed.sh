@@ -26,6 +26,8 @@ import {
   type AskMessage,
 } from "@/lib/api";
 import { LazyMarkdownContent } from "@/components/markdown-content";
+import { useMediaQuery } from "@/hooks/use-media-query";
+import { LG_MEDIA_QUERY } from "@/lib/responsive-layout";
 import { cn } from "@/lib/utils";
 
 interface AskPanelProps {
@@ -365,17 +367,21 @@ export function AskPanel({
   const copilot = "text-[rgb(var(--copilot))]";
   const ctrl =
     "border border-[rgb(var(--foreground)/0.1)] bg-[rgb(var(--foreground)/0.04)] text-[rgb(var(--foreground)/0.6)] hover:bg-[rgb(var(--foreground)/0.07)] hover:text-[rgb(var(--foreground)/0.85)]";
+  const isDesktop = useMediaQuery(LG_MEDIA_QUERY);
 
   return (
     <div
-      className="@container relative flex h-full shrink-0 flex-col rounded-2xl border border-[rgb(var(--copilot)/0.25)] bg-[rgb(var(--background-elevated)/0.72)] backdrop-blur-xl"
-      style={{ width: panelWidth }}
+      className={cn(
+        "@container relative flex h-full shrink-0 flex-col rounded-2xl border border-[rgb(var(--copilot)/0.25)] bg-[rgb(var(--background-elevated)/0.72)] backdrop-blur-xl",
+        !isDesktop && "w-full max-lg:h-[60vh]",
+      )}
+      style={isDesktop ? { width: panelWidth } : undefined}
     >
       {/* Drag the left edge to trade width between the chat and the co-pilot. */}
       <div
         role="separator"
         aria-orientation="vertical"
-        className="absolute -left-1 top-0 z-10 h-full w-2 cursor-col-resize hover:bg-[rgb(var(--copilot)/0.25)]"
+        className="absolute -left-1 top-0 z-10 hidden h-full w-2 cursor-col-resize hover:bg-[rgb(var(--copilot)/0.25)] lg:block"
         onPointerDown={(e) => {
           e.preventDefault();
           const startX = e.clientX;

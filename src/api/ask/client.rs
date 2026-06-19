@@ -70,6 +70,32 @@ fn strip_model_markup_sentinels(content: &str) -> String {
         .replace("]<]minimax[>", "")
 }
 
+/// Sanitize a *final* answer before it is shown to the operator.
+///
+/// The forced final-synthesis pass runs with tools disabled, so
+/// [`parse_text_tool_calls`] is skipped (it only fires when tools are offered).
+/// MiniMax nonetheless sometimes free-styles a tool call as text on that pass —
+/// wrapped in its interleave sentinels — and the raw `<tool_call>`/`<invoke>`
+/// markup would otherwise reach the chat verbatim (observed in prod). This
+/// strips the sentinels and any leaked tool-call markup, returning only the
+/// prose the model actually wrote (often empty when it emitted only a call).
+pub(crate) fn strip_leaked_tool_markup(content: &str) -> String {
+    let content = strip_model_markup_sentinels(content);
+    // Remove well-formed tool-call blocks (non-greedy; an `<invoke>` nested in a
+    // `<tool_call>` is consumed by the outer match).
+    let tool_block = regex::Regex::new(r#"(?s)<tool_call>.*?</tool_call>"#)
+        .expect("valid tool-call block regex");
+    let invoke_block =
+        regex::Regex::new(r#"(?s)<invoke\b.*?</invoke>"#).expect("valid invoke block regex");
+    let s = tool_block.replace_all(&content, "");
+    let s = invoke_block.replace_all(&s, "");
+    // Drop any dangling/unclosed markup fragments the model left behind.
+    let dangling =
+        regex::Regex::new(r#"(?s)</?(?:tool_call|invoke|command|arg_key|arg_value)\b[^>]*>"#)
+            .expect("valid dangling-tag regex");
+    dangling.replace_all(&s, "").trim().to_string()
+}
+
 fn parse_text_tool_calls(raw_content: &str) -> Vec<ToolCall> {
     let content = strip_model_markup_sentinels(raw_content);
     let content = content.as_str();
@@ -461,6 +487,26 @@ mod tests {
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0].name, "bash");
         assert_eq!(calls[1].name, "read_history");
+    }
+
+    #[test]
+    fn strips_leaked_minimax_tool_markup_to_empty() {
+        // Verbatim shape leaked into a prod Ask answer (mission cd6cfe3f) on the
+        // tools-disabled synthesis pass, where the text tool-call parser is
+        // skipped. Nothing but markup → sanitized result is empty so the caller
+        // falls back to the canned notice instead of showing garbage.
+        let out = strip_leaked_tool_markup(
+            "]<]minimax[>[<tool_call> ]<]minimax[>[<invoke name=\"bash\">]<]minimax[>[<command>cd /workspaces/mission-cd6cfe3f/verity-benchmark && echo hi</command>]<]minimax[>[</invoke> ]<]minimax[>[</tool_call>",
+        );
+        assert_eq!(out, "");
+    }
+
+    #[test]
+    fn keeps_prose_around_leaked_markup() {
+        let out = strip_leaked_tool_markup(
+            "Here is the status.\n]<]minimax[>[<invoke name=\"bash\"><command>ls</command></invoke> Done.",
+        );
+        assert_eq!(out, "Here is the status.\n Done.");
     }
 
     #[test]

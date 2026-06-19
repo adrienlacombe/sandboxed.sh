@@ -534,7 +534,7 @@ impl AssistantMcp {
             },
             ToolDefinition {
                 name: "workspace_bash".to_string(),
-                description: "Run a bash command inside a sandboxed.sh workspace with the workspace's configured environment variables (GH_TOKEN, SSH keys, ...) — the same context missions run in. Prefer this over local bash for git/gh operations and anything needing workspace secrets.".to_string(),
+                description: "Run a bash command inside a sandboxed.sh workspace — the same context missions run in, with the workspace's configured environment variables and (when a GitHub account is connected in the dashboard) GitHub git credentials wired in for `git push`. Prefer this over local bash for git operations and anything needing workspace secrets.".to_string(),
                 input_schema: json!({
                     "type": "object",
                     "required": ["command"],
@@ -1665,6 +1665,54 @@ fn scrub_sensitive_json(value: &mut Value) {
     }
 }
 
+#[tokio::main(flavor = "current_thread")]
+async fn main() {
+    if std::env::args().any(|arg| arg == "--version" || arg == "-V") {
+        println!("assistant-mcp {SERVER_VERSION}");
+        return;
+    }
+
+    let server = AssistantMcp::new();
+    let stdin = std::io::stdin();
+    let mut stdout = std::io::stdout();
+
+    for line in BufReader::new(stdin.lock()).lines() {
+        let Ok(line) = line else {
+            break;
+        };
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        let request = match serde_json::from_str::<JsonRpcRequest>(&line) {
+            Ok(request) => request,
+            Err(error) => {
+                let response =
+                    JsonRpcResponse::error(Value::Null, -32700, format!("Parse error: {error}"));
+                if let Ok(serialized) = serde_json::to_string(&response) {
+                    let _ = writeln!(stdout, "{serialized}");
+                    let _ = stdout.flush();
+                }
+                continue;
+            }
+        };
+
+        // Notifications (no id), e.g. the `notifications/initialized` the MCP
+        // client sends after `initialize`, expect no reply per JSON-RPC.
+        // Returning a "-32601 Method not found" error here breaks the handshake
+        // with stricter clients.
+        if request.id.is_null() && request.method.starts_with("notifications/") {
+            continue;
+        }
+
+        let response = server.handle_request(request).await;
+        if let Ok(serialized) = serde_json::to_string(&response) {
+            let _ = writeln!(stdout, "{serialized}");
+            let _ = stdout.flush();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1949,53 +1997,5 @@ mod tests {
         assert!(output_dir_for_shared_file(&mission_id, Some("/var/tmp".to_string())).is_err());
         // Relative paths are rejected.
         assert!(output_dir_for_shared_file(&mission_id, Some("tmp/x".to_string())).is_err());
-    }
-}
-
-#[tokio::main(flavor = "current_thread")]
-async fn main() {
-    if std::env::args().any(|arg| arg == "--version" || arg == "-V") {
-        println!("assistant-mcp {SERVER_VERSION}");
-        return;
-    }
-
-    let server = AssistantMcp::new();
-    let stdin = std::io::stdin();
-    let mut stdout = std::io::stdout();
-
-    for line in BufReader::new(stdin.lock()).lines() {
-        let Ok(line) = line else {
-            break;
-        };
-        if line.trim().is_empty() {
-            continue;
-        }
-
-        let request = match serde_json::from_str::<JsonRpcRequest>(&line) {
-            Ok(request) => request,
-            Err(error) => {
-                let response =
-                    JsonRpcResponse::error(Value::Null, -32700, format!("Parse error: {error}"));
-                if let Ok(serialized) = serde_json::to_string(&response) {
-                    let _ = writeln!(stdout, "{serialized}");
-                    let _ = stdout.flush();
-                }
-                continue;
-            }
-        };
-
-        // Notifications (no id), e.g. the `notifications/initialized` the MCP
-        // client sends after `initialize`, expect no reply per JSON-RPC.
-        // Returning a "-32601 Method not found" error here breaks the handshake
-        // with stricter clients.
-        if request.id.is_null() && request.method.starts_with("notifications/") {
-            continue;
-        }
-
-        let response = server.handle_request(request).await;
-        if let Ok(serialized) = serde_json::to_string(&response) {
-            let _ = writeln!(stdout, "{serialized}");
-            let _ = stdout.flush();
-        }
     }
 }

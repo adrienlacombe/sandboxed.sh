@@ -15,6 +15,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 // Control event/command types (Phase 6 of the decomposition).
+pub mod board;
 pub mod events;
 pub use events::*;
 
@@ -40,8 +41,8 @@ use uuid::Uuid;
 
 #[allow(unused_imports)]
 use super::supervision::{
-    ack_promotion_loop, cleanup_stale_active_missions_once, recover_server_shutdown_missions,
-    stale_mission_cleanup_loop, stuck_mission_watchdog_loop,
+    ack_promotion_loop, background_task_autoresume_loop, cleanup_stale_active_missions_once,
+    recover_server_shutdown_missions, stale_mission_cleanup_loop, stuck_mission_watchdog_loop,
 };
 use crate::agents::{AgentContext, AgentRef, TerminalReason};
 use crate::config::Config;
@@ -54,8 +55,8 @@ use super::auth::AuthUser;
 use super::desktop;
 use super::library::SharedLibrary;
 use super::mission_store::{
-    self, create_mission_store, now_string, Mission, MissionHistoryEntry, MissionStore,
-    MissionStoreType,
+    self, create_mission_store, now_string, BoardTask, BoardTaskStatus, Mission,
+    MissionHistoryEntry, MissionStore, MissionStoreType, NewBoardTask,
 };
 use super::routes::AppState;
 
@@ -424,6 +425,129 @@ const METADATA_SOURCE_USER: &str = "user";
 const METADATA_VERSION_V1: &str = "v1";
 static MISSION_TITLE_UPDATE_LOCK: std::sync::LazyLock<Mutex<()>> =
     std::sync::LazyLock::new(|| Mutex::new(()));
+
+/// Stall-guard: number of consecutive auto-armed fallback wakeups per mission,
+/// since the last real user message or self-armed automation. Bounds how many
+/// times the server will auto-resume an orchestrator that keeps parking without
+/// scheduling its own wakeup, so a genuinely-finished orchestrator isn't woken
+/// forever (after the cap it's left for a human).
+static STALL_GUARD_CONSECUTIVE_ARMS: std::sync::LazyLock<std::sync::Mutex<HashMap<Uuid, u32>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+const STALL_GUARD_MAX_CONSECUTIVE_ARMS: u32 = 3;
+const STALL_GUARD_WAKEUP_SECONDS: u64 = 1200;
+
+/// Clear a mission's stall-guard counter — called when a real user message
+/// arrives (the operator is steering it) so the guard's budget resets.
+pub(crate) fn reset_stall_guard(mission_id: Uuid) {
+    if let Ok(mut m) = STALL_GUARD_CONSECUTIVE_ARMS.lock() {
+        m.remove(&mission_id);
+    }
+}
+
+/// If an orchestrator mission (one that has spawned child missions) parks in
+/// `AwaitingUser` with no active automation, arm a one-shot fallback wakeup so
+/// it re-checks and continues instead of stalling on an auto-notification that
+/// won't arrive. Leaf missions (no children) are never touched, so a mission
+/// legitimately awaiting a human answer is never auto-resumed. Bounded per
+/// mission; a no-op when the agent already armed its own wakeup.
+/// Returns `true` when a fallback wakeup was armed (used by tests; callers may
+/// ignore it).
+async fn maybe_arm_stall_guard_wakeup(
+    mission_store: &Arc<dyn MissionStore>,
+    mission_id: Uuid,
+) -> bool {
+    // Only orchestrators are guarded — leaf missions awaiting a human are not.
+    let has_children = mission_store
+        .get_child_missions(mission_id)
+        .await
+        .map(|c| !c.is_empty())
+        .unwrap_or(false);
+    if !has_children {
+        return false;
+    }
+    // The agent self-armed a wakeup → it manages its own cadence; reset + skip.
+    if mission_has_active_automation(mission_store, mission_id).await {
+        reset_stall_guard(mission_id);
+        return false;
+    }
+    // Bound consecutive auto-arms.
+    let count = {
+        let Ok(mut m) = STALL_GUARD_CONSECUTIVE_ARMS.lock() else {
+            return false;
+        };
+        let c = m.entry(mission_id).or_insert(0);
+        if *c >= STALL_GUARD_MAX_CONSECUTIVE_ARMS {
+            return false;
+        }
+        *c += 1;
+        *c
+    };
+    tracing::info!(
+        mission_id = %mission_id,
+        arm = count,
+        max = STALL_GUARD_MAX_CONSECUTIVE_ARMS,
+        "Stall-guard: orchestrator parked in awaiting_user with no wakeup armed; arming fallback"
+    );
+    let prompt = "Auto-resume (stall-guard): your previous turn ended in awaiting_user \
+without scheduling a wakeup, but you are an orchestrator with work that may still be in \
+flight. Re-check your workers / board tasks / open PRs + CI and continue. If something is \
+genuinely async (CI, a long build), call ScheduleWakeup so you resume yourself. If \
+everything is truly done, report completion and stop."
+        .to_string();
+    let reason = format!(
+        "stall-guard auto-resume {}/{} (orchestrator parked with no wakeup armed)",
+        count, STALL_GUARD_MAX_CONSECUTIVE_ARMS
+    );
+    crate::api::mission_runner::spawn_claude_builtin_wakeup_automation(
+        mission_id,
+        STALL_GUARD_WAKEUP_SECONDS,
+        prompt,
+        reason,
+    );
+    true
+}
+
+#[cfg(test)]
+mod stall_guard_tests {
+    use super::*;
+
+    async fn mk(store: &Arc<dyn MissionStore>, parent: Option<Uuid>) -> Uuid {
+        store
+            .create_mission_with_parent(Some("m"), None, None, None, None, None, None, parent, None)
+            .await
+            .expect("create")
+            .id
+    }
+
+    #[tokio::test]
+    async fn leaf_mission_is_never_guarded() {
+        let store: Arc<dyn MissionStore> = Arc::new(mission_store::InMemoryMissionStore::new());
+        let leaf = mk(&store, None).await;
+        // No children → never armed, regardless of how many times it parks.
+        for _ in 0..5 {
+            assert!(!maybe_arm_stall_guard_wakeup(&store, leaf).await);
+        }
+    }
+
+    #[tokio::test]
+    async fn orchestrator_arms_then_caps_then_resets() {
+        let store: Arc<dyn MissionStore> = Arc::new(mission_store::InMemoryMissionStore::new());
+        let boss = mk(&store, None).await;
+        let _child = mk(&store, Some(boss)).await; // makes `boss` an orchestrator
+        reset_stall_guard(boss);
+        // Arms up to the cap, then stops (leaves it for a human).
+        for _ in 0..STALL_GUARD_MAX_CONSECUTIVE_ARMS {
+            assert!(maybe_arm_stall_guard_wakeup(&store, boss).await);
+        }
+        assert!(!maybe_arm_stall_guard_wakeup(&store, boss).await); // capped
+                                                                    // A real user message resets the budget.
+        reset_stall_guard(boss);
+        assert!(maybe_arm_stall_guard_wakeup(&store, boss).await);
+        reset_stall_guard(boss);
+    }
+}
+
 struct MetadataRefreshTaskEntry {
     handle: tokio::task::JoinHandle<()>,
     force_refresh: bool,
@@ -2452,13 +2576,58 @@ pub struct ControlMessageResponse {
 }
 
 /// A message waiting in the queue
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueuedMessage {
     pub id: Uuid,
     pub content: String,
     pub agent: Option<String>,
     /// Which mission this queued message belongs to
     pub mission_id: Option<Uuid>,
+}
+
+/// Serialize the control session queue to a stable JSON snapshot for
+/// persistence across restarts (see `MissionStore::save_control_queue`).
+fn serialize_queue_snapshot(
+    queue: &VecDeque<(Uuid, String, Option<String>, Option<Uuid>)>,
+) -> String {
+    let items: Vec<QueuedMessage> = queue
+        .iter()
+        .map(|(id, content, agent, target_mid)| QueuedMessage {
+            id: *id,
+            content: content.clone(),
+            agent: agent.clone(),
+            mission_id: *target_mid,
+        })
+        .collect();
+    serde_json::to_string(&items).unwrap_or_else(|_| "[]".to_string())
+}
+
+/// Persist the control queue snapshot iff it changed since `last_persisted`
+/// (debounced so unchanged iterations don't churn the DB).
+///
+/// Called both at the actor-loop top and immediately after every dequeue. The
+/// post-dequeue call is what prevents stale double-execution: without it, a
+/// popped message lingers in the persisted snapshot until the next loop pass, so
+/// a crash after the pop (during the potentially-awaiting work that starts the
+/// run) would restore and re-run a message that already started — bypassing the
+/// in-memory idempotency guard.
+async fn persist_control_queue_if_changed(
+    mission_store: &Arc<dyn MissionStore>,
+    session_user_id: &str,
+    queue: &VecDeque<(Uuid, String, Option<String>, Option<Uuid>)>,
+    last_persisted: &mut String,
+) {
+    let snapshot = serialize_queue_snapshot(queue);
+    if snapshot != *last_persisted {
+        if let Err(e) = mission_store
+            .save_control_queue(session_user_id, &snapshot)
+            .await
+        {
+            tracing::warn!("Failed to persist control queue: {e}");
+        } else {
+            *last_persisted = snapshot;
+        }
+    }
 }
 
 /// Tool result posted by the frontend for an interactive tool call.
@@ -3131,6 +3300,11 @@ pub async fn post_message(
     let id = req.client_message_id.unwrap_or_else(Uuid::new_v4);
     let agent = req.agent;
     let target_mission_id = req.mission_id;
+    // A real user message means the operator is steering this mission — reset
+    // its stall-guard budget so future genuine stalls get the full allowance.
+    if let Some(mid) = target_mission_id {
+        reset_stall_guard(mid);
+    }
     let control = control_for_user(&state, &user).await;
     let (queued_tx, queued_rx) = oneshot::channel();
     tracing::info!(
@@ -3149,6 +3323,7 @@ pub async fn post_message(
             content,
             agent,
             target_mission_id,
+            strict: false,
             respond: queued_tx,
         })
         .await
@@ -3164,6 +3339,285 @@ pub async fn post_message(
         }
     };
     Ok(Json(ControlMessageResponse { id, queued }))
+}
+
+// ---------------------------------------------------------------------------
+// Task board API (see `board` module for the scheduler).
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, serde::Deserialize)]
+pub struct BoardUpsertRequest {
+    pub tasks: Vec<NewBoardTask>,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct BoardUtilization {
+    pub pending: usize,
+    pub running: usize,
+    pub settled: usize,
+    pub accepted: usize,
+    pub failed: usize,
+    pub cancelled: usize,
+    pub total: usize,
+    pub max_parallel: usize,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct BoardResponse {
+    pub tasks: Vec<BoardTask>,
+    pub utilization: BoardUtilization,
+}
+
+fn board_utilization(tasks: &[BoardTask], max_parallel: usize) -> BoardUtilization {
+    let count = |s: BoardTaskStatus| tasks.iter().filter(|t| t.status == s).count();
+    BoardUtilization {
+        pending: count(BoardTaskStatus::Pending),
+        running: count(BoardTaskStatus::Running),
+        settled: count(BoardTaskStatus::Settled),
+        accepted: count(BoardTaskStatus::Accepted),
+        failed: count(BoardTaskStatus::Failed),
+        cancelled: count(BoardTaskStatus::Cancelled),
+        total: tasks.len(),
+        max_parallel,
+    }
+}
+
+/// GET /api/control/missions/:id/board — full board for a boss mission.
+pub async fn get_mission_board(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<BoardResponse>, (StatusCode, String)> {
+    let control = control_for_user(&state, &user).await;
+    let tasks = control
+        .mission_store
+        .list_board_tasks(id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let max_parallel = crate::settings::max_parallel_missions_cached_or(control.max_parallel);
+    Ok(Json(BoardResponse {
+        utilization: board_utilization(&tasks, max_parallel),
+        tasks,
+    }))
+}
+
+/// POST /api/control/missions/:id/board/tasks — register/update tasks.
+/// The scheduler picks up ready tasks within one pass (~3s).
+pub async fn upsert_mission_board_tasks(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    Path(id): Path<Uuid>,
+    Json(req): Json<BoardUpsertRequest>,
+) -> Result<Json<BoardResponse>, (StatusCode, String)> {
+    if req.tasks.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "tasks is required".to_string()));
+    }
+    for t in &req.tasks {
+        if t.task_key.trim().is_empty() || t.prompt.trim().is_empty() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "every task needs a non-empty task_key and prompt".to_string(),
+            ));
+        }
+        // Same operator policy as the orchestrator MCP: worker missions never
+        // burn Claude tokens. Enforced here too so the API can't be used to
+        // bypass the MCP-level check.
+        let claude_allowed = std::env::var("SANDBOXED_SH_ALLOW_CLAUDE_WORKERS")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        let is_claude = t.backend.eq_ignore_ascii_case("claudecode")
+            || t.model_override
+                .as_deref()
+                .map(|m| m.to_ascii_lowercase().contains("claude"))
+                .unwrap_or(false);
+        if t.backend.trim().is_empty() || (is_claude && !claude_allowed) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "task `{}`: workers need an explicit non-Claude backend (got `{}`)",
+                    t.task_key, t.backend
+                ),
+            ));
+        }
+    }
+
+    let control = control_for_user(&state, &user).await;
+    // The boss mission must exist — tasks attached to a typo'd uuid would
+    // never be scheduled against the right workspace.
+    let boss = control
+        .mission_store
+        .get_mission(id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
+        .ok_or((StatusCode::NOT_FOUND, format!("mission {} not found", id)))?;
+
+    control
+        .mission_store
+        .upsert_board_tasks(boss.id, req.tasks)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    let tasks = control
+        .mission_store
+        .list_board_tasks(id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let max_parallel = crate::settings::max_parallel_missions_cached_or(control.max_parallel);
+    Ok(Json(BoardResponse {
+        utilization: board_utilization(&tasks, max_parallel),
+        tasks,
+    }))
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct BoardVerdictRequest {
+    /// "accept" or "reject".
+    pub action: String,
+    /// Required for reject: feedback delivered to the worker.
+    #[serde(default)]
+    pub feedback: Option<String>,
+}
+
+/// POST /api/control/board/tasks/:task_id/verdict — boss judgment on a
+/// settled task. Accept is terminal; reject resumes the worker with feedback
+/// (or re-queues the task if the worker mission is gone).
+pub async fn board_task_verdict(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    Path(task_id): Path<Uuid>,
+    Json(req): Json<BoardVerdictRequest>,
+) -> Result<Json<BoardTask>, (StatusCode, String)> {
+    let control = control_for_user(&state, &user).await;
+    let mut task = control
+        .mission_store
+        .get_board_task(task_id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
+        .ok_or((StatusCode::NOT_FOUND, format!("task {} not found", task_id)))?;
+
+    match req.action.as_str() {
+        "accept" => {
+            if task.status != BoardTaskStatus::Settled && task.status != BoardTaskStatus::Failed {
+                return Err((
+                    StatusCode::CONFLICT,
+                    format!("task `{}` is {}, not settled", task.task_key, task.status),
+                ));
+            }
+            task.status = BoardTaskStatus::Accepted;
+        }
+        "reject" => {
+            let feedback = req
+                .feedback
+                .as_deref()
+                .map(str::trim)
+                .filter(|f| !f.is_empty())
+                .ok_or((
+                    StatusCode::BAD_REQUEST,
+                    "reject requires non-empty feedback".to_string(),
+                ))?;
+            if task.status.is_terminal() && task.status != BoardTaskStatus::Failed {
+                return Err((
+                    StatusCode::CONFLICT,
+                    format!("task `{}` is already {}", task.task_key, task.status),
+                ));
+            }
+            task.notes = {
+                let stamp = now_string();
+                Some(match &task.notes {
+                    Some(n) => format!("{n}\n[{stamp}] rejected: {feedback}"),
+                    None => format!("[{stamp}] rejected: {feedback}"),
+                })
+            };
+            // Prefer resuming the existing worker (it has the context); fall
+            // back to a fresh spawn via the scheduler when the worker is gone.
+            let resumed = if let Some(worker_id) = task.worker_mission_id {
+                let (tx, _rx) = oneshot::channel();
+                control
+                    .cmd_tx
+                    .send(ControlCommand::UserMessage {
+                        id: Uuid::new_v4(),
+                        content: format!(
+                            "[task-board] The boss rejected your result for task `{}`. \
+                             Address this feedback, then end your turn with the same \
+                             done/BLOCKED contract as before:\n\n{}",
+                            task.task_key, feedback
+                        ),
+                        agent: None,
+                        target_mission_id: Some(worker_id),
+                        strict: false,
+                        respond: tx,
+                    })
+                    .await
+                    .is_ok()
+            } else {
+                false
+            };
+            if resumed {
+                task.status = BoardTaskStatus::Running;
+                // A rejection grants a fresh retry budget: the boss explicitly
+                // asked for another attempt.
+                task.attempts = 1;
+            } else {
+                task.status = BoardTaskStatus::Pending;
+                task.attempts = 0;
+                task.worker_mission_id = None;
+                task.prompt = format!(
+                    "{}\n\n[task-board] Previous attempt was rejected with feedback:\n{}",
+                    task.prompt, feedback
+                );
+            }
+            task.outcome = None;
+        }
+        other => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("unknown action `{}` (use accept|reject)", other),
+            ));
+        }
+    }
+
+    control
+        .mission_store
+        .save_board_task(&task)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    Ok(Json(task))
+}
+
+/// POST /api/control/board/tasks/:task_id/cancel — mark a task cancelled.
+/// A running worker is left to finish its current turn; its settle is ignored.
+pub async fn cancel_board_task(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    Path(task_id): Path<Uuid>,
+) -> Result<Json<BoardTask>, (StatusCode, String)> {
+    let control = control_for_user(&state, &user).await;
+    let mut task = control
+        .mission_store
+        .get_board_task(task_id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
+        .ok_or((StatusCode::NOT_FOUND, format!("task {} not found", task_id)))?;
+    if task.status.is_terminal() {
+        return Err((
+            StatusCode::CONFLICT,
+            format!("task `{}` is already {}", task.task_key, task.status),
+        ));
+    }
+    task.status = BoardTaskStatus::Cancelled;
+    task.notes = {
+        let stamp = now_string();
+        Some(match &task.notes {
+            Some(n) => format!("{n}\n[{stamp}] cancelled"),
+            None => format!("[{stamp}] cancelled"),
+        })
+    };
+    control
+        .mission_store
+        .save_board_task(&task)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    Ok(Json(task))
 }
 
 /// Submit a frontend tool result to resume the running agent.
@@ -4509,6 +4963,13 @@ fn conversation_profile_enabled(profile: Option<&str>) -> bool {
     matches!(profile, Some("conversation"))
 }
 
+/// Interactive/frontend tools whose call args (the question payload) must
+/// survive history projection so the dashboard can render the item — even
+/// after it's answered. Mirrors the dashboard's `isUiTool` check.
+fn is_interactive_ui_tool(name: &str) -> bool {
+    name == "question" || name == "AskUserQuestion" || name.starts_with("ui_")
+}
+
 fn project_conversation_events(
     events: Vec<mission_store::StoredEvent>,
     keep_full_tool_call_ids: &HashSet<String>,
@@ -4559,6 +5020,19 @@ fn project_conversation_events(
             continue;
         };
         if keep_full_tool_call_ids.contains(&tool_call_id) {
+            projected.push(event);
+            continue;
+        }
+        // Interactive UI tools (question / AskUserQuestion / ui_*) carry the
+        // question payload the dashboard needs to render the item even after
+        // it's answered. Stubbing them drops the args, so an answered question
+        // would reload as an empty "reply below" prompt. Never stub them or
+        // their results, regardless of the recency window.
+        if event
+            .tool_name
+            .as_deref()
+            .is_some_and(is_interactive_ui_tool)
+        {
             projected.push(event);
             continue;
         }
@@ -6251,6 +6725,11 @@ fn spawn_control_session(
         mission_search_cache,
     };
 
+    // Shared registry of in-flight Claude Code background shell tasks. Written
+    // by the control actor's ToolResult arm; read by the auto-resume watcher.
+    let background_tasks: super::mission_runner::BackgroundTaskRegistry =
+        Arc::new(RwLock::new(std::collections::HashMap::new()));
+
     // Spawn the main control actor
     tokio::spawn(control_actor_loop(
         config.clone(),
@@ -6261,6 +6740,7 @@ fn spawn_control_session(
         cmd_rx,
         mission_cmd_rx,
         mission_cmd_tx,
+        state.cmd_tx.clone(),
         events_tx.clone(),
         events_rx,
         tool_hub.clone(),
@@ -6271,6 +6751,7 @@ fn spawn_control_session(
         mission_store,
         secrets,
         user_id,
+        Arc::clone(&background_tasks),
     ));
 
     // Recover missions stopped by the previous backend process. Graceful
@@ -6319,6 +6800,27 @@ fn spawn_control_session(
             Arc::clone(&state.mission_store),
             events_tx.clone(),
         ));
+    }
+
+    // Spawn the background-task auto-resume watcher. When a mission agent
+    // launches a `Bash` job with `run_in_background: true` and then ends its
+    // turn, the mission parks in `AwaitingUser` with nothing to wake it when the
+    // job finishes. This watcher polls captured background tasks, detects
+    // completion inside the workspace, and resumes the agent with the output.
+    // Uses an in-memory registry (no persistent store required). Gated by
+    // `BACKGROUND_TASK_AUTORESUME` (default enabled).
+    if super::mission_runner::background_task_autoresume_enabled() {
+        tokio::spawn(background_task_autoresume_loop(
+            Arc::clone(&state.mission_store),
+            state.cmd_tx.clone(),
+            events_tx.clone(),
+            workspaces.clone(),
+            Arc::clone(&background_tasks),
+        ));
+    } else {
+        tracing::info!(
+            "Background-task auto-resume watcher not started (BACKGROUND_TASK_AUTORESUME disabled)"
+        );
     }
 
     // Spawn event logger task (logs all events to SQLite for debugging/replay)
@@ -6909,6 +7411,7 @@ async fn automation_scheduler_loop(
                         content: substituted_content.clone(),
                         agent: None,
                         target_mission_id: Some(mission.id),
+                        strict: false,
                         respond: respond_tx,
                     })
                     .await;
@@ -7841,6 +8344,12 @@ async fn maybe_finalize_terminal_mission(
                     status: new_status,
                     summary: mission_status_summary_for_terminal_reason(reason),
                 });
+
+                // Stall-guard: orchestrators that park in awaiting_user with no
+                // wakeup armed can't resume themselves — arm a bounded fallback.
+                if new_status == MissionStatus::AwaitingUser {
+                    maybe_arm_stall_guard_wakeup(mission_store, mission_id).await;
+                }
             }
         }
         Ok(None) => {
@@ -8131,6 +8640,10 @@ async fn control_actor_loop(
     mut cmd_rx: mpsc::Receiver<ControlCommand>,
     mut mission_cmd_rx: mpsc::Receiver<crate::tools::mission::MissionControlCommand>,
     mission_cmd_tx: mpsc::Sender<crate::tools::mission::MissionControlCommand>,
+    // Clone of the actor's own command sender, used by the task-board
+    // scheduler to spawn workers and deliver digests through the normal
+    // message-routing path (always try_send, never await — see board.rs).
+    self_cmd_tx: mpsc::Sender<ControlCommand>,
     events_tx: broadcast::Sender<AgentEvent>,
     mut events_rx: broadcast::Receiver<AgentEvent>,
     tool_hub: Arc<FrontendToolHub>,
@@ -8141,10 +8654,61 @@ async fn control_actor_loop(
     mission_store: Arc<dyn MissionStore>,
     secrets: Option<Arc<SecretsStore>>,
     session_user_id: String,
+    // Shared registry of in-flight Claude Code background shell tasks. Written
+    // here from the `ToolResult` event arm; read by the auto-resume watcher.
+    background_tasks: super::mission_runner::BackgroundTaskRegistry,
 ) {
     // Queue stores (id, content, agent, target_mission_id) for the current/primary mission
     // The target_mission_id tracks which mission each queued message is intended for
     let mut queue: VecDeque<(Uuid, String, Option<String>, Option<Uuid>)> = VecDeque::new();
+    // Re-drive any messages that were queued before the last restart. They are
+    // persisted as a JSON snapshot (see `persist_control_queue_if_changed`) so a
+    // restart doesn't lose pending work. We re-inject them through the normal
+    // command channel rather than pushing straight onto `queue`: an idle actor
+    // never dequeues a pre-filled `queue` on its own, so the work would
+    // otherwise sit forever. Routing them as commands also de-duplicates against
+    // a client retry of the same id via `accept_user_message_id` (whichever
+    // arrives first runs; the other is dropped), so nothing executes twice.
+    let mut restored_db_snapshot = String::new();
+    if let Ok(payload) = mission_store.load_control_queue(&session_user_id).await {
+        if !payload.trim().is_empty() {
+            match serde_json::from_str::<Vec<QueuedMessage>>(&payload) {
+                Ok(items) => {
+                    let count = items.len();
+                    for it in items {
+                        let (ack_tx, _ack_rx) = tokio::sync::oneshot::channel();
+                        if let Err(e) = self_cmd_tx.try_send(ControlCommand::UserMessage {
+                            id: it.id,
+                            content: it.content,
+                            agent: it.agent,
+                            target_mission_id: it.mission_id,
+                            strict: false,
+                            respond: ack_tx,
+                        }) {
+                            tracing::warn!("Failed to re-queue restored control message: {e}");
+                        }
+                    }
+                    if count > 0 {
+                        // Remember the stale on-disk snapshot so the first
+                        // loop-top persist below rewrites the DB to the real
+                        // (re-injected) state instead of leaving it stale.
+                        restored_db_snapshot = payload;
+                        tracing::info!("Re-queued {count} message(s) from the previous session");
+                    }
+                }
+                Err(e) => tracing::warn!("Failed to parse persisted control queue: {e}"),
+            }
+        }
+    }
+    // Snapshot of the queue as last written to the store; used to debounce
+    // persistence so we only write to the DB when the queue actually changes.
+    // When messages were restored, seed it with the stale on-disk snapshot so
+    // the first loop-top persist overwrites it with the live queue.
+    let mut last_persisted_queue: String = if restored_db_snapshot.is_empty() {
+        serialize_queue_snapshot(&queue)
+    } else {
+        restored_db_snapshot
+    };
     let mut history: Vec<(String, String)> = Vec::new(); // (role, content) pairs (user/assistant)
     let mut running: Option<tokio::task::JoinHandle<(Uuid, String, crate::agents::AgentResult)>> =
         None;
@@ -8157,10 +8721,11 @@ async fn control_actor_loop(
     // Track current activity label for the main runner
     let mut main_runner_activity: Option<String> = None;
     // Idempotency guard for user sends. The dashboard may retry a POST if a
-    // weak connection drops after the command reached this actor but before
-    // the HTTP response got back. Since the client can now provide the UUID,
-    // ignore repeated commands with the same id instead of queueing/running
-    // the same user message twice.
+    // weak connection drops after the command reached this actor but before the
+    // HTTP response got back; since the client provides the UUID, repeated
+    // commands with the same id are ignored instead of running twice. Restored
+    // messages (re-injected as commands above) rely on this same guard: the
+    // first occurrence runs, any later duplicate is dropped.
     let mut accepted_user_message_ids: HashSet<Uuid> = HashSet::new();
     // Track subtasks for the main runner
     let mut main_runner_subtasks: Vec<super::mission_runner::SubtaskInfo> = Vec::new();
@@ -8185,6 +8750,25 @@ async fn control_actor_loop(
         Uuid,
         super::mission_runner::MissionRunner,
     > = std::collections::HashMap::new();
+
+    // Correlate Bash `tool_call_id` -> command string so that when the matching
+    // `Bash` ToolResult carries a background-start marker we can record the
+    // launched command in the background-task registry. Capped to avoid
+    // unbounded growth if a result is ever dropped; entries are removed when
+    // the matching result arrives. Only `Bash` calls are tracked.
+    let mut pending_bash_commands: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    const MAX_PENDING_BASH_COMMANDS: usize = 256;
+    let background_autoresume_enabled = super::mission_runner::background_task_autoresume_enabled();
+
+    // Task-board scheduler cadence: the 100ms tick is far too hot for store
+    // scans, so passes run every few seconds. Each pass spawns ready workers,
+    // sweeps zombies, and wakes idle bosses whose board needs a decision.
+    const BOARD_PASS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
+    let mut last_board_pass = tokio::time::Instant::now();
+    // Per-boss "wake outstanding" flags, coalescing board wakes across passes.
+    let mut board_wake_state: std::collections::HashMap<Uuid, bool> =
+        std::collections::HashMap::new();
 
     // Helper to extract file paths from text (for mission summaries)
     fn extract_file_paths(text: &str) -> Vec<String> {
@@ -8248,6 +8832,28 @@ async fn control_actor_loop(
         if let Some(raw) = result.as_str() {
             if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(raw) {
                 return Some(parsed);
+            }
+        }
+        None
+    }
+
+    /// Extract the human-readable text from a tool result `Value`.
+    ///
+    /// The Claude Code runner emits either a plain string or an object of the
+    /// form `{ "content": ..., "stdout": ..., "stderr": ..., "is_error": ... }`
+    /// (see `runners::claudecode`). We prefer `content`, falling back to
+    /// `stdout`, then the whole string. Returns `None` when no text is present.
+    fn tool_result_text(result: &serde_json::Value) -> Option<String> {
+        if let Some(s) = result.as_str() {
+            return Some(s.to_string());
+        }
+        if let Some(obj) = result.as_object() {
+            for key in ["content", "stdout"] {
+                if let Some(s) = obj.get(key).and_then(|v| v.as_str()) {
+                    if !s.is_empty() {
+                        return Some(s.to_string());
+                    }
+                }
             }
         }
         None
@@ -8356,11 +8962,24 @@ async fn control_actor_loop(
     }
 
     loop {
+        // Persist the pending queue whenever it changes so a restart doesn't
+        // lose queued messages. Debounced by snapshot comparison — the DB is
+        // written only when the queue actually changed (no per-iteration churn
+        // during streaming, where the queue is usually unchanged). Each dequeue
+        // site below also persists immediately so a popped message can't be
+        // re-run after a crash (see `persist_control_queue_if_changed`).
+        persist_control_queue_if_changed(
+            &mission_store,
+            &session_user_id,
+            &queue,
+            &mut last_persisted_queue,
+        )
+        .await;
         tokio::select! {
             cmd = cmd_rx.recv() => {
                 let Some(cmd) = cmd else { break };
                 match cmd {
-                    ControlCommand::UserMessage { id, content, agent: msg_agent, target_mission_id, respond } => {
+                    ControlCommand::UserMessage { id, content, agent: msg_agent, target_mission_id, strict, respond } => {
                         if !accept_user_message_id(&mut accepted_user_message_ids, id) {
                             let status_snapshot = status.read().await;
                             let _ = respond.send(if status_snapshot.state != ControlRunState::Idle {
@@ -8433,26 +9052,30 @@ async fn control_actor_loop(
                         // through unchanged. See `api/grok_goal.rs`.
                         let goal_target_mission = effective_target.or(main_mission_id);
                         let mut content = content;
-                        match maybe_begin_grok_goal(
-                            &mission_store,
-                            &events_tx,
-                            goal_target_mission,
-                            &content,
-                        )
-                        .await
-                        {
-                            GrokGoalKickoff::Passthrough => {}
-                            GrokGoalKickoff::Rewritten { prompt } => {
-                                content = prompt;
-                            }
-                            GrokGoalKickoff::Rejected { reason } => {
-                                let _ = events_tx.send(AgentEvent::Error {
-                                    message: reason,
-                                    mission_id: goal_target_mission,
-                                    resumable: true,
-                                });
-                                let _ = respond.send(UserMessageAck::Dropped);
-                                continue;
+                        // Strict (control-plane) messages are system-generated and must
+                        // never be reinterpreted as a `/goal` kickoff — skip the rewrite.
+                        if !strict {
+                            match maybe_begin_grok_goal(
+                                &mission_store,
+                                &events_tx,
+                                goal_target_mission,
+                                &content,
+                            )
+                            .await
+                            {
+                                GrokGoalKickoff::Passthrough => {}
+                                GrokGoalKickoff::Rewritten { prompt } => {
+                                    content = prompt;
+                                }
+                                GrokGoalKickoff::Rejected { reason } => {
+                                    let _ = events_tx.send(AgentEvent::Error {
+                                        message: reason,
+                                        mission_id: goal_target_mission,
+                                        resumable: true,
+                                    });
+                                    let _ = respond.send(UserMessageAck::Dropped);
+                                    continue;
+                                }
                             }
                         }
 
@@ -8626,6 +9249,28 @@ async fn control_actor_loop(
                             }
                         }
 
+                        // Strict (control-plane) messages must never leak into an
+                        // *unrelated* mission. If the target is some OTHER mission
+                        // than the main session's and we got here, Case 1/2 (queue
+                        // to / start a parallel runner) didn't fire — drop rather
+                        // than fall through to the main session, which would land a
+                        // board wake / bg-autoresume / worker dispatch in the wrong
+                        // mission. The scheduler re-issues on its next pass.
+                        //
+                        // When the target IS the main session's mission, there is
+                        // no leak: Case 3 below is exactly where we want it — it
+                        // activates an idle/AwaitingUser main mission and starts a
+                        // fresh turn (e.g. the bg-task auto-resume waking a mission
+                        // that parked on the user while a background job ran).
+                        if strict && !target_is_main {
+                            tracing::warn!(
+                                target = ?effective_target,
+                                "Dropping strict control-plane message: non-main target not deliverable this pass"
+                            );
+                            let _ = respond.send(UserMessageAck::Dropped);
+                            continue;
+                        }
+
                         // Case 3: Queue to main session (default behavior)
                         // Auto-create mission on first message if none exists
                         {
@@ -8797,6 +9442,15 @@ async fn control_actor_loop(
                         }
                         if running.is_none() {
                             if let Some((mid, msg, per_msg_agent, msg_target_mid)) = queue.pop_front() {
+                                // Persist the dequeue before the awaits that start
+                                // the run, so a crash here can't restore + re-run it.
+                                persist_control_queue_if_changed(
+                                    &mission_store,
+                                    &session_user_id,
+                                    &queue,
+                                    &mut last_persisted_queue,
+                                )
+                                .await;
                                 set_and_emit_status(
                                     &status,
                                     &events_tx,
@@ -9693,6 +10347,16 @@ async fn control_actor_loop(
                                 // Start execution if not already running
                                 if running.is_none() {
                                     if let Some((mid, msg, _per_msg_agent, msg_target_mid)) = queue.pop_front() {
+                                        // Persist the dequeue before the awaits that
+                                        // start the run, so a crash here can't
+                                        // restore + re-run it.
+                                        persist_control_queue_if_changed(
+                                            &mission_store,
+                                            &session_user_id,
+                                            &queue,
+                                            &mut last_persisted_queue,
+                                        )
+                                        .await;
                                         let target_mid = msg_target_mid.unwrap_or(mission_id);
                                         set_and_emit_status(
                                             &status,
@@ -10446,6 +11110,15 @@ async fn control_actor_loop(
 
                 // Start next queued message, if any.
                 if let Some((mid, msg, per_msg_agent, msg_target_mid)) = queue.pop_front() {
+                    // Persist the dequeue before the awaits that start the run, so
+                    // a crash here can't restore + re-run it.
+                    persist_control_queue_if_changed(
+                        &mission_store,
+                        &session_user_id,
+                        &queue,
+                        &mut last_persisted_queue,
+                    )
+                    .await;
                     set_and_emit_status(
                         &status,
                         &events_tx,
@@ -10763,6 +11436,17 @@ async fn control_actor_loop(
                                         "parallel turn finished with no follow-up queued",
                                     )
                                     .await;
+                                    // Task-board settle hook: if this mission is a
+                                    // board worker, persist the outcome and notify
+                                    // the boss. No-op otherwise.
+                                    board::on_worker_settled(
+                                        &mission_store,
+                                        *mission_id,
+                                        &result.output,
+                                        result.terminal_reason,
+                                        result.success,
+                                    )
+                                    .await;
                                     completed_missions.push(*mission_id);
                                 }
                             }
@@ -10780,6 +11464,45 @@ async fn control_actor_loop(
                     )
                     .await;
                     tracing::info!("Parallel mission {} removed from runners", mid);
+                }
+
+                // Task-board scheduler: spawn workers for ready tasks and
+                // sweep zombies. Throttled — store scans on every 100ms tick
+                // would hammer sqlite for nothing.
+                if last_board_pass.elapsed() >= BOARD_PASS_INTERVAL {
+                    last_board_pass = tokio::time::Instant::now();
+                    // Missions actively executing a turn (parallel runners +
+                    // the main session), so the scheduler won't wake a busy boss.
+                    let mut running_ids: std::collections::HashSet<Uuid> = parallel_runners
+                        .iter()
+                        .filter(|(_, r)| r.is_running())
+                        .map(|(id, _)| *id)
+                        .collect();
+                    if running.is_some() {
+                        if let Some(mid) = running_mission_id {
+                            running_ids.insert(mid);
+                        }
+                    }
+                    let snapshot = board::RunnerSnapshot {
+                        present: parallel_runners.keys().copied().collect(),
+                        running_ids,
+                        running_count: parallel_runners
+                            .values()
+                            .filter(|r| r.is_running())
+                            .count(),
+                        main_running: running.is_some(),
+                    };
+                    let max_parallel = crate::settings::max_parallel_missions_cached_or(
+                        config.max_parallel_missions,
+                    );
+                    board::scheduler_pass(
+                        &mission_store,
+                        &self_cmd_tx,
+                        &snapshot,
+                        max_parallel,
+                        &mut board_wake_state,
+                    )
+                    .await;
                 }
             }
             // Force-reap a runner whose cancel was fired but whose
@@ -10901,6 +11624,21 @@ async fn control_actor_loop(
                                     runner
                                         .active_tool_calls
                                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                }
+
+                                // Background-task auto-resume: stash the command
+                                // for any `Bash` call so the matching ToolResult
+                                // can attach it to a captured background task.
+                                if background_autoresume_enabled
+                                    && name == "Bash"
+                                    && pending_bash_commands.len() < MAX_PENDING_BASH_COMMANDS
+                                {
+                                    if let Some(cmd) =
+                                        args.get("command").and_then(|v| v.as_str())
+                                    {
+                                        pending_bash_commands
+                                            .insert(tool_call_id.clone(), cmd.to_string());
+                                    }
                                 }
 
                                 // Emit activity event for real-time SSE
@@ -11086,6 +11824,63 @@ async fn control_actor_loop(
                             }
                         }
                         _ => {}
+                    }
+
+                    // Background-task auto-resume capture: when a `Bash` tool
+                    // result is the CLI's background-launch confirmation, record
+                    // the task so the watcher can wake the agent once it finishes.
+                    // (Must run before the desktop block below, which `continue`s
+                    // past non-desktop tool results.)
+                    if background_autoresume_enabled {
+                        if let AgentEvent::ToolResult {
+                            tool_call_id,
+                            name,
+                            result,
+                            mission_id,
+                        } = &event
+                        {
+                            // Always reclaim the correlated command, even if this
+                            // isn't a background start, so the map can't leak.
+                            let command = pending_bash_commands.remove(tool_call_id);
+                            if name == "Bash" {
+                                if let (Some(mid), Some(text)) =
+                                    (mission_id, tool_result_text(result))
+                                {
+                                    if let Some((task_id, output_path)) =
+                                        super::runners::claudecode::parse_background_task_start(
+                                            &text,
+                                        )
+                                    {
+                                        let task = super::mission_runner::BackgroundTask {
+                                            id: task_id.clone(),
+                                            output_path: output_path.clone(),
+                                            command: command.unwrap_or_default(),
+                                            started_at: std::time::Instant::now(),
+                                        };
+                                        tracing::info!(
+                                            mission_id = %mid,
+                                            background_task_id = %task_id,
+                                            output_path = %output_path,
+                                            "Captured Claude Code background task; \
+                                             scheduling auto-resume on completion"
+                                        );
+                                        // Mirror onto the runner (informational).
+                                        if let Some(runner) = parallel_runners.get_mut(mid) {
+                                            runner
+                                                .background_tasks
+                                                .insert(task_id.clone(), task.clone());
+                                        }
+                                        // Source of truth: the shared registry.
+                                        background_tasks
+                                            .write()
+                                            .await
+                                            .entry(*mid)
+                                            .or_default()
+                                            .insert(task_id, task);
+                                    }
+                                }
+                            }
+                        }
                     }
 
                     // Track desktop sessions for mission reconnect/resume.
@@ -11346,7 +12141,7 @@ async fn run_single_control_turn(
     }
     // Ensure a workspace directory for this mission (if applicable).
     let (working_dir_path, runtime_workspace) = if let Some(mid) = mission_id {
-        let ws = workspace::resolve_workspace(&workspaces, &config, workspace_id).await;
+        let mut ws = workspace::resolve_workspace(&workspaces, &config, workspace_id).await;
         if let Err(e) =
             workspace::sync_workspace_mcp_binaries_for_workspace(&config.working_dir, &ws).await
         {
@@ -11360,7 +12155,7 @@ async fn run_single_control_turn(
         let lib_guard = library.read().await;
         let lib_ref = lib_guard.as_ref().map(|l| l.as_ref());
         let dir = match Box::pin(workspace::prepare_mission_workspace_with_skills_backend(
-            &ws,
+            &mut ws,
             &mcp,
             lib_ref,
             mid,
@@ -11368,6 +12163,7 @@ async fn run_single_control_turn(
             None, // custom_providers: TODO integrate with provider store
             effective_config_profile.as_deref(),
             boss_user_id.as_deref(),
+            Some(&config.working_dir),
         ))
         .await
         {
@@ -11995,6 +12791,7 @@ pub async fn create_automation(
                     content,
                     agent: None,
                     target_mission_id: Some(target_mission_id),
+                    strict: false,
                     respond: respond_tx,
                 })
                 .await;
@@ -13244,6 +14041,7 @@ pub async fn webhook_receiver(
             content: substituted_content,
             agent: None,
             target_mission_id: Some(mission.id),
+            strict: false,
             respond: respond_tx,
         })
         .await;
@@ -14397,6 +15195,7 @@ pub async fn send_telegram_message_api(
                     content,
                     agent: None,
                     target_mission_id: Some(mapping.mission_id),
+                    strict: false,
                     respond: tx,
                 })
                 .await;
@@ -14602,6 +15401,55 @@ mod tests {
             stub.metadata["call_content_bytes"],
             serde_json::json!("{\"cmd\":\"old\"}".len())
         );
+    }
+
+    #[test]
+    fn conversation_projection_keeps_interactive_ui_tools_full() {
+        // An old, answered AskUserQuestion must NOT be stubbed: the dashboard
+        // needs its args to render the question, otherwise it shows the
+        // misleading empty "reply below" prompt for an already-answered item.
+        let mission_id = Uuid::new_v4();
+        let mut call = stored_test_event(
+            mission_id,
+            1,
+            "tool_call",
+            Some("q-1"),
+            "{\"questions\":[{\"question\":\"Pick one\",\"options\":[]}]}",
+        );
+        call.tool_name = Some("AskUserQuestion".to_string());
+        let mut result = stored_test_event(
+            mission_id,
+            2,
+            "tool_result",
+            Some("q-1"),
+            "{\"answers\":[[\"A\"]]}",
+        );
+        result.tool_name = Some("AskUserQuestion".to_string());
+        // A newer ordinary tool pair that SHOULD still be stubbed.
+        let newer_call =
+            stored_test_event(mission_id, 3, "tool_call", Some("b-1"), "{\"cmd\":\"x\"}");
+        let newer_result =
+            stored_test_event(mission_id, 4, "tool_result", Some("b-1"), "{\"ok\":true}");
+
+        let projected = project_conversation_events(
+            vec![call, result, newer_call, newer_result],
+            &HashSet::new(),
+            &HashMap::new(),
+        );
+
+        // The question call + result survive intact.
+        let q_call = projected
+            .iter()
+            .find(|e| e.tool_call_id.as_deref() == Some("q-1") && e.event_type == "tool_call")
+            .expect("question tool_call kept full");
+        assert!(q_call.content.contains("Pick one"));
+        assert!(projected
+            .iter()
+            .any(|e| e.tool_call_id.as_deref() == Some("q-1") && e.event_type == "tool_result"));
+        // The ordinary newer pair is stubbed as usual.
+        assert!(projected
+            .iter()
+            .any(|e| e.tool_call_id.as_deref() == Some("b-1") && e.event_type == "tool_stub"));
     }
 
     #[test]
@@ -18668,7 +19516,7 @@ Investigate <service/> failures.
                         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
-                        lagged = lagged.saturating_add(n as u64);
+                        lagged = lagged.saturating_add(n);
                     }
                     Err(broadcast::error::RecvError::Closed) => break,
                 }

@@ -1,9 +1,10 @@
 //! SQLite-based mission store with full event logging.
 
 use super::{
-    now_string, sanitize_filename, Automation, AutomationExecution, CommandSource, DailyUsageStats,
-    ExecutionStatus, FreshSession, HourlyUsageStats, Mission, MissionHistoryEntry, MissionMode,
-    MissionStatus, MissionStatusCounts, MissionStore, ModelUsageStats, PalomaCooldownState,
+    now_string, sanitize_filename, Automation, AutomationExecution, BoardTask, BoardTaskOutcome,
+    BoardTaskStatus, CommandSource, DailyUsageStats, ExecutionStatus, FreshSession,
+    HourlyUsageStats, Mission, MissionHistoryEntry, MissionMode, MissionStatus,
+    MissionStatusCounts, MissionStore, ModelUsageStats, NewBoardTask, PalomaCooldownState,
     PalomaDecision, PalomaMissionCard, PalomaSchedulerJob, PalomaUserPreferences, RetryConfig,
     StopPolicy, StoredEvent, TelegramActionExecution, TelegramActionExecutionKind,
     TelegramActionExecutionStatus, TelegramAlert, TelegramAlertPreference, TelegramChannel,
@@ -627,6 +628,44 @@ CREATE TABLE IF NOT EXISTS proxy_usage (
 
 CREATE INDEX IF NOT EXISTS idx_proxy_usage_timestamp ON proxy_usage(timestamp);
 CREATE INDEX IF NOT EXISTS idx_proxy_usage_model ON proxy_usage(model);
+
+-- Task board: server-scheduled worker tasks owned by a boss mission.
+-- The control loop spawns workers for ready tasks and settles them when the
+-- worker turn ends; the boss only plans and judges. See api::control::board.
+CREATE TABLE IF NOT EXISTS board_tasks (
+    id TEXT PRIMARY KEY,
+    boss_mission_id TEXT NOT NULL,
+    task_key TEXT NOT NULL,
+    title TEXT NOT NULL,
+    prompt TEXT NOT NULL,
+    backend TEXT NOT NULL,
+    model_override TEXT,
+    model_effort TEXT,
+    working_directory TEXT,
+    depends_on TEXT NOT NULL DEFAULT '[]',
+    status TEXT NOT NULL DEFAULT 'pending',
+    outcome TEXT,
+    worker_mission_id TEXT,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    result_digest TEXT,
+    notes TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(boss_mission_id, task_key),
+    FOREIGN KEY (boss_mission_id) REFERENCES missions(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_board_tasks_boss ON board_tasks(boss_mission_id);
+CREATE INDEX IF NOT EXISTS idx_board_tasks_worker ON board_tasks(worker_mission_id);
+CREATE INDEX IF NOT EXISTS idx_board_tasks_status ON board_tasks(status);
+
+-- Persisted control-session message queue (JSON snapshot) so pending queued
+-- messages survive a restart. Single row (the DB is already per-user).
+CREATE TABLE IF NOT EXISTS control_queue (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    payload TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
 "#;
 
 /// Content size threshold for inline storage (64KB).
@@ -2888,6 +2927,42 @@ impl MissionStore for SqliteMissionStore {
             )
             .map_err(|e| e.to_string())?;
             Ok(())
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
+    async fn save_control_queue(&self, _user_id: &str, payload: &str) -> Result<(), String> {
+        let conn = self.conn.clone();
+        let payload = payload.to_string();
+        let now = now_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "INSERT INTO control_queue (id, payload, updated_at) VALUES (1, ?1, ?2)
+                 ON CONFLICT(id) DO UPDATE SET payload = ?1, updated_at = ?2",
+                params![payload, now],
+            )
+            .map_err(|e| e.to_string())?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
+    async fn load_control_queue(&self, _user_id: &str) -> Result<String, String> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let payload: Option<String> = conn
+                .query_row(
+                    "SELECT payload FROM control_queue WHERE id = 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|e| e.to_string())?;
+            Ok(payload.unwrap_or_default())
         })
         .await
         .map_err(|e| e.to_string())?
@@ -9111,6 +9186,258 @@ impl MissionStore for SqliteMissionStore {
         .await
         .map_err(|e| e.to_string())?
     }
+
+    // ---- Task board ------------------------------------------------------
+
+    async fn upsert_board_tasks(
+        &self,
+        boss_mission_id: Uuid,
+        tasks: Vec<NewBoardTask>,
+    ) -> Result<Vec<BoardTask>, String> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let now = now_string();
+            let mut out = Vec::with_capacity(tasks.len());
+            for t in tasks {
+                let existing: Option<(String, String)> = conn
+                    .query_row(
+                        "SELECT id, status FROM board_tasks WHERE boss_mission_id = ?1 AND task_key = ?2",
+                        params![boss_mission_id.to_string(), t.task_key],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .optional()
+                    .map_err(|e| format!("Failed to look up board task: {e}"))?;
+
+                let depends_on_json = serde_json::to_string(&t.depends_on)
+                    .map_err(|e| format!("Failed to serialize depends_on: {e}"))?;
+
+                let row_id = match existing {
+                    Some((id, status)) if status == "pending" => {
+                        conn.execute(
+                            "UPDATE board_tasks SET title = ?1, prompt = ?2, backend = ?3, \
+                             model_override = ?4, model_effort = ?5, working_directory = ?6, \
+                             depends_on = ?7, updated_at = ?8 WHERE id = ?9",
+                            params![
+                                t.title,
+                                t.prompt,
+                                t.backend,
+                                t.model_override,
+                                t.model_effort,
+                                t.working_directory,
+                                depends_on_json,
+                                now,
+                                id,
+                            ],
+                        )
+                        .map_err(|e| format!("Failed to update board task: {e}"))?;
+                        id
+                    }
+                    Some((id, _)) => id, // non-pending: leave untouched
+                    None => {
+                        let id = Uuid::new_v4().to_string();
+                        conn.execute(
+                            "INSERT INTO board_tasks (id, boss_mission_id, task_key, title, prompt, \
+                             backend, model_override, model_effort, working_directory, depends_on, \
+                             status, attempts, created_at, updated_at) \
+                             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'pending', 0, ?11, ?11)",
+                            params![
+                                id,
+                                boss_mission_id.to_string(),
+                                t.task_key,
+                                t.title,
+                                t.prompt,
+                                t.backend,
+                                t.model_override,
+                                t.model_effort,
+                                t.working_directory,
+                                depends_on_json,
+                                now,
+                            ],
+                        )
+                        .map_err(|e| format!("Failed to insert board task: {e}"))?;
+                        id
+                    }
+                };
+
+                let task = conn
+                    .query_row(
+                        &format!("SELECT {BOARD_TASK_COLUMNS} FROM board_tasks WHERE id = ?1"),
+                        params![row_id],
+                        parse_board_task_row,
+                    )
+                    .map_err(|e| format!("Failed to re-read board task: {e}"))?;
+                out.push(task);
+            }
+            Ok(out)
+        })
+        .await
+        .map_err(|e| format!("Task join error: {e}"))?
+    }
+
+    async fn list_board_tasks(&self, boss_mission_id: Uuid) -> Result<Vec<BoardTask>, String> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let mut stmt = conn
+                .prepare(&format!(
+                    "SELECT {BOARD_TASK_COLUMNS} FROM board_tasks \
+                     WHERE boss_mission_id = ?1 ORDER BY created_at ASC, task_key ASC"
+                ))
+                .map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map(params![boss_mission_id.to_string()], parse_board_task_row)
+                .map_err(|e| e.to_string())?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())
+        })
+        .await
+        .map_err(|e| format!("Task join error: {e}"))?
+    }
+
+    async fn list_active_board_missions(&self) -> Result<Vec<Uuid>, String> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT DISTINCT boss_mission_id FROM board_tasks \
+                     WHERE status IN ('pending', 'running', 'settled')",
+                )
+                .map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(|e| e.to_string())?;
+            let mut out = Vec::new();
+            for r in rows {
+                let s = r.map_err(|e| e.to_string())?;
+                if let Ok(id) = Uuid::parse_str(&s) {
+                    out.push(id);
+                }
+            }
+            Ok(out)
+        })
+        .await
+        .map_err(|e| format!("Task join error: {e}"))?
+    }
+
+    async fn get_board_task(&self, task_id: Uuid) -> Result<Option<BoardTask>, String> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            conn.query_row(
+                &format!("SELECT {BOARD_TASK_COLUMNS} FROM board_tasks WHERE id = ?1"),
+                params![task_id.to_string()],
+                parse_board_task_row,
+            )
+            .optional()
+            .map_err(|e| e.to_string())
+        })
+        .await
+        .map_err(|e| format!("Task join error: {e}"))?
+    }
+
+    async fn get_board_task_by_worker(
+        &self,
+        worker_mission_id: Uuid,
+    ) -> Result<Option<BoardTask>, String> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            conn.query_row(
+                &format!(
+                    "SELECT {BOARD_TASK_COLUMNS} FROM board_tasks \
+                     WHERE worker_mission_id = ?1 ORDER BY updated_at DESC LIMIT 1"
+                ),
+                params![worker_mission_id.to_string()],
+                parse_board_task_row,
+            )
+            .optional()
+            .map_err(|e| e.to_string())
+        })
+        .await
+        .map_err(|e| format!("Task join error: {e}"))?
+    }
+
+    async fn save_board_task(&self, task: &BoardTask) -> Result<(), String> {
+        let conn = self.conn.clone();
+        let t = task.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let depends_on_json = serde_json::to_string(&t.depends_on)
+                .map_err(|e| format!("Failed to serialize depends_on: {e}"))?;
+            let updated = conn
+                .execute(
+                    "UPDATE board_tasks SET task_key = ?1, title = ?2, prompt = ?3, backend = ?4, \
+                     model_override = ?5, model_effort = ?6, working_directory = ?7, depends_on = ?8, \
+                     status = ?9, outcome = ?10, worker_mission_id = ?11, attempts = ?12, \
+                     result_digest = ?13, notes = ?14, updated_at = ?15 WHERE id = ?16",
+                    params![
+                        t.task_key,
+                        t.title,
+                        t.prompt,
+                        t.backend,
+                        t.model_override,
+                        t.model_effort,
+                        t.working_directory,
+                        depends_on_json,
+                        t.status.to_string(),
+                        t.outcome.map(|o| o.to_string()),
+                        t.worker_mission_id.map(|id| id.to_string()),
+                        t.attempts as i64,
+                        t.result_digest,
+                        t.notes,
+                        now_string(),
+                        t.id.to_string(),
+                    ],
+                )
+                .map_err(|e| format!("Failed to save board task: {e}"))?;
+            if updated == 0 {
+                return Err(format!("Board task {} not found", t.id));
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|e| format!("Task join error: {e}"))?
+    }
+}
+
+/// Column list shared by every board task SELECT so `parse_board_task_row`
+/// indices stay in sync.
+const BOARD_TASK_COLUMNS: &str = "id, boss_mission_id, task_key, title, prompt, backend, \
+    model_override, model_effort, working_directory, depends_on, status, outcome, \
+    worker_mission_id, attempts, result_digest, notes, created_at, updated_at";
+
+fn parse_board_task_row(row: &rusqlite::Row<'_>) -> Result<BoardTask, rusqlite::Error> {
+    let id: String = row.get(0)?;
+    let boss_mission_id: String = row.get(1)?;
+    let depends_on_json: String = row.get(9)?;
+    let status_str: String = row.get(10)?;
+    let outcome_str: Option<String> = row.get(11)?;
+    let worker_mission_id: Option<String> = row.get(12)?;
+    let attempts: i64 = row.get(13)?;
+    Ok(BoardTask {
+        id: Uuid::parse_str(&id)
+            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,
+        boss_mission_id: Uuid::parse_str(&boss_mission_id)
+            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,
+        task_key: row.get(2)?,
+        title: row.get(3)?,
+        prompt: row.get(4)?,
+        backend: row.get(5)?,
+        model_override: row.get(6)?,
+        model_effort: row.get(7)?,
+        working_directory: row.get(8)?,
+        depends_on: serde_json::from_str(&depends_on_json).unwrap_or_default(),
+        status: BoardTaskStatus::parse(&status_str).unwrap_or(BoardTaskStatus::Pending),
+        outcome: outcome_str.as_deref().and_then(BoardTaskOutcome::parse),
+        worker_mission_id: worker_mission_id.and_then(|s| Uuid::parse_str(&s).ok()),
+        attempts: attempts as u32,
+        result_digest: row.get(14)?,
+        notes: row.get(15)?,
+        created_at: row.get(16)?,
+        updated_at: row.get(17)?,
+    })
 }
 
 fn telegram_user_role_to_str(role: TelegramUserRole) -> &'static str {
@@ -13120,5 +13447,91 @@ mod tests {
             .await
             .expect("filtered");
         assert!(filtered.is_empty());
+    }
+
+    #[tokio::test]
+    async fn board_tasks_roundtrip() {
+        use crate::api::mission_store::{BoardTaskOutcome, BoardTaskStatus, NewBoardTask};
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let store = SqliteMissionStore::new(temp_dir.path().to_path_buf(), "test-user")
+            .await
+            .expect("store");
+
+        let boss = store
+            .create_mission(Some("boss"), None, None, None, None, None, None)
+            .await
+            .expect("boss mission");
+
+        let new = |key: &str, deps: Vec<&str>| NewBoardTask {
+            task_key: key.to_string(),
+            title: format!("title-{key}"),
+            prompt: format!("prompt-{key}"),
+            backend: "codex".to_string(),
+            model_override: Some("gpt-5.5".to_string()),
+            model_effort: Some("high".to_string()),
+            working_directory: Some("/workspaces/x/wt-1".to_string()),
+            depends_on: deps.into_iter().map(String::from).collect(),
+        };
+
+        let tasks = store
+            .upsert_board_tasks(boss.id, vec![new("t1", vec![]), new("t2", vec!["t1"])])
+            .await
+            .expect("upsert");
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(tasks[0].status, BoardTaskStatus::Pending);
+        assert_eq!(tasks[1].depends_on, vec!["t1".to_string()]);
+
+        // Active boards includes our boss.
+        let active = store.list_active_board_missions().await.expect("active");
+        assert_eq!(active, vec![boss.id]);
+
+        // Bind t1 to a worker, settle it, look it up by worker.
+        let worker = Uuid::new_v4();
+        let mut t1 = tasks[0].clone();
+        t1.worker_mission_id = Some(worker);
+        t1.status = BoardTaskStatus::Running;
+        t1.attempts = 1;
+        store.save_board_task(&t1).await.expect("save running");
+
+        let by_worker = store
+            .get_board_task_by_worker(worker)
+            .await
+            .expect("by worker")
+            .expect("found");
+        assert_eq!(by_worker.task_key, "t1");
+
+        let mut settled = by_worker;
+        settled.status = BoardTaskStatus::Settled;
+        settled.outcome = Some(BoardTaskOutcome::Success);
+        settled.result_digest = Some("did the thing".to_string());
+        store.save_board_task(&settled).await.expect("save settled");
+
+        let listed = store.list_board_tasks(boss.id).await.expect("list");
+        let t1 = listed.iter().find(|t| t.task_key == "t1").unwrap();
+        assert_eq!(t1.status, BoardTaskStatus::Settled);
+        assert_eq!(t1.outcome, Some(BoardTaskOutcome::Success));
+        assert_eq!(t1.result_digest.as_deref(), Some("did the thing"));
+
+        // Upserting an existing pending task updates it; settled stays.
+        let updated = store
+            .upsert_board_tasks(boss.id, vec![new("t2", vec![]), new("t1", vec![])])
+            .await
+            .expect("upsert again");
+        let t2 = updated.iter().find(|t| t.task_key == "t2").unwrap();
+        assert!(t2.depends_on.is_empty(), "pending task should be updated");
+        let t1 = updated.iter().find(|t| t.task_key == "t1").unwrap();
+        assert_eq!(
+            t1.status,
+            BoardTaskStatus::Settled,
+            "settled task must not be reset by upsert"
+        );
+
+        // get_board_task by id.
+        let fetched = store
+            .get_board_task(t2.id)
+            .await
+            .expect("get")
+            .expect("some");
+        assert_eq!(fetched.task_key, "t2");
     }
 }
